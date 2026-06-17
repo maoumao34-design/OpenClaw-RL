@@ -40,3 +40,6 @@ secrets.yaml
 .vscode/
 .idea/
 *.swp
+
+# Papers
+*.pdf
