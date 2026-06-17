@@ -141,6 +141,74 @@ $$\mathcal{L}_i^{OPD} = \sum_{v \in S_i} \max(-A_v \rho_v, -A_v \cdot \text{clip
 
 ---
 
+## 其他重要实现细节
+
+### 1. OPD 使用全局 log-prob，不是 subset 归一化
+
+代码注释里明确解释了为什么用 **GLOBAL ratio** 而不是 subset 内归一化：
+
+> 如果用 subset 内归一化的 ratio，student 可以通过把 subset 外的质量压到接近零来"满足"约束，而不真正学习 teacher 的分布。用全局 ratio 才能让 IS 校正是诚实的。
+
+```python
+# ell_cur = raw_logits(v) - global_lse(raw_logits)  ← 全局 log-prob，有 autograd
+# rho_v = exp(ell_cur - ell_old)                    ← 全局 ratio
+```
+
+实现上用了两个自定义 autograd Function：
+- `_VocabParallelGatherRawLogits`：在 TP 分片的词表上 gather 指定 vocab id 的 raw logits
+- `_VocabParallelGlobalLSE`：跨 TP 分片计算全局 log-sum-exp
+
+**代价：** backward 时需要 materialize `[R, V_local]` 的全局 softmax，显存开销不可避免。
+
+---
+
+### 2. hint_opd_loss 和 openclaw_topk_select_loss 的默认权重不同
+
+| 模块 | w_rl 默认值 | w_opd 默认值 | 含义 |
+|------|-----------|------------|------|
+| `hint_opd_loss.py` | **0.0** | 1.0 | 纯 OPD，无 GRPO |
+| `openclaw_topk_select_loss.py` | **1.0** | 1.0 | GRPO + OPD 混合 |
+
+论文的完整方法是 `openclaw_topk_select_loss`（w_rl=1.0, w_opd=1.0）。
+
+---
+
+### 3. 训练与提交的解耦机制
+
+`openclaw_rollout.py` 里有一个关键的 **pause/resume 机制**：
+
+```python
+worker.resume_submission()   # 开放样本提交
+completed_samples = drain_output_queue(...)  # 等待收集足够样本
+worker.pause_submission()    # 暂停提交 + 清空 record 文件
+# → 触发 Megatron 梯度更新
+```
+
+训练时 submission 被 **暂停**，防止训练期间的请求产生用旧权重生成的样本混入下一轮。这是论文里"异步但不污染"的核心保证。
+
+---
+
+### 4. old_log_probs 来源必须是 Megatron，不能用 SGLang rollout
+
+代码里有明确的 assert：
+
+```python
+assert not getattr(args, "use_rollout_logprobs", False), (
+    "hint_opd loss requires old-policy log-probs from Megatron old_actor, not SGLang rollout"
+)
+```
+
+原因：SGLang rollout 输出的 log-prob 精度不够，OPD 需要精确的全局 log-prob 来计算 IS weight 和 advantage。
+
+---
+
+### 5. rollout_batch_size 决定每轮训练等待的样本数
+
+`_drain_output_queue` 里等待 `args.rollout_batch_size` 个 group 才触发训练。
+启动脚本里设置的是 `--rollout-batch-size 16`，即每收集 16 个 session turn 才更新一次参数。
+
+等待超过 30 秒没有新样本时会打印进度日志，可以用来判断 pipeline 是否卡住。
+
 ## 复现难点
 
 1. **异步基础设施**：四个组件完全解耦，需要实现可靠的 session 级消息路由和 buffer 同步机制
