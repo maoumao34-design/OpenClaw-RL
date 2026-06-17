@@ -51,6 +51,30 @@ $$r_t = o + \sum_{i=1}^{m} r_i / m$$
 
 Advantage 计算：按 step index 分组标准化，而非全轨迹聚类。
 
+#### ⚠️ 实际 GRPO 实现细节（与标准 GRPO 的差异）
+
+论文说 GRPO，但代码实现是 **PPO-style clipped surrogate**，不是标准 GRPO：
+
+```python
+# slime/slime/utils/ppo_utils.py: compute_policy_loss()
+ratio = exp(-ppo_kl)                          # ppo_kl = log π_old - log π_new
+pg_loss1 = -ratio * advantages                # 未裁剪项
+pg_loss2 = -clip(ratio, 1-eps_lo, 1+eps_hi) * advantages  # 裁剪项
+loss = max(pg_loss1, pg_loss2)                # 取较大值（更保守）
+```
+
+**与标准 GRPO 的关键差异：**
+
+| 项目 | 标准 GRPO | 实际实现 |
+|------|----------|---------|
+| 裁剪方式 | 无裁剪或对称裁剪 | **非对称裁剪** eps_lo=0.2, eps_hi=0.28 |
+| KL 惩罚 | 通常有 | kl_loss_coef=0.0（**实际关闭**）|
+| reward 归一化 | 组内归一化 | `--disable-rewards-normalization`（**关闭**）|
+| 优势聚合 | 组内标准化 | per-step-index 分组标准化 |
+| loss 聚合 | mean | `sum_of_sample_mean`（sample 内 mean，sample 间 sum）|
+
+**重要**：`--disable-rewards-normalization` 是默认开启的，意味着 reward 直接用 PRM 的原始分数 {+1, -1, 0}，不做归一化处理。这使得训练信号更稀疏但更准确。
+
 ---
 
 ### 信号二：Directive Signal → OPD（Hindsight-Guided On-Policy Distillation）
