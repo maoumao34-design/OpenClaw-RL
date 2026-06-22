@@ -132,6 +132,8 @@ $$\mathcal{L}_i^{OPD} = \sum_{v \in S_i} \max(-A_v \rho_v, -A_v \cdot \text{clip
 
 ### 训练循环（Training Loop）
 
+![各模型角色图](openclaw_model_roles.svg)
+
 ```
 Simulator ──请求──▶ Policy Model ──(action, next_state)──▶ PRM Judge
     ▲                    ▲                                       │
