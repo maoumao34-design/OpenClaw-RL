@@ -196,16 +196,42 @@ OpenClaw-RL Personal Agent Track 有两套独立的交互方式：
 
 ## 下一步计划
 
+### Simulator / Evaluator 开源替代选型
+
+论文原版 simulator 用 GPT-4.1，evaluator 用 GPT-4o，均无外部 API 访问权限。
+
+**选定替代方案：Qwen3.5-122B-A10B（自托管）**
+
+选择依据：
+- IFBench 76.5（全模型最高），roleplay / instruction following 场景最优
+- AMD 官方有 OpenClaw + Qwen3.5 + SGLang 验证案例
+- 同 Qwen 系列，与 Policy（Qwen3-4B）tokenizer 完全兼容
+- MoE 架构仅激活 10B 参数，2×H20 即可部署
+- DeepSeek V4 对比：V4-Flash 需 175GB VRAM，V4-Pro 500GB，均不现实；且优势在 coding/math，非本任务所需
+
+代码只需修改 `openai_api.py` 的一行（`responses.create` → `chat.completions.create`），其余通过环境变量切换：
+```bash
+export OPENAI_BASE_URL="http://<simulator-host>:8001/v1"
+export OPENAI_API_KEY="dummy"
+export OPENAI_MODEL="Qwen3.5-122B-A10B"
+```
+
+---
+
+## 下一步计划
+
 **Phase 1 启动前的准备：**
 
-1. **申请 8×H20 + CUDA 12.9 workspace**（训练需要 8 张 GPU：actor×4 + rollout×2 + PRM×2）
-2. **确认外部 LLM API**：需要 `OPENAI_API_KEY` 和支持 GPT-4.1 / GPT-4o 的端点，OR 配置 `OPENAI_BASE_URL` 指向本地 Qwen3-32B 等兼容服务
-3. **创建 checkpoint 保存目录**：`mkdir -p /dfs/data/models/ckpt/`
-4. **运行训练**：`bash run_qwen3_4b_openclaw_rl.sh`
-5. **运行客户端（复现 Table 3）**：
+1. **申请 8×H20 + CUDA 12.9 workspace**（训练：actor×4 + rollout×2 + PRM×2）
+2. **申请独立小 workspace（2×H20）**跑 Qwen3.5-122B-A10B simulator 服务
+3. **修改 `openai_api.py`**：`client.responses.create()` → `client.chat.completions.create()`
+4. **创建 checkpoint 保存目录**：`mkdir -p /dfs/data/models/ckpt/`
+5. **运行训练**：`bash run_qwen3_4b_openclaw_rl.sh`
+6. **运行客户端（复现 Table 3）**：
    ```bash
-   export OPENAI_API_KEY="..."
-   export OPENAI_MODEL="gpt-4.1"
+   export OPENAI_BASE_URL="http://<simulator-host>:8001/v1"
+   export OPENAI_API_KEY="dummy"
+   export OPENAI_MODEL="Qwen3.5-122B-A10B"
    cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
    python gsm8k_personal_agent.py --method combined --training-rounds 16
    ```
