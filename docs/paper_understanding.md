@@ -120,11 +120,11 @@ $$\mathcal{L}_i^{OPD} = \sum_{v \in S_i} \max(-A_v \rho_v, -A_v \cdot \text{clip
 | GUI Agent | Qwen3VL-8B-Thinking（多模态）| — |
 | SWE Agent | Qwen3-4B | — |
 | Tool-call Agent | Qwen3-4B-SFT | — |
-| PRM Judge | Qwen3-4B / Qwen3VL-8B-Thinking | **核心训练信号**，给每步打分 |
-| Personal Agent Simulator | GPT-4.1（官方代码默认值）| 扮演 student/teacher，生成训练对话 |
-| Evaluator | GPT-4o（官方代码默认值）| 仅用于评估，不参与训练 |
+| PRM Judge | Qwen3-4B-Thinking-2507 | 与 policy 同一模型（Section 4.1）|
+| Personal Agent Simulator | **Qwen3-32B** | Section 4.1 明确写明，扮演 student/TA/teacher |
+| Evaluator（Table 3）| 无独立模型 | **Rule-based** session 计数，不调用 LLM |
 
-> **注**："用户模拟器 Qwen3-32B" 是早期笔记的错误归因。官方代码 `gsm8k_personal_agent.py` 明确使用 `gpt-4.1` 作为 Personal Agent track 的 simulator。Qwen3-32B 可能对应论文中其他 environment 的模拟器，尚未核实。
+> **注**：早期笔记曾误记 Evaluator 为 GPT-4o，Simulator 为 GPT-4.1，来源是 OEL 模块的 `gsm8k_personal_agent.py`（PR #96，论文提交后加入，与 Table 3 无关）。论文 Section 4.1 明确：Simulator = Qwen3-32B；Table 3 指标为 rule-based session 计数，无需 LLM。
 
 ---
 
@@ -152,76 +152,41 @@ Simulator ──请求──▶ Policy Model ──(action, next_state)──▶
 
 每次 Policy 回复一句话，PRM 就判断"这一步做得好不好"，给 +1/−1/0 分。这个分数通过 GRPO 计算 advantage，驱动 Megatron 更新 Policy 权重。**训练信号的核心来源，不替代。**
 
-**Simulator（论文 Personal Agent track：GPT-4.1）**
+**Simulator（Qwen3-32B，Section 4.1）**
 
-扮演"懒学生"或"挑剔老师"，不断给 Policy 发消息推动多轮对话。训练完成后直接丢弃，不出现在最终产品里。它的作用是提供足够自然的对话，让 Policy 有东西可以学——但训练信号本身来自 PRM，不来自 Simulator 的质量。
+扮演"懒学生"或"挑剔老师"，不断给 Policy 发消息推动多轮对话。训练完成后直接丢弃，不出现在最终产品里。训练信号本身来自 PRM，不来自 Simulator 的质量。
 
-**Evaluator（GPT-4o）**
+**Evaluator（Table 3：rule-based，无独立模型）**
 
-只在评估阶段使用，判断 Policy 的回复是否符合"学生风格"或"老师风格"，产出 Table 3 的数值（0.17 → 0.76 → 0.81）。与训练完全无关。
+Table 3 指标是 rule-based session 计数——检查 Policy 回复是否满足预设规则（Student: 无 bold/编号列表/\boxed{}；TA: 回复 > 100 词；Teacher: 含暖词），达到连续 3 次满足则收敛，记录最少所需 session 数。不需要 LLM 打分。
 
 ### 评估阶段（Evaluation Only）
 
+Table 3 用 `openclaw-test/student_chat.py`、`TA_chat.py`、`teacher_chat.py` 发起对话，再用 rule-based 脚本判断 Policy 回复是否收敛（不调用 LLM）：
+
 ```
-Evaluator ──测试请求──▶ Policy Model（turn_type="side"，不产生训练数据）
-    ▲                         │
-    └──── 个性化得分 ◀─────────┘
-    （Table 3 数值来源）
+student_chat.py ──测试请求──▶ Policy Model（turn_type="side"，不产生训练数据）
+                                    │
+                          Policy 回复
+                                    │
+                    rule-based 判断（Student/TA/Teacher 规则）
+                    连续 3 次满足 → 记录 session 数（Table 3 指标）
 ```
 
 ---
 
-## 本复现的模型替代方案
+## Simulator 部署方案（待定）
 
-因无外部 API 访问，Simulator 和 Evaluator 均用开源模型自托管替代。
+论文 Simulator 为 **Qwen3-32B**（Section 4.1）。有两条路径：
 
-### 选型结论：Qwen3.5-122B-A10B
+| 路径 | 说明 | 差异 |
+|------|------|------|
+| **方案 A：直接部署 Qwen3-32B** | 完全忠实论文，TP=4 on 4×H20 | 零偏差 |
+| **方案 B：Qwen3.5-122B-A10B 替代** | 本地正在下载，MoE 仅 10B active，TP=2 on 2×H20 | 对话风格略有差异，训练信号（PRM）不变 |
 
-**选择依据（对比 DeepSeek V4）：**
+**决策状态：** 待确认（见 work_log.md 当前状态）。
 
-| 维度 | Qwen3.5-122B-A10B | DeepSeek V4-Flash |
-|---|---|---|
-| 任务匹配 | IFBench **76.5**（全模型最高），专项强调 roleplay/多轮对话/instruction following | 擅长 coding/math，非本任务优势方向 |
-| 与 Policy 兼容性 | 同 Qwen 系列，tokenizer 和 chat template 完全兼容 | 不同系列 |
-| SGLang 支持 | 原生支持，官方有专项文档；AMD 官方博客有 OpenClaw+Qwen3.5+SGLang 验证案例 | Day-0 支持，较新，edge case 未充分 hardened |
-| No-think 模式 | `enable_thinking: false`，roleplay 场景直接关掉推理 | Non-think 模式行为较新 |
-| 激活参数 | 仅 **10B active**（总量 122B MoE），推理轻量 | ~13B active，但权重体积 ~175GB VRAM |
-| H20 部署 | TP=2 即可跑，独立小 workspace | 需要较大配置，V4-Pro（500GB FP8）完全不现实 |
-
-### 替代方案汇总
-
-| 组件 | 论文原版 | 本复现替代 | 影响 |
-|------|---------|-----------|------|
-| Simulator | GPT-4.1 | **Qwen3.5-122B-A10B**（自托管）| 对话风格略有差异，训练信号（PRM）不变 |
-| Evaluator | GPT-4o | **Qwen3.5-122B-A10B**（自托管）| 数值与论文不可直接对比，内部前后一致 |
-| Policy | Qwen3-4B-Thinking-2507 | 同上（不替代）| — |
-| PRM | Qwen3-4B | 同上（不替代）| — |
-
-### 部署配置
-
-```bash
-# Simulator workspace（独立 2×H20）启动 Qwen3.5-122B-A10B
-sglang serve \
-  --model-path Qwen/Qwen3.5-122B-A10B \
-  --tp 2 \
-  --reasoning-parser qwen3 \
-  --host 0.0.0.0 --port 8001
-
-# 训练侧环境变量
-export OPENAI_BASE_URL="http://<simulator-host>:8001/v1"
-export OPENAI_API_KEY="dummy"
-export OPENAI_MODEL="Qwen3.5-122B-A10B"
-```
-
-### 切换回原始闭源模型
-
-仅需修改环境变量，代码零改动：
-
-```bash
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-export OPENAI_API_KEY="sk-xxxxx"
-export OPENAI_MODEL="gpt-4.1"
-```
+**注**：Evaluator 已确认为 rule-based session 计数，不需要任何 LLM 模型。
 
 ---
 

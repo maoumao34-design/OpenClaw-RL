@@ -1,280 +1,121 @@
 # 复现工作记录
 
-记录每次工作的进展，用于汇报。
+汇报与整体复盘用。技术细节通过各条目链接查阅。
 
 ---
 
 ## 2026-06-17 论文理解 + 环境搭建启动
 
-**目标：** 读懂论文，开始搭建复现环境
+**目标：** 读懂论文，搭建基础 conda 环境
 
 **完成内容：**
-
-### 论文理解
-- 通读 OpenClaw-RL 论文（arXiv:2603.10165）
-- 整理论文核心机制文档：`docs/paper_understanding.md`
-  - 四组件异步架构（Policy Server / Environment Server / PRM Server / Trainer）
-  - GRPO 实为 PPO-style 非对称裁剪（eps_lo=0.2, eps_hi=0.28）
-  - OPD（Off-Policy Distillation）使用全局 log-prob 校正
-  - Binary RL：用二值奖励替代 PRM 分步打分
-
-### 环境初始化
+- 通读论文，整理核心机制（四组件异步架构、两类信号 GRPO+OPD、四类环境）→ [`paper_understanding.md`](paper_understanding.md)
 - 创建 conda 环境 `/dfs/data/envs/openclaw-rl`（Python 3.12）
-- 安装 torch 2.9.1+cu129
+- 安装 torch 2.9.1+cu129、sglang、slime 等基础依赖
 
-### 依赖安装
-- 安装 sglang（解决 outlines_core 0.1.26 PyPI sdist 损坏问题，下载 wheel 本地安装）
-- 安装 slime（commit 02fef7e9）
-
-### 遇到的主要问题
-1. **outlines_core==0.1.26 PyPI sdist 元数据损坏**（version=0.0.0）→ 本地下载 wheel 安装，patch outlines METADATA 移除依赖声明
-2. **DeepEP 编译失败**：CPU workspace 默认目标 sm_75，DeepEP 需要 sm_90 指令 → 决定申请 H20+CUDA12.9 GPU workspace 编译（H20 为 sm_90）
-3. **pip 误用系统 Python 3.13**：conda activate 后 which pip 仍指向 miniconda3 base → 改用 `/dfs/data/envs/openclaw-rl/bin/pip` 全路径调用
+**主要问题：**
+- `outlines_core` PyPI sdist 损坏无法直接安装 → 从 GitHub Releases 手动下载 wheel 本地安装，已解决
+- DeepEP 需要 sm_90 架构编译，CPU workspace 上无法进行 → 确认 Qwen3-4B 是密集模型不依赖 DeepEP，跳过
+- pip 调用误走系统 Python 3.13 而非 conda 环境 → 改用完整路径 `/dfs/data/envs/openclaw-rl/bin/pip`
 
 ---
 
-## 2026-06-18 环境搭建（Phase 1）
+## 2026-06-18 环境搭建（续）
 
-**目标：** 在 modelfactory 上搭建 OpenClaw-RL 复现环境
+**目标：** 完成 CPU workspace 上所有 Python 依赖安装
 
 **完成内容：**
+- 安装 slime、Megatron-LM、mbridge、megatron-bridge、megatron-core 等所有核心依赖
+- 确认 Qwen3-4B 密集模型不需要 DeepEP，从依赖列表移除
 
-### 环境初始化
-- 创建 conda 环境：`/dfs/data/envs/openclaw-rl`（Python 3.12，持久化跨 workspace）
-- 安装 torch 2.9.1+cu129（CUDA 12.9 编译版本）
-
-### 依赖安装（CPU workspace，CUDA 12.9）
-以下依赖已安装完成：
-
-| 依赖 | 版本/提交 | 状态 |
-|------|-----------|------|
-| torch | 2.9.1+cu129 | ✅ |
-| sglang | commit d566816d | ✅ |
-| slime | commit 02fef7e9 | ✅ |
-| Megatron-LM (megatron-core) | commit 3714d81d | ✅ |
-| mbridge | commit 89eb1088 | ✅ |
-| torch_memory_saver | commit dc689760 | ✅ |
-| megatron-bridge | commit 35b4ebfc | ✅ |
-| requirements.txt（主依赖列表） | — | ✅ |
-
-### 待完成（需要 GPU workspace）
-以下依赖需要在 H20 + CUDA 12.9 的 GPU workspace 上编译：
-
-| 依赖 | 命令 | 备注 |
-|------|------|------|
-| int4_qat kernel | `pip install -e slime/slime/backends/megatron_utils/kernels/int4_qat --no-build-isolation` | — |
-| apex | `APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install -v --no-build-isolation .` | 需 keepalive 防 idle 关机 |
-| flash-attn 2.7.4.post1 | `MAX_JOBS=8 pip install --no-build-isolation -v flash-attn==2.7.4.post1` | 编译时间长 |
-| flashinfer-jit-cache 0.6.3 | `pip install "flashinfer-jit-cache==0.6.3" --index-url https://flashinfer.ai/whl/cu129` | — |
-| TransformerEngine 2.10.0 | `NVTE_FRAMEWORK=pytorch pip install --no-build-isolation "transformer_engine[pytorch,core_cu12]==2.10.0"` | — |
-
-**编译注意：** 在 H20（sm_90）上编译，若后续在 A100（sm_80）训练，需加 `TORCH_CUDA_ARCH_LIST="8.0"`
-
-### 跳过的依赖
-| 依赖 | 原因 |
-|------|------|
-| DeepEP | 需要 sm_90（H100/H20），仅用于 MoE 模型 Expert Parallelism，Qwen3-4B（密集模型）不需要 |
-
-### 遇到的主要问题
-1. **outlines_core PyPI sdist 损坏** → 下载 wheel 本地安装，patch outlines METADATA 移除依赖声明
-2. **pip 使用系统 Python 3.13 而非 conda env** → 改用完整路径 `/dfs/data/envs/openclaw-rl/bin/pip`
-3. **Megatron-LM/mbridge 等 git+ 依赖无法直连 GitHub** → 先本地克隆（ghfast 镜像）再 `pip install -e`
-4. **系统级 PIP_CONSTRAINT 冲突（protobuf 4.24.4 vs 6.33.5）** → `PIP_CONSTRAINT=""` 临时绕过（conda env 与系统隔离，无风险）
-5. **megatron-bridge 子模块拉取失败** → 手动配置子模块 URL 为 ghfast 镜像后初始化
+**主要问题：**
+- Megatron-LM / slime 等 `git+https://github.com/...` 依赖在 modelfactory 无法直连 GitHub → 在本地用 ghfast 镜像克隆后上传，或在服务器上配置 ghfast 代理后安装
+- `PIP_CONSTRAINT` 环境变量与新依赖冲突 → 安装时临时 `export PIP_CONSTRAINT=` 清空绕过
+- megatron-bridge 含 git submodule，拉取时子模块 URL 指向 GitHub 直连失败 → 手动修改 `.gitmodules` 改用 ghfast 镜像后 `git submodule update`
 
 ---
 
----
+## 2026-06-22 GPU 编译 + 模型准备
 
-## 2026-06-22 GPU 编译 + 模型下载
-
-**目标：** 在 H20 + CUDA 12.9 workspace 上完成 GPU 编译依赖安装，下载模型权重
+**目标：** 在 GPU workspace 完成需要 CUDA 编译的依赖，下载并转换 Policy 模型
 
 **完成内容：**
+- GPU 编译依赖全部完成（均需 sm_90 / H20 GPU）：
+  - flashinfer（SGLang 推理加速）
+  - int4_qat（量化支持）
+  - apex（Megatron 混合精度）
+  - flash-attn 2.7.4.post1
+  - TransformerEngine 2.10.0
+- 下载 Qwen3-4B-Thinking-2507（7.6 GB），加载验证通过
+- HF → torch_dist 格式转换，保存至 `/dfs/data/models/torch_dist/qwen3-4b-thinking-2507`（Megatron 训练所需格式）
+- 本地开始下载 Qwen3.5-122B-A10B-GPTQ-Int4（Simulator 候选，~65 GB）
 
-### 根目录清理
-- 删除临时文件：slime.zip、req_no_git.txt、src/、tmp_wheels/ 内容、Untitled*.ipynb
-- req_install.log 移至 /dfs/data/logs/
+→ 完整环境安装步骤见 [`implementation_path.md → 环境准备`](implementation_path.md)
 
-### GPU Workspace 申请
-- 申请 H20 × 1 + CUDA 12.9 小型编译专用 workspace（16核 64GB）
-- 原因：H20-8-PREMIUM 排队，先用小 workspace 做编译，编译结果保存在 conda env（持久化）
-
-### GPU 编译依赖安装
-
-| 依赖 | 状态 | 备注 |
-|------|------|------|
-| flashinfer-jit-cache 0.6.3 | ✅ | 本地下载 wheel 上传安装（modelfactory 限速，本地 10MB/s 更快） |
-| int4_qat kernel (fake_int4_quant_cuda) | ✅ | — |
-| apex 0.1 | ✅ | `APEX_CUDA_EXT=1 APEX_CPP_EXT=1 MAX_JOBS=16` |
-| flash-attn 2.7.4.post1 | ✅ | 从源码编译（torch2.9 无预编译 wheel）；需先拉 cutlass + composable_kernel 子模块 |
-| TransformerEngine 2.10.0 | ✅ | 下载预编译 cu12 wheel（287MB） |
+**⚠️ 此日同时发现重大方向错误，见下条**
 
 ---
 
-### 模型下载
+## 2026-06-22 方向更正
 
-| 模型 | 路径 | 状态 |
-|------|------|------|
-| Qwen3-4B-Thinking-2507 | `/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507` | ✅ 7.6GB，加载验证通过 |
+**背景：** 完整阅读论文 PDF + git log 时间线核查后，发现此前复现方向存在两处根本性错误，已全部更正。
 
 ---
 
-### 模型格式转换
+**错误 1：一直在配置错误的训练脚本（Binary RL 基线，而非论文主方法）**
 
-| 步骤 | 命令 | 状态 |
-|------|------|------|
-| HF → torch_dist | `/dfs/data/envs/openclaw-rl/bin/torchrun --nproc-per-node 1 slime/tools/convert_hf_to_torch_dist.py --megatron-to-hf-mode bridge --hf-checkpoint /dfs/data/models/Qwen/Qwen3-4B-Thinking-2507 --save /dfs/data/models/torch_dist/qwen3-4b-thinking-2507 --num-layers 36 --hidden-size 2560 --ffn-hidden-size 9728 --num-attention-heads 32 --num-query-groups 8 --rotary-base 5000000 --vocab-size 151936 --kv-channels 128 --qk-layernorm --swiglu` | ✅ |
-
-转换后路径：`/dfs/data/models/torch_dist/qwen3-4b-thinking-2507`
-
-### 运行脚本路径配置
-
-修改 `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` 中四个路径占位符：
-
-```bash
-HF_CKPT=${HF_CKPT:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
-REF_LOAD=${REF_LOAD:-${HF_CKPT}}
-SAVE_CKPT=${SAVE_CKPT:-/dfs/data/models/ckpt/qwen3-4b-openclaw-rl}
-PRM_MODEL_PATH=${PRM_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
-```
-
-以及 PYTHONPATH：`/dfs/data/openclaw-rl-project/OpenClaw-RL-official/Megatron-LM/`
-
-（官方仓库无 push 权限，通过 `sed -i` 直接在 modelfactory 上应用。）
+- 原计划：`openclaw-rl/run_qwen3_4b_openclaw_rl.sh`
+  - 这是 Table 3 "GRPO" 基线列（Binary RL，仅 GRPO，无 OPD）
+- 正确：`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`
+  - 这是 Table 3 "Hybrid RL (Ours)" 主方法（GRPO + OPD 混合损失）
+- 根本原因：`openclaw-rl/` 目录名容易被误认为是主方法，未在项目开始时从论文实验设计出发验证文件
+- → 详见 [`WARNINGS.md → 方法与脚本对应`](WARNINGS.md)，完整步骤见 [`implementation_path.md`](implementation_path.md)
 
 ---
 
-## 2026-06-22 训练数据流分析
+**错误 2：一直计划用 OEL 模块的评估脚本（与论文 Table 3 完全无关）**
 
-**目标：** 理解 Personal Agent 训练数据如何产生、外部依赖是什么
-
-**完成内容：**
-
-### 训练数据流全貌
-
-OpenClaw-RL Personal Agent Track 有两套独立的交互方式：
-
-**方式 A：直接训练（`gsm8k_personal_agent.py`）**  
-→ 连接 **port 30000**（slime 训练服务器直接暴露的推理 API）  
-→ 请求携带 `session_id`、`turn_type`（main/side）、`session_done` 字段  
-→ `turn_type="main"` 的 turn 进入训练 buffer；`turn_type="side"` 仅用于评估不训练  
-→ 外部 LLM（GPT-4.1）扮演 student/teacher 模拟器  
-→ **这是复现 Table 3 的完整脚本**
-
-**方式 B：文件系统工作流（`openclaw-test/` 三个脚本）**  
-→ 连接 **port 18789**（`openclaw_api_server.py` gateway）  
-→ OpenClaw 作为文件操作 Agent，读写 workspace 目录下的 homework 文件  
-→ 三阶段：student 写作业 → TA 批改 → teacher 评论
-
-### 三阶段工作流
-
-| 脚本 | 角色 | 输入 | 输出（workspace 文件）|
-|------|------|------|------|
-| `student_chat.py` | 懒学生（外部 LLM）| GSM8K.json | `homework/i.txt`（解答）|
-| `TA_chat.py` | 助教（外部 LLM）| 上一步 homework | `homework1/i.txt`（批改）|
-| `teacher_chat.py` | 老师（外部 LLM）| 上一步 homework1 | `homework2/i.txt`（评论）|
-
-### 关键发现
-
-1. **GSM8K.json 已存在** ✅：路径 `/dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-test/GSM8K.json`
-
-2. **外部 LLM 要求**：
-   - 模拟器（simulator）：GPT-4.1（默认），通过 `OPENAI_API_KEY` + `OPENAI_BASE_URL` 配置
-   - 评估器（evaluator）：GPT-4o（默认）
-   - 注意：`gsm8k_personal_agent.py` 使用 `client.responses.create()`（新版 Responses API），需要支持该接口的端点
-
-3. **`openclaw_api_server.py` 双重角色**：
-   - 作为独立 FastAPI 服务暴露在 port 18789（`openclaw-test/` 脚本用）
-   - 作为 slime 的回调模块：`--custom-generate-function-path openclaw_api_server.generate`
-
-4. **Port 30000**：slime 训练服务器（SGLang + openclaw hooks），`gsm8k_personal_agent.py` 直连此端口发送 `session_id`/`turn_type` 字段
-
-5. **`rollout_batch_size=16`**：每收集 16 个 session turn 触发一次梯度更新
+- 原计划：`openclaw-rl/oel/eval/gsm8k_personal_agent.py`
+  - 属于 OEL 模块，由外部贡献者 PR #96 于 2026-04-20 加入，晚于论文提交（2026-03-11）
+  - 用 LLM 0-1 打分，与 Table 3 指标根本不同
+- 正确：`openclaw-test/student_chat.py` + `TA_chat.py` + `teacher_chat.py`
+  - Table 3 指标为 rule-based session 计数，无需 LLM
+- 根本原因：未用 git log 核查文件加入时间，直接使用"看起来相关"的脚本
+- → 详见 [`WARNINGS.md → 禁止使用的目录`](WARNINGS.md)，Table 3 指标定义见 [`paper_understanding.md`](paper_understanding.md)
 
 ---
 
-## 下一步计划
+**新增理解：三端口架构与 OpenClaw 的必要角色**
 
-### Simulator / Evaluator 开源替代选型
-
-论文原版 simulator 用 GPT-4.1，evaluator 用 GPT-4o，均无外部 API 访问权限。
-
-**选定替代方案：Qwen3.5-122B-A10B（自托管）**
-
-选择依据：
-- IFBench 76.5（全模型最高），roleplay / instruction following 场景最优
-- AMD 官方有 OpenClaw + Qwen3.5 + SGLang 验证案例
-- 同 Qwen 系列，与 Policy（Qwen3-4B）tokenizer 完全兼容
-- MoE 架构仅激活 10B 参数，2×H20 即可部署
-- DeepSeek V4 对比：V4-Flash 需 175GB VRAM，V4-Pro 500GB，均不现实；且优势在 coding/math，非本任务所需
-
-代码只需修改 `openai_api.py` 的一行（`responses.create` → `chat.completions.create`），其余通过环境变量切换：
-```bash
-export OPENAI_BASE_URL="http://<simulator-host>:8001/v1"
-export OPENAI_API_KEY="dummy"
-export OPENAI_MODEL="Qwen3.5-122B-A10B"
-```
+- 完整三端口架构：Port 30001（Simulator, Qwen3-32B SGLang）→ Port 18789（OpenClaw gateway，workspace 文件工具）→ Port 30000（RL training proxy）
+- OpenClaw 是论文四组件架构中的 Environment Server，提供 homework 文件读写工具并注入训练 header（X-Session-Id / X-Turn-Type），不可替代
+- → 详见 [`implementation_path.md → 系统架构`](implementation_path.md)
 
 ---
 
-## 下一步计划
+**关键决策（已确认）：**
+- 评估指标：rule-based session 计数（Student/TA/Teacher 三套规则，连续 3 次满足即收敛）→ [`paper_understanding.md`](paper_understanding.md)
+- Simulator：论文为 Qwen3-32B（Section 4.1），**待确认**是否直接部署或用 Qwen3.5-122B 替代
 
-**Phase 1 启动 checklist：**
+**此日工作产出：**
+- [`implementation_path.md`](implementation_path.md)：完整端到端实现路径（7 个实验块，每块含所需文件和步骤）
+- [`WARNINGS.md`](WARNINGS.md)：禁止使用的目录和文件清单（含时间线证据）
 
-#### 本地已完成
-- [x] `personalization_evaluator.py` + `gsm8k_personal_agent.py`：`responses.create()` → `chat.completions.create()`（官方仓库无 push 权限，需在 modelfactory 上 `sed` 应用）
+---
 
-#### modelfactory 上执行（按顺序）
+## 当前状态（2026-06-22）
 
-**Step 1：申请两个 workspace**
-- 训练 workspace：8×H20 + CUDA 12.9（actor×4 + rollout×2 + PRM×2）
-- Simulator workspace：2×H20（跑 Qwen3.5-122B-A10B）
+### 已就绪
+- [x] 环境 + 所有 GPU 编译依赖
+- [x] Qwen3-4B-Thinking-2507（HF + torch_dist 格式）
+- [x] GSM8K.json 数据集（已在仓库）
+- [x] 完整实现路径文档（[`implementation_path.md`](implementation_path.md)）
+- [x] 警示文档（[`WARNINGS.md`](WARNINGS.md)）
 
-**Step 2：应用代码补丁（在训练 workspace 上）**
-```bash
-BASE=/dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
+### 进行中
+- [ ] Qwen3.5-122B-A10B-GPTQ-Int4 本地下载（~65 GB，Simulator 候选）
 
-# personalization_evaluator.py
-sed -i \
-  's/client\.responses\.create(/client.chat.completions.create(/g;
-   s/resp\.output\[0\]\.content\[0\]\.text/resp.choices[0].message.content/g' \
-  $BASE/personalization_evaluator.py
-
-# gsm8k_personal_agent.py
-sed -i \
-  's/client\.responses\.create(model=model, input=msgs/client.chat.completions.create(model=model, messages=msgs/g;
-   s/resp\.output\[0\]\.content\[0\]\.text/resp.choices[0].message.content/g' \
-  $BASE/gsm8k_personal_agent.py
-```
-
-**Step 3：创建 checkpoint 目录（在训练 workspace 上）**
-```bash
-mkdir -p /dfs/data/models/ckpt/
-```
-
-**Step 4：在 simulator workspace 上启动 Qwen3.5-122B-A10B**
-```bash
-sglang serve \
-  --model-path Qwen/Qwen3.5-122B-A10B \
-  --tp 2 \
-  --reasoning-parser qwen3 \
-  --host 0.0.0.0 --port 8001
-```
-
-**Step 5：在训练 workspace 上启动训练**
-```bash
-cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl
-bash run_qwen3_4b_openclaw_rl.sh
-```
-
-**Step 6：等训练 server 就绪后，启动客户端**
-```bash
-export OPENCLAW_RL_BASE="http://localhost:30000"
-export OPENAI_BASE_URL="http://<simulator-workspace-ip>:8001/v1"
-export OPENAI_API_KEY="dummy"
-export OPENAI_MODEL="Qwen3.5-122B-A10B"
-
-cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
-python gsm8k_personal_agent.py --method combined --training-rounds 16
-```
+### 下一步（优先级顺序）
+1. 确认 OpenClaw 能否安装到 modelfactory（是 Environment Server，不可跳过）
+2. 确认 Simulator 模型：Qwen3-32B（完全忠实论文）vs Qwen3.5-122B（正在下载中）→ [`paper_understanding.md → Simulator 部署方案`](paper_understanding.md)
+3. 申请 8×H20 训练 workspace（Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1）
