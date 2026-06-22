@@ -220,18 +220,61 @@ export OPENAI_MODEL="Qwen3.5-122B-A10B"
 
 ## 下一步计划
 
-**Phase 1 启动前的准备：**
+**Phase 1 启动 checklist：**
 
-1. **申请 8×H20 + CUDA 12.9 workspace**（训练：actor×4 + rollout×2 + PRM×2）
-2. **申请独立小 workspace（2×H20）**跑 Qwen3.5-122B-A10B simulator 服务
-3. **修改 `openai_api.py`**：`client.responses.create()` → `client.chat.completions.create()`
-4. **创建 checkpoint 保存目录**：`mkdir -p /dfs/data/models/ckpt/`
-5. **运行训练**：`bash run_qwen3_4b_openclaw_rl.sh`
-6. **运行客户端（复现 Table 3）**：
-   ```bash
-   export OPENAI_BASE_URL="http://<simulator-host>:8001/v1"
-   export OPENAI_API_KEY="dummy"
-   export OPENAI_MODEL="Qwen3.5-122B-A10B"
-   cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
-   python gsm8k_personal_agent.py --method combined --training-rounds 16
-   ```
+#### 本地已完成
+- [x] `personalization_evaluator.py` + `gsm8k_personal_agent.py`：`responses.create()` → `chat.completions.create()`（官方仓库无 push 权限，需在 modelfactory 上 `sed` 应用）
+
+#### modelfactory 上执行（按顺序）
+
+**Step 1：申请两个 workspace**
+- 训练 workspace：8×H20 + CUDA 12.9（actor×4 + rollout×2 + PRM×2）
+- Simulator workspace：2×H20（跑 Qwen3.5-122B-A10B）
+
+**Step 2：应用代码补丁（在训练 workspace 上）**
+```bash
+BASE=/dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
+
+# personalization_evaluator.py
+sed -i \
+  's/client\.responses\.create(/client.chat.completions.create(/g;
+   s/resp\.output\[0\]\.content\[0\]\.text/resp.choices[0].message.content/g' \
+  $BASE/personalization_evaluator.py
+
+# gsm8k_personal_agent.py
+sed -i \
+  's/client\.responses\.create(model=model, input=msgs/client.chat.completions.create(model=model, messages=msgs/g;
+   s/resp\.output\[0\]\.content\[0\]\.text/resp.choices[0].message.content/g' \
+  $BASE/gsm8k_personal_agent.py
+```
+
+**Step 3：创建 checkpoint 目录（在训练 workspace 上）**
+```bash
+mkdir -p /dfs/data/models/ckpt/
+```
+
+**Step 4：在 simulator workspace 上启动 Qwen3.5-122B-A10B**
+```bash
+sglang serve \
+  --model-path Qwen/Qwen3.5-122B-A10B \
+  --tp 2 \
+  --reasoning-parser qwen3 \
+  --host 0.0.0.0 --port 8001
+```
+
+**Step 5：在训练 workspace 上启动训练**
+```bash
+cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl
+bash run_qwen3_4b_openclaw_rl.sh
+```
+
+**Step 6：等训练 server 就绪后，启动客户端**
+```bash
+export OPENCLAW_RL_BASE="http://localhost:30000"
+export OPENAI_BASE_URL="http://<simulator-workspace-ip>:8001/v1"
+export OPENAI_API_KEY="dummy"
+export OPENAI_MODEL="Qwen3.5-122B-A10B"
+
+cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
+python gsm8k_personal_agent.py --method combined --training-rounds 16
+```
