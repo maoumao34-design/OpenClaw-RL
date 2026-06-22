@@ -113,15 +113,79 @@ $$\mathcal{L}_i^{OPD} = \sum_{v \in S_i} \max(-A_v \rho_v, -A_v \cdot \text{clip
 
 ## 基础模型选择
 
-| 组件 | 模型 |
-|------|------|
-| Personal Agent Policy | Qwen3-4B-Thinking-2507 |
-| Terminal Agent | Qwen3-8B |
-| GUI Agent | Qwen3VL-8B-Thinking（多模态）|
-| SWE Agent | Qwen3-4B |
-| Tool-call Agent | Qwen3-4B-SFT |
-| PRM Judge | Qwen3-4B / Qwen3VL-8B-Thinking |
-| 用户模拟器 | Qwen3-32B |
+| 组件 | 模型 | 说明 |
+|------|------|------|
+| Personal Agent Policy | Qwen3-4B-Thinking-2507 | **被训练的模型**，最终产出 |
+| Terminal Agent | Qwen3-8B | — |
+| GUI Agent | Qwen3VL-8B-Thinking（多模态）| — |
+| SWE Agent | Qwen3-4B | — |
+| Tool-call Agent | Qwen3-4B-SFT | — |
+| PRM Judge | Qwen3-4B / Qwen3VL-8B-Thinking | **核心训练信号**，给每步打分 |
+| Personal Agent Simulator | GPT-4.1（官方代码默认值）| 扮演 student/teacher，生成训练对话 |
+| Evaluator | GPT-4o（官方代码默认值）| 仅用于评估，不参与训练 |
+
+> **注**："用户模拟器 Qwen3-32B" 是早期笔记的错误归因。官方代码 `gsm8k_personal_agent.py` 明确使用 `gpt-4.1` 作为 Personal Agent track 的 simulator。Qwen3-32B 可能对应论文中其他 environment 的模拟器，尚未核实。
+
+---
+
+## 各模型在训练流程中的角色
+
+### 训练循环（Training Loop）
+
+```
+Simulator ──请求──▶ Policy Model ──(action, next_state)──▶ PRM Judge
+    ▲                    ▲                                       │
+    │                    │ 更新权重（梯度）                    奖励信号
+    └──回复继续对话──────┤                                  r ∈ {+1,−1,0}
+                         │                                       │
+                    Trainer (Megatron) ◀─────────────────────────┘
+                    GRPO + OPD 梯度更新
+```
+
+**Policy Model（Qwen3-4B-Thinking-2507）**
+
+唯一被训练的模型，也是训练完成后实际部署使用的产出。训练前是普通助手，训练后学会了在不同用户风格（懒学生/严格老师）下调整回答方式。
+
+**PRM Judge（Qwen3-4B）**
+
+每次 Policy 回复一句话，PRM 就判断"这一步做得好不好"，给 +1/−1/0 分。这个分数通过 GRPO 计算 advantage，驱动 Megatron 更新 Policy 权重。**训练信号的核心来源，不替代。**
+
+**Simulator（论文 Personal Agent track：GPT-4.1）**
+
+扮演"懒学生"或"挑剔老师"，不断给 Policy 发消息推动多轮对话。训练完成后直接丢弃，不出现在最终产品里。它的作用是提供足够自然的对话，让 Policy 有东西可以学——但训练信号本身来自 PRM，不来自 Simulator 的质量。
+
+**Evaluator（GPT-4o）**
+
+只在评估阶段使用，判断 Policy 的回复是否符合"学生风格"或"老师风格"，产出 Table 3 的数值（0.17 → 0.76 → 0.81）。与训练完全无关。
+
+### 评估阶段（Evaluation Only）
+
+```
+Evaluator ──测试请求──▶ Policy Model（turn_type="side"，不产生训练数据）
+    ▲                         │
+    └──── 个性化得分 ◀─────────┘
+    （Table 3 数值来源）
+```
+
+---
+
+## 本复现的模型替代方案
+
+因无外部 API 访问，Simulator 和 Evaluator 均用开源模型自托管替代：
+
+| 组件 | 论文原版 | 本复现替代 | 影响 |
+|------|---------|-----------|------|
+| Simulator | GPT-4.1 | Qwen3-32B（自托管）| 对话风格略有差异，训练信号（PRM）不变 |
+| Evaluator | GPT-4o | Qwen3-32B（自托管）| 数值与论文不可直接对比，内部前后一致 |
+| Policy | Qwen3-4B-Thinking-2507 | 同上 | — |
+| PRM | Qwen3-4B | 同上 | — |
+
+切换回原始闭源模型：修改两个环境变量即可，无需改代码：
+```bash
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_API_KEY="sk-xxxxx"
+export OPENAI_MODEL="gpt-4.1"
+```
 
 ---
 
