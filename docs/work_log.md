@@ -103,6 +103,24 @@
 
 ---
 
+## 2026-06-22 OpenClaw 安装（进行中）
+
+**目标：** 在 modelfactory 上安装 OpenClaw，打通 port 18789 gateway
+
+**完成内容：**
+- 所有文档修缮完毕，推送 GitHub，modelfactory `git pull` 同步完成
+- 本地 clone OpenClaw 仓库（`github.com/openclaw/openclaw`）并上传至 `/dfs/data/openclaw-rl-project/openclaw/`
+- 升级 Node.js v18.19.1 → v22.23.0（OpenClaw 要求 Node 22.19+）
+- 安装 corepack，pnpm 配置放置后台运行中
+
+**主要问题：**
+- modelfactory 网速限制，OpenClaw 仓库无法直接 clone → 本地下载压缩后上传解决
+- Node.js 版本不足（v18 < 要求的 v22.19+），nvm/Docker 均不可用 → NodeSource apt 安装 v22.23.0 解决
+
+**当前状态：** pnpm 安装中，待明日确认完成后继续 OpenClaw 初始化
+
+---
+
 ## 当前状态（2026-06-22）
 
 ### 已就绪
@@ -111,11 +129,13 @@
 - [x] GSM8K.json 数据集（已在仓库）
 - [x] 完整实现路径文档（[`implementation_path.md`](implementation_path.md)）
 - [x] 警示文档（[`WARNINGS.md`](WARNINGS.md)）
+- [x] OpenClaw 仓库上传至 modelfactory，Node.js 22.23.0 已安装
 
 ### 进行中
 - [ ] Qwen3.5-122B-A10B-GPTQ-Int4 本地下载（~65 GB，Simulator 候选）
+- [ ] OpenClaw pnpm 安装（后台运行中，待明日确认）
 
 ### 下一步（优先级顺序）
-1. 确认 OpenClaw 能否安装到 modelfactory（是 Environment Server，不可跳过）
-2. 确认 Simulator 模型：Qwen3-32B（完全忠实论文）vs Qwen3.5-122B（正在下载中）→ [`paper_understanding.md → Simulator 部署方案`](paper_understanding.md)
+1. 确认 pnpm 安装完成，继续 OpenClaw 初始化（`openclaw onboard` + rl-training-headers 扩展）
+2. 确认 Simulator 模型：Qwen3-32B vs Qwen3.5-122B → [`paper_understanding.md → Simulator 部署方案`](paper_understanding.md)
 3. 申请 8×H20 训练 workspace（Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1）
