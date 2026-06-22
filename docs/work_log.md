@@ -120,8 +120,92 @@
 
 ---
 
+### 模型格式转换
+
+| 步骤 | 命令 | 状态 |
+|------|------|------|
+| HF → torch_dist | `/dfs/data/envs/openclaw-rl/bin/torchrun --nproc-per-node 1 slime/tools/convert_hf_to_torch_dist.py --megatron-to-hf-mode bridge --hf-checkpoint /dfs/data/models/Qwen/Qwen3-4B-Thinking-2507 --save /dfs/data/models/torch_dist/qwen3-4b-thinking-2507 --num-layers 36 --hidden-size 2560 --ffn-hidden-size 9728 --num-attention-heads 32 --num-query-groups 8 --rotary-base 5000000 --vocab-size 151936 --kv-channels 128 --qk-layernorm --swiglu` | ✅ |
+
+转换后路径：`/dfs/data/models/torch_dist/qwen3-4b-thinking-2507`
+
+### 运行脚本路径配置
+
+修改 `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` 中四个路径占位符：
+
+```bash
+HF_CKPT=${HF_CKPT:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
+REF_LOAD=${REF_LOAD:-${HF_CKPT}}
+SAVE_CKPT=${SAVE_CKPT:-/dfs/data/models/ckpt/qwen3-4b-openclaw-rl}
+PRM_MODEL_PATH=${PRM_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
+```
+
+以及 PYTHONPATH：`/dfs/data/openclaw-rl-project/OpenClaw-RL-official/Megatron-LM/`
+
+（官方仓库无 push 权限，通过 `sed -i` 直接在 modelfactory 上应用。）
+
+---
+
+## 2026-06-22 训练数据流分析
+
+**目标：** 理解 Personal Agent 训练数据如何产生、外部依赖是什么
+
+**完成内容：**
+
+### 训练数据流全貌
+
+OpenClaw-RL Personal Agent Track 有两套独立的交互方式：
+
+**方式 A：直接训练（`gsm8k_personal_agent.py`）**  
+→ 连接 **port 30000**（slime 训练服务器直接暴露的推理 API）  
+→ 请求携带 `session_id`、`turn_type`（main/side）、`session_done` 字段  
+→ `turn_type="main"` 的 turn 进入训练 buffer；`turn_type="side"` 仅用于评估不训练  
+→ 外部 LLM（GPT-4.1）扮演 student/teacher 模拟器  
+→ **这是复现 Table 3 的完整脚本**
+
+**方式 B：文件系统工作流（`openclaw-test/` 三个脚本）**  
+→ 连接 **port 18789**（`openclaw_api_server.py` gateway）  
+→ OpenClaw 作为文件操作 Agent，读写 workspace 目录下的 homework 文件  
+→ 三阶段：student 写作业 → TA 批改 → teacher 评论
+
+### 三阶段工作流
+
+| 脚本 | 角色 | 输入 | 输出（workspace 文件）|
+|------|------|------|------|
+| `student_chat.py` | 懒学生（外部 LLM）| GSM8K.json | `homework/i.txt`（解答）|
+| `TA_chat.py` | 助教（外部 LLM）| 上一步 homework | `homework1/i.txt`（批改）|
+| `teacher_chat.py` | 老师（外部 LLM）| 上一步 homework1 | `homework2/i.txt`（评论）|
+
+### 关键发现
+
+1. **GSM8K.json 已存在** ✅：路径 `/dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-test/GSM8K.json`
+
+2. **外部 LLM 要求**：
+   - 模拟器（simulator）：GPT-4.1（默认），通过 `OPENAI_API_KEY` + `OPENAI_BASE_URL` 配置
+   - 评估器（evaluator）：GPT-4o（默认）
+   - 注意：`gsm8k_personal_agent.py` 使用 `client.responses.create()`（新版 Responses API），需要支持该接口的端点
+
+3. **`openclaw_api_server.py` 双重角色**：
+   - 作为独立 FastAPI 服务暴露在 port 18789（`openclaw-test/` 脚本用）
+   - 作为 slime 的回调模块：`--custom-generate-function-path openclaw_api_server.generate`
+
+4. **Port 30000**：slime 训练服务器（SGLang + openclaw hooks），`gsm8k_personal_agent.py` 直连此端口发送 `session_id`/`turn_type` 字段
+
+5. **`rollout_batch_size=16`**：每收集 16 个 session turn 触发一次梯度更新
+
+---
+
 ## 下一步计划
 
-1. 转换模型格式（HF → torch_dist for Megatron）
-2. 修改启动脚本路径配置
-3. 运行 Phase 1：openclaw-rl Binary RL 验证 pipeline
+**Phase 1 启动前的准备：**
+
+1. **申请 8×H20 + CUDA 12.9 workspace**（训练需要 8 张 GPU：actor×4 + rollout×2 + PRM×2）
+2. **确认外部 LLM API**：需要 `OPENAI_API_KEY` 和支持 GPT-4.1 / GPT-4o 的端点，OR 配置 `OPENAI_BASE_URL` 指向本地 Qwen3-32B 等兼容服务
+3. **创建 checkpoint 保存目录**：`mkdir -p /dfs/data/models/ckpt/`
+4. **运行训练**：`bash run_qwen3_4b_openclaw_rl.sh`
+5. **运行客户端（复现 Table 3）**：
+   ```bash
+   export OPENAI_API_KEY="..."
+   export OPENAI_MODEL="gpt-4.1"
+   cd /dfs/data/openclaw-rl-project/OpenClaw-RL-official/openclaw-rl/oel/eval
+   python gsm8k_personal_agent.py --method combined --training-rounds 16
+   ```
