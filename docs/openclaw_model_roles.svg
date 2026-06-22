@@ -23,7 +23,7 @@
 <rect x="36" y="74" width="148" height="72" rx="6" fill="#fff8e1" stroke="#f59e0b" stroke-width="1.8"/>
 <text x="110" y="96" text-anchor="middle" font-size="12" font-weight="600" fill="#92400e" font-family="sans-serif">Simulator</text>
 <text x="110" y="112" text-anchor="middle" font-size="10" fill="#92400e" font-family="sans-serif">论文: GPT-4.1</text>
-<text x="110" y="126" text-anchor="middle" font-size="10" fill="#92400e" font-family="sans-serif">替代: Qwen3-32B</text>
+<text x="110" y="126" text-anchor="middle" font-size="10" fill="#92400e" font-family="sans-serif">替代: Qwen3.5-122B-A10B</text>
 
 <!-- POLICY SERVER BOX -->
 <rect x="296" y="74" width="188" height="72" rx="6" fill="#e8f5e9" stroke="#4caf50" stroke-width="2.5"/>
@@ -80,7 +80,7 @@
 <rect x="36" y="380" width="148" height="72" rx="6" fill="#f3e5f5" stroke="#9c27b0" stroke-width="1.8"/>
 <text x="110" y="402" text-anchor="middle" font-size="12" font-weight="600" fill="#4a148c" font-family="sans-serif">Evaluator</text>
 <text x="110" y="418" text-anchor="middle" font-size="10" fill="#4a148c" font-family="sans-serif">代码默认: GPT-4o</text>
-<text x="110" y="432" text-anchor="middle" font-size="10" fill="#4a148c" font-family="sans-serif">替代: Qwen3-32B</text>
+<text x="110" y="432" text-anchor="middle" font-size="10" fill="#4a148c" font-family="sans-serif">替代: Qwen3.5-122B-A10B</text>
 
 <!-- Evaluator -> Policy -->
 <line x1="184" y1="416" x2="294" y2="416" stroke="#9c27b0" stroke-width="1.5" marker-end="url(#arr)"/>
