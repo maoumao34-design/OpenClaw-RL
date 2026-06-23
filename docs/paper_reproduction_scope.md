@@ -278,8 +278,8 @@ RL proxy server（port 30000，由 openclaw-combine/run_*.sh 启动）
 - **Evaluator**：rule-based session 计数（无需 LLM，已确认）
 - **复现顺序**：Personal Agent → Tool-call → Terminal → SWE → GUI（难度递增）→ 详见 `implementation_path.md`
 
-### 待确认
-- **Simulator 模型**：Qwen3-32B（论文原版）vs Qwen3.5-122B-A10B（本地下载中）
+### 已确认
+- **Simulator 模型**：**Qwen3-32B**（论文原版）。Qwen3.5-122B 本地备用，后续优化时使用。
 
 ### 下一步
 - [ ] 确认 OpenClaw 能否安装到 modelfactory（最高优先级）
