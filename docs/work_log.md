@@ -117,11 +117,46 @@
 - modelfactory 网速限制，OpenClaw 仓库无法直接 clone → 本地下载压缩后上传解决
 - Node.js 版本不足（v18 < 要求的 v22.19+），nvm/Docker 均不可用 → NodeSource apt 安装 v22.23.0 解决
 
-**当前状态：** pnpm 安装中，待明日确认完成后继续 OpenClaw 初始化
+**当前状态：** pnpm 11.2.2 安装完成（2026-06-23 确认）
 
 ---
 
-## 当前状态（2026-06-22）
+## 2026-06-23 OpenClaw 安装完成 + 训练脚本编写
+
+**目标：** 完成 OpenClaw 配置，编写端到端训练启动脚本
+
+**完成内容：**
+
+**OpenClaw 安装（在 modelfactory Workspace_cuda129_CPU 完成）：**
+- `rl-training-headers` 插件：从官方仓库 TypeScript 源码手动编译为 JS（`index.js` + `package.json` + `openclaw.plugin.json`），复制至 `/usr/lib/node_modules/openclaw/dist/extensions/rl-training-headers/`，`openclaw plugins enable rl-training-headers` 成功（输出 "fetch patched"）
+  - 插件文件：[`scripts/rl-training-headers/`](../scripts/rl-training-headers/)
+- OpenAI provider 配置：通过 `openclaw config --section model` wizard 配置，`api-key=EMPTY`，model=`openai/qwen3-4b`
+- LLM provider 指向：`OPENAI_BASE_URL=http://localhost:30000/v1`（port 30000 = RL training proxy，使用 OpenAI 兼容格式，与 OpenAI 服务无关）
+
+**三端口架构完整确认（通过读 openclaw-test/README.md 和 openclaw_opd_api_server.py）：**
+- Port 30001：Simulator (Qwen3-32B)，由 `launch_user_llm.sh` 启动；供 student/TA/teacher_chat.py 使用
+- Port 18789：OpenClaw gateway，调用 port 30000 作为 LLM provider
+- Port 30000：RL training proxy，由训练进程自动启动；记录 X-Session-Id/X-Turn-Type，转发至内部 SGLang
+
+**训练启动脚本：**
+- [`scripts/train_with_services.sh`](../scripts/train_with_services.sh)：编排所有四个服务
+  - Step 1：先启动训练（绕过 run_qwen3_4b_openclaw_combine.sh 开头的 pkill）
+  - Step 2：Ray head 就绪后启动 Simulator（GPU 8）
+  - Step 3：启动 OpenClaw gateway（OPENAI_BASE_URL → port 30000）
+  - Step 4：运行模拟循环（student → TA → teacher，顺序依赖，循环供 rollout 数据）
+
+**主要问题：**
+- `openclaw plugins install <path>` 失败（期待预编译 dist/index.js）→ 手动编译 TypeScript，直接复制到系统目录解决
+- pnpm 网络超时（3分57秒无法下载包）→ 完全绕过 pnpm，使用系统安装的 `openclaw` CLI 解决
+- `openclaw config set openai.config.baseUrl` 配置 schema 不支持 → 改用环境变量 `OPENAI_BASE_URL` 方式传入
+
+**待在 modelfactory 验证：**
+- `openclaw start` 是否是启动 gateway 的正确命令（可能需要调整）
+- `OPENCLAW_GATEWAY_TOKEN` 如何从 `~/.openclaw/openclaw.json` 读取
+
+---
+
+## 当前状态（2026-06-23）
 
 ### 已就绪
 - [x] 环境 + 所有 GPU 编译依赖
@@ -129,13 +164,13 @@
 - [x] GSM8K.json 数据集（已在仓库）
 - [x] 完整实现路径文档（[`implementation_path.md`](implementation_path.md)）
 - [x] 警示文档（[`WARNINGS.md`](WARNINGS.md)）
-- [x] OpenClaw 仓库上传至 modelfactory，Node.js 22.23.0 已安装
+- [x] OpenClaw 安装完成（Node 22.23、rl-training-headers 插件、openai provider）
+- [x] `train_with_services.sh` 编写完成（[`scripts/train_with_services.sh`](../scripts/train_with_services.sh)）
 
 ### 进行中
-- [ ] Qwen3.5-122B-A10B-GPTQ-Int4 本地下载（~65 GB，Simulator 候选）
-- [ ] OpenClaw pnpm 安装（后台运行中，待明日确认）
+- [ ] Qwen3-32B 本地下载（Simulator，论文 Section 4.1 指定）
 
 ### 下一步（优先级顺序）
-1. 确认 pnpm 安装完成，继续 OpenClaw 初始化（`openclaw onboard` + rl-training-headers 扩展）
-2. 确认 Simulator 模型：Qwen3-32B vs Qwen3.5-122B → [`paper_understanding.md → Simulator 部署方案`](paper_understanding.md)
-3. 申请 8×H20 训练 workspace（Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1）
+1. **Qwen3-32B 上传** → `/dfs/data/models/Qwen/Qwen3-32B/`
+2. **modelfactory 验证** `openclaw start` 命令 + 获取 `OPENCLAW_GATEWAY_TOKEN`
+3. **提交训练 job**（选 Workspace_cuda129_CPU + 9×H20 GPU）
