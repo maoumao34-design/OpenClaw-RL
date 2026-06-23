@@ -2,36 +2,49 @@
 # train_with_services.sh
 #
 # 完整的 OpenClaw-RL Hybrid RL 训练启动脚本。
+# 适用于 modelfactory job 提交：
+#   代码解释器: bash
+#   代码路径:   /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/train_with_services.sh
+#   GPU 数量:   9
 #
-# GPU 分配（默认 9×H20）：
+# GPU 分配：
 #   GPU 0-7  → 训练 (Ray + Megatron + SGLang)
 #   GPU 8    → Qwen3-32B Simulator (SGLang, port 30001)
 #
-# 端口说明：
+# 端口：
 #   30000  → RL training proxy（训练进程自动启动）
-#   30001  → Simulator / External LLM
+#   30001  → Simulator
 #   18789  → OpenClaw gateway
-#
-# 使用前设置（必填）：
-#   export POLICY_MODEL_PATH=/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507
-#   export SIMULATOR_MODEL_PATH=/dfs/data/models/Qwen/Qwen3-32B
-#   export OPENCLAW_GATEWAY_TOKEN=<token>   # 从 openclaw.json 读取
-#
-# 获取 OPENCLAW_GATEWAY_TOKEN：
-#   cat ~/.openclaw/openclaw.json | grep -i token
-#
-# 可选覆盖：
-#   SAVE_CKPT, REPO_ROOT, NUM_TRAINING_GPUS, SIMULATOR_GPU
-#   NUM_PROBLEMS_PER_ROUND, CONDA_ENV, WANDB_API_KEY
 
 set -euo pipefail
 
 # =====================================================================
-# 配置
+# 配置（job 提交时直接使用这些默认值，无需额外 export）
 # =====================================================================
-POLICY_MODEL_PATH=${POLICY_MODEL_PATH:?"必须设置 POLICY_MODEL_PATH"}
-SIMULATOR_MODEL_PATH=${SIMULATOR_MODEL_PATH:?"必须设置 SIMULATOR_MODEL_PATH"}
-OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:?"必须设置 OPENCLAW_GATEWAY_TOKEN"}
+POLICY_MODEL_PATH=${POLICY_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
+SIMULATOR_MODEL_PATH=${SIMULATOR_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-32B}
+
+# OPENCLAW_GATEWAY_TOKEN：优先用环境变量，否则从 openclaw.json 自动读取
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+    OPENCLAW_GATEWAY_TOKEN=$(python3 -c "
+import json, pathlib, sys
+cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
+if not cfg.exists(): sys.exit(1)
+d = json.loads(cfg.read_text())
+# 尝试常见字段名
+for key in ['gatewayToken','gateway_token','token']:
+    v = d.get(key) or d.get('gateway',{}).get('token','') or d.get('auth',{}).get('token','')
+    if v: print(v); sys.exit(0)
+sys.exit(1)
+" 2>/dev/null) || true
+fi
+
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+    echo "错误：无法读取 OPENCLAW_GATEWAY_TOKEN" >&2
+    echo "请手动运行：cat ~/.openclaw/openclaw.json  找到 token 字段后" >&2
+    echo "在脚本顶部加一行：OPENCLAW_GATEWAY_TOKEN=xxx" >&2
+    exit 1
+fi
 
 SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-combine}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
