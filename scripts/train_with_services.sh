@@ -31,10 +31,12 @@ import json, pathlib, sys
 cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
 if not cfg.exists(): sys.exit(1)
 d = json.loads(cfg.read_text())
-# 尝试常见字段名
-for key in ['gatewayToken','gateway_token','token']:
-    v = d.get(key) or d.get('gateway',{}).get('token','') or d.get('auth',{}).get('token','')
-    if v: print(v); sys.exit(0)
+# 实际结构：gateway.auth.token
+v = (d.get('gateway') or {}).get('auth', {}).get('token', '')
+if v: print(v); sys.exit(0)
+# 兜底：gateway.token / 顶层 token
+v = (d.get('gateway') or {}).get('token', '') or d.get('token', '')
+if v: print(v); sys.exit(0)
 sys.exit(1)
 " 2>/dev/null) || true
 fi
@@ -52,11 +54,15 @@ NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-8}
 SIMULATOR_GPU=${SIMULATOR_GPU:-8}
 NUM_PROBLEMS_PER_ROUND=${NUM_PROBLEMS_PER_ROUND:-6}
 DATASET=${DATASET:-${REPO_ROOT}/openclaw-test/GSM8K.json}
-CONDA_ENV=${CONDA_ENV:-}
+# Table 3 评估：最多跑 SESSION_LIMIT 个 session，之后运行收敛检测
+SESSION_LIMIT=${SESSION_LIMIT:-72}
+CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
+CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
 OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
+SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 
 mkdir -p "${LOGS_DIR}"
 echo "日志目录: ${LOGS_DIR}"
@@ -65,7 +71,7 @@ echo "日志目录: ${LOGS_DIR}"
 # conda 环境
 # =====================================================================
 if [ -n "${CONDA_ENV}" ]; then
-    source "$(conda info --base)/etc/profile.d/conda.sh"
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
     conda activate "${CONDA_ENV}"
     echo "已激活 conda: ${CONDA_ENV}"
 fi
@@ -184,14 +190,25 @@ wait_for_port "RL training proxy" 30000 600
 echo ""
 echo "=== [4/4] 启动模拟循环（Student → TA → Teacher）==="
 
+# 各 persona 的第一条消息回复累积文件（供 check_convergence.py 使用）
+# 说明：chat 脚本每次启动会清空自己的 --output 文件，所以每轮结束后手动 cat 到 _all 文件
+STUDENT_ALL="${LOGS_DIR}/results_student_all.txt"
+TA_ALL="${LOGS_DIR}/results_TA_all.txt"
+TEACHER_ALL="${LOGS_DIR}/results_teacher_all.txt"
+
 run_simulation_round() {
     local round=$1
     echo "--- 模拟 round ${round} 开始 ---"
+
+    local round_student="${LOGS_DIR}/results_student_round${round}.txt"
+    local round_ta="${LOGS_DIR}/results_TA_round${round}.txt"
+    local round_teacher="${LOGS_DIR}/results_teacher_round${round}.txt"
 
     # 每轮清理 workspace，避免上轮文件干扰
     rm -rf "${WORKSPACE}/homework" "${WORKSPACE}/homework1" "${WORKSPACE}/homework2"
 
     # Student：让 OpenClaw 解 GSM8K 作业（要求非 AI 风格输出）
+    # --output 捕获每个 session 对第一条消息的回复，供收敛检测使用
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
     OPENAI_API_KEY=EMPTY \
     OPENAI_BASE_URL=http://localhost:30001/v1 \
@@ -199,7 +216,9 @@ run_simulation_round() {
     OPENCLAW_GATEWAY_URL=http://localhost:18789 \
     python "${OPENCLAW_DIR}/student_chat.py" \
         --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}"
+        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
+        --output "${round_student}"
+    cat "${round_student}" >> "${STUDENT_ALL}"
 
     # TA：让 OpenClaw 批改作业（要求详细批改意见）
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
@@ -209,7 +228,9 @@ run_simulation_round() {
     OPENCLAW_GATEWAY_URL=http://localhost:18789 \
     python "${OPENCLAW_DIR}/TA_chat.py" \
         --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}"
+        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
+        --output "${round_ta}"
+    cat "${round_ta}" >> "${TA_ALL}"
 
     # Teacher：让 OpenClaw 写温暖的教师评语（要求包含 well done / excellent）
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
@@ -219,19 +240,35 @@ run_simulation_round() {
     OPENCLAW_GATEWAY_URL=http://localhost:18789 \
     python "${OPENCLAW_DIR}/teacher_chat.py" \
         --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}"
+        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
+        --output "${round_teacher}"
+    cat "${round_teacher}" >> "${TEACHER_ALL}"
 
     echo "--- 模拟 round ${round} 完成（${NUM_PROBLEMS_PER_ROUND} 个问题 × 3 persona = $((NUM_PROBLEMS_PER_ROUND * 3)) 个 session）---"
 }
 
 simulation_loop() {
     local round=0
-    while kill -0 "${TRAINING_PID}" 2>/dev/null; do
+    local total_sessions=0
+    # 每轮产生 NUM_PROBLEMS_PER_ROUND 个 session，最多跑到 SESSION_LIMIT
+    local max_rounds=$(( (SESSION_LIMIT + NUM_PROBLEMS_PER_ROUND - 1) / NUM_PROBLEMS_PER_ROUND ))
+
+    while kill -0 "${TRAINING_PID}" 2>/dev/null && [ ${round} -lt ${max_rounds} ]; do
         round=$((round + 1))
+        total_sessions=$((round * NUM_PROBLEMS_PER_ROUND))
+        echo "模拟 round ${round}/${max_rounds}（累计 session 数：${total_sessions}/${SESSION_LIMIT}）"
         run_simulation_round ${round} \
             2>&1 | tee -a "${LOGS_DIR}/simulation.log" || true
     done
-    echo "训练进程已结束，模拟循环退出。"
+
+    echo "模拟循环结束（共 ${round} 轮，~${total_sessions} sessions）"
+    echo ""
+    echo "=== 收敛检测（Table 3 指标）==="
+    python "${SCRIPTS_DIR}/check_convergence.py" \
+        --student "${STUDENT_ALL}" \
+        --ta      "${TA_ALL}" \
+        --teacher "${TEACHER_ALL}" \
+        2>&1 | tee "${LOGS_DIR}/convergence_result.txt"
 }
 
 simulation_loop &
