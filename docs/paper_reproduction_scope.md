@@ -72,16 +72,21 @@ for session in training_sessions:
 ```
               Hybrid RL  GRPO   OPD   Mem0  Cognee
 Joint opt:
-  Student      11.6      15.4  30.8   13.6  15.8
-  TA            8.2      12.0  34.0   14.6  15.4
-  Teacher      14.8      24.4  ...
-  Average      10.3      ...
+  Student      11.6      15.4  30.8   13.6  14.6
+  TA            8.2      12.0  34.0   15.8  15.4
+  Teacher      11.4      14.8  24.4   14.2  14.8
+  Average      10.3      14.1  29.7   14.5  14.9
 
 Separate opt:
-  Student      19.2      22.8  34.6   13.4  16.0
-  ...
+  Student      19.2      22.8  34.6   13.4  15.6
+  TA           11.8      22.4  36.0   16.0  14.8
+  Teacher      14.0      18.0  17.6   15.8  15.0
+  Average      15.0      21.1  29.4   15.1  15.1
 ```
 （数字越小越好）
+
+> ⚠️ 纠错记录（2026-06-23）：Teacher Joint Hybrid RL 原记为 14.8，从论文 HTML 版核实为 **11.4**。
+> 验证：(11.6 + 8.2 + 11.4) / 3 = 10.4 ≈ 10.3（与 Average 一致）。
 
 ### Joint vs Separate 区别
 

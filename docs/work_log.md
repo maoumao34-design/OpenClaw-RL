@@ -156,6 +156,45 @@
 
 ---
 
+## 2026-06-23 论文结构理解 + 复现路线规划 + 文档建立
+
+**目标：** 搞清楚 Table 3 的 Joint/Separate 含义、完整复现路线、论文各图表定位
+
+**完成内容：**
+
+**Joint vs Separate 含义确认（通过读 paper_reproduction_scope.md 中的数字）：**
+- **Joint optimization**：一个训练 job，Student/TA/Teacher 三个 persona 混合训练同一个模型，对应 Table 3 上半块
+- **Separate optimization**：三个独立训练 job，每个只训练一种 persona，对应 Table 3 下半块
+- 当前 `train_with_services.sh` 实现的是 Joint（模拟循环每轮跑全部三个 persona）
+- 要得到 Table 3 完整两块数字需要 Joint（3 个方法）+ Separate（9 个方法×persona 组合）共 12 个训练 job
+
+**Table 3 完整复现路线制定（5 Phase）：**
+- Phase 1：Joint Hybrid RL（当前，已有脚本）→ 验证主结论
+- Phase 2：Joint GRPO + OPD 基线（需写 `train_grpo_joint.sh`、`train_opd_joint.sh`）
+- Phase 3：Separate Hybrid RL（需写 3 个单 persona 脚本）
+- Phase 4：Separate 基线（低优先级）
+- Phase 5：Mem0/Cognee（独立生态，最低优先级）
+- → 详见 [`paper_reproduction_scope.md → Table 3 完整复现执行路线`](paper_reproduction_scope.md)
+
+**论文图表结构全面梳理（通过 arXiv HTML 抓取）：**
+- Figure 1-4、Table 1-2：全部是方法说明图/配置表，**不是实验数据，不需要复现**
+- Figure 5（step 横轴）：General Agent 四个 track 训练曲线，需要独立训练环境
+- Figure 6（step 横轴）：ReTool + RLVR 扩展实验训练曲线
+- Figure 7：OPD 消融曲线（log-prob clipping 有无对比）
+- Table 3-5：Personal Agent 主结果 + OPD 消融，是复现核心
+- Figure 2 虽然有"对话示例"但是挑选的示意图，不是定量结果
+
+**数据纠错：**
+- `paper_reproduction_scope.md` 中 Teacher Joint Hybrid RL 误记为 14.8 → 实际为 **11.4**
+  - 验证：(11.6 + 8.2 + 11.4) / 3 = 10.4 ≈ 10.3 ✓
+- Separate 完整数字补全（之前有 "..." 占位）
+
+**新建文档：**
+- [`docs/paper_full_text.md`](paper_full_text.md)：论文完整内容 markdown 版（从 arXiv HTML 提取）
+  - 包含 Abstract、全部 Section 正文、Table 3/4/5 完整数据、所有公式（LaTeX）、Figure captions、快速查阅表
+
+---
+
 ## 当前状态（2026-06-23）
 
 ### 已就绪
@@ -165,12 +204,15 @@
 - [x] 完整实现路径文档（[`implementation_path.md`](implementation_path.md)）
 - [x] 警示文档（[`WARNINGS.md`](WARNINGS.md)）
 - [x] OpenClaw 安装完成（Node 22.23、rl-training-headers 插件、openai provider）
-- [x] `train_with_services.sh` 编写完成（[`scripts/train_with_services.sh`](../scripts/train_with_services.sh)）
+- [x] `train_with_services.sh` 编写完成（Joint Hybrid RL，modelfactory job 可直接提交）
+- [x] Table 3 完整复现路线文档（Phase 1-5）
+- [x] 论文完整 markdown 版（[`docs/paper_full_text.md`](paper_full_text.md)）
 
 ### 进行中
-- [ ] Qwen3-32B 本地下载（Simulator，论文 Section 4.1 指定）
+- [ ] Qwen3-32B 本地下载 → 上传至 `/dfs/data/models/Qwen/Qwen3-32B/`
 
 ### 下一步（优先级顺序）
-1. **Qwen3-32B 上传** → `/dfs/data/models/Qwen/Qwen3-32B/`
-2. **modelfactory 验证** `openclaw start` 命令 + 获取 `OPENCLAW_GATEWAY_TOKEN`
-3. **提交训练 job**（选 Workspace_cuda129_CPU + 9×H20 GPU）
+1. **Qwen3-32B 上传完成** → 确认路径 `/dfs/data/models/Qwen/Qwen3-32B/`
+2. **modelfactory 验证两点**：`openclaw start` 命令 + `OPENCLAW_GATEWAY_TOKEN` 读取方式
+3. **提交 Joint Hybrid RL 训练 job**（Workspace_cuda129_CPU + 9×H20）
+4. 训练完成后跑 `evaluate_table3.py` → 得到 Phase 1 三行数字
