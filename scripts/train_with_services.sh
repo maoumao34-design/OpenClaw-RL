@@ -51,7 +51,7 @@ fi
 SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-combine}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
 NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-8}
-SIMULATOR_GPU=${SIMULATOR_GPU:-8}
+SIMULATOR_GPU=${SIMULATOR_GPU:-7}
 NUM_PROBLEMS_PER_ROUND=${NUM_PROBLEMS_PER_ROUND:-6}
 DATASET=${DATASET:-${REPO_ROOT}/openclaw-test/GSM8K.json}
 # Table 3 评估：最多跑 SESSION_LIMIT 个 session，之后运行收敛检测
