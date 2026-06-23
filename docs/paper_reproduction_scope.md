@@ -83,6 +83,59 @@ Separate opt:
 ```
 （数字越小越好）
 
+### Joint vs Separate 区别
+
+| 设定 | 训练方式 | 对应脚本 |
+|------|---------|---------|
+| **Joint opt** | 一个 job，Student/TA/Teacher 三个 persona 混合训练同一个模型 | 模拟循环每轮跑 student → TA → teacher |
+| **Separate opt** | 三个独立 job，每个只训练一种 persona | 模拟循环只跑对应的一个脚本 |
+
+### Table 3 完整复现执行路线
+
+**Phase 1：Joint Block — Hybrid RL 列（当前阶段）**
+
+| 步骤 | 操作 | 脚本 | 状态 |
+|------|------|------|------|
+| 1a | Joint 训练，Hybrid RL | `scripts/train_with_services.sh` | ✅ 已写，待跑 |
+| 1b | 评估：3 个 persona 各数收敛 session | `scripts/evaluate_table3.py` | ✅ 已写，待跑 |
+| 1c | 得到 Joint / Hybrid RL 列：Student=?, TA=?, Teacher=? | — | ⬜ |
+
+**Phase 2：Joint Block — 基线列（GRPO、OPD）**
+
+每列结构与 Phase 1 相同，只换训练脚本（模拟循环不变，三个 persona 仍全部保留）：
+
+| 步骤 | 操作 | 训练后端 | 状态 |
+|------|------|---------|------|
+| 2a | Joint 训练，GRPO only | `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` | ⬜ 需写 `train_grpo_joint.sh` |
+| 2b | 评估 GRPO 列 | `evaluate_table3.py` | ⬜ |
+| 2c | Joint 训练，OPD only | `openclaw-opd/run_qwen3_4b_openclaw_opd.sh` | ⬜ 需写 `train_opd_joint.sh` |
+| 2d | 评估 OPD 列 | `evaluate_table3.py` | ⬜ |
+
+**Phase 3：Separate Block — Hybrid RL 列**
+
+三个独立 job，每个模拟循环只保留一个 persona：
+
+| 步骤 | 训练内容 | 需要的脚本 | 状态 |
+|------|---------|----------|------|
+| 3a | Separate 训练，只训 Student | `train_separate_student.sh` | ⬜ 需写 |
+| 3b | Separate 训练，只训 TA | `train_separate_ta.sh` | ⬜ 需写 |
+| 3c | Separate 训练，只训 Teacher | `train_separate_teacher.sh` | ⬜ 需写 |
+| 3d | 评估三个 checkpoint 各自的收敛 session | `evaluate_table3.py` | ⬜ |
+
+**Phase 4：Separate Block — 基线列（低优先级）**
+
+同 Phase 3，分别换 GRPO / OPD 训练后端，共再跑 6 个 job。
+
+**Phase 5：Mem0 / Cognee 基线（独立生态，最低优先级）**
+
+不属于本仓库，需单独研究 Mem0 / Cognee 的 API 接入方式。
+
+---
+
+**优先级建议：**  
+Phase 1 → Phase 2 → Phase 3（Hybrid RL 列）→ Phase 3（基线）→ Phase 4 → Phase 5  
+Phase 1 完成后即可验证主结论（Joint Hybrid RL < Joint GRPO < Joint OPD）。
+
 ---
 
 ## 二、General Agent（Figure 5）
