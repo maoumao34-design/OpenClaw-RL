@@ -141,11 +141,12 @@ wait_for_port() {
             return 1
         fi
         if [ -n "${logfile}" ] && [ -f "${logfile}" ]; then
-            if grep -qE "Job 'raysubmit_.*' failed|can't open file '/workspace/train_async.py'" "${logfile}" 2>/dev/null; then
-                echo "错误：Ray 训练 job 已失败（见 ${logfile}）" >&2
-                dump_log_tail "${logfile}" 120
-                return 1
-            fi
+        if grep -qE "Job 'raysubmit_.*' failed|can't open file '/workspace/train_async.py'|patch failed|Traceback|CUDA out of memory" "${logfile}" 2>/dev/null; then
+            echo "错误：Ray 训练 job 已失败（见 ${logfile}）" >&2
+            grep -E "failed|Error|error|Traceback|can't open|patch failed|OOM|CUDA" "${logfile}" 2>/dev/null | tail -20 >&2 || true
+            dump_log_tail "${logfile}" 120
+            return 1
+        fi
         fi
         if [ ${waited} -ge ${max_wait} ]; then
             echo "超时：${name} 在 ${max_wait}s 内未启动" >&2

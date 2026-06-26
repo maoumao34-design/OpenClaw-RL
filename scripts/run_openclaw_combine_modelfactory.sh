@@ -30,6 +30,8 @@ if [ "${SMOKE_PROFILE}" = "1" ]; then
         -e 's/--sglang-context-length 32768/--sglang-context-length 8192/' \
         -e 's/^export TP="2"/export TP="1"/' \
         -e 's/^export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="8192"/' \
+        -e 's/PRM_GPUS=${PRM_GPUS:-2}/PRM_GPUS=${PRM_GPUS:-1}/' \
+        -e 's/PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-2}/PRM_NUM_GPUS_PER_ENGINE=${PRM_NUM_GPUS_PER_ENGINE:-1}/' \
         "${PATCHED}"
 fi
 
