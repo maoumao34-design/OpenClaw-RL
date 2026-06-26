@@ -1,0 +1,25 @@
+---
+description: OpenClaw-RL Table 3 复现技术规则（脚本、评估、禁止项）
+alwaysApply: true
+---
+
+# 复现目标与禁止项
+
+**目标**：Table 3 Phase 1 — Joint Hybrid RL（Student 11.6 / TA 8.2 / Teacher 11.4 / Avg 10.3）
+
+**禁止**：`openclaw-rl/oel/`、`openclaw-fireworks/`、`openclaw-tinker/`；`gsm8k_personal_agent.py`、`personalization_evaluator.py`
+
+**必须用**：
+- 训练：`OpenClaw-RL-official/openclaw-combine/run_qwen3_4b_openclaw_combine.sh`
+- 编排正式：`scripts/train_with_services.sh`（**8 GPU**）
+- 编排 smoke：`scripts/smoke_train_with_services.sh`（**3 GPU，非论文配置**）
+- 评估：`openclaw-test/student_chat.py`、`TA_chat.py`、`teacher_chat.py`
+- 收敛：`scripts/check_convergence.py`（rule-based 连续 3 session，非 LLM 打分）
+
+**Simulator**：Qwen3-32B，外部 vLLM；地址/key 只写在 `scripts/simulator.env`（读 `simulator.env.example`）
+
+**Policy/OpenClaw**：`~/.openclaw/openclaw.json` → `primary=sglang/qwen3-4b`，`baseUrl=http://127.0.0.1:30000/v1`
+
+**架构**：外部 32B Simulator → OpenClaw :18789 → RL proxy :30000 → 8×GPU Megatron（4+2+1+1）
+
+**决策参考**：`docs/WARNINGS.md`、`docs/paper_reproduction_scope.md`、`docs/smoke_test.md`

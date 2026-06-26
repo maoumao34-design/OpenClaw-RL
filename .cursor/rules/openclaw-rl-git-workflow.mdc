@@ -1,0 +1,14 @@
+---
+description: OpenClaw-RL 复现项目 Git 与工作流约定
+alwaysApply: true
+---
+
+# Git 与工作流
+
+- 仓库：`https://github.com/maoumao34-design/OpenClaw-RL.git`（复现脚本与 docs）
+- 官方训练代码在 modelfactory：`/dfs/data/openclaw-rl-project/OpenClaw-RL-official/`（不在此仓）
+- **每次实质改动必须本地 git commit**，message 写清 why
+- **禁止自动 push**；推送 GitHub 前先说明改动内容，等用户确认
+- 每个 commit 应可回退（`git log` / `git revert` / `git checkout <hash> -- <file>`）
+- **不要 commit/push**：`scripts/simulator.env`（含内网 URL/API key）、未用户要求的本地 doc 草稿
+- 遇错记录到 `docs/issues_log.md`；阶段进展更新 `docs/work_log.md`
