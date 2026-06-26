@@ -37,23 +37,48 @@ smoke_train_with_services.sh
    - `baseUrl`: `http://127.0.0.1:30000/v1`
 3. OpenClaw-RL-official、conda 环境、模型与 torch_dist 路径可用
 
-## modelfactory 提交
+## 1. 配置 Simulator（只改一个文件）
 
-**GPU：3**（申请 4 也可以，脚本默认只用 GPU 0–2）
-
-**代码路径：**
+**文件路径：**
 
 ```text
-/dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/smoke_train_with_services.sh
+/dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/simulator.env
 ```
 
-**环境变量：**
+首次使用（只需一次）：
 
 ```bash
-export SIMULATOR_BASE_URL=http://<qwen3-32b-vllm内网>/v1
-export SIMULATOR_API_KEY=EMPTY
-export EXTERNAL_MODEL=qwen3-32b
+cd /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts
+cp simulator.env.example simulator.env
 ```
+
+之后换 vLLM 服务、换地址或 key，**只编辑 `simulator.env` 这三行**：
+
+```bash
+SIMULATOR_BASE_URL=http://<32B-vllm-内网地址>/v1
+SIMULATOR_API_KEY=EMPTY
+EXTERNAL_MODEL=qwen3-32b
+```
+
+验证：
+
+```bash
+source simulator.env
+curl -s "${SIMULATOR_BASE_URL%/v1}/health"
+```
+
+> `simulator.env` 不要 push 到 GitHub（已在 .gitignore）。模板见 `simulator.env.example`。
+
+## 2. modelfactory 提交 job
+
+| 字段 | 填什么 |
+|------|--------|
+| **代码解释器** | `bash`（不是 `python`） |
+| **代码** | `.../OpenClaw-RL/scripts/smoke_train_with_services.sh` |
+| **参数** | 留空 |
+| **GPU** | **3× H20**（不要选 CPU / 0 GPU） |
+
+**不需要**在 job 表单填环境变量；脚本会自动读 `scripts/simulator.env`。
 
 ## 通过标准
 

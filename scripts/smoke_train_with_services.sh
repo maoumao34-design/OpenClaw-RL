@@ -13,15 +13,27 @@
 #   代码路径:   .../OpenClaw-RL/scripts/smoke_train_with_services.sh
 #   GPU 数量:   3（或 4，脚本默认只用 0-2）
 #
-# 提交前必须 export：
-#   SIMULATOR_BASE_URL=http://<qwen3-32b-vllm内网>/v1
-#   SIMULATOR_API_KEY=EMPTY
-#   EXTERNAL_MODEL=qwen3-32b
+# Simulator 地址：编辑 scripts/simulator.env（见 simulator.env.example）
 #
 # openclaw.json 需已配置 primary=sglang/qwen3-4b, baseUrl=http://127.0.0.1:30000/v1
 # =============================================================================
 
 set -euo pipefail
+
+SCRIPTS_DIR=$(dirname "$(realpath "$0")")
+SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
+if [ ! -f "${SIMULATOR_ENV}" ]; then
+    if [ -f "${SCRIPTS_DIR}/simulator.env.example" ]; then
+        cp "${SCRIPTS_DIR}/simulator.env.example" "${SIMULATOR_ENV}"
+        echo "已创建 ${SIMULATOR_ENV} — 请填写 Simulator 地址和 key 后重新提交 job"
+    fi
+    exit 1
+fi
+set -a
+# shellcheck disable=SC1091
+source "${SIMULATOR_ENV}"
+set +a
+echo "已加载: ${SIMULATOR_ENV}"
 
 POLICY_MODEL_PATH=${POLICY_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
 POLICY_TORCH_DIST=${POLICY_TORCH_DIST:-/dfs/data/models/torch_dist/qwen3-4b-thinking-2507}
@@ -46,11 +58,10 @@ CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/smoke_$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
-SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 SMOKE_COMBINE_LAUNCHER="${SCRIPTS_DIR}/smoke_run_qwen3_4b_openclaw_combine.sh"
 
-if [ -z "${SIMULATOR_BASE_URL}" ]; then
-    echo "错误：必须设置 SIMULATOR_BASE_URL（外部 Qwen3-32B vLLM 地址）" >&2
+if [ -z "${SIMULATOR_BASE_URL}" ] || [[ "${SIMULATOR_BASE_URL}" == *"<"* ]]; then
+    echo "错误：请在 ${SIMULATOR_ENV} 中填写 SIMULATOR_BASE_URL" >&2
     exit 1
 fi
 

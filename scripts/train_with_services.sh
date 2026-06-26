@@ -16,15 +16,28 @@
 #   GPU 0-7  → Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1（megatron 默认）
 #   Simulator → 外部机器（不在本 job 占 GPU）
 #
-# 提交 job 前必须 export（或在平台环境变量里配置）：
-#   SIMULATOR_BASE_URL=http://<simulator-host>:30001/v1
-#   SIMULATOR_API_KEY=<与 SGLang --api-key 一致；无 auth 则 EMPTY>
+# Simulator 地址：编辑 scripts/simulator.env（见 simulator.env.example）
 #
 # 端口（训练机本机）：
 #   30000  → RL training proxy
 #   18789  → OpenClaw gateway
 
 set -euo pipefail
+
+SCRIPTS_DIR=$(dirname "$(realpath "$0")")
+SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
+if [ ! -f "${SIMULATOR_ENV}" ]; then
+    if [ -f "${SCRIPTS_DIR}/simulator.env.example" ]; then
+        cp "${SCRIPTS_DIR}/simulator.env.example" "${SIMULATOR_ENV}"
+        echo "已创建 ${SIMULATOR_ENV} — 请填写 Simulator 地址和 key 后重新提交 job"
+    fi
+    exit 1
+fi
+set -a
+# shellcheck disable=SC1091
+source "${SIMULATOR_ENV}"
+set +a
+echo "已加载: ${SIMULATOR_ENV}"
 
 # =====================================================================
 # 配置
@@ -43,9 +56,8 @@ SGLANG_API_KEY=${SGLANG_API_KEY:-openclaw-rl-key}
 NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-8}
 TRAINING_CUDA_DEVICES=${TRAINING_CUDA_DEVICES:-$(seq -s, 0 $((NUM_TRAINING_GPUS - 1)))}
 
-if [ -z "${SIMULATOR_BASE_URL}" ]; then
-    echo "错误：必须设置 SIMULATOR_BASE_URL（外部 Simulator OpenAI 兼容地址）" >&2
-    echo "示例：export SIMULATOR_BASE_URL=http://10.x.x.x:30001/v1" >&2
+if [ -z "${SIMULATOR_BASE_URL}" ] || [[ "${SIMULATOR_BASE_URL}" == *"<"* ]]; then
+    echo "错误：请在 ${SIMULATOR_ENV} 中填写 SIMULATOR_BASE_URL" >&2
     exit 1
 fi
 
@@ -80,7 +92,6 @@ CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
-SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 
 mkdir -p "${LOGS_DIR}"
 echo "日志目录: ${LOGS_DIR}"

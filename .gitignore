@@ -33,6 +33,7 @@ Thumbs.db
 
 # Secrets / API keys
 .env
+scripts/simulator.env
 *.key
 secrets.yaml
 
