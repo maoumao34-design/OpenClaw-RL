@@ -136,9 +136,16 @@ wait_for_port() {
         sleep 10
         waited=$((waited + 10))
         if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
-            echo "错误：${name} 进程已退出" >&2
+            echo "错误：${name} 依赖进程已退出" >&2
             dump_log_tail "${logfile}"
             return 1
+        fi
+        if [ -n "${logfile}" ] && [ -f "${logfile}" ]; then
+            if grep -qE "Job 'raysubmit_.*' failed|can't open file '/workspace/train_async.py'" "${logfile}" 2>/dev/null; then
+                echo "错误：Ray 训练 job 已失败（见 ${logfile}）" >&2
+                dump_log_tail "${logfile}" 120
+                return 1
+            fi
         fi
         if [ ${waited} -ge ${max_wait} ]; then
             echo "超时：${name} 在 ${max_wait}s 内未启动" >&2

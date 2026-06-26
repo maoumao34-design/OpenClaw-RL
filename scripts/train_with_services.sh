@@ -195,7 +195,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_MODEL_PATH="${POLICY_MODEL_PATH}" \
   PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
-  bash "${REPO_ROOT}/openclaw-combine/run_qwen3_4b_openclaw_combine.sh" \
+  bash "${SCRIPTS_DIR}/run_openclaw_combine_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
 

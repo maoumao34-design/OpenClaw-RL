@@ -107,7 +107,8 @@ tail -80  /dfs/data/openclaw-rl-project/logs/smoke_*/simulation.log
 常见原因：
 
 - Simulator URL 不可达、torch_dist 路径错误、openclaw.json 未指向 30000、GPU 数不足 3
-- **`training.log` 在 Ray stop 后立即结束**：多为 patched combine 脚本把 `REPO_ROOT` 解析成 `logs/`（找不到 `slime/`）。需使用最新 `smoke_run_qwen3_4b_openclaw_combine.sh`（已固定 `REPO_ROOT=OpenClaw-RL-official`）
+- **`training.log` 在 Ray stop 后立即结束**：多为 patched combine 脚本把 `REPO_ROOT` 解析成 `logs/`（找不到 `slime/`）。需使用最新 `run_openclaw_combine_modelfactory.sh`
+- **`can't open file '/workspace/train_async.py'`**：Ray job 工作目录错误；需 modelfactory patch（`--working-dir=${SLIME_ROOT}` + 绝对路径 `train_async.py`）
 - **OpenClaw 18789 超时、`openclaw.log` 停在 `loading configuration` / `force: no listeners`**：先等 `:30000` RL proxy（脚本已调整顺序）；并在 `openclaw.json` 设 `gateway.controlUi.enabled: false`；手动验证见下
 
 ## 通过后
