@@ -4,6 +4,9 @@
 # OpenClaw-RL Hybrid RL 训练编排（Table 3 Phase 1: Joint Hybrid RL）
 # 基于 commit 0f4582c5 的 9 GPU 论文布局，Simulator 改为外部 API 服务。
 #
+# 正式训练前冒烟（3 GPU，非论文配置）请用 scripts/smoke_train_with_services.sh
+# 说明见 docs/smoke_test.md
+#
 # modelfactory job 提交：
 #   代码解释器: bash
 #   代码路径:   /dfs/data/openclaw-rl-project/openclaw-rl/scripts/train_with_services.sh
