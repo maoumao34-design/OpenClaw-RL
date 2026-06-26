@@ -167,6 +167,61 @@ wait_for_external_simulator() {
     echo "外部 Simulator 已就绪"
 }
 
+launch_openclaw_gateway() {
+    echo "启动 OpenClaw gateway（port 18789，headless）..."
+    local openclaw_cmd=(openclaw gateway run --allow-unconfigured --force --bind loopback --verbose
+        --token "${OPENCLAW_GATEWAY_TOKEN}")
+    if command -v stdbuf >/dev/null 2>&1; then
+        OPENCLAW_SKIP_CHANNELS=1 \
+        OPENCLAW_SKIP_PROVIDERS=1 \
+        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
+        OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
+        OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+        stdbuf -oL -eL "${openclaw_cmd[@]}" >> "${LOGS_DIR}/openclaw.log" 2>&1 &
+    else
+        OPENCLAW_SKIP_CHANNELS=1 \
+        OPENCLAW_SKIP_PROVIDERS=1 \
+        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
+        OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
+        OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+        "${openclaw_cmd[@]}" >> "${LOGS_DIR}/openclaw.log" 2>&1 &
+    fi
+    OPENCLAW_PID=$!
+    echo "OpenClaw PID: ${OPENCLAW_PID}"
+}
+
+wait_for_openclaw_gateway() {
+    local max_wait=${1:-900}
+    local waited=0
+    local logfile="${LOGS_DIR}/openclaw.log"
+    local last_log_size=0
+    echo "等待 OpenClaw gateway (http://127.0.0.1:18789/healthz)..."
+    while ! curl -sf "http://127.0.0.1:18789/healthz" > /dev/null 2>&1; do
+        sleep 10
+        waited=$((waited + 10))
+        if [ -n "${OPENCLAW_PID}" ] && ! kill -0 "${OPENCLAW_PID}" 2>/dev/null; then
+            echo "错误：OpenClaw gateway 进程已退出" >&2
+            dump_log_tail "${logfile}"
+            return 1
+        fi
+        if [ -f "${logfile}" ]; then
+            local cur_size
+            cur_size=$(wc -c < "${logfile}" | tr -d ' ')
+            if [ "${cur_size}" -eq "${last_log_size}" ] && [ $((waited % 60)) -eq 0 ] && [ "${waited}" -ge 60 ]; then
+                echo "  提示：openclaw.log ${waited}s 无新输出；确认 ~/.openclaw/openclaw.json 含 gateway.mode=local 且 controlUi.enabled=false" >&2
+            fi
+            last_log_size="${cur_size}"
+        fi
+        if [ ${waited} -ge ${max_wait} ]; then
+            echo "超时：OpenClaw gateway 在 ${max_wait}s 内未启动" >&2
+            dump_log_tail "${logfile}"
+            return 1
+        fi
+        echo "  已等待 ${waited}s..."
+    done
+    echo "OpenClaw gateway 已就绪 (port 18789)"
+}
+
 OPENCLAW_PID=""
 TRAINING_PID=""
 
@@ -217,13 +272,12 @@ echo "=== [2/3] 外部 Simulator + OpenClaw gateway + RL proxy :30000 ==="
 
 wait_for_external_simulator 300
 
-OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-  openclaw gateway run --allow-unconfigured --force \
-  > "${LOGS_DIR}/openclaw.log" 2>&1 &
-OPENCLAW_PID=$!
-
-wait_for_port "OpenClaw gateway" 18789 300 "${OPENCLAW_PID}" "${LOGS_DIR}/openclaw.log"
+# RL proxy :30000 必须先起来；OpenClaw primary 指向 127.0.0.1:30000，且 SGLang 加载较慢。
+echo "等待 RL training proxy (port 30000)..."
 wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
+
+launch_openclaw_gateway
+wait_for_openclaw_gateway 900
 
 # --- [3/3] 一轮模拟（foreground，失败即退出）---
 echo ""
