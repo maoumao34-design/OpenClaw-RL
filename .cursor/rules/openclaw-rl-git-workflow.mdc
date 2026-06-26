@@ -11,4 +11,4 @@ alwaysApply: true
 - **禁止自动 push**；推送 GitHub 前先说明改动内容，等用户确认
 - 每个 commit 应可回退（`git log` / `git revert` / `git checkout <hash> -- <file>`）
 - **不要 commit/push**：`scripts/simulator.env`（含内网 URL/API key）、未用户要求的本地 doc 草稿
-- 遇错记录到 `docs/issues_log.md`；阶段进展更新 `docs/work_log.md`
+- 遇错记录到 `docs/issues_log.md`；阶段进展更新 `docs/work_log.md`（格式见 `.cursor/rules/openclaw-rl-documentation.mdc` 与 `work_log.md` 文首规范）

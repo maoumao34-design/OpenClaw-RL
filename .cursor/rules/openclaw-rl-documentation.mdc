@@ -1,0 +1,50 @@
+---
+description: OpenClaw-RL 工作记录与问题记录的方法与分工
+alwaysApply: true
+---
+
+# 文档分工
+
+| 文件 | 用途 | 何时写 |
+|------|------|--------|
+| `docs/work_log.md` | **日复盘 / 汇报**：做了什么、卡在哪、下一步 | 每个工作阶段结束、重大进展或方向变更后 |
+| `docs/issues_log.md` | **具体问题**：报错、根因、解决方案 | job 失败、环境/脚本踩坑时 |
+| `docs/paper_reproduction_scope.md` | 复现决策权威参考 | 范围/Phase/指标争议时更新 |
+| `docs/WARNINGS.md` | 禁止误用的目录与脚本 | 发现易错路径时 |
+| `docs/codebase_analysis.md` 等 | 技术细节（不在 work_log 展开） | 读源码后的深度结论 |
+
+其他 doc 文首保留 `[← 工作记录](work_log.md)` 回链。
+
+# work_log.md 写法
+
+- **按日期分节**：`## YYYY-MM-DD`；一天多主题可用 `### 子标题`
+- **每节三块**（按需）：
+  - **目标：** 当天要达成什么
+  - **完成内容：**  bullet，**摘要级**；细节用 `→ [文档](path)` 外链
+  - **主要问题：** 当天遇到的阻塞与 workaround（已解决的可简述；未解决写「待验证」）
+- **文末维护** `## 当前状态（日期）`：
+  - **已就绪**：`- [x]` checklist
+  - **下一步**：numbered list，可操作
+- **不要**在 work_log 堆长日志/大段代码；日志贴 issues_log 或 job 输出
+
+# issues_log.md 写法
+
+```
+## [YYYY-MM-DD] 简短问题描述
+**步骤：** 哪个脚本/Step（如 train_with_services.sh Step 2）
+**现象：**
+\`\`\`
+关键日志/报错（原文）
+\`\`\`
+**根因：** …
+**解决方案：** …（若方案被后续取代，用 > 注：已弃用，见下一条）
+```
+
+- 方案变更时**保留旧记录**，用注释说明弃用原因，勿删历史
+- 可附 **基线 commit**、环境变量、job ID
+
+# Agent 协助时
+
+- 完成实质工作后：**更新 work_log**（至少「当前状态」）
+- 排查失败时：**追加 issues_log**
+- work_log / issues_log 改动随项目 **git commit**；push 前等用户确认
