@@ -38,12 +38,41 @@ echo "  OPD teacher: ${OPENCLAW_COMBINE_OPD_TEACHER_SOURCE}"
 echo "  Patched script: ${PATCHED}"
 echo "=============================================="
 
+# Patched script is written outside openclaw-combine/ (e.g. logs/). The official script
+# derives REPO_ROOT from SCRIPT_DIR/.. which breaks slime/Megatron paths — override below.
 sed \
     -e 's/--tensor-model-parallel-size 4/--tensor-model-parallel-size 1/' \
     -e 's/--rollout-num-gpus-per-engine 2/--rollout-num-gpus-per-engine 1/' \
     -e 's/--rollout-batch-size 16/--rollout-batch-size 4/' \
+    -e 's/--max-tokens-per-gpu 32768/--max-tokens-per-gpu 8192/' \
+    -e 's/--rollout-max-context-len 32768/--rollout-max-context-len 8192/' \
+    -e 's/--sglang-context-length 32768/--sglang-context-length 8192/' \
     -e 's/^export TP="2"/export TP="1"/' \
+    -e 's/^export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="8192"/' \
     "${OFFICIAL}" > "${PATCHED}"
+
+# Official launcher kills all python on the node; that breaks modelfactory job runners.
+# Smoke only needs a clean Ray session.
+python3 - "${PATCHED}" "${REPO_ROOT}" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+repo_root = sys.argv[2]
+text = path.read_text()
+text = text.replace(
+    "pkill -9 sglang\nsleep 3\nray stop --force\npkill -9 ray\npkill -9 python\nsleep 3\npkill -9 ray\npkill -9 python",
+    'echo "[smoke] skip aggressive pkill; stopping Ray only"\nray stop --force 2>/dev/null || true',
+    1,
+)
+text = text.replace(
+    'SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"\nREPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." &>/dev/null && pwd)"',
+    f'SCRIPT_DIR="{repo_root}/openclaw-combine"\nREPO_ROOT="{repo_root}"',
+    1,
+)
+path.write_text(text)
+PY
+
 chmod +x "${PATCHED}"
 
 exec bash "${PATCHED}"

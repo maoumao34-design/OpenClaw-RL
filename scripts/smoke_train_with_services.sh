@@ -112,8 +112,14 @@ dump_log_tail() {
     local logfile=$1
     local lines=${2:-80}
     if [ -f "${logfile}" ]; then
-        echo "--- ${logfile} (last ${lines} lines) ---" >&2
-        tail -n "${lines}" "${logfile}" >&2
+        local total
+        total=$(wc -l < "${logfile}" | tr -d ' ')
+        echo "--- ${logfile} (${total} lines total; showing last ${lines}) ---" >&2
+        if [ "${total}" -le 200 ]; then
+            cat "${logfile}" >&2
+        else
+            tail -n "${lines}" "${logfile}" >&2
+        fi
         echo "--- end ---" >&2
     fi
 }

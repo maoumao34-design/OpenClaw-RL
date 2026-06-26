@@ -102,7 +102,10 @@ tail -40  /dfs/data/openclaw-rl-project/logs/smoke_*/openclaw.log
 tail -80  /dfs/data/openclaw-rl-project/logs/smoke_*/simulation.log
 ```
 
-常见原因：Simulator URL 不可达、torch_dist 路径错误、openclaw.json 未指向 30000、GPU 数不足 3。
+常见原因：
+
+- Simulator URL 不可达、torch_dist 路径错误、openclaw.json 未指向 30000、GPU 数不足 3
+- **`training.log` 在 Ray stop 后立即结束**：多为 patched combine 脚本把 `REPO_ROOT` 解析成 `logs/`（找不到 `slime/`）。需使用最新 `smoke_run_qwen3_4b_openclaw_combine.sh`（已固定 `REPO_ROOT=OpenClaw-RL-official`）
 
 ## 通过后
 
