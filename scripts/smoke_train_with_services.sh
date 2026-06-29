@@ -1,5 +1,4 @@
 #!/bin/bash
-echo "=== SCRIPT STARTED: CWD=$(pwd) SELF=$0 ===" && touch /dfs/data/openclaw-rl-project/logs/smoke_debug_started
 # =============================================================================
 # SMOKE TEST ONLY — Step B：3 GPU 端到端冒烟（Hybrid RL 缩配）
 #
@@ -73,10 +72,9 @@ fi
 
 # OPENCLAW_GATEWAY_TOKEN
 if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-    OPENCLAW_GATEWAY_TOKEN=$(python3 -u -c "
+    OPENCLAW_GATEWAY_TOKEN=$(python3 -c "
 import json, pathlib, sys
 cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
-print('DEBUG token: cfg=', cfg, 'exists=', cfg.exists(), file=sys.stderr)
 if not cfg.exists(): sys.exit(1)
 d = json.loads(cfg.read_text())
 v = (d.get('gateway') or {}).get('auth', {}).get('token', '')
@@ -84,7 +82,7 @@ if v: print(v); sys.exit(0)
 v = (d.get('gateway') or {}).get('token', '') or d.get('token', '')
 if v: print(v); sys.exit(0)
 sys.exit(1)
-") || true
+" 2>/dev/null) || true
 fi
 
 if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
