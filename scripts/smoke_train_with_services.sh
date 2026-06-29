@@ -1,4 +1,5 @@
 #!/bin/bash
+echo "=== SCRIPT STARTED: CWD=$(pwd) SELF=$0 ===" && touch /dfs/data/openclaw-rl-project/logs/smoke_debug_started
 # =============================================================================
 # SMOKE TEST ONLY — Step B：3 GPU 端到端冒烟（Hybrid RL 缩配）
 #
