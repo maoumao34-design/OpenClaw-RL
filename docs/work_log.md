@@ -147,19 +147,89 @@
 
 ---
 
-## 当前状态（2026-06-23）
+## 2026-06-26
+
+**目标：** Step B 3 GPU smoke 端到端跑通；部署外部 Simulator；修复 modelfactory 上 smoke 脚本连环问题
+
+**完成内容：**
+
+### 外部 Simulator（Qwen3-32B vLLM）
+- modelfactory 独立服务部署成功；`scripts/simulator.env` 已填写，`curl /health` → HTTP 200
+- 训练 job 通过 `SIMULATOR_BASE_URL` 调用，不占训练 GPU
+
+### OpenClaw 配置确认
+- `~/.openclaw/openclaw.json` 已核对：`primary=sglang/qwen3-4b`，`baseUrl=127.0.0.1:30000`，`controlUi.enabled=false`，`rl-training-headers` 已启用
+- workspace 手动测 `openclaw gateway run`（headless 参数）约 **1s** 即 `ready`（18789）
+
+### Smoke 脚本迭代（已 push GitHub `main`）
+| Commit | 内容 |
+|--------|------|
+| `7f657e1` | patched combine 在 `logs/` 下时 `REPO_ROOT` 解析错误 → 固定为 `OpenClaw-RL-official` |
+| `96c40e5` | 先等 RL proxy `:30000` 再起 OpenClaw；headless gateway 参数；`/healthz` 检测；900s 超时 |
+| `2687e58` | 新增 `run_openclaw_combine_modelfactory.sh`：Ray job 用 `SLIME_ROOT/train_async.py` + `--working-dir` |
+| `01f3eb0` | smoke 3 GPU：强制 `PRM_NUM_GPUS_PER_ENGINE=1`（inference 默认 TP=2 与 3 卡布局冲突） |
+
+### 文档 / 讨论
+- GPU 布局：论文 4+2+1+1 是 Megatron 训练并行策略，非 4B 权重下限；H20 上可先 7 GPU 或 smoke 再 8 GPU
+- 删除临时分支 `fix/smoke-repo-root`（fix 已合入 `main`）
+
+**主要问题：**（细节见 [`issues_log.md`](issues_log.md) 2026-06-26 smoke 条目）
+- smoke job **尚未通过**；最后一次失败为 Ray job 失败（`PRM_NUM_GPUS_PER_ENGINE=2`），`01f3eb0` 已修，**待下周重新提交 job 验证**
+- 早期失败：OpenClaw 18789 超时（旧脚本启动顺序/日志缓冲）；`/workspace/train_async.py` 找不到
+
+**GitHub：** `main` 已 push 至 `01f3eb0`；`.cursor/` 规则 commit 亦在 `main`（用户确认可上传）
+
+---
+
+## 2026-06-29
+
+**目标：** 回归复现进度，3 GPU smoke 跑通
+
+**完成内容：**
+
+- 更换 Simulator 服务地址（新 Qwen3-32B 服务），更新 `scripts/simulator.env`；`curl /health` 验证 HTTP 200
+- 确认 workspace 上直接运行 `bash smoke_train_with_services.sh` 正常：script started → log 目录创建 → conda 激活 → 训练进程启动
+
+**主要问题：**
+
+- **Modelfactory job 提交系统异常**（系统维护期间）：bash/python job 均无输出、无日志、脚本未执行；直接在 workspace terminal 运行完全正常 → 确认是平台层面问题，非代码问题
+- 排查过程排除了：CRLF 换行、路径解析、simulator.env 空格、openclaw token、脚本内容等所有代码侧原因
+- **根因**：modelfactory 系统维护，维护期间 job 提交静默失败
+
+**处理方式：** 维护结束后改用 **workspace 直接运行**（申请 GPU 后 `bash scripts/smoke_train_with_services.sh`）；后续大训练 job 恢复后再试提交
+
+---
+
+## 当前状态（2026-06-29）
 
 ### 已就绪
+- [x] 环境 + GPU 编译依赖
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] 外部 Qwen3-32B Simulator（vLLM，`simulator.env` 已配，新地址验证 HTTP 200）
+- [x] OpenClaw + `openclaw.json` + rl-training-headers
+- [x] `scripts/smoke_train_with_services.sh`（workspace terminal 直接运行验证通过）
+- [x] `scripts/train_with_services.sh`（8 GPU 正式训练脚本）
+- [x] `scripts/check_convergence.py`
+
+### 未验证 / 阻塞
+- [ ] **3 GPU smoke `✅ SMOKE PASSED`**（等待 modelfactory 维护结束，在 GPU workspace 直接运行）
+- [ ] 8 GPU 正式 Table 3 训练（等 smoke 通过后）
+
+### 下一步
+1. 等系统维护结束，在当前 workspace 申请 3 GPU
+2. `bash scripts/smoke_train_with_services.sh 2>&1 | tee /dfs/data/openclaw-rl-project/logs/smoke_workspace_$(date +%Y%m%d_%H%M%S).txt`
+3. smoke 通过后，用 GPU workspace 或恢复正常的 job 提交跑 8 GPU 正式训练
+
+---
+
+## 历史状态（2026-06-23，已被 6/26 架构更新取代）
+
+### 已就绪（6/23 时点）
 - [x] 环境 + 所有 GPU 编译依赖
 - [x] Qwen3-4B-Thinking-2507（`/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507`）
 - [x] Qwen3-32B（`/dfs/data/models/Qwen/Qwen3-32B`，17 shards）
 - [x] OpenClaw 安装完成（Node 22.23、rl-training-headers 插件）
-- [x] `train_with_services.sh`（所有 bug 修复，GPU 7 共用方案）
-- [x] `check_convergence.py`（post-processing，自动输出 Table 3 数字）
-- [x] Table 3 完整复现路线（Phase 1-5）→ [`paper_reproduction_scope.md`](openclaw-rl/docs/paper_reproduction_scope.md)
-- [x] 论文索引 [`paper_index.md`](openclaw-rl/docs/paper_index.md)
-- [x] Joint Hybrid RL 训练 job 已提交（`app-job-1159-1782206197366`，排队中）
+- [x] `check_convergence.py`
+- [x] Table 3 完整复现路线 → [`paper_reproduction_scope.md`](paper_reproduction_scope.md)
 
-### 下一步
-1. 等 job 开始运行，确认四个服务依次启动（训练→Simulator→OpenClaw→模拟循环）
-2. 模拟循环结束后 `check_convergence.py` 自动输出 Table 3 Phase 1（Joint Hybrid RL）三行数字
+> 6/24 8 GPU job 因 Simulator 与 GPU 7 共用失败；6/26 已改为**外部 Simulator + 8 GPU 全用于训练**。
