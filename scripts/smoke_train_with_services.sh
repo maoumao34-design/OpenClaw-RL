@@ -73,9 +73,10 @@ fi
 
 # OPENCLAW_GATEWAY_TOKEN
 if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
-    OPENCLAW_GATEWAY_TOKEN=$(python3 -c "
+    OPENCLAW_GATEWAY_TOKEN=$(python3 -u -c "
 import json, pathlib, sys
 cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
+print('DEBUG token: cfg=', cfg, 'exists=', cfg.exists(), file=sys.stderr)
 if not cfg.exists(): sys.exit(1)
 d = json.loads(cfg.read_text())
 v = (d.get('gateway') or {}).get('auth', {}).get('token', '')
@@ -83,7 +84,7 @@ if v: print(v); sys.exit(0)
 v = (d.get('gateway') or {}).get('token', '') or d.get('token', '')
 if v: print(v); sys.exit(0)
 sys.exit(1)
-" 2>/dev/null) || true
+") || true
 fi
 
 if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
