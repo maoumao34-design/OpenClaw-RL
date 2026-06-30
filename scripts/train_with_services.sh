@@ -81,7 +81,7 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
     exit 1
 fi
 
-SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-combine}
+SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-topk-select}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
 NUM_PROBLEMS_PER_ROUND=${NUM_PROBLEMS_PER_ROUND:-6}
 DATASET=${DATASET:-${REPO_ROOT}/openclaw-test/GSM8K.json}
@@ -127,7 +127,7 @@ wait_for_port() {
     local logfile=${5:-}
     local waited=0
     echo "等待 ${name} (port ${port})..."
-    while ! nc -z localhost "${port}" 2>/dev/null; do
+    while ! curl -s --max-time 5 "http://localhost:${port}/" > /dev/null 2>&1; do
         sleep 10
         waited=$((waited + 10))
         if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
@@ -195,7 +195,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_MODEL_PATH="${POLICY_MODEL_PATH}" \
   PRM_TEACHER_LOAD="${POLICY_MODEL_PATH}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
-  bash "${SCRIPTS_DIR}/run_openclaw_combine_modelfactory.sh" \
+  bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
 
@@ -229,75 +229,116 @@ wait_for_port "OpenClaw gateway"  18789 300 "${OPENCLAW_PID}" "${LOGS_DIR}/openc
 wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 
 # =====================================================================
-# 第3步：模拟循环
+# 第3步：模拟循环（论文 Joint：INIT 顺序建立 + Joint 三角色并行）
+# 论文 Appendix A.1：先顺序完成 Student→TA→Teacher 建立 homework1/ homework2/，
+# 之后三 Simulator 同时运行（homework1/ homework2/ 固定不清空）。
 # =====================================================================
 echo ""
-echo "=== [3/3] 模拟循环（Student → TA → Teacher）==="
+echo "=== [3/3] 模拟循环（INIT 顺序 → Joint 三角色并行）==="
 
 STUDENT_ALL="${LOGS_DIR}/results_student_all.txt"
 TA_ALL="${LOGS_DIR}/results_TA_all.txt"
 TEACHER_ALL="${LOGS_DIR}/results_teacher_all.txt"
 
-run_simulation_round() {
-    local round=$1
-    echo "--- 模拟 round ${round} 开始 ---"
+# 单角色调用封装（$1=名称 $2=脚本 $3=题数 $4=输出文件）
+run_one_persona() {
+    local name=$1 script=$2 num=$3 output=$4
+    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+    OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
+    OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
+    EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
+    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
+    python "${OPENCLAW_DIR}/${script}" \
+        --dataset "${DATASET}" \
+        --num-problems "${num}" \
+        --output "${output}" \
+    || echo "警告：${name} 模拟未完全完成，继续训练"
+}
 
-    local round_student="${LOGS_DIR}/results_student_round${round}.txt"
-    local round_ta="${LOGS_DIR}/results_TA_round${round}.txt"
-    local round_teacher="${LOGS_DIR}/results_teacher_round${round}.txt"
+# ─────────────────────────────────────────────────────────────────
+# INIT 阶段（论文 Appendix A.1：顺序执行 Student → TA → Teacher）
+# 处理全量 SESSION_LIMIT 道题，一次性建立 homework1/ homework2/：
+#   Student  写解答  → homework/
+#   TA       批改    → ensure_homework_dir 复制 homework→homework1/，追加批注
+#   Teacher  点评    → ensure_homework_dir 复制 homework1→homework2/，追加点评
+# Joint 阶段中 homework1/ homework2/ 不再清空（固定内容来自本阶段）
+# ─────────────────────────────────────────────────────────────────
+run_init_phase() {
+    echo ""
+    echo "=== INIT：建立 homework1/ homework2/（SESSION_LIMIT=${SESSION_LIMIT} 题，一次性）==="
 
     rm -rf "${WORKSPACE}/homework" "${WORKSPACE}/homework1" "${WORKSPACE}/homework2"
 
-    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-    OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
-    OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
-    EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
-    python "${OPENCLAW_DIR}/student_chat.py" \
-        --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
-        --output "${round_student}"
-    cat "${round_student}" >> "${STUDENT_ALL}"
+    local init_s="${LOGS_DIR}/results_student_init.txt"
+    local init_ta="${LOGS_DIR}/results_TA_init.txt"
+    local init_t="${LOGS_DIR}/results_teacher_init.txt"
 
-    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-    OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
-    OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
-    EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
-    python "${OPENCLAW_DIR}/TA_chat.py" \
-        --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
-        --output "${round_ta}"
+    echo "  [INIT 1/3] Student → homework/..."
+    run_one_persona "Student" "student_chat.py" "${SESSION_LIMIT}" "${init_s}"
+    cat "${init_s}" >> "${STUDENT_ALL}"
+
+    echo "  [INIT 2/3] TA（ensure_homework_dir: homework→homework1/）..."
+    run_one_persona "TA" "TA_chat.py" "${SESSION_LIMIT}" "${init_ta}"
+    cat "${init_ta}" >> "${TA_ALL}"
+
+    echo "  [INIT 3/3] Teacher（ensure_homework_dir: homework1→homework2/）..."
+    run_one_persona "Teacher" "teacher_chat.py" "${SESSION_LIMIT}" "${init_t}"
+    cat "${init_t}" >> "${TEACHER_ALL}"
+
+    echo "=== INIT 完成：homework1/ homework2/ 已固定，进入 Joint 阶段 ==="
+}
+
+# ─────────────────────────────────────────────────────────────────
+# Joint round（论文 Appendix A.1：三 Simulator 同时运行）
+# homework1/ homework2/ 由 INIT 建立后不再清空；ensure_homework_dir
+# 检测到目录已存在会跳过复制，三角色各自操作独立目录无文件冲突：
+#   Student  → homework/（prepare_homework_files 覆写题目文件，不影响 homework1/）
+#   TA       → homework1/（追加批注，不影响 homework/）
+#   Teacher  → homework2/（追加点评，不影响 homework1/）
+# ─────────────────────────────────────────────────────────────────
+run_joint_round() {
+    local round=$1
+    echo "--- Joint round ${round} 开始（${NUM_PROBLEMS_PER_ROUND} 题 × 三角色并行）---"
+
+    local round_s="${LOGS_DIR}/results_student_round${round}.txt"
+    local round_ta="${LOGS_DIR}/results_TA_round${round}.txt"
+    local round_t="${LOGS_DIR}/results_teacher_round${round}.txt"
+
+    run_one_persona "Student" "student_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_s}" \
+        >> "${LOGS_DIR}/sim_student.log" 2>&1 &
+    local pid_s=$!
+
+    run_one_persona "TA" "TA_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_ta}" \
+        >> "${LOGS_DIR}/sim_ta.log" 2>&1 &
+    local pid_ta=$!
+
+    run_one_persona "Teacher" "teacher_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_t}" \
+        >> "${LOGS_DIR}/sim_teacher.log" 2>&1 &
+    local pid_t=$!
+
+    wait "${pid_s}" "${pid_ta}" "${pid_t}"
+
+    cat "${round_s}"  >> "${STUDENT_ALL}"
     cat "${round_ta}" >> "${TA_ALL}"
+    cat "${round_t}"  >> "${TEACHER_ALL}"
 
-    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-    OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
-    OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
-    EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
-    python "${OPENCLAW_DIR}/teacher_chat.py" \
-        --dataset "${DATASET}" \
-        --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
-        --output "${round_teacher}"
-    cat "${round_teacher}" >> "${TEACHER_ALL}"
-
-    echo "--- 模拟 round ${round} 完成 ---"
+    echo "--- Joint round ${round} 完成 ---"
 }
 
 simulation_loop() {
+    run_init_phase 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
+
     local round=0
-    local total_sessions=0
     local max_rounds=$(( (SESSION_LIMIT + NUM_PROBLEMS_PER_ROUND - 1) / NUM_PROBLEMS_PER_ROUND ))
 
     while kill -0 "${TRAINING_PID}" 2>/dev/null && [ ${round} -lt ${max_rounds} ]; do
         round=$((round + 1))
-        total_sessions=$((round * NUM_PROBLEMS_PER_ROUND))
-        echo "模拟 round ${round}/${max_rounds}（累计 session：${total_sessions}/${SESSION_LIMIT}）"
-        run_simulation_round ${round} \
+        echo "Joint round ${round}/${max_rounds}"
+        run_joint_round ${round} \
             2>&1 | tee -a "${LOGS_DIR}/simulation.log" || true
     done
 
-    echo "模拟循环结束（共 ${round} 轮）"
+    echo "模拟循环结束（INIT 1 次 + Joint ${round} 轮）"
     echo ""
     echo "=== 收敛检测（Table 3 指标）==="
     python "${SCRIPTS_DIR}/check_convergence.py" \

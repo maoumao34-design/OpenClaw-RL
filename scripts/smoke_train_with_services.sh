@@ -11,7 +11,7 @@
 # modelfactory job 提交示例：
 #   代码解释器: bash
 #   代码路径:   .../OpenClaw-RL/scripts/smoke_train_with_services.sh
-#   GPU 数量:   3（或 4，脚本默认只用 0-2）
+#   GPU 数量:   4（topk-select 需要 PRM Teacher，最少 Actor×1+Rollout×1+PRM×1+Teacher×1=4 GPU）
 #
 # Simulator 地址：编辑 scripts/simulator.env（见 simulator.env.example）
 #
@@ -44,10 +44,10 @@ EXTERNAL_MODEL=${EXTERNAL_MODEL:-qwen3-32b}
 SGLANG_API_KEY=${SGLANG_API_KEY:-openclaw-rl-key}
 
 # 3 GPU 缩配（第 4 张卡若有也不使用，除非改 TRAINING_CUDA_DEVICES）
-NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-3}
+NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-4}
 TRAINING_CUDA_DEVICES=${TRAINING_CUDA_DEVICES:-$(seq -s, 0 $((NUM_TRAINING_GPUS - 1)))}
 
-SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/smoke-qwen3-4b-openclaw-combine}
+SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/smoke-qwen3-4b-openclaw-topk-select}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
 NUM_PROBLEMS_PER_ROUND=${NUM_PROBLEMS_PER_ROUND:-1}
 SESSION_LIMIT=${SESSION_LIMIT:-1}
@@ -58,15 +58,15 @@ CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/smoke_$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
-SMOKE_COMBINE_LAUNCHER="${SCRIPTS_DIR}/smoke_run_qwen3_4b_openclaw_combine.sh"
+SMOKE_TOPK_SELECT_LAUNCHER="${SCRIPTS_DIR}/smoke_run_qwen3_4b_openclaw_topk_select.sh"
 
 if [ -z "${SIMULATOR_BASE_URL}" ] || [[ "${SIMULATOR_BASE_URL}" == *"<"* ]]; then
     echo "错误：请在 ${SIMULATOR_ENV} 中填写 SIMULATOR_BASE_URL" >&2
     exit 1
 fi
 
-if [ ! -x "${SMOKE_COMBINE_LAUNCHER}" ] && [ ! -f "${SMOKE_COMBINE_LAUNCHER}" ]; then
-    echo "错误：找不到 ${SMOKE_COMBINE_LAUNCHER}" >&2
+if [ ! -x "${SMOKE_TOPK_SELECT_LAUNCHER}" ] && [ ! -f "${SMOKE_TOPK_SELECT_LAUNCHER}" ]; then
+    echo "错误：找不到 ${SMOKE_TOPK_SELECT_LAUNCHER}" >&2
     exit 1
 fi
 
@@ -93,12 +93,12 @@ fi
 mkdir -p "${LOGS_DIR}"
 echo ""
 echo "============================================================"
-echo "  OpenClaw-RL SMOKE TEST (3 GPU) — NOT production training"
+echo "  OpenClaw-RL SMOKE TEST (4 GPU) — NOT production training"
 echo "============================================================"
 echo "日志目录:       ${LOGS_DIR}"
 echo "外部 Simulator: ${SIMULATOR_BASE_URL} (model=${EXTERNAL_MODEL})"
 echo "训练 GPU:       ${TRAINING_CUDA_DEVICES} (NUM_GPUS=${NUM_TRAINING_GPUS})"
-echo "模拟:           ${NUM_PROBLEMS_PER_ROUND} 题 × 1 轮 (Student→TA→Teacher)"
+echo "模拟:           INIT ${NUM_PROBLEMS_PER_ROUND} 题×3 顺序 + 1 轮 Joint 并行（验证并发）topk-select k=4 m=1"
 echo "正式训练脚本:   scripts/train_with_services.sh (8 GPU)"
 echo ""
 
@@ -132,7 +132,7 @@ wait_for_port() {
     local logfile=${5:-}
     local waited=0
     echo "等待 ${name} (port ${port})..."
-    while ! nc -z localhost "${port}" 2>/dev/null; do
+    while ! curl -s --max-time 5 "http://localhost:${port}/" > /dev/null 2>&1; do
         sleep 10
         waited=$((waited + 10))
         if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
@@ -247,7 +247,7 @@ trap cleanup EXIT INT TERM
 echo ""
 echo "=== [1/3] 启动 SMOKE 训练（GPU ${TRAINING_CUDA_DEVICES}）==="
 
-export SMOKE_COMBINE_SCRIPT="${LOGS_DIR}/.smoke_run_qwen3_4b_openclaw_combine.sh"
+export SMOKE_TOPK_SELECT_SCRIPT="${LOGS_DIR}/.smoke_run_qwen3_4b_openclaw_topk_select.sh"
 
 CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   REPO_ROOT="${REPO_ROOT}" \
@@ -259,7 +259,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_TEACHER_LOAD="${POLICY_MODEL_PATH}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   USE_WANDB=0 \
-  bash "${SMOKE_COMBINE_LAUNCHER}" \
+  bash "${SMOKE_TOPK_SELECT_LAUNCHER}" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
 
@@ -287,15 +287,13 @@ wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 launch_openclaw_gateway
 wait_for_openclaw_gateway 900
 
-# --- [3/3] 一轮模拟（foreground，失败即退出）---
+# --- [3/3] SMOKE 模拟（INIT 顺序建立 + 1 轮 Joint 并行，foreground）---
 echo ""
-echo "=== [3/3] SMOKE 模拟 1 轮（Student → TA → Teacher，各 ${NUM_PROBLEMS_PER_ROUND} 题）==="
+echo "=== [3/3] SMOKE 模拟：INIT 顺序（${NUM_PROBLEMS_PER_ROUND} 题×3）+ 1 轮 Joint 并行 ==="
 
 STUDENT_OUT="${LOGS_DIR}/results_student_smoke.txt"
 TA_OUT="${LOGS_DIR}/results_TA_smoke.txt"
 TEACHER_OUT="${LOGS_DIR}/results_teacher_smoke.txt"
-
-rm -rf "${WORKSPACE}/homework" "${WORKSPACE}/homework1" "${WORKSPACE}/homework2"
 
 run_smoke_chat() {
     local script_name=$1
@@ -312,9 +310,37 @@ run_smoke_chat() {
         --output "${output_path}"
 }
 
+# INIT 阶段：顺序建立 homework1/ homework2/（与正式训练架构一致）
+rm -rf "${WORKSPACE}/homework" "${WORKSPACE}/homework1" "${WORKSPACE}/homework2"
+
+echo "  [SMOKE INIT 1/3] Student → homework/..."
 run_smoke_chat "student_chat.py" "${STUDENT_OUT}" 2>&1 | tee "${LOGS_DIR}/simulation.log"
+
+echo "  [SMOKE INIT 2/3] TA（ensure_homework_dir: homework→homework1/）..."
 run_smoke_chat "TA_chat.py" "${TA_OUT}" 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
+
+echo "  [SMOKE INIT 3/3] Teacher（ensure_homework_dir: homework1→homework2/）..."
 run_smoke_chat "teacher_chat.py" "${TEACHER_OUT}" 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
+
+# Joint 阶段：三角色并行（验证并发无文件冲突）
+echo ""
+echo "  [SMOKE Joint] 三角色并行（各 ${NUM_PROBLEMS_PER_ROUND} 题）..."
+
+JOINT_S="${LOGS_DIR}/results_student_smoke_joint.txt"
+JOINT_TA="${LOGS_DIR}/results_TA_smoke_joint.txt"
+JOINT_T="${LOGS_DIR}/results_teacher_smoke_joint.txt"
+
+run_smoke_chat "student_chat.py" "${JOINT_S}" >> "${LOGS_DIR}/sim_student.log" 2>&1 &
+pid_s=$!
+run_smoke_chat "TA_chat.py" "${JOINT_TA}" >> "${LOGS_DIR}/sim_ta.log" 2>&1 &
+pid_ta=$!
+run_smoke_chat "teacher_chat.py" "${JOINT_T}" >> "${LOGS_DIR}/sim_teacher.log" 2>&1 &
+pid_t=$!
+wait "${pid_s}" "${pid_ta}" "${pid_t}"
+
+echo "  [SMOKE Joint] 完成"
+echo "  并行日志：${LOGS_DIR}/sim_student.log / sim_ta.log / sim_teacher.log"
+echo ""
 
 if ! kill -0 "${TRAINING_PID}" 2>/dev/null; then
     echo ""
