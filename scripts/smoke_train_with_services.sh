@@ -302,7 +302,7 @@ run_smoke_chat() {
     OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
     OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
     EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
+    OPENCLAW_GATEWAY_URL=http://localhost:30000 \
     python "${OPENCLAW_DIR}/${script_name}" \
         --dataset "${DATASET}" \
         --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
