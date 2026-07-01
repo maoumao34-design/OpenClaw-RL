@@ -43,7 +43,7 @@ echo "已加载: ${SIMULATOR_ENV}"
 # 配置
 # =====================================================================
 POLICY_MODEL_PATH=${POLICY_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
-POLICY_TORCH_DIST=${POLICY_TORCH_DIST:-/dfs/data/models/torch_dist/qwen3-4b-thinking-2507}
+POLICY_TORCH_DIST=${POLICY_TORCH_DIST:-/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist}
 
 # 外部 Simulator（必填）
 SIMULATOR_BASE_URL=${SIMULATOR_BASE_URL:-}
@@ -190,10 +190,10 @@ echo "=== [1/3] 启动训练（GPU ${TRAINING_CUDA_DEVICES}，NUM_GPUS=${NUM_TRA
 CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   NUM_GPUS="${NUM_TRAINING_GPUS}" \
   HF_CKPT="${POLICY_MODEL_PATH}" \
-  REF_LOAD="${POLICY_MODEL_PATH}" \
+  REF_LOAD="${POLICY_TORCH_DIST}" \
   SAVE_CKPT="${SAVE_CKPT}" \
   PRM_MODEL_PATH="${POLICY_MODEL_PATH}" \
-  PRM_TEACHER_LOAD="${POLICY_MODEL_PATH}" \
+  PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
