@@ -47,6 +47,41 @@ SIMULATOR_API_KEY=<与 SGLang api-key 一致，无 auth 填 EMPTY>
 
 ---
 
+## [2026-06-26] 3 GPU smoke 连环失败（modelfactory）
+
+**步骤：** `scripts/smoke_train_with_services.sh`
+
+### 1) patched combine `REPO_ROOT` → `logs/`
+
+**现象：** `training.log` 在 `ray stop` 后结束，8265 未就绪  
+**根因：** patched 脚本在 `logs/smoke_*/` 下，`REPO_ROOT=SCRIPT_DIR/..` 指向 `logs/`，找不到 `slime/`  
+**修复：** commit `7f657e1`，`run_openclaw_combine_modelfactory.sh` 固定 `REPO_ROOT`
+
+### 2) OpenClaw gateway 18789 超时（300s）
+
+**现象：** `openclaw.log` 仅 `loading configuration` + `force: no listeners`  
+**根因：** 旧脚本与训练并行起 OpenClaw、无 headless 参数、日志块缓冲；workspace 手动测同配置 ~1s ready  
+**修复：** commit `96c40e5`，先等 `:30000`、headless gateway、`/healthz`、900s
+
+### 3) Ray job：`/workspace/train_async.py` 不存在
+
+**现象：**
+```
+python3: can't open file '/workspace/train_async.py'
+Job 'raysubmit_...' failed
+```
+**根因：** modelfactory Ray 默认 cwd 为 `/workspace`；入口在 `slime/train_async.py`  
+**修复：** commit `2687e58`，`--working-dir=${SLIME_ROOT}` + 绝对路径 `train_async.py`
+
+### 4) inference 模式 PRM TP=2 vs 3 GPU
+
+**现象：** log 中 `PRM_GPUS=1` 但 `PRM_NUM_GPUS_PER_ENGINE=2`；Ray job 失败  
+**根因：** OPD inference 默认 PRM 2 卡 TP=2，smoke 仅 3 GPU（1+1+1）  
+**修复：** commit `01f3eb0`，export + sed 强制 `PRM_NUM_GPUS_PER_ENGINE=1`  
+**状态：** 待下周重新提交 smoke job 验证
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

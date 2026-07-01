@@ -1,3 +1,5 @@
+[← 工作记录](work_log.md)
+
 # OpenClaw-RL 完整实现路径
 
 > 基于对论文（arXiv:2603.10165）和代码库的完整分析（2026-06-22）。  
@@ -70,12 +72,43 @@ port 18789 ─── OpenClaw gateway（workspace 文件工具 + rl-training-hea
 port 30000 ─── RL 训练代理（openclaw-combine 启动脚本负责启动）
 ```
 
+### GPU 配置阶梯（三步走）
+
+| 阶段 | GPU 数 | Actor TP | Rollout | PRM | OPD 路径 | 目的 |
+|------|--------|---------|---------|-----|---------|------|
+| **Smoke**（已写脚本）| 3 | TP=1 | 1 GPU | 1 GPU | inference（无 Megatron teacher）| 管道联调，不产生论文质量训练信号 |
+| **小规模验证**（下一步）| 6 | TP=2 | 2 GPU | 1+1 GPU | **megatron（论文原版路径）**| 第一次真实 Hybrid RL 训练，验证 OPD 闭环 |
+| **完整论文配置** | 8 | TP=4 | 2 GPU | 1+1 GPU | megatron | Table 3 正式复现 |
+
+**Smoke 的本质限制**：`OPD_SRC=inference` 意味着没有独立的 Megatron PRM Teacher，OPD 教师 log-prob 精度不够，只能验证三端口管道是否通畅，不能产生论文质量的训练信号。
+
+**为什么 6 GPU 比直接跳 8 GPU 更合理**：第一次跑 megatron mode，Actor TP=2 已足够验证 OPD Megatron 路径，失败时日志更容易定位；8 GPU 资源需求更高，调试成本也更高。
+
+#### 6 GPU 脚本改动（相对于 `run_qwen3_4b_openclaw_combine.sh`）
+
+需要新建 `scripts/train_6gpu_with_services.sh`，在调用官方脚本前覆盖三个变量：
+
+```bash
+export NUM_GPUS=6
+export ACTOR_GPUS=2
+# 在 PERF_ARGS 里将 --tensor-model-parallel-size 从 4 改为 2
+# 其余保持不变：ROLLOUT_GPUS=2, PRM_GPUS=1, PRM_TEACHER_GPUS=1, OPD_SRC=megatron（默认）
+```
+
+与 smoke 的区别：
+- `OPD_SRC` 不设置（走默认 `megatron`）→ PRM Teacher 独立 Megatron 实例启动
+- `ACTOR_GPUS=2` 而非 1 → TP=2，序列并行开启
+- `ROLLOUT_GPUS=2` 保持和论文一致（SGLang TP=2）
+
+---
+
 ### 步骤
 
 **Step A：申请 workspace**
-- 训练机：8×H20 + CUDA 12.9
-  - GPU 分配：Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1
-- Simulator 机：1×H20 96 GB（托管 Simulator LLM）
+- 训练机：6×H20（小规模验证）或 8×H20（完整论文配置）+ CUDA 12.9
+  - 6 GPU 分配：Actor×2 + Rollout×2 + PRM×1 + PRM Teacher×1
+  - 8 GPU 分配：Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1
+- Simulator 机：1×H20 96 GB（托管 Simulator LLM，外部独立）
 
 **Step B：安装 OpenClaw + 配置** ⚠️ *当前阻塞项，需优先确认能否安装*
 - 文件：`extensions/rl-training-headers/`（整个目录）
@@ -99,9 +132,11 @@ port 30000 ─── RL 训练代理（openclaw-combine 启动脚本负责启动
 
 **Step D：启动 Hybrid RL 训练服务器**
 - 文件：`slime/train_async.py`（被脚本调用，无需直接修改）
-- 启动脚本（二选一）：
-  - **论文原版**：`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`
-  - README 推荐版（post-paper 改进）：`openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh`
+- 启动脚本（按阶段选择）：
+  - **Smoke（3 GPU）**：`scripts/smoke_train_with_services.sh`（已写，管道联调用）
+  - **小规模验证（6 GPU）**：`scripts/train_6gpu_with_services.sh`（待写，第一次真实训练）
+  - **完整论文配置（8 GPU）**：`scripts/train_with_services.sh`（已写，Table 3 正式复现）
+  - 论文原版脚本：`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`（官方，被上述脚本调用）
 - 依赖文件（自动加载，需在 PYTHONPATH 里）：
   - `openclaw-combine/openclaw_combine_api_server.py`（proxy server，port 30000）
   - `openclaw-combine/openclaw_combine_rollout.py`（rollout 循环）
@@ -343,6 +378,9 @@ port 30000 ─── RL 训练代理（openclaw-combine 启动脚本负责启动
 | `slime/tools/convert_hf_to_torch_dist.py` | P2 | HF→Megatron 格式转换 |
 | `extensions/rl-training-headers/` | ① Step B | OpenClaw 训练头插件 |
 | **`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`** | ① Step D | **Hybrid RL 主训练脚本（论文原版）** |
+| `scripts/smoke_train_with_services.sh` | ① Step D | Smoke（3 GPU）管道联调 |
+| `scripts/train_6gpu_with_services.sh` | ① Step D | 小规模验证（6 GPU，待写）|
+| `scripts/train_with_services.sh` | ① Step D | 完整论文配置（8 GPU）|
 | `openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh` | ① Step D / ⑦ | 改进版 Hybrid RL / Ablation |
 | `openclaw-combine/openclaw_combine_api_server.py` | ① Step D | RL proxy server（port 30000）|
 | `openclaw-combine/openclaw_combine_rollout.py` | ① Step D | Rollout 循环控制 |

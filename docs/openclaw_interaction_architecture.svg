@@ -1,0 +1,109 @@
+<svg viewBox="0 0 840 550" xmlns="http://www.w3.org/2000/svg" font-family="monospace, sans-serif">
+  <rect width="840" height="550" fill="#18181b" rx="12"/>
+
+  <!-- COMPONENT BOXES -->
+  <rect x="20" y="18" width="140" height="54" rx="8" fill="#3b82f6" opacity="0.18"/>
+  <rect x="20" y="18" width="140" height="54" rx="8" fill="none" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="90" y="41" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="bold">Simulator</text>
+  <text x="90" y="56" text-anchor="middle" fill="#a1a1aa" font-size="10">Qwen3-32B · port 30001</text>
+  <text x="90" y="68" text-anchor="middle" fill="#a1a1aa" font-size="9">student_chat.py</text>
+
+  <rect x="248" y="18" width="175" height="54" rx="8" fill="#a855f7" opacity="0.18"/>
+  <rect x="248" y="18" width="175" height="54" rx="8" fill="none" stroke="#a855f7" stroke-width="1.5"/>
+  <text x="335" y="41" text-anchor="middle" fill="#a855f7" font-size="12" font-weight="bold">OpenClaw Gateway</text>
+  <text x="335" y="56" text-anchor="middle" fill="#a1a1aa" font-size="10">port 18789 · Buffer + 路由</text>
+  <text x="335" y="68" text-anchor="middle" fill="#a1a1aa" font-size="9">openclaw_combine_select_api_server.py</text>
+
+  <rect x="522" y="18" width="140" height="54" rx="8" fill="#22c55e" opacity="0.15"/>
+  <rect x="522" y="18" width="140" height="54" rx="8" fill="none" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="592" y="41" text-anchor="middle" fill="#22c55e" font-size="12" font-weight="bold">SGLang Policy</text>
+  <text x="592" y="56" text-anchor="middle" fill="#a1a1aa" font-size="10">Qwen3-4B · port 30000</text>
+  <text x="592" y="68" text-anchor="middle" fill="#a1a1aa" font-size="9">生成对话回复</text>
+
+  <rect x="706" y="18" width="118" height="54" rx="8" fill="#f59e0b" opacity="0.15"/>
+  <rect x="706" y="18" width="118" height="54" rx="8" fill="none" stroke="#f59e0b" stroke-width="1.5"/>
+  <text x="765" y="41" text-anchor="middle" fill="#f59e0b" font-size="12" font-weight="bold">PRM Judge</text>
+  <text x="765" y="56" text-anchor="middle" fill="#a1a1aa" font-size="10">SGLang · GPU 6</text>
+  <text x="765" y="68" text-anchor="middle" fill="#a1a1aa" font-size="9">hint + score ±1</text>
+
+  <!-- Lifelines -->
+  <line x1="90"  y1="72" x2="90"  y2="510" stroke="#52525b" stroke-width="1" stroke-dasharray="4,4"/>
+  <line x1="335" y1="72" x2="335" y2="510" stroke="#52525b" stroke-width="1" stroke-dasharray="4,4"/>
+  <line x1="592" y1="72" x2="592" y2="510" stroke="#52525b" stroke-width="1" stroke-dasharray="4,4"/>
+  <line x1="765" y1="72" x2="765" y2="510" stroke="#52525b" stroke-width="1" stroke-dasharray="4,4"/>
+
+  <!-- TURN 0 -->
+  <rect x="8" y="90" width="824" height="16" rx="3" fill="#3b82f6" opacity="0.08"/>
+  <text x="16" y="102" fill="#3b82f6" font-size="10" font-weight="bold">第 0 轮对话</text>
+
+  <line x1="90" y1="118" x2="244" y2="118" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#aB)"/>
+  <text x="165" y="113" text-anchor="middle" fill="#3b82f6" font-size="10">① 固定 first_message</text>
+
+  <line x1="335" y1="135" x2="518" y2="135" stroke="#22c55e" stroke-width="1.5" marker-end="url(#aG)"/>
+  <text x="425" y="130" text-anchor="middle" fill="#22c55e" font-size="10">② 转发给 4B 生成回复</text>
+
+  <line x1="518" y1="150" x2="340" y2="150" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aG)"/>
+  <text x="425" y="145" text-anchor="middle" fill="#22c55e" font-size="10">③ 4B 回复</text>
+
+  <line x1="244" y1="165" x2="95" y2="165" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aB)"/>
+  <text x="165" y="160" text-anchor="middle" fill="#3b82f6" font-size="10">④ 回复返回 Simulator</text>
+
+  <rect x="253" y="173" width="164" height="18" rx="3" fill="#a855f7" opacity="0.12"/>
+  <text x="335" y="185" text-anchor="middle" fill="#a855f7" font-size="10">⑤ 暂存本轮数据，等待下一轮</text>
+
+  <!-- 32B generates -->
+  <rect x="8" y="200" width="228" height="16" rx="3" fill="#52525b" opacity="0.10"/>
+  <text x="16" y="212" fill="#a1a1aa" font-size="9" font-style="italic">  32B 生成下一条学生消息……</text>
+
+  <!-- TURN 1 -->
+  <rect x="8" y="226" width="824" height="16" rx="3" fill="#3b82f6" opacity="0.08"/>
+  <text x="16" y="238" fill="#3b82f6" font-size="10" font-weight="bold">第 1 轮对话  ──  新消息到达，同时触发：对上一轮打分 ＋ 生成本轮回复</text>
+
+  <line x1="90" y1="256" x2="244" y2="256" stroke="#3b82f6" stroke-width="1.5" marker-end="url(#aB)"/>
+  <text x="165" y="251" text-anchor="middle" fill="#3b82f6" font-size="10">① 下一条学生消息</text>
+
+  <text x="253" y="274" fill="#f59e0b" font-size="10" font-weight="bold">② 同时发出（并行）：</text>
+
+  <line x1="335" y1="288" x2="760" y2="288" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#aO)"/>
+  <text x="548" y="283" text-anchor="middle" fill="#f59e0b" font-size="10">对上一轮回复打分（异步）</text>
+
+  <line x1="335" y1="305" x2="518" y2="305" stroke="#22c55e" stroke-width="1.5" marker-end="url(#aG)"/>
+  <text x="425" y="300" text-anchor="middle" fill="#22c55e" font-size="10">生成本轮回复</text>
+
+  <!-- bracket -->
+  <line x1="249" y1="284" x2="249" y2="309" stroke="#a1a1aa" stroke-width="1.2" opacity="0.4"/>
+  <line x1="249" y1="296" x2="258" y2="296" stroke="#a1a1aa" stroke-width="1.2" opacity="0.4"/>
+
+  <line x1="518" y1="322" x2="340" y2="322" stroke="#22c55e" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aG)"/>
+  <text x="425" y="317" text-anchor="middle" fill="#22c55e" font-size="10">③ 本轮 4B 回复</text>
+
+  <line x1="760" y1="338" x2="340" y2="338" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aO)"/>
+  <text x="548" y="333" text-anchor="middle" fill="#f59e0b" font-size="9">③ hint + score ±1（异步返回）</text>
+
+  <line x1="244" y1="354" x2="95" y2="354" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#aB)"/>
+  <text x="165" y="349" text-anchor="middle" fill="#3b82f6" font-size="10">④ 回复返回 Simulator</text>
+
+  <rect x="253" y="362" width="164" height="18" rx="3" fill="#a855f7" opacity="0.12"/>
+  <text x="335" y="374" text-anchor="middle" fill="#a855f7" font-size="10">暂存本轮数据，等待下一轮</text>
+
+  <rect x="253" y="384" width="164" height="18" rx="3" fill="#a855f7" opacity="0.12"/>
+  <text x="335" y="396" text-anchor="middle" fill="#a855f7" font-size="10">上一轮 Sample 提交 → 训练队列</text>
+
+  <!-- KEY INSIGHT -->
+  <rect x="8" y="416" width="824" height="58" rx="6" fill="#27272a" stroke="#52525b" stroke-width="1"/>
+  <text x="24" y="435" fill="#e4e4e7" font-size="11" font-weight="bold">为什么需要"延迟一拍"？</text>
+  <text x="24" y="452" fill="#a1a1aa" font-size="10">PRM 打分需要两样东西：① 上一轮的 Policy 回复  ② 用户的下一条消息（作为 next_state）</text>
+  <text x="24" y="468" fill="#a1a1aa" font-size="10">第 0 轮结束时，"下一条消息"还没有，只能暂存等待；第 1 轮消息到达才能同时触发打分和生成。</text>
+
+  <defs>
+    <marker id="aB" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="aG" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#22c55e"/>
+    </marker>
+    <marker id="aO" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#f59e0b"/>
+    </marker>
+  </defs>
+</svg>

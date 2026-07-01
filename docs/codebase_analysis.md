@@ -1,3 +1,5 @@
+[← 工作记录](work_log.md)
+
 # OpenClaw-RL 官方仓库代码分析
 
 > 基于 https://github.com/Gen-Verse/OpenClaw-RL 的完整代码阅读
@@ -109,6 +111,37 @@ opd_loss = sum_of_sample_mean(pg_t)
 loss = w_rl * grpo_loss + w_opd * opd_loss  # 默认 w_rl=w_opd=1.0
 ```
 
+**Hint 生成机制（`openclaw-opd/openclaw_opd_api_server.py` 实现，combine 复用）：**
+
+Hint 不是用户的原始回复，而是 **PRM 从 next-state 中提炼出的事后改进建议**，流程如下：
+
+```
+t 轮：agent 生成回复 a_t
+t+1 轮：用户发来新消息 s_{t+1}（next-state signal）
+         ↓
+PRM（同一 4B 模型）接收：
+  - a_t（agent 刚才说了什么）
+  - s_{t+1}（用户接下来怎么反应的）
+         ↓
+PRM 判断：s_{t+1} 是否揭示了"事后来看能改进 a_t"的有用信息？
+  - \boxed{1}：是 → 输出 1-3 句具体可操作的 hint（[HINT_START]...[HINT_END]）
+  - \boxed{-1}：否 → 不输出 hint，该轮不产生 OPD 样本
+         ↓
+hint 追加到对话里最后一条 user 消息末尾：
+  原始消息 + "\n\n[user's hint / instruction]\n" + hint
+         ↓
+Teacher 收到的是这个"增强版"对话 + 原始回复 a_t
+Student 收到的是原始对话 + 原始回复 a_t（不含 hint）
+```
+
+**实际例子（Student persona）：**
+- `a_t`："答案是 **42**，步骤如下：\n1. 首先... "（含 markdown）
+- `s_{t+1}`（用户）："直接告诉我答案就好，不用这些格式"
+- PRM 生成 hint："用户不喜欢 bold、编号列表和 boxed 格式，偏好简洁纯文本回答"
+- Teacher 输入：`[原始 prompt] + "请解题\n\n[user's hint / instruction]\n用户不喜欢..."`
+
+**关键：** M=3 次投票，取最长的通过 hint 作为最优候选（`_select_best_hint`）；Hybrid 方法进一步保留所有通过的 hint 作为 M 个候选，由 `_select_k_star` 在 loss 计算时选最优。
+
 **9-cell 支持矩阵（`--distill-subset-mode` × `--hint-selection`）：**
 
 |  | `shortest` | `token_optimal` | `sequence_optimal` |
@@ -121,7 +154,58 @@ loss = w_rl * grpo_loss + w_opd * opd_loss  # 默认 w_rl=w_opd=1.0
 
 ---
 
-### 4. `Megatron-LM/` — 分布式训练后端
+### 4. `openclaw-test/` — Personal Agent 评估套件
+
+**职责：** 运行 Student / TA / Teacher 三种 persona 的模拟对话，同时产生训练 rollout 数据并记录收敛检测所需的回复。
+
+#### 收敛检测机制（2026-06-23 读源码确认）
+
+三个脚本（`student_chat.py` / `TA_chat.py` / `teacher_chat.py`）均有 `--output` flag。当 `turn == 0`（每个 session 的第一条消息）时，policy 的回复会被追加到 output 文件：
+
+```python
+if output_file and turn == 0:
+    with open(output_file, "a", encoding="utf-8") as f:
+        f.write(f"[session: {session_user}]\n")
+        f.write(f"{openclaw_reply}\n\n")
+```
+
+**收敛检测是事后分析（post-processing）**，不需要实时逻辑：
+1. 跑完全部 session（上限 72），output 文件里有按顺序排列的所有第一条回复
+2. 解析文件，按规则逐条检查，找最早的连续 3 次通过点 → 这就是 Table 3 的 session 数字
+
+**注意：** 每次调用脚本会清空 `--output` 文件（`open(args.output, "w").close()`）。多轮循环时需在每轮结束后 `cat round_N.txt >> all.txt` 跨轮累积。
+
+#### Workspace 文件在 Joint 训练中的不变性（论文 + 代码双重确认）
+
+`TA_chat.py` 和 `teacher_chat.py` 均调用 `ensure_homework_dir()`：
+
+```python
+def ensure_homework_dir(workspace_dir, source_name, target_name):
+    """If target_name dir doesn't exist in workspace, copy source_name to target_name."""
+    # 只有 target 不存在时才 copy
+    shutil.copytree(source, target)
+```
+
+**关键行为**：`homework1/` 一旦存在，TA 就直接读它，不再从 `homework/` 重新 copy。
+
+- Joint 训练启动前：Student 跑完所有题 → TA 跑完（创建 `homework1/`）→ Teacher 跑完（创建 `homework2/`）
+- Joint 训练期间：三个 Simulator 并发运行，`homework1/` / `homework2/` 内容固定，Student 的新输出**不会**流入 TA 的 workspace
+
+与论文 Appendix A.1 "first save... then start joint optimization" 完全一致。→ 详见 [`paper_understanding.md`](paper_understanding.md) "Joint 训练的 Workspace 文件机制" 节。
+
+**规则（paper Section 4.1 p.10）：**
+
+| Persona | 规则 |
+|---------|------|
+| Student | `not re.search(r'\*\*|^\d+\.|\bboxed\{', r, re.M)` |
+| TA | `len(r.split()) > 100` |
+| Teacher | `any(w in r.lower() for w in ['well done','excellent','great job'])` |
+
+**实现：** `scripts/check_convergence.py` 读三个 master output 文件，输出 Table 3 三行数字。
+
+---
+
+### 5. `Megatron-LM/` — 分布式训练后端
 
 **职责：** 负责实际的梯度更新，通过 `megatron-bridge` 与 slime 集成。
 

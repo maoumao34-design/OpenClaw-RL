@@ -45,6 +45,7 @@ alwaysApply: true
 
 # Agent 协助时
 
-- 完成实质工作后：**更新 work_log**（至少「当前状态」）
-- 排查失败时：**追加 issues_log**
-- work_log / issues_log 改动随项目 **git commit**；push 前等用户确认
+- 完成实质工作后：**在本地更新 work_log**（至少「当前状态」）
+- 排查失败时：**在本地追加 issues_log**
+- **不要**自动 commit/push 工作记录；仅当用户说「记录并同步到 GitHub」时再 commit + push docs
+- 脚本/代码改动仍按 git-workflow 规则本地 commit，push 前等用户确认

@@ -37,7 +37,8 @@ scripts/simulator.env
 *.key
 secrets.yaml
 
-# IDE
+# IDE / Cursor（仅本机，不上传 GitHub）
+.cursor/
 .vscode/
 .idea/
 *.swp

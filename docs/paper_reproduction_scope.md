@@ -1,3 +1,5 @@
+[← 工作记录](work_log.md)
+
 # OpenClaw-RL 论文完整复现范围
 
 > 基于对原文（arXiv:2603.10165）的完整阅读（2026-06-22）。  
@@ -28,7 +30,7 @@
 | PRM | Qwen3-4B-Thinking-2507 | 与 policy 同一模型 |
 | Simulator | **Qwen3-32B** | 扮演 student / TA / teacher |
 | Evaluator | **无独立模型** | 见下方"评估指标"说明 |
-| 训练硬件 | 4 GPU policy actor + 2 GPU policy server + 1 GPU PRM actor + 1 GPU PRM server | 共 8 GPU |
+| 训练硬件 | 4 GPU policy actor + 2 GPU policy server + 1 GPU PRM Judge (SGLang，打分+生成 hint) + 1 GPU PRM Teacher (Megatron，teacher log-probs) | 共 8 GPU |
 | 数据集 | GSM8K | 已在仓库中 |
 | learning rate | 1×10⁻⁵ | |
 | log-prob clip C | 1 | |
@@ -36,11 +38,11 @@
 
 ### 三种用户场景
 
-| 场景 | 目标 | Simulator 判断标准 |
-|------|------|------------------|
-| Student | 回复不要有 AI 格式感 | 无 `**bold**`、无编号列表、无 `\boxed{}` → 说 DONE |
-| TA | 批改评语要足够详细 | 回复 > 100 tokens → 说 DONE |
-| Teacher | 评论要友好耐心 | 包含 "well done" / "excellent" 等暖词 → 说 DONE |
+| 场景 | 适应类型 | 目标 | Simulator 判断标准 | Table 3 Joint 收敛 |
+|------|---------|------|------------------|-------------------|
+| Student | **Suppress**（抑制 AI 格式） | 回复不要有 AI 格式感 | 无 `**bold**`、无编号列表、无 `\boxed{}` → 说 DONE | 11.6（最慢，需主动压制已有风格）|
+| TA | **Amplify**（放大输出长度）| 批改评语要足够详细 | 回复 > 100 tokens → 说 DONE | 8.2（最快，量化标准明确）|
+| Teacher | **Add**（添加暖词风格）| 评论要友好耐心 | 包含 "well done" / "excellent" 等暖词 → 说 DONE | 11.4（需新增原本缺失的风格）|
 
 ### ⚠️ Table 3 的评估指标（关键，最容易理解错）
 
@@ -90,10 +92,10 @@ Separate opt:
 
 ### Joint vs Separate 区别
 
-| 设定 | 训练方式 | 对应脚本 |
+| 设定 | 训练方式 | 模拟结构 |
 |------|---------|---------|
-| **Joint opt** | 一个 job，Student/TA/Teacher 三个 persona 混合训练同一个模型 | 模拟循环每轮跑 student → TA → teacher |
-| **Separate opt** | 三个独立 job，每个只训练一种 persona | 模拟循环只跑对应的一个脚本 |
+| **Joint opt** | 一个 job，Student/TA/Teacher 三个 persona 混合训练同一个模型 | **INIT 阶段**（一次性顺序）：Student → TA → Teacher 各跑 72 题，建立 `homework1/` `homework2/`；**Joint 阶段**（循环并行）：三 Simulator 同时运行，各操作独立目录 |
+| **Separate opt** | 三个独立 job，每个只训练一种 persona | 模拟循环只跑对应的一个 Simulator 脚本 |
 
 ### Table 3 完整复现执行路线
 
@@ -102,7 +104,7 @@ Separate opt:
 | 步骤 | 操作 | 脚本 | 状态 |
 |------|------|------|------|
 | 1a | Joint 训练，Hybrid RL | `scripts/train_with_services.sh` | ✅ 已写，待跑 |
-| 1b | 评估：3 个 persona 各数收敛 session | `scripts/evaluate_table3.py` | ✅ 已写，待跑 |
+| 1b | 评估：3 个 persona 各数收敛 session | `scripts/check_convergence.py` | ✅ 已写，待跑 |
 | 1c | 得到 Joint / Hybrid RL 列：Student=?, TA=?, Teacher=? | — | ⬜ |
 
 **Phase 2：Joint Block — 基线列（GRPO、OPD）**
@@ -112,9 +114,9 @@ Separate opt:
 | 步骤 | 操作 | 训练后端 | 状态 |
 |------|------|---------|------|
 | 2a | Joint 训练，GRPO only | `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` | ⬜ 需写 `train_grpo_joint.sh` |
-| 2b | 评估 GRPO 列 | `evaluate_table3.py` | ⬜ |
+| 2b | 评估 GRPO 列 | `check_convergence.py` | ⬜ |
 | 2c | Joint 训练，OPD only | `openclaw-opd/run_qwen3_4b_openclaw_opd.sh` | ⬜ 需写 `train_opd_joint.sh` |
-| 2d | 评估 OPD 列 | `evaluate_table3.py` | ⬜ |
+| 2d | 评估 OPD 列 | `check_convergence.py` | ⬜ |
 
 **Phase 3：Separate Block — Hybrid RL 列**
 
@@ -125,7 +127,7 @@ Separate opt:
 | 3a | Separate 训练，只训 Student | `train_separate_student.sh` | ⬜ 需写 |
 | 3b | Separate 训练，只训 TA | `train_separate_ta.sh` | ⬜ 需写 |
 | 3c | Separate 训练，只训 Teacher | `train_separate_teacher.sh` | ⬜ 需写 |
-| 3d | 评估三个 checkpoint 各自的收敛 session | `evaluate_table3.py` | ⬜ |
+| 3d | 评估三个 checkpoint 各自的收敛 session | `check_convergence.py` | ⬜ |
 
 **Phase 4：Separate Block — 基线列（低优先级）**
 
@@ -133,7 +135,27 @@ Separate opt:
 
 **Phase 5：Mem0 / Cognee 基线（独立生态，最低优先级）**
 
-不属于本仓库，需单独研究 Mem0 / Cognee 的 API 接入方式。
+**核心区别：Mem0 / Cognee 不训练模型，模型权重全程不动。**
+
+适应机制是"上下文注入"而非梯度更新：每个 session 结束后把用户偏好存入外部记忆库，下一个 session 推理前检索相关记忆并注入 prompt。这就是论文所说的"impose additional context overhead at inference time"。
+
+| 项目 | 说明 |
+|------|------|
+| Mem0 | `pip install mem0ai`；向量数据库型记忆系统（Chhikara et al., 2025）|
+| Cognee | `pip install cognee`；知识图谱型记忆系统（Markovic et al., 2025）|
+| 基座模型 | 固定的 Qwen3-4B-Thinking-2507，权重不更新 |
+| 评估逻辑 | 与 RL 方法完全相同：rule-based session 计数，连续 3 session 通过即收敛 |
+
+**实现步骤（当时再写具体代码）：**
+
+1. 安装对应库，初始化记忆客户端
+2. 在 `student_chat.py` / `TA_chat.py` / `teacher_chat.py` 的 session 循环外层包一层记忆读写逻辑：
+   - session 开始前：检索与当前用户相关的记忆，拼入 system prompt
+   - session 结束后：把本次对话写入记忆库
+3. 不启动 OpenClaw gateway（不需要 RL 训练管道），直接调用固定模型推理
+4. 用同一个 `check_convergence.py` 统计收敛 session 数
+
+**注意：** 论文中 Mem0/Cognee 在 joint 设置下的数字与 separate 设置几乎相同（joint avg 14.5 vs separate 15.1），因为记忆是 per-user 独立存储的，多用户并行不带来协同效应，这与 RL 方法的 joint 大幅提升形成对比。
 
 ---
 
@@ -217,8 +239,8 @@ Terminal < Tool-call < SWE < GUI
 | 模型 | 大小 | 用于 | 是否需要下载 |
 |------|------|------|------------|
 | Qwen3-4B-Thinking-2507 | 7.6GB | Policy + PRM（Personal Agent / SWE / tool-call PRM）| ✅ 已在 modelfactory |
-| **Qwen3-32B** | ~64GB BF16 / ~16GB GPTQ-Int4 | Simulator（论文原版）| ❌ 未下载 |
-| Qwen3.5-122B-A10B-GPTQ-Int4 | ~65GB | Simulator（我们的替代方案）| 下载中 |
+| **Qwen3-32B** | ~64GB BF16 | Simulator（论文原版，**已确认使用**）| ✅ 已在 modelfactory |
+| Qwen3.5-122B-A10B-GPTQ-Int4 | ~65GB | Simulator 备用（已决定不用于复现）| 下载中（搁置）|
 | Qwen3-8B | ~5GB | Terminal policy / ReTool PRM | ❌ 未下载 |
 | Qwen3VL-8B-Thinking | ~8GB | GUI policy + PRM | ❌ 未下载 |
 | Qwen3-4B-SFT | ~8GB | Tool-call policy | ❌ 未下载（需找 slime 提供的版本）|
@@ -289,10 +311,12 @@ Terminal < Tool-call < SWE < GUI
 
 | | 我们一直在配置 | 应该用 |
 |--|-------------|--------|
-| 脚本 | `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` | **`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`** |
-| 方法 | Binary RL（GRPO only）= Table 3 "GRPO" 基线 | **Hybrid RL（GRPO + OPD）= Table 3 "Hybrid RL (Ours)"** |
+| 脚本 | `openclaw-rl/run_qwen3_4b_openclaw_rl.sh` | **`openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh`** |
+| 方法 | Binary RL（GRPO only）= Table 3 "GRPO" 基线 | **Hybrid RL（k=4, m=3, seq-optimal）= Table 3 "Hybrid RL (Ours)"** |
 
-`openclaw-rl/` 是单独的 GRPO 方法，不是论文的主贡献。论文主方法（Hybrid RL）对应 `openclaw-combine/`。
+`openclaw-rl/` 是单独的 GRPO 方法，不是论文的主贡献。论文主方法（Hybrid RL）对应 `openclaw-combine/` 下的 topk-select 脚本（k=4, m=3；Table 5 验证：k=4 → avg 10.3 = Table 3 主结果）。
+
+> ⚠️ 二次更正（2026-06-29）：`openclaw-combine/` 目录下存在两个脚本，`run_qwen3_4b_openclaw_combine.sh`（basic combine，m=1，无 k）是简化版，**不是论文主方法**；`run_qwen3_4b_openclaw_topk_select.sh`（k=4, m=3）才是论文 Table 3 结果对应的脚本。
 
 ### 错误 2：客户端脚本用错了
 
@@ -314,12 +338,14 @@ OpenClaw gateway（port 18789，rl-training-headers 扩展）→
 RL proxy server（port 30000，由 openclaw-combine/run_*.sh 启动）
 ```
 
-正确训练脚本：`openclaw-combine/run_qwen3_4b_openclaw_combine.sh`  
+正确训练脚本：`openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh`（k=4, m=3, seq-optimal）  
 正确客户端：`openclaw-test/student_chat.py` / `TA_chat.py` / `teacher_chat.py`
 
 ---
 
-## 当前复现状态（2026-06-22）
+## 当前复现状态（2026-06-22，历史快照）
+
+> **当前状态请看 [`work_log.md`](work_log.md) 的「当前状态」节。** 下方为 2026-06-22 时点的历史记录，保留作决策溯源用。
 
 ### 已完成
 - [x] 环境搭建（conda env + 所有 GPU 编译依赖）
