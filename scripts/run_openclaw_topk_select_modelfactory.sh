@@ -9,7 +9,8 @@
 # seq-optimal hint selection and Megatron PRM Teacher.
 # 8 GPU layout: Actor×4 (TP=4) + Rollout×2 + PRM SGLang×1 + PRM Teacher×1.
 #
-# SMOKE_PROFILE=1 applies 4-GPU smoke sed overrides (see smoke_run_qwen3_4b_openclaw_topk_select.sh).
+# SMOKE_PROFILE=1    applies 4-GPU smoke sed overrides (see smoke_run_qwen3_4b_openclaw_topk_select.sh).
+# MINITEST_PROFILE=1 applies 5-GPU pre-test sed overrides (see minitest_run_qwen3_4b_openclaw_topk_select.sh).
 
 set -euo pipefail
 
@@ -17,6 +18,7 @@ REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
 OFFICIAL="${REPO_ROOT}/openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh"
 PATCHED="${OPENCLAW_TOPK_SELECT_SCRIPT:-${TMPDIR:-/tmp}/run_qwen3_4b_openclaw_topk_select_modelfactory.sh}"
 SMOKE_PROFILE=${SMOKE_PROFILE:-0}
+MINITEST_PROFILE=${MINITEST_PROFILE:-0}
 
 if [ ! -f "${OFFICIAL}" ]; then
     echo "错误：找不到官方 topk-select 脚本: ${OFFICIAL}" >&2
@@ -39,6 +41,17 @@ if [ "${SMOKE_PROFILE}" = "1" ]; then
         -e 's/^export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="8192"/' \
         -e 's/export PRM_M="${PRM_M:-3}"/export PRM_M="${PRM_M:-1}"/' \
         -e 's/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-3}"/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-1}"/' \
+        "${PATCHED}"
+elif [ "${MINITEST_PROFILE}" = "1" ]; then
+    # 5-GPU pre-test：仅减少并行度和数据量，其他与 8GPU 正式完全一致。
+    # Actor TP 4→2, Rollout 2→1, SGLang TP "2"→"1"（均为并行度调整，不影响流程）
+    # num-rollout 100000000→300（~18 训练步，验证流水线，不做完整训练）
+    # 不变：context=32768, batch=16, m=3, k=4, sequence_optimal
+    sed -i \
+        -e 's/--tensor-model-parallel-size 4/--tensor-model-parallel-size 2/' \
+        -e 's/--rollout-num-gpus-per-engine 2/--rollout-num-gpus-per-engine 1/' \
+        -e 's/^export TP="2"/export TP="1"/' \
+        -e 's/--num-rollout 100000000/--num-rollout 300/' \
         "${PATCHED}"
 fi
 

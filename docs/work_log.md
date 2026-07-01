@@ -375,6 +375,29 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 | smoke m | 1（正式 m=3）|
 | smoke max-tokens-per-gpu | 8192（正式 32768）|
 
+### 8GPU 正式训练前置验证脚本编写（Pre-test）
+
+为降低 8 GPU 正式训练风险，新建 5 GPU（2+1+1+1）前置验证脚本，在完整论文配置下跑 300 个 rollout（~18 步）验证整条流水线。
+
+**新增脚本：**
+- [`scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh`](../scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh)：5 GPU 训练 launcher（MINITEST_PROFILE=1，Actor×2 TP=2 / Rollout×1 / PRM×1 / Teacher×1）
+- [`scripts/minitest_train_with_services.sh`](../scripts/minitest_train_with_services.sh)：5 GPU 完整流水线（含 Simulator 连通 + OpenClaw + 模拟循环 + 收敛检测），入口脚本
+
+**修改脚本：**
+- [`scripts/run_openclaw_topk_select_modelfactory.sh`](../scripts/run_openclaw_topk_select_modelfactory.sh)：新增 `MINITEST_PROFILE=1` 分支，sed 补丁：`TP 4→2`、`rollout-gpus 2→1`、`SGLang TP "2"→"1"`、`num-rollout→300`
+
+**与 8GPU 正式版的唯一差异：**
+
+| 参数 | 正式（8 GPU）| Pre-test（5 GPU）|
+|------|------------|----------------|
+| `tensor-model-parallel-size` | 4 | 2 |
+| `rollout-num-gpus-per-engine` | 2 | 1 |
+| `export TP` | `"2"` | `"1"` |
+| `num-rollout` | 100000000 | 300（~18 步）|
+| context / batch / m / k | 32768 / 16 / 3 / 4 | **同正式**（不变）|
+
+**说明：** Pre-test 通过即说明完整流水线（4B model、torch_dist 加载、PRM Teacher、Simulator 调用链、收敛检测）均无问题，可直接提交 8 GPU job。
+
 ---
 
 ## 当前状态（2026-07-01）
@@ -385,17 +408,21 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 - [x] 外部 Qwen3-32B Simulator（vLLM，`simulator.env` 地址 `10.254.107.247`，HTTP 200）
 - [x] OpenClaw + `openclaw.json` + rl-training-headers
 - [x] `scripts/smoke_train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000；REF_LOAD→torch_dist；评估 token→SGLANG_API_KEY**）
-- [x] `scripts/train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000；REF_LOAD→torch_dist**）
-- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`
+- [x] `scripts/train_with_services.sh`（8 GPU 正式）
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`（支持 SMOKE_PROFILE / MINITEST_PROFILE / 生产三模式）
 - [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
+- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh`（5 GPU pre-test launcher）
+- [x] `scripts/minitest_train_with_services.sh`（5 GPU pre-test 完整流水线）
 - [x] `scripts/check_convergence.py`
 - [x] **4 GPU smoke `✅ SMOKE PASSED`**（commit `5aa3c74`，128 GB RAM 节点，2026-07-01）
 
 ### 未验证 / 阻塞
+- [ ] 5 GPU Pre-test（`scripts/minitest_train_with_services.sh`）
 - [ ] 8 GPU 正式 Table 3 训练
 
 ### 下一步
-1. 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
+1. 提交 5 GPU pre-test（`scripts/minitest_train_with_services.sh`，≥128 GB RAM）；通过后直接提交正式训练
+2. Pre-test 通过 → 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
 
 ---
 
