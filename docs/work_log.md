@@ -317,26 +317,85 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 
 ---
 
-## 当前状态（2026-06-30 晚）
+## 2026-07-01
+
+**目标：** 完成 4 GPU smoke 测试，打通端到端流程
+
+**完成内容：**
+
+### 积压文件同步（`98273cb`）
+
+之前多次 commit 均为"定点提交"（只提当次改动文件），导致新建脚本和文档改动未入库：
+- 新建脚本 `run_openclaw_topk_select_modelfactory.sh`、`smoke_run_qwen3_4b_openclaw_topk_select.sh` 从未 `git add`
+- `paper_understanding.md`、`work_log.md`、`paper_reproduction_scope.md` 等文档改动积压
+
+一次性补提 15 个文件（+1127 行，-382 行），覆盖至前一日所有工作。
+
+**根因归纳**：workspace 无法 push GitHub，本地负责 push，但每次 push 只 stage 了当次操作文件；已记入长期记忆，后续每次 push 前先 `git status` 检查全部积压改动。
+
+### 4 GPU Smoke 调试（续）
+
+继续昨日 smoke 调试，新增四个问题：
+
+**问题 4：`REF_LOAD` / `PRM_TEACHER_LOAD` 使用 HF 路径，缺少 bridge mode**
+- 现象：`AssertionError: Only bridge mode is supported for loading HF checkpoint`（`slime/backends/megatron_utils/checkpoint.py:134`）
+- 根因：之前 commit `3b3e7e0` 误将 `REF_LOAD` 设为 HF 路径；官方 topk-select 脚本使用 `_torch_dist` 格式。Megatron 检测到 HF checkpoint 后要求 `--megatron-to-hf-mode bridge`，但该参数在 topk-select 脚本中不存在
+- 修复：`REF_LOAD` / `PRM_TEACHER_LOAD` 改用 `POLICY_TORCH_DIST`（`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）；同时修正 `POLICY_TORCH_DIST` 路径拼写（原错误路径 `torch_dist/qwen3-4b-thinking-2507`）→ 已 push `672d9a7`，**两个脚本均更新（smoke + 正式）**
+
+**问题 5：Worker 节点 RAM 不足（64 GB）**
+- 现象：`ray.exceptions.OutOfMemoryError`，节点内存 `62.x GB / 64.00 GB (0.97)`
+- 根因：Ray actor 调度到 64 GB RAM 节点（非 workspace 头节点的 282 GB）；torch_dist checkpoint 含 Adam optimizer states，每个 Megatron actor 占用 ~24 GB；Actor + PRM Teacher 两个 Megatron actor 同时加载 = ~48 GB，加系统进程超过 95% 阈值
+- 说明：8 GPU 正式跑 TP=4，每个 actor 只需加载 1/4 模型 = ~6 GB，无此问题；smoke TP=1 加载完整 checkpoint 是独有现象
+- 修复：申请 ≥128 GB RAM 节点提交 job（内存比 GPU 好申请）
+
+**问题 6：评估阶段 401 Unauthorized**
+- 现象：`student_chat.py` 调 `http://localhost:30000/v1/chat/completions` 报 401
+- 根因：`run_smoke_chat()` 传的是 `OPENCLAW_GATEWAY_TOKEN`（OpenClaw CLI 的 token），而 RL proxy（port 30000）使用 `SGLANG_API_KEY` 鉴权，两者不匹配
+- 修复：`run_smoke_chat()` 中 `OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}"` → `OPENCLAW_GATEWAY_TOKEN="${SGLANG_API_KEY}"` → 已 push `5aa3c74`
+
+### ✅ SMOKE PASSED
+
+128 GB RAM 节点，commit `5aa3c74`，smoke 完整跑通：
+- 训练阶段：Ray job 正常启动，Actor/Rollout/PRM/Teacher 四组件均初始化
+- OpenClaw gateway 和 RL proxy（port 30000）正常就绪
+- INIT 阶段：Student → TA → Teacher 顺序建立 `homework/` `homework1/` `homework2/`
+- Joint 阶段：三角色并行，无文件冲突，Teacher 第 3 轮完成（max-turns=4，提前收敛）
+- 输出：`✅ SMOKE PASSED`
+
+**当前验证通过的 smoke 配置：**
+
+| 参数 | 值 |
+|------|-----|
+| GPU 数 | 4（Actor×1 TP=1 / Rollout×1 / PRM SGLang×1 / Teacher×1）|
+| Worker 节点 RAM | ≥128 GB |
+| POLICY_MODEL_PATH | `/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507` |
+| POLICY_TORCH_DIST | `/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist` |
+| REF_LOAD / PRM_TEACHER_LOAD | `POLICY_TORCH_DIST` |
+| Simulator | `http://10.254.107.247:8443`（Qwen3-32B vLLM）|
+| smoke m | 1（正式 m=3）|
+| smoke max-tokens-per-gpu | 8192（正式 32768）|
+
+---
+
+## 当前状态（2026-07-01）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
-- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] Qwen3-4B-Thinking HF + torch_dist（路径：`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
 - [x] 外部 Qwen3-32B Simulator（vLLM，`simulator.env` 地址 `10.254.107.247`，HTTP 200）
 - [x] OpenClaw + `openclaw.json` + rl-training-headers
-- [x] `scripts/smoke_train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000**）
-- [x] `scripts/train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000**）
+- [x] `scripts/smoke_train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000；REF_LOAD→torch_dist；评估 token→SGLANG_API_KEY**）
+- [x] `scripts/train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000；REF_LOAD→torch_dist**）
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`
 - [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
 - [x] `scripts/check_convergence.py`
+- [x] **4 GPU smoke `✅ SMOKE PASSED`**（commit `5aa3c74`，128 GB RAM 节点，2026-07-01）
 
 ### 未验证 / 阻塞
-- [ ] **4 GPU smoke `✅ SMOKE PASSED`**（第 N 次提交中，三个已知问题已修复）
-- [ ] 8 GPU 正式 Table 3 训练（等 smoke 通过后）
+- [ ] 8 GPU 正式 Table 3 训练
 
 ### 下一步
-1. 等当前 smoke job 结果，查 `logs/smoke_*/` 日志
-2. smoke 通过后提交 8 GPU 正式训练
+1. 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
 
 ---
 
