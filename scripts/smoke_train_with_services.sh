@@ -298,7 +298,7 @@ TEACHER_OUT="${LOGS_DIR}/results_teacher_smoke.txt"
 run_smoke_chat() {
     local script_name=$1
     local output_path=$2
-    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+    OPENCLAW_GATEWAY_TOKEN="${SGLANG_API_KEY}" \
     OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
     OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
     EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
