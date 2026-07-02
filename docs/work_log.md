@@ -400,29 +400,55 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 
 ---
 
-## 当前状态（2026-07-01）
+## 2026-07-02
+
+**目标：** 提交 5 GPU pre-test，验证 8 GPU 正式训练流水线
+
+**完成内容：**
+
+### Pre-test 脚本完善 + 提交
+
+- 补充 `--save-interval 100→5`（MINITEST_PROFILE sed 分支），支持可抢占式 job（被抢占后从 checkpoint 续跑，每 5 步存一次） → commit `eb518c1`
+- workspace `git pull` 同步至 `eb518c1`，提交可抢占 5 GPU job
+
+### Pre-test 运行进展（截至 16:48）
+
+- INIT 阶段：15:42 完成（72 题 × Student→TA→Teacher 顺序建立 homework1/ homework2/）
+- Joint 阶段：进行中，Round 6/12，每轮约 14 分钟，预计 18:20-18:50 完成
+- 训练侧：300 rollout 尚未到上限（模拟是当前瓶颈）
+
+### 论文理解补充
+
+- 确认 `num-rollout 100000000` = "不限制"写法，实际靠手动 kill 或收敛判断停止
+- 确认 1 rollout = 1 session（完整的一次多轮对话）
+- 确认 Personal Agent max turns：论文 Appendix A.1 未写固定数字，以 context length 32768 token 作隐式上限；脚本 default `--max-turns 8` 与此一致（GSM8K 场景下 8 turn 不会撞 context limit）
+
+---
+
+## 当前状态（2026-07-02）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist（路径：`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
 - [x] 外部 Qwen3-32B Simulator（vLLM，`simulator.env` 地址 `10.254.107.247`，HTTP 200）
 - [x] OpenClaw + `openclaw.json` + rl-training-headers
-- [x] `scripts/smoke_train_with_services.sh`（**已修复：nc→curl；GATEWAY_URL→30000；REF_LOAD→torch_dist；评估 token→SGLANG_API_KEY**）
+- [x] `scripts/smoke_train_with_services.sh`（已修复所有 smoke 问题）
 - [x] `scripts/train_with_services.sh`（8 GPU 正式）
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`（支持 SMOKE_PROFILE / MINITEST_PROFILE / 生产三模式）
 - [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
-- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh`（5 GPU pre-test launcher）
+- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh`（5 GPU pre-test launcher，save-interval=5 支持可抢占）
 - [x] `scripts/minitest_train_with_services.sh`（5 GPU pre-test 完整流水线）
 - [x] `scripts/check_convergence.py`
 - [x] **4 GPU smoke `✅ SMOKE PASSED`**（commit `5aa3c74`，128 GB RAM 节点，2026-07-01）
 
+### 进行中
+- [ ] **5 GPU Pre-test 运行中**（Joint round 6/12，预计 18:20-18:50 结束，2026-07-02）
+
 ### 未验证 / 阻塞
-- [ ] 5 GPU Pre-test（`scripts/minitest_train_with_services.sh`）
 - [ ] 8 GPU 正式 Table 3 训练
 
 ### 下一步
-1. 提交 5 GPU pre-test（`scripts/minitest_train_with_services.sh`，≥128 GB RAM）；通过后直接提交正式训练
-2. Pre-test 通过 → 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
+1. Pre-test 结束后确认结果 → 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
 
 ---
 
