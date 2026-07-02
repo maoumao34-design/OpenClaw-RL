@@ -52,6 +52,7 @@ elif [ "${MINITEST_PROFILE}" = "1" ]; then
         -e 's/--rollout-num-gpus-per-engine 2/--rollout-num-gpus-per-engine 1/' \
         -e 's/^export TP="2"/export TP="1"/' \
         -e 's/--num-rollout 100000000/--num-rollout 300/' \
+        -e 's/--save-interval 100/--save-interval 5/' \
         "${PATCHED}"
 fi
 
