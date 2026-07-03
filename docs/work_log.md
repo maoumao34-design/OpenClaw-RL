@@ -525,15 +525,29 @@ maximum context length is 16384 tokens. prompt contains at least 16385 input tok
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 16384 → **32768**，2026-07-03 修复）
 
+### 待修复（smoke 通过后执行）
+
+**`train_with_services.sh` 启动顺序错误（影响 8 GPU 正式训练）**
+
+当前 step 2 顺序：先起 OpenClaw → 等 18789 → 等 30000。
+正确顺序应为：先等 30000 → 再起 OpenClaw → 等 18789。
+（同 `smoke_train_with_services.sh` 和 `minitest_train_with_services.sh` 的做法，smoke 里甚至有注释"RL proxy :30000 必须先起来"）
+提交 8 GPU 前必须修复，否则 OpenClaw 启动时 sglang provider 连不上 30000，复现原始 404。
+
 ### 待完成（下一步）
-1. **push 本次修复**：三个脚本（`train_with_services.sh` / `minitest_train_with_services.sh` / `smoke_train_with_services.sh`）+ `work_log.md`
-2. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
-3. **重提交 5 GPU minitest**：`scripts/minitest_train_with_services.sh`（验证训练队列非 0）
-4. **minitest 通过后提交 8 GPU 正式 Table 3 训练**：`scripts/train_with_services.sh`
+1. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
+2. **重提交 smoke（4 GPU）验证**：`scripts/smoke_train_with_services.sh`
+   - 观察 `training.log` 是否出现 `combine samples: 16/16` → 训练迭代开始
+   - 若 queue 仍为 0，说明 18789 调用链还有问题；若出现 `iter 1`，则修复有效
+3. **smoke 通过后**：修复 `train_with_services.sh` 启动顺序（见上）→ 提交 8 GPU 正式训练
 
 ### 未验证
-- [ ] 5 GPU minitest（有训练步骤的完整流水线）
+- [ ] smoke 重跑（18789 修复后验证训练队列）
 - [ ] 8 GPU 正式 Table 3 训练
+
+### 附：pre-test 无 checkpoint 的根因
+
+pre-test 日志显示 `save-interval 5` 但无任何 checkpoint 产生，根因同上：训练队列永远 `0/16`（因 OPENCLAW_GATEWAY_URL=30000 绕过了 rl-training-headers，所有 session 均为 "side"），无训练步骤 → save-interval 永远不触发。
 
 ---
 
