@@ -136,14 +136,9 @@
 
 **完成内容：**
 - Qwen3-32B 上传完整确认：`/dfs/data/models/Qwen/Qwen3-32B/`（17 个 safetensors shard）
-- 修复 `train_with_services.sh` 三处 bug：
-  1. Token 读取路径：`gateway.token` → `gateway.auth.token`（实际 JSON 结构多一层 `auth`）
-  2. conda 激活：硬编码 `/dfs/data/miniconda3` 路径，环境设为 `/dfs/data/envs/openclaw-rl`
-  3. `SIMULATOR_GPU`：从 8 改为 7（平台 GPU 上限 8 张，GPU 7 与 PRM teacher 共用，Qwen3-4B 约 8GB + Qwen3-32B 约 64GB = 72GB < H20 96GB）
+- 修复 `train_with_services.sh` 三处 bug：token 读取路径（`gateway.token` → `gateway.auth.token`）、conda 激活路径、`SIMULATOR_GPU` 从 8 改为 7
 - 提交训练 job：`app-job-1159-1782206197366`，8×H20，64 CPU 核，128GB 内存，排队中
-
-**关键确认：**
-- job 使用保存的 workspace 镜像，openclaw CLI（`/usr/bin/openclaw`）在 job 环境中可用，无需迁移到 `/dfs/data/`
+- 确认 openclaw CLI（`/usr/bin/openclaw`）在 job 环境中可用，无需迁移到 `/dfs/data/`
 
 ---
 
