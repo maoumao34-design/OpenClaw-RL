@@ -180,11 +180,13 @@ launch_openclaw_gateway() {
     local openclaw_cmd=(openclaw gateway run --force --bind loopback --verbose
         --token "${OPENCLAW_GATEWAY_TOKEN}")
     if command -v stdbuf >/dev/null 2>&1; then
+        OPENCLAW_SKIP_CHANNELS=1 \
         OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
         OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
         OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
         stdbuf -oL -eL "${openclaw_cmd[@]}" >> "${LOGS_DIR}/openclaw.log" 2>&1 &
     else
+        OPENCLAW_SKIP_CHANNELS=1 \
         OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
         OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
         OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
