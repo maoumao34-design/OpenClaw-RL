@@ -447,6 +447,50 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 | `_all.txt` 跨轮追加 | ✅ | `cat >>` 模式正确 |
 | 训练参数（TP=2 minitest / TP=4 生产，rollout=1/2）| ✅ | MINITEST_PROFILE sed 补丁正确 |
 
+### 发现问题：Pre-test 0 训练步骤（根因确认，已修复）
+
+**现象：** `training.log` 持续输出 `waiting for combine samples: 0/16, queue=0`，整个 pre-test 无 checkpoint 产生；Policy 回复中出现 "I don't have access to your local file system"（无工具访问）。
+
+**根因：commit `482fdc6` 架构错误。**
+
+当时为修复 smoke 的 `404`，将 `OPENCLAW_GATEWAY_URL` 从 `18789` 改为 `30000`，结论写的是"18789 不暴露 `/v1/chat/completions`"——这个判断是**错的**：18789 是 OpenClaw gateway，确实暴露该 endpoint；当时 404 是因为 OpenClaw 尚未完整配置（并非 endpoint 不存在）。
+
+改为 30000 后的实际影响：
+
+| 影响 | 机制 |
+|------|------|
+| 0 训练数据 | 绕过 OpenClaw → rl-training-headers 不注入 `X-Turn-Type: main` → RL proxy 默认 "side" → 训练队列永远为空 |
+| Policy 无文件访问 | 绕过 OpenClaw → Policy 无 workspace 工具 → 只能说"I don't have access" |
+
+**架构验证（2026-07-03，所有组件已全部核查）：**
+
+| 组件 | 状态 |
+|------|------|
+| `rl-training-headers` 插件 | `enabled`（`stock:rl-training-headers/index.js` v1.0.0）|
+| `sglang-provider` 插件 | `enabled` |
+| sglang `baseUrl` | `http://127.0.0.1:30000/v1`（精确对应 RL proxy）|
+| sglang `apiKey` | `openclaw-rl-key`（与 `SGLANG_API_KEY` 一致）|
+| 默认 model | `sglang/qwen3-4b`（与官方 `SERVED_MODEL_NAME="qwen3-4b"` 一致）|
+| gateway token 读取路径 | `gateway.auth.token = b125280f...`（train 脚本 python 读取逻辑正确）|
+| workspace 路径 | `/root/.openclaw/workspace`（与脚本 `WORKSPACE=${HOME}/.openclaw/workspace` 一致）|
+
+**完整链路：**
+```
+student_chat.py
+  → POST http://localhost:18789/v1/chat/completions  (model=default)
+  → OpenClaw gateway (primary = sglang/qwen3-4b)
+  → rl-training-headers 注入 X-Turn-Type:main + X-Session-Id
+  → POST http://127.0.0.1:30000/v1  (RL proxy，看到 X-Turn-Type:main → 写训练队列)
+  → SGLang (Policy Qwen3-4B)
+```
+
+**修复：** 三个脚本全部将 `OPENCLAW_GATEWAY_URL` 改回 `18789`，并修正 minitest 的 token 错误（`SGLANG_API_KEY` → `OPENCLAW_GATEWAY_TOKEN`）：
+- `scripts/train_with_services.sh`
+- `scripts/minitest_train_with_services.sh`
+- `scripts/smoke_train_with_services.sh`
+
+---
+
 ### 发现问题：Simulator context length 不足（已修复）
 
 **现象：** `sim_student.log` 出现反复 400 错误：
@@ -472,23 +516,23 @@ maximum context length is 16384 tokens. prompt contains at least 16385 input tok
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist（路径：`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
-- [x] OpenClaw + `openclaw.json` + rl-training-headers
-- [x] `scripts/smoke_train_with_services.sh`（已修复所有 smoke 问题）
-- [x] `scripts/train_with_services.sh`（8 GPU 正式）
+- [x] OpenClaw + `openclaw.json` + rl-training-headers（已验证，完整链路通）
+- [x] `scripts/smoke_train_with_services.sh`（18789 修复后）
+- [x] `scripts/train_with_services.sh`（8 GPU 正式，18789 修复后）
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`（支持 SMOKE_PROFILE / MINITEST_PROFILE / 生产三模式）
 - [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
-- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_train_with_services.sh`
+- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_train_with_services.sh`（18789 + token 修复后）
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 16384 → **32768**，2026-07-03 修复）
-- [x] **4 GPU smoke `✅ SMOKE PASSED`**（commit `5aa3c74`，128 GB RAM 节点，2026-07-01）
-- [x] **5 GPU pre-test 流水线验证通过**（所有论文参数对齐确认）
 
 ### 待完成（下一步）
-1. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
-2. **确认 pre-test 有训练步骤**：`tail -100 .../training.log | grep -i "iter\|step\|loss"`
-3. **提交 8 GPU 正式 Table 3 训练**：`scripts/train_with_services.sh`
+1. **push 本次修复**：三个脚本（`train_with_services.sh` / `minitest_train_with_services.sh` / `smoke_train_with_services.sh`）+ `work_log.md`
+2. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
+3. **重提交 5 GPU minitest**：`scripts/minitest_train_with_services.sh`（验证训练队列非 0）
+4. **minitest 通过后提交 8 GPU 正式 Table 3 训练**：`scripts/train_with_services.sh`
 
 ### 未验证
+- [ ] 5 GPU minitest（有训练步骤的完整流水线）
 - [ ] 8 GPU 正式 Table 3 训练
 
 ---

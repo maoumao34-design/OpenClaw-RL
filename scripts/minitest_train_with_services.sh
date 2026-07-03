@@ -277,11 +277,11 @@ TEACHER_ALL="${LOGS_DIR}/results_teacher_all.txt"
 
 run_one_persona() {
     local name=$1 script=$2 num=$3 output=$4
-    OPENCLAW_GATEWAY_TOKEN="${SGLANG_API_KEY}" \
+    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
     OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
     OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
     EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:30000 \
+    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
     python "${OPENCLAW_DIR}/${script}" \
         --dataset "${DATASET}" \
         --num-problems "${num}" \

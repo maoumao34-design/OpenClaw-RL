@@ -247,7 +247,7 @@ run_one_persona() {
     OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
     OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
     EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:30000 \
+    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
     python "${OPENCLAW_DIR}/${script}" \
         --dataset "${DATASET}" \
         --num-problems "${num}" \
