@@ -7,7 +7,7 @@ the minimum session number where the policy's first-message response satisfies t
 user preference rule for 3 consecutive sessions.
 
 Rules (paper Section 4.1 p.10, verbatim from PDF):
-  Student:  no bold (**), no numbered list (^\d+.), no \boxed{}
+  Student:  no bold (**), no numbered list (^\\d+.), no \\boxed{}
   TA:       word count > 100
   Teacher:  contains 'well done', 'excellent', or 'great job' (case-insensitive)
 
@@ -161,7 +161,7 @@ def main() -> None:
             conv_values.append(conv)
             print(f"  {persona:8s}: converged at session {conv:3d}  (checked {n} sessions)")
         else:
-            print(f"  {persona:8s}: NOT converged  (checked {n}/{SESSION_LIMIT} sessions)")
+            print(f"  {persona:8s}: NOT converged  (checked {n} sessions)")
 
     print()
     if conv_values:
