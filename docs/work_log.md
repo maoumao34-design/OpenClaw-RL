@@ -425,30 +425,71 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 
 ---
 
-## 当前状态（2026-07-02）
+## 2026-07-03
+
+**目标：** 审查 5 GPU pre-test 结果，确认无论文偏离，决定是否提交 8 GPU 正式训练
+
+**完成内容：**
+
+### Pre-test 结果审查
+
+对照论文逐项核查（本地代码 + pre-test 日志）：
+
+| 检查项 | 状态 | 说明 |
+|--------|------|------|
+| 输出文件只记录第 1 轮回复（`turn==0`） | ✅ | 三个脚本全部确认 |
+| Simulator 模型 Qwen3-32B | ✅ | `EXTERNAL_MODEL=qwen3-32b` |
+| Policy / PRM 模型 Qwen3-4B-Thinking-2507 | ✅ | run script 确认 |
+| k=4, m=3, sequence_optimal | ✅ | run script 默认值全部对齐 |
+| W_RL=1.0, W_OPD=1.0, clip=1.0 | ✅ | run script 确认 |
+| 模拟循环无限运行 | ✅ | commit `5833f51` 已修复 |
+| 收敛判断 rule-based | ✅ | `check_convergence.py` 实现正确 |
+| `_all.txt` 跨轮追加 | ✅ | `cat >>` 模式正确 |
+| 训练参数（TP=2 minitest / TP=4 生产，rollout=1/2）| ✅ | MINITEST_PROFILE sed 补丁正确 |
+
+### 发现问题：Simulator context length 不足（已修复）
+
+**现象：** `sim_student.log` 出现反复 400 错误：
+```
+maximum context length is 16384 tokens. prompt contains at least 16385 input tokens.
+```
+
+**根因：** `scripts/launch_simulator.sh` 默认 `MAX_TOKENS=16384`，而 Policy 最大回复长度 8192 token，TA 反馈等详细回复累积 2-3 轮后即超 16384。
+
+**影响评估：**
+- 收敛数据**完整**：output 写在 `turn==0`，context overflow 发生在 `turn>=1`，第一轮回复已写入，不影响收敛判断
+- 会话完整性**受损**：部分 session 崩溃导致作业文件未写完，TA/Teacher 后续步骤可能读到不完整内容
+- 正式训练必须修复
+
+**修复：** `launch_simulator.sh` 默认值 `16384 → 32768`（与 Policy context 对齐）→ commit 本次
+
+**操作要求：** Simulator 需重启以应用新 context 配置
+
+---
+
+## 当前状态（2026-07-03）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist（路径：`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
-- [x] 外部 Qwen3-32B Simulator（vLLM，`simulator.env` 地址 `10.254.107.247`，HTTP 200）
 - [x] OpenClaw + `openclaw.json` + rl-training-headers
 - [x] `scripts/smoke_train_with_services.sh`（已修复所有 smoke 问题）
 - [x] `scripts/train_with_services.sh`（8 GPU 正式）
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`（支持 SMOKE_PROFILE / MINITEST_PROFILE / 生产三模式）
 - [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
-- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh`（5 GPU pre-test launcher，save-interval=5 支持可抢占）
-- [x] `scripts/minitest_train_with_services.sh`（5 GPU pre-test 完整流水线）
+- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_train_with_services.sh`
 - [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 16384 → **32768**，2026-07-03 修复）
 - [x] **4 GPU smoke `✅ SMOKE PASSED`**（commit `5aa3c74`，128 GB RAM 节点，2026-07-01）
+- [x] **5 GPU pre-test 流水线验证通过**（所有论文参数对齐确认）
 
-### 进行中
-- [ ] **5 GPU Pre-test 运行中**（Joint round 6/12，预计 18:20-18:50 结束，2026-07-02）
+### 待完成（下一步）
+1. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
+2. **确认 pre-test 有训练步骤**：`tail -100 .../training.log | grep -i "iter\|step\|loss"`
+3. **提交 8 GPU 正式 Table 3 训练**：`scripts/train_with_services.sh`
 
-### 未验证 / 阻塞
+### 未验证
 - [ ] 8 GPU 正式 Table 3 训练
-
-### 下一步
-1. Pre-test 结束后确认结果 → 提交 8 GPU 正式训练（`scripts/train_with_services.sh`）
 
 ---
 
