@@ -339,19 +339,35 @@
 
 ## 2026-07-03
 
-**目标：** 审查 5 GPU pre-test 结果，确认无论文偏离，决定是否提交 8 GPU 正式训练
+**目标：** 审查 5 GPU pre-test 结果，确认无论文偏离；修复 smoke 18789 404 并验证训练数据生成
 
 ### Pre-test 结果审查
 
 **完成内容：**
 - 对照论文逐项核查九项（输出写法、模型、k/m/hint_selection、权重/clip、循环、收敛、累积、训练参数）→ 全部 ✅
 
-### 问题修复
+### 问题修复（Pre-test 遗留）
 
 **主要问题：**
-- **Pre-test 0 训练步骤 + 无 checkpoint**：commit `482fdc6` 将 `OPENCLAW_GATEWAY_URL` 改为 30000 绕过 OpenClaw gateway，rl-training-headers 未注入 `X-Turn-Type:main` → 训练队列永远 0 → save-interval 不触发；架构组件全部核查确认 → 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)；三脚本改回 18789，commit `83810e4`
-- **Simulator context overflow**：`launch_simulator.sh` 默认 16384，Policy 多轮后超限 → 核查官方 `launch_user_llm.sh` 确认 32768 → 已修 `scripts/launch_simulator.sh`；Simulator 需重启生效
-- **`train_with_services.sh` 启动顺序**（待修复）：OpenClaw 在 30000 就绪前启动，sglang provider 连不上 → 复现原始 404；待 smoke 验证通过后修复
+- **Pre-test 0 训练步骤 + 无 checkpoint**：commit `482fdc6` 将 `OPENCLAW_GATEWAY_URL` 改为 30000 绕过 OpenClaw gateway，rl-training-headers 未注入 `X-Turn-Type:main` → 训练队列永远 0；架构核查全部确认 → 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)；三脚本改回 18789，commit `83810e4`
+- **Simulator context overflow**：`launch_simulator.sh` 默认 16384，Policy 多轮后超限 → 核查官方确认 32768，已修；Simulator 需重启生效
+
+### work_log 格式清理
+
+**完成内容：**
+- 审查并修复 06-23、06-29、06-30、07-01 四个日期条目的格式违规（非标字段、多行问题描述、分析级内容）→ commit `d49c574`、`f5a69a2`
+
+### Smoke 18789 404 根因诊断与修复
+
+**完成内容：**
+- 通过 debug curl probe（`openclaw_debug.log`）确认根因：`/v1/chat/completions` 路由完全不存在于 `openclaw gateway run`，response body 为纯文本 `Not Found`（9 字节），`/v1/models` 同样 404
+- 阅读 `openclaw_opd_api_server.py`，确认 `OpenClawOPDAPIServer`（port 30000）自带 `/v1/chat/completions`，通过 `X-Session-Id`（取自 `body.user`）和 `X-Turn-Type`（默认 `side`）区分 main/side turn；`openclaw gateway run` 是设备连接层，不提供 API 路由
+- 实现 `scripts/rl_gateway_proxy.py`：取代 OpenClaw gateway，在 18789 接收请求、注入 `X-Session-Id` 和 `X-Turn-Type: main`，转发至 30000；smoke + minitest 两个脚本均更新 → commit `eafd060`
+
+**主要问题：**（排查过程详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)）
+- 本次修复均不影响 `openclaw.json` 配置，workspace tools 暂未注入（不影响 smoke 验证，正式训练再评估）
+
+**待下周验证：** smoke job（4 GPU）提交后，`training.log` 是否出现 `combine samples: 16/16` → iter 1 启动
 
 ---
 
@@ -360,19 +376,22 @@
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist（`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
-- [x] OpenClaw + `openclaw.json` + rl-training-headers（链路全部核查，详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)）
-- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh`（18789 + token 修复，commit `83810e4`）
-- [x] `scripts/run_openclaw_topk_select_modelfactory.sh` / `smoke_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_run_qwen3_4b_openclaw_topk_select.sh`
+- [x] `openclaw.json` 配置正确（`rl-training-headers` enabled、sglang provider 已验证）
+- [x] `scripts/rl_gateway_proxy.py`：替代 `openclaw gateway run`，注入 `X-Session-Id`/`X-Turn-Type: main`（commit `eafd060`）
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh`（已换用 proxy，commit `eafd060`）
+- [x] `scripts/train_with_services.sh`（18789 URL 正确，启动顺序 bug 待修）
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh` / smoke / minitest launcher 脚本
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 32768，2026-07-03 修复）
+- [x] conda env `/dfs/data/envs/openclaw-rl` 已有 fastapi / uvicorn / httpx
 
 ### 下一步
-1. **重启 Simulator**：`git pull` + `launch_simulator.sh`（新 context=32768）
-2. **重提交 smoke（4 GPU）验证**：`scripts/smoke_train_with_services.sh`，观察 `training.log` 是否出现 `combine samples: 16/16` → iter 1
-3. **smoke 通过后**：修复 `train_with_services.sh` 启动顺序（先等 30000 再起 OpenClaw）→ 提交 8 GPU 正式训练
+1. **重启 Simulator**（如 context=32768 版本尚未生效）：`launch_simulator.sh`
+2. **重提交 smoke（4 GPU）**：`scripts/smoke_train_with_services.sh`，观察 `training.log` 出现 `combine samples: 16/16` → iter 1 即通过
+3. **smoke 通过后**：修复 `train_with_services.sh` 启动顺序（先等 30000 再起 proxy）→ 提交 8 GPU 正式训练
 
 ### 未验证
-- [ ] smoke 重跑（18789 修复后验证训练队列）
+- [ ] smoke 重跑（proxy 替换后，`X-Session-Id`/`X-Turn-Type: main` 注入是否使训练队列正常累积）
 - [ ] 8 GPU 正式 Table 3 训练
 
 ---
