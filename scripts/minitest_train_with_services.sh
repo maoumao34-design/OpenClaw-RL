@@ -257,7 +257,7 @@ wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 echo "启动 OpenClaw gateway（port 18789）..."
 OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-openclaw gateway run --allow-unconfigured --force \
+openclaw gateway run --force \
   > "${LOGS_DIR}/openclaw.log" 2>&1 &
 OPENCLAW_PID=$!
 

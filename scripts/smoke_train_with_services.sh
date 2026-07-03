@@ -177,7 +177,7 @@ wait_for_external_simulator() {
 
 launch_openclaw_gateway() {
     echo "启动 OpenClaw gateway（port 18789，headless）..."
-    local openclaw_cmd=(openclaw gateway run --allow-unconfigured --force --bind loopback --verbose
+    local openclaw_cmd=(openclaw gateway run --force --bind loopback --verbose
         --token "${OPENCLAW_GATEWAY_TOKEN}")
     if command -v stdbuf >/dev/null 2>&1; then
         OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
