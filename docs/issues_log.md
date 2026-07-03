@@ -82,6 +82,30 @@ Job 'raysubmit_...' failed
 
 ---
 
+## [2026-07-01] 4 GPU Smoke 续（REF_LOAD / RAM / 鉴权）
+
+**步骤：** `scripts/smoke_train_with_services.sh`（接 [2026-06-26] 3 GPU smoke 连环失败，问题 4 后新提交）
+
+### 4) REF_LOAD / PRM_TEACHER_LOAD 使用 HF 路径
+
+**现象：** `AssertionError: Only bridge mode is supported for loading HF checkpoint`（`slime/backends/megatron_utils/checkpoint.py:134`）  
+**根因：** commit `3b3e7e0` 误将 `REF_LOAD` 设为 HF 路径；Megatron 检测到 HF checkpoint 时要求 `--megatron-to-hf-mode bridge`，该参数在 topk-select 脚本中不存在  
+**修复：** `REF_LOAD` / `PRM_TEACHER_LOAD` 改用 `POLICY_TORCH_DIST`（`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）；同时修正路径拼写错误；commit `672d9a7`（smoke + 正式脚本均更新）
+
+### 5) Worker 节点 RAM 不足（64 GB OOM）
+
+**现象：** `ray.exceptions.OutOfMemoryError`，节点内存 `62.x GB / 64.00 GB (0.97)`  
+**根因：** smoke TP=1 每个 Megatron actor 加载完整 checkpoint（~24 GB）；Actor + PRM Teacher 同时加载 ~48 GB，加系统进程超 64 GB 节点 95% OOM 阈值；正式 8 GPU TP=4 每 actor 仅 ~6 GB，无此问题  
+**修复：** 申请 ≥128 GB RAM 节点提交 job
+
+### 6) 评估阶段 401 Unauthorized
+
+**现象：** `student_chat.py` 调 `http://localhost:30000/v1/chat/completions` 报 401  
+**根因：** `run_smoke_chat()` 传的是 `OPENCLAW_GATEWAY_TOKEN`（OpenClaw CLI token），RL proxy（port 30000）使用 `SGLANG_API_KEY` 鉴权，两者不同  
+**修复：** `run_smoke_chat()` 中 token 改为 `SGLANG_API_KEY`；commit `5aa3c74`
+
+---
+
 ## [2026-07-03] Pre-test 0 训练步骤 + 无 checkpoint（commit `482fdc6` 架构绕过）
 
 **步骤：** 5 GPU pre-test `scripts/minitest_train_with_services.sh`
