@@ -82,6 +82,51 @@ Job 'raysubmit_...' failed
 
 ---
 
+## [2026-07-03] Pre-test 0 训练步骤 + 无 checkpoint（commit `482fdc6` 架构绕过）
+
+**步骤：** 5 GPU pre-test `scripts/minitest_train_with_services.sh`
+
+**现象：**
+- `training.log` 持续 `waiting for combine samples: 0/16, queue=0`，无训练步骤
+- Policy 回复出现 "I don't have access to your local file system"
+- `save-interval 5` 但无任何 checkpoint 产生
+- 所有 session 日志显示 `[side] session=unknown`
+
+**根因：** commit `482fdc6`（2026-06-30）将 `OPENCLAW_GATEWAY_URL` 从 18789 改为 30000
+
+| 影响 | 机制 |
+|------|------|
+| 0 训练数据 | 绕过 OpenClaw → rl-training-headers 不注入 `X-Turn-Type:main` → RL proxy 默认 "side" → 训练队列永远为空 |
+| Policy 无文件访问 | 绕过 OpenClaw gateway → Policy 缺少 workspace 工具 |
+
+`482fdc6` 的原始诊断（"18789 不暴露 `/v1/chat/completions`"）是错的。真实 404 根因是当时 OpenClaw 在 30000 就绪前启动，sglang provider 初始化失败；应只改启动顺序而非 URL。
+
+**架构核查（2026-07-03）：**
+- `rl-training-headers`：`enabled`（`stock:rl-training-headers/index.js` v1.0.0）
+- `sglang-provider`：`enabled`，`baseUrl=http://127.0.0.1:30000/v1`，`apiKey=openclaw-rl-key`
+- 默认 model：`sglang/qwen3-4b`（= 官方 `SERVED_MODEL_NAME`）
+- gateway token 读取路径 `gateway.auth.token`：脚本读取逻辑正确
+
+**修复：** commit `83810e4`，三脚本改回 `OPENCLAW_GATEWAY_URL=http://localhost:18789`；minitest token 由 `SGLANG_API_KEY` 改回 `OPENCLAW_GATEWAY_TOKEN`
+
+**遗留：** `train_with_services.sh` 启动顺序仍错（先起 OpenClaw 再等 30000）→ 待 smoke 验证通过后修复
+
+---
+
+## [2026-07-03] Simulator context overflow（16384 → 32768）
+
+**步骤：** 5 GPU pre-test 模拟阶段（`sim_student.log`）
+
+**现象：** 反复 400 错误 `maximum context length is 16384 tokens. prompt contains at least 16385 input tokens`
+
+**根因：** `scripts/launch_simulator.sh` 默认 `MAX_TOKENS=16384`；Policy 单次回复最大 8192 token，TA/Teacher 的详细反馈在 2-3 轮后累积超限
+
+**影响：** 收敛数据完整（output 写 turn==0，overflow 在 turn>=1）；会话完整性受损（部分作业文件未写完，TA/Teacher 可能读到不完整内容）
+
+**修复：** `launch_simulator.sh` 默认值 16384 → 32768（核查官方 `openclaw-test/launch_user_llm.sh` 确认）；Simulator 需重启生效
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

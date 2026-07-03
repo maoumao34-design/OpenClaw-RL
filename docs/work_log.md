@@ -429,85 +429,17 @@ H20 资源释放，开始正式提交 smoke job，连续排查三个问题：
 
 **目标：** 审查 5 GPU pre-test 结果，确认无论文偏离，决定是否提交 8 GPU 正式训练
 
-**完成内容：**
-
 ### Pre-test 结果审查
 
-对照论文逐项核查（本地代码 + pre-test 日志）：
+**完成内容：**
+- 对照论文逐项核查九项（输出写法、模型、k/m/hint_selection、权重/clip、循环、收敛、累积、训练参数）→ 全部 ✅
 
-| 检查项 | 状态 | 说明 |
-|--------|------|------|
-| 输出文件只记录第 1 轮回复（`turn==0`） | ✅ | 三个脚本全部确认 |
-| Simulator 模型 Qwen3-32B | ✅ | `EXTERNAL_MODEL=qwen3-32b` |
-| Policy / PRM 模型 Qwen3-4B-Thinking-2507 | ✅ | run script 确认 |
-| k=4, m=3, sequence_optimal | ✅ | run script 默认值全部对齐 |
-| W_RL=1.0, W_OPD=1.0, clip=1.0 | ✅ | run script 确认 |
-| 模拟循环无限运行 | ✅ | commit `5833f51` 已修复 |
-| 收敛判断 rule-based | ✅ | `check_convergence.py` 实现正确 |
-| `_all.txt` 跨轮追加 | ✅ | `cat >>` 模式正确 |
-| 训练参数（TP=2 minitest / TP=4 生产，rollout=1/2）| ✅ | MINITEST_PROFILE sed 补丁正确 |
+### 问题修复
 
-### 发现问题：Pre-test 0 训练步骤（根因确认，已修复）
-
-**现象：** `training.log` 持续输出 `waiting for combine samples: 0/16, queue=0`，整个 pre-test 无 checkpoint 产生；Policy 回复中出现 "I don't have access to your local file system"（无工具访问）。
-
-**根因：commit `482fdc6` 架构错误。**
-
-当时为修复 smoke 的 `404`，将 `OPENCLAW_GATEWAY_URL` 从 `18789` 改为 `30000`，结论写的是"18789 不暴露 `/v1/chat/completions`"——这个判断是**错的**：18789 是 OpenClaw gateway，确实暴露该 endpoint；当时 404 是因为 OpenClaw 尚未完整配置（并非 endpoint 不存在）。
-
-改为 30000 后的实际影响：
-
-| 影响 | 机制 |
-|------|------|
-| 0 训练数据 | 绕过 OpenClaw → rl-training-headers 不注入 `X-Turn-Type: main` → RL proxy 默认 "side" → 训练队列永远为空 |
-| Policy 无文件访问 | 绕过 OpenClaw → Policy 无 workspace 工具 → 只能说"I don't have access" |
-
-**架构验证（2026-07-03，所有组件已全部核查）：**
-
-| 组件 | 状态 |
-|------|------|
-| `rl-training-headers` 插件 | `enabled`（`stock:rl-training-headers/index.js` v1.0.0）|
-| `sglang-provider` 插件 | `enabled` |
-| sglang `baseUrl` | `http://127.0.0.1:30000/v1`（精确对应 RL proxy）|
-| sglang `apiKey` | `openclaw-rl-key`（与 `SGLANG_API_KEY` 一致）|
-| 默认 model | `sglang/qwen3-4b`（与官方 `SERVED_MODEL_NAME="qwen3-4b"` 一致）|
-| gateway token 读取路径 | `gateway.auth.token = b125280f...`（train 脚本 python 读取逻辑正确）|
-| workspace 路径 | `/root/.openclaw/workspace`（与脚本 `WORKSPACE=${HOME}/.openclaw/workspace` 一致）|
-
-**完整链路：**
-```
-student_chat.py
-  → POST http://localhost:18789/v1/chat/completions  (model=default)
-  → OpenClaw gateway (primary = sglang/qwen3-4b)
-  → rl-training-headers 注入 X-Turn-Type:main + X-Session-Id
-  → POST http://127.0.0.1:30000/v1  (RL proxy，看到 X-Turn-Type:main → 写训练队列)
-  → SGLang (Policy Qwen3-4B)
-```
-
-**修复：** 三个脚本全部将 `OPENCLAW_GATEWAY_URL` 改回 `18789`，并修正 minitest 的 token 错误（`SGLANG_API_KEY` → `OPENCLAW_GATEWAY_TOKEN`）：
-- `scripts/train_with_services.sh`
-- `scripts/minitest_train_with_services.sh`
-- `scripts/smoke_train_with_services.sh`
-
----
-
-### 发现问题：Simulator context length 不足（已修复）
-
-**现象：** `sim_student.log` 出现反复 400 错误：
-```
-maximum context length is 16384 tokens. prompt contains at least 16385 input tokens.
-```
-
-**根因：** `scripts/launch_simulator.sh` 默认 `MAX_TOKENS=16384`，而 Policy 最大回复长度 8192 token，TA 反馈等详细回复累积 2-3 轮后即超 16384。
-
-**影响评估：**
-- 收敛数据**完整**：output 写在 `turn==0`，context overflow 发生在 `turn>=1`，第一轮回复已写入，不影响收敛判断
-- 会话完整性**受损**：部分 session 崩溃导致作业文件未写完，TA/Teacher 后续步骤可能读到不完整内容
-- 正式训练必须修复
-
-**修复：** `launch_simulator.sh` 默认值 `16384 → 32768`（与 Policy context 对齐）→ commit 本次
-
-**操作要求：** Simulator 需重启以应用新 context 配置
+**主要问题：**
+- **Pre-test 0 训练步骤 + 无 checkpoint**：commit `482fdc6` 将 `OPENCLAW_GATEWAY_URL` 改为 30000 绕过 OpenClaw gateway，rl-training-headers 未注入 `X-Turn-Type:main` → 训练队列永远 0 → save-interval 不触发；架构组件全部核查确认 → 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)；三脚本改回 18789，commit `83810e4`
+- **Simulator context overflow**：`launch_simulator.sh` 默认 16384，Policy 多轮后超限 → 核查官方 `launch_user_llm.sh` 确认 32768 → 已修 `scripts/launch_simulator.sh`；Simulator 需重启生效
+- **`train_with_services.sh` 启动顺序**（待修复）：OpenClaw 在 30000 就绪前启动，sglang provider 连不上 → 复现原始 404；待 smoke 验证通过后修复
 
 ---
 
@@ -515,39 +447,21 @@ maximum context length is 16384 tokens. prompt contains at least 16385 input tok
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
-- [x] Qwen3-4B-Thinking HF + torch_dist（路径：`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
-- [x] OpenClaw + `openclaw.json` + rl-training-headers（已验证，完整链路通）
-- [x] `scripts/smoke_train_with_services.sh`（18789 修复后）
-- [x] `scripts/train_with_services.sh`（8 GPU 正式，18789 修复后）
-- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`（支持 SMOKE_PROFILE / MINITEST_PROFILE / 生产三模式）
-- [x] `scripts/smoke_run_qwen3_4b_openclaw_topk_select.sh`
-- [x] `scripts/minitest_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_train_with_services.sh`（18789 + token 修复后）
+- [x] Qwen3-4B-Thinking HF + torch_dist（`/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist`）
+- [x] OpenClaw + `openclaw.json` + rl-training-headers（链路全部核查，详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md)）
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh`（18789 + token 修复，commit `83810e4`）
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh` / `smoke_run_qwen3_4b_openclaw_topk_select.sh` / `minitest_run_qwen3_4b_openclaw_topk_select.sh`
 - [x] `scripts/check_convergence.py`
-- [x] `scripts/launch_simulator.sh`（context 16384 → **32768**，2026-07-03 修复）
+- [x] `scripts/launch_simulator.sh`（context 32768，2026-07-03 修复）
 
-### 待修复（smoke 通过后执行）
-
-**`train_with_services.sh` 启动顺序错误（影响 8 GPU 正式训练）**
-
-当前 step 2 顺序：先起 OpenClaw → 等 18789 → 等 30000。
-正确顺序应为：先等 30000 → 再起 OpenClaw → 等 18789。
-（同 `smoke_train_with_services.sh` 和 `minitest_train_with_services.sh` 的做法，smoke 里甚至有注释"RL proxy :30000 必须先起来"）
-提交 8 GPU 前必须修复，否则 OpenClaw 启动时 sglang provider 连不上 30000，复现原始 404。
-
-### 待完成（下一步）
-1. **重启 Simulator**：kill 旧 sglang 进程，`git pull` 后重新执行 `launch_simulator.sh`（新 context=32768）
-2. **重提交 smoke（4 GPU）验证**：`scripts/smoke_train_with_services.sh`
-   - 观察 `training.log` 是否出现 `combine samples: 16/16` → 训练迭代开始
-   - 若 queue 仍为 0，说明 18789 调用链还有问题；若出现 `iter 1`，则修复有效
-3. **smoke 通过后**：修复 `train_with_services.sh` 启动顺序（见上）→ 提交 8 GPU 正式训练
+### 下一步
+1. **重启 Simulator**：`git pull` + `launch_simulator.sh`（新 context=32768）
+2. **重提交 smoke（4 GPU）验证**：`scripts/smoke_train_with_services.sh`，观察 `training.log` 是否出现 `combine samples: 16/16` → iter 1
+3. **smoke 通过后**：修复 `train_with_services.sh` 启动顺序（先等 30000 再起 OpenClaw）→ 提交 8 GPU 正式训练
 
 ### 未验证
 - [ ] smoke 重跑（18789 修复后验证训练队列）
 - [ ] 8 GPU 正式 Table 3 训练
-
-### 附：pre-test 无 checkpoint 的根因
-
-pre-test 日志显示 `save-interval 5` 但无任何 checkpoint 产生，根因同上：训练队列永远 `0/16`（因 OPENCLAW_GATEWAY_URL=30000 绕过了 rl-training-headers，所有 session 均为 "side"），无训练步骤 → save-interval 永远不触发。
 
 ---
 
