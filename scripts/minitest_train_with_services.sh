@@ -347,11 +347,10 @@ simulation_loop() {
     run_init_phase 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
 
     local round=0
-    local max_rounds=$(( (SESSION_LIMIT + NUM_PROBLEMS_PER_ROUND - 1) / NUM_PROBLEMS_PER_ROUND ))
 
-    while kill -0 "${TRAINING_PID}" 2>/dev/null && [ ${round} -lt ${max_rounds} ]; do
+    while kill -0 "${TRAINING_PID}" 2>/dev/null; do
         round=$((round + 1))
-        echo "Joint round ${round}/${max_rounds}"
+        echo "Joint round ${round}"
         run_joint_round ${round} \
             2>&1 | tee -a "${LOGS_DIR}/simulation.log" || true
     done
