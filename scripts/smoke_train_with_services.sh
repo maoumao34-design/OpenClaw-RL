@@ -311,12 +311,22 @@ run_smoke_chat() {
 # INIT 阶段：顺序建立 homework1/ homework2/（与正式训练架构一致）
 rm -rf "${WORKSPACE}/homework" "${WORKSPACE}/homework1" "${WORKSPACE}/homework2"
 
-echo "[DEBUG] curl /v1/chat/completions → ${LOGS_DIR}/openclaw_debug.log"
-curl -sv \
-    -X POST http://localhost:18789/v1/chat/completions \
+echo "[DEBUG] === OpenClaw API probe ===" | tee -a "${LOGS_DIR}/openclaw_debug.log"
+echo "[DEBUG] 1) GET /v1/models" | tee -a "${LOGS_DIR}/openclaw_debug.log"
+curl -sv -X GET http://localhost:18789/v1/models \
+    -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
+    >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
+echo "[DEBUG] 2) POST /v1/chat/completions model=default" | tee -a "${LOGS_DIR}/openclaw_debug.log"
+curl -sv -X POST http://localhost:18789/v1/chat/completions \
     -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
     -H "Content-Type: application/json" \
     -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"stream":false}' \
+    >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
+echo "[DEBUG] 3) POST /v1/chat/completions model=sglang/qwen3-4b" | tee -a "${LOGS_DIR}/openclaw_debug.log"
+curl -sv -X POST http://localhost:18789/v1/chat/completions \
+    -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{"model":"sglang/qwen3-4b","messages":[{"role":"user","content":"hello"}],"stream":false}' \
     >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
 echo "--- openclaw_debug.log ---" && cat "${LOGS_DIR}/openclaw_debug.log"
 
