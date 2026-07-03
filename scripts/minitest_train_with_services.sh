@@ -254,11 +254,13 @@ wait_for_external_simulator 300
 echo "等待 RL training proxy (port 30000)..."
 wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 
-echo "启动 OpenClaw gateway（port 18789）..."
-OPENCLAW_SKIP_CHANNELS=1 \
-OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
+echo "启动 RL gateway proxy（port 18789，替代 openclaw gateway run）..."
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-openclaw gateway run --force \
+SGLANG_API_KEY="${SGLANG_API_KEY}" \
+RL_PROXY_URL="http://127.0.0.1:30000" \
+GATEWAY_PORT=18789 \
+GATEWAY_BIND=127.0.0.1 \
+python "${SCRIPTS_DIR}/rl_gateway_proxy.py" \
   > "${LOGS_DIR}/openclaw.log" 2>&1 &
 OPENCLAW_PID=$!
 

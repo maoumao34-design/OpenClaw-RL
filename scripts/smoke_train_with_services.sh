@@ -176,24 +176,16 @@ wait_for_external_simulator() {
 }
 
 launch_openclaw_gateway() {
-    echo "启动 OpenClaw gateway（port 18789，headless）..."
-    local openclaw_cmd=(openclaw gateway run --force --bind loopback --verbose
-        --token "${OPENCLAW_GATEWAY_TOKEN}")
-    if command -v stdbuf >/dev/null 2>&1; then
-        OPENCLAW_SKIP_CHANNELS=1 \
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
-        OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
-        OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-        stdbuf -oL -eL "${openclaw_cmd[@]}" >> "${LOGS_DIR}/openclaw.log" 2>&1 &
-    else
-        OPENCLAW_SKIP_CHANNELS=1 \
-        OPENCLAW_SKIP_BROWSER_CONTROL_SERVER=1 \
-        OPENCLAW_GATEWAY_STARTUP_TRACE=1 \
-        OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-        "${openclaw_cmd[@]}" >> "${LOGS_DIR}/openclaw.log" 2>&1 &
-    fi
+    echo "启动 RL gateway proxy（port 18789，替代 openclaw gateway run）..."
+    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+    SGLANG_API_KEY="${SGLANG_API_KEY}" \
+    RL_PROXY_URL="http://127.0.0.1:30000" \
+    GATEWAY_PORT=18789 \
+    GATEWAY_BIND=127.0.0.1 \
+    python "${SCRIPTS_DIR}/rl_gateway_proxy.py" \
+        >> "${LOGS_DIR}/openclaw.log" 2>&1 &
     OPENCLAW_PID=$!
-    echo "OpenClaw PID: ${OPENCLAW_PID}"
+    echo "Gateway proxy PID: ${OPENCLAW_PID}"
 }
 
 wait_for_openclaw_gateway() {
