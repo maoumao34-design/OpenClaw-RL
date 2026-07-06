@@ -113,8 +113,14 @@ dump_log_tail() {
     local logfile=$1
     local lines=${2:-80}
     if [ -f "${logfile}" ]; then
-        echo "--- ${logfile} (last ${lines} lines) ---" >&2
-        tail -n "${lines}" "${logfile}" >&2
+        local total
+        total=$(wc -l < "${logfile}" | tr -d ' ')
+        echo "--- ${logfile} (${total} lines total; showing last ${lines}) ---" >&2
+        if [ "${total}" -le 200 ]; then
+            cat "${logfile}" >&2
+        else
+            tail -n "${lines}" "${logfile}" >&2
+        fi
         echo "--- end ---" >&2
     fi
 }
@@ -134,6 +140,14 @@ wait_for_port() {
             echo "错误：${name} 进程已退出" >&2
             dump_log_tail "${logfile}"
             return 1
+        fi
+        if [ -n "${logfile}" ] && [ -f "${logfile}" ]; then
+            if grep -qE "Job 'raysubmit_.*' failed|can't open file '/workspace/train_async.py'|patch failed|Traceback|CUDA out of memory" "${logfile}" 2>/dev/null; then
+                echo "错误：Ray 训练 job 已失败（见 ${logfile}）" >&2
+                grep -E "failed|Error|error|Traceback|can't open|patch failed|OOM|CUDA" "${logfile}" 2>/dev/null | tail -20 >&2 || true
+                dump_log_tail "${logfile}" 120
+                return 1
+            fi
         fi
         if [ ${waited} -ge ${max_wait} ]; then
             echo "超时：${name} 在 ${max_wait}s 内未启动" >&2
@@ -188,6 +202,7 @@ echo ""
 echo "=== [1/3] 启动训练（GPU ${TRAINING_CUDA_DEVICES}，NUM_GPUS=${NUM_TRAINING_GPUS}）==="
 
 CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
+  REPO_ROOT="${REPO_ROOT}" \
   NUM_GPUS="${NUM_TRAINING_GPUS}" \
   HF_CKPT="${POLICY_MODEL_PATH}" \
   REF_LOAD="${POLICY_TORCH_DIST}" \
