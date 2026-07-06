@@ -30,6 +30,8 @@ cp "${OFFICIAL}" "${PATCHED}"
 if [ "${SMOKE_PROFILE}" = "1" ]; then
     # topk-select 已经默认 PRM_GPUS=1 PRM_NUM_GPUS_PER_ENGINE=1，无需 sed
     # 额外缩配：PRM_M 3→1、OPENCLAW_TOPK_MAX_CAND 3→1（smoke 只需验证流通）
+    # PRM_MAX_NEW_TOKENS 8192→4096：PRM judge 引擎与 rollout 共用 sglang-context-length，
+    # smoke 把它缩到 8192 后 prompt_len+8192 必然超限（sglang 400），judge 永远拿不到有效票。
     sed -i \
         -e 's/--tensor-model-parallel-size 4/--tensor-model-parallel-size 1/' \
         -e 's/--rollout-num-gpus-per-engine 2/--rollout-num-gpus-per-engine 1/' \
@@ -41,6 +43,7 @@ if [ "${SMOKE_PROFILE}" = "1" ]; then
         -e 's/^export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="8192"/' \
         -e 's/export PRM_M="${PRM_M:-3}"/export PRM_M="${PRM_M:-1}"/' \
         -e 's/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-3}"/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-1}"/' \
+        -e 's/--prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-8192}"/--prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-4096}"/' \
         "${PATCHED}"
 elif [ "${MINITEST_PROFILE}" = "1" ]; then
     # 5-GPU pre-test：仅减少并行度和数据量，其他与 8GPU 正式完全一致。
