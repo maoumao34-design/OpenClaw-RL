@@ -218,15 +218,22 @@ echo "=== [2/3] 外部 Simulator 连通性 + OpenClaw gateway ==="
 
 wait_for_external_simulator 300
 
+# RL proxy :30000 必须先起来；OpenClaw primary 指向 127.0.0.1:30000，且 SGLang 加载较慢。
+echo "等待 RL training proxy (port 30000)..."
+wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
+
 echo ""
-echo "启动 OpenClaw gateway（port 18789）..."
+echo "启动 RL gateway proxy（port 18789，替代 openclaw gateway run）..."
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-  openclaw gateway run --allow-unconfigured --force \
+SGLANG_API_KEY="${SGLANG_API_KEY}" \
+RL_PROXY_URL="http://127.0.0.1:30000" \
+GATEWAY_PORT=18789 \
+GATEWAY_BIND=127.0.0.1 \
+python "${SCRIPTS_DIR}/rl_gateway_proxy.py" \
   > "${LOGS_DIR}/openclaw.log" 2>&1 &
 OPENCLAW_PID=$!
 
-wait_for_port "OpenClaw gateway"  18789 300 "${OPENCLAW_PID}" "${LOGS_DIR}/openclaw.log"
-wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
+wait_for_port "OpenClaw gateway" 18789 300 "${OPENCLAW_PID}" "${LOGS_DIR}/openclaw.log"
 
 # =====================================================================
 # 第3步：模拟循环（论文 Joint：INIT 顺序建立 + Joint 三角色并行）

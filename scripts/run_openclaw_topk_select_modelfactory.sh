@@ -27,6 +27,15 @@ fi
 
 cp "${OFFICIAL}" "${PATCHED}"
 
+# 断点续训：Megatron 在 --load 无效（不存在 / 没有 latest_checkpointed_iteration.txt）时
+# 会自动回退到 --ref-load 从预训练权重重新开始（args.finetune=True, start_rollout_id=0，
+# 见 slime/utils/arguments.py:1814-1831）。官方脚本从不传 --load，导致任何一次重启
+# 都会丢弃已训练进度。这里让 --load 指向 SAVE_CKPT：首次运行时该目录还不存在，会
+# 自动回退到 ref_load（行为不变）；一旦存过 checkpoint，重启即可自动续训。
+sed -i \
+    -e 's/--save "${SAVE_CKPT}"/--save "${SAVE_CKPT}"\n   --load "${SAVE_CKPT}"/' \
+    "${PATCHED}"
+
 if [ "${SMOKE_PROFILE}" = "1" ]; then
     # topk-select 已经默认 PRM_GPUS=1 PRM_NUM_GPUS_PER_ENGINE=1，无需 sed
     # 额外缩配：PRM_M 3→1、OPENCLAW_TOPK_MAX_CAND 3→1（smoke 只需验证流通）
