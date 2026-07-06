@@ -89,13 +89,18 @@ SESSION_LIMIT=${SESSION_LIMIT:-72}
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
-OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
+OPENCLAW_DIR="${LOGS_DIR}/openclaw-test-patched"
 
 mkdir -p "${LOGS_DIR}"
 echo "日志目录: ${LOGS_DIR}"
 echo "外部 Simulator: ${SIMULATOR_BASE_URL} (model=${EXTERNAL_MODEL})"
+
+# openclaw-test/*.py 硬编码 "model": "default"，当前 OpenClaw CLI（2026.6.9）的
+# /v1/chat/completions 只认 openclaw/openclaw-<agentId> 这套 agent-target 格式，
+# 会直接 400。生成一份改了这一个字段的补丁副本，官方目录本身不动。
+bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLAW_DIR}"
 
 # =====================================================================
 # conda
@@ -238,13 +243,11 @@ echo "等待 RL training proxy (port 30000)..."
 wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 
 echo ""
-echo "启动 RL gateway proxy（port 18789，替代 openclaw gateway run）..."
+echo "启动 OpenClaw gateway（port 18789）..."
+echo "前提：~/.openclaw/openclaw.json 需已设 gateway.http.endpoints.chatCompletions.enabled=true"
+echo "（openclaw config set gateway.http.endpoints.chatCompletions.enabled true），否则 /v1/chat/completions 404。"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-SGLANG_API_KEY="${SGLANG_API_KEY}" \
-RL_PROXY_URL="http://127.0.0.1:30000" \
-GATEWAY_PORT=18789 \
-GATEWAY_BIND=127.0.0.1 \
-python "${SCRIPTS_DIR}/rl_gateway_proxy.py" \
+  openclaw gateway run --allow-unconfigured --force \
   > "${LOGS_DIR}/openclaw.log" 2>&1 &
 OPENCLAW_PID=$!
 

@@ -55,9 +55,9 @@ DATASET=${DATASET:-${REPO_ROOT}/openclaw-test/GSM8K.json}
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
-OPENCLAW_DIR=${REPO_ROOT}/openclaw-test
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/smoke_$(date +%Y%m%d_%H%M%S)}
 WORKSPACE=${HOME}/.openclaw/workspace
+OPENCLAW_DIR="${LOGS_DIR}/openclaw-test-patched"
 SMOKE_TOPK_SELECT_LAUNCHER="${SCRIPTS_DIR}/smoke_run_qwen3_4b_openclaw_topk_select.sh"
 
 if [ -z "${SIMULATOR_BASE_URL}" ] || [[ "${SIMULATOR_BASE_URL}" == *"<"* ]]; then
@@ -91,6 +91,12 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
 fi
 
 mkdir -p "${LOGS_DIR}"
+
+# openclaw-test/*.py 硬编码 "model": "default"，当前 OpenClaw CLI（2026.6.9）的
+# /v1/chat/completions 只认 openclaw/openclaw-<agentId> 这套 agent-target 格式，
+# 会直接 400。生成一份改了这一个字段的补丁副本，官方目录本身不动。
+bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLAW_DIR}"
+
 echo ""
 echo "============================================================"
 echo "  OpenClaw-RL SMOKE TEST (4 GPU) — NOT production training"
@@ -176,16 +182,14 @@ wait_for_external_simulator() {
 }
 
 launch_openclaw_gateway() {
-    echo "启动 RL gateway proxy（port 18789，替代 openclaw gateway run）..."
+    echo "启动 OpenClaw gateway（port 18789）..."
+    echo "前提：~/.openclaw/openclaw.json 需已设 gateway.http.endpoints.chatCompletions.enabled=true"
+    echo "（openclaw config set gateway.http.endpoints.chatCompletions.enabled true），否则 /v1/chat/completions 404。"
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-    SGLANG_API_KEY="${SGLANG_API_KEY}" \
-    RL_PROXY_URL="http://127.0.0.1:30000" \
-    GATEWAY_PORT=18789 \
-    GATEWAY_BIND=127.0.0.1 \
-    python "${SCRIPTS_DIR}/rl_gateway_proxy.py" \
+    openclaw gateway run --allow-unconfigured --force \
         >> "${LOGS_DIR}/openclaw.log" 2>&1 &
     OPENCLAW_PID=$!
-    echo "Gateway proxy PID: ${OPENCLAW_PID}"
+    echo "Gateway PID: ${OPENCLAW_PID}"
 }
 
 wait_for_openclaw_gateway() {
@@ -308,17 +312,11 @@ echo "[DEBUG] 1) GET /v1/models" | tee -a "${LOGS_DIR}/openclaw_debug.log"
 curl -sv -X GET http://localhost:18789/v1/models \
     -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
     >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
-echo "[DEBUG] 2) POST /v1/chat/completions model=default" | tee -a "${LOGS_DIR}/openclaw_debug.log"
+echo "[DEBUG] 2) POST /v1/chat/completions model=openclaw/default" | tee -a "${LOGS_DIR}/openclaw_debug.log"
 curl -sv -X POST http://localhost:18789/v1/chat/completions \
     -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
     -H "Content-Type: application/json" \
-    -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"stream":false}' \
-    >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
-echo "[DEBUG] 3) POST /v1/chat/completions model=sglang/qwen3-4b" | tee -a "${LOGS_DIR}/openclaw_debug.log"
-curl -sv -X POST http://localhost:18789/v1/chat/completions \
-    -H "Authorization: Bearer ${OPENCLAW_GATEWAY_TOKEN}" \
-    -H "Content-Type: application/json" \
-    -d '{"model":"sglang/qwen3-4b","messages":[{"role":"user","content":"hello"}],"stream":false}' \
+    -d '{"model":"openclaw/default","user":"smoke-probe","messages":[{"role":"user","content":"hello"}],"stream":false}' \
     >> "${LOGS_DIR}/openclaw_debug.log" 2>&1 || true
 echo "--- openclaw_debug.log ---" && cat "${LOGS_DIR}/openclaw_debug.log"
 
