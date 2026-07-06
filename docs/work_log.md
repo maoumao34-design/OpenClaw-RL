@@ -371,7 +371,49 @@
 
 ---
 
-## 当前状态（2026-07-03）
+## 2026-07-06
+
+**目标：** 排查 smoke 训练队列为何仍为 0；核查 8 GPU 正式脚本是否同步了 smoke/minitest 的全部修复；深挖 18789 404 的真实根因
+
+**完成内容：**
+- 修复 smoke PRM judge 400/503（`PRM_MAX_NEW_TOKENS` 与缩配 context 冲突）→ commit `be0bc0e`；smoke 首次跑出真实训练样本提交，`update_weights()` 前的训练 step 确认执行 → 细节见 [`issues_log.md`](issues_log.md)
+- 核查 8 GPU 正式脚本，补齐四处遗漏（gateway 启动方式、快速失败日志检测、断点续训 `--load`、`REPO_ROOT` 转发）→ commit `ed0aa01`、`61903e4`
+- **重大方向修正**：`rl_gateway_proxy.py` 建立在 2026-07-03 的误诊之上——`openclaw gateway run` 本就内置完整 agent 循环（含工具调用）暴露 `/v1/chat/completions`，真实 404 根因是 `gateway.http.endpoints.chatCompletions.enabled` 默认关闭 + `model` 字段格式不符 → 详见 [`issues_log.md`](issues_log.md)
+- 服务器验证：开启配置后认证/路由正常；撤掉 `rl_gateway_proxy.py`，三脚本改回真实 `openclaw gateway run`；新增 `scripts/prepare_openclaw_test_scripts.sh` 只打 `model` 字段补丁，官方 `openclaw-test/` 目录不动 → commit `ea19053`
+
+**主要问题：**（细节见 [`issues_log.md`](issues_log.md) 2026-07-06 各条目）
+- smoke `update_weights()` OOM（TP=1 缩配显存不足，评估 minitest/8GPU 不会复现，未在 smoke 上追加修复）
+- `rl_gateway_proxy.py` 误诊 + 修复（本 session 最大方向修正，见上）
+
+**待 modelfactory 验证：** minitest（5 GPU）排队中；smoke 用回真实 gateway 重跑一次，确认 tool call/文件读写真实发生 + 训练队列正常累积
+
+---
+
+## 当前状态（2026-07-06）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（本次新增，是 18789 端点的真正开关）
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁（`"default"` → `"openclaw/default"`），官方目录不动
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本统一用真实 `openclaw gateway run`（commit `ea19053`，`rl_gateway_proxy.py` 已删除）
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load "${SAVE_CKPT}"` + smoke `PRM_MAX_NEW_TOKENS` 修复
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+
+### 下一步
+1. minitest（5 GPU）排队结果确认
+2. smoke 用真实 gateway 重跑一次，确认 Student/TA/Teacher 对话里模型真的读写了 homework 文件（tool_calls），训练队列正常累积
+3. 上述通过后提交 8 GPU 正式 Table 3 训练
+
+### 未验证
+- [ ] 真实 `openclaw gateway run` + `chatCompletions` 开关下，policy 是否真的执行了文件读写 tool call
+- [ ] minitest 5 GPU 完整跑通（TP=2，`update_weights()` 是否仍 OOM）
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-03，已被 7/6 gateway 架构修正取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖

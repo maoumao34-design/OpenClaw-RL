@@ -151,6 +151,87 @@ Job 'raysubmit_...' failed
 
 ---
 
+## [2026-07-06] smoke PRM judge 400/503（PRM_MAX_NEW_TOKENS 与缩配 context 冲突）
+
+**步骤：** 4 GPU smoke `scripts/smoke_train_with_services.sh`
+
+**现象：** `training.log` 里每轮 PRM judge/eval 调用均失败：
+```
+[OpenClaw-OPD] PRM eval query failed (vote 0): Client error '400 Bad Request' for url 'http://<ip>:3794/generate'
+（此后全部变为）Server error '503 Service Unavailable' for url '...'
+[OpenClaw-Combine-Select] session=... turn=N no valid hint (votes=[None]), sample dropped
+```
+`combine samples` 队列从 0 GPU job 开始到结束全程停在 `0/4`。
+
+**根因：** `run_openclaw_topk_select_modelfactory.sh` 的 `SMOKE_PROFILE` sed 补丁把 `--sglang-context-length`/`CONTEXT_LENGTH` 从官方 32768 缩到 8192（省显存），但没有同步缩小 `--prm-max-new-tokens`（仍为官方默认 8192）。PRM judge 引擎与 rollout 共用同一个 `sglang_context_length`，`prompt_len + 8192 > 8192` 对任何非空 prompt 恒成立，sglang 直接 400；PRM 引擎疑似因此卡死，此后全部 503。8 GPU 正式配置（context=32768）不受影响。
+
+**修复：** `SMOKE_PROFILE` 补丁增加一行 `--prm-max-new-tokens 8192 → 4096`；commit `be0bc0e`
+
+---
+
+## [2026-07-06] smoke `update_weights()` OOM（TP=1 缩配显存不足）
+
+**步骤：** 4 GPU smoke，PRM 修复后首次真实跑通数据流
+
+**现象：**
+```
+ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update_weights()
+```
+崩溃前日志已出现 `submitted OPD+RL sample session=... index=7 reward=-1.0`，说明 `async_train()`（真正的前向/反向/optimizer step）已执行完毕，OOM 发生在训练步之后的权重同步（推给 sglang 推理引擎）阶段。训练进程死后，18789 → 30000 转发失败（`httpx.ConnectError`），表现为 student/teacher_chat.py 端的 500。
+
+**根因：** smoke 把 Actor 从官方 TP=4 强行缩到 TP=1，整个 4B 模型 + 梯度 + 权重同步缓冲全部挤在一张卡，无张量并行分摊显存。此前从未真正走到 `update_weights()`（训练队列一直是 0），OOM 是链路修复后第一次暴露。
+
+**评估：** minitest（TP=2）/ 8GPU 正式（TP=4）显存分摊更充分，理论上不会复现；若 minitest 也 OOM 则需进一步排查 `update_weight_from_distributed.py` 是否有不必要的全量 gather。**未在 smoke 上追加修复**（低优先级，smoke 本不要求跑完整训练）。
+
+---
+
+## [2026-07-06] 8GPU 正式脚本与 smoke/minitest 存在未同步的修复
+
+**步骤：** 8 GPU 正式训练前置核查（用户要求：确认 smoke/minitest 的改动是否都同步到 `train_with_services.sh`）
+
+**现象：** 逐条比对 `git log` + `diff` 后发现 `train_with_services.sh` 遗漏四处已在 smoke/minitest 验证过的修复：
+
+| 遗漏项 | 影响 |
+|---|---|
+| 仍用 `openclaw gateway run` 而非当时的 `rl_gateway_proxy.py` | 会直接复现最初的 18789 404（此项后被 [下一条] 整体推翻重做）|
+| `wait_for_port` 缺少 Traceback/CUDA OOM 快速失败检测 | 训练崩溃时会傻等满 900s 超时，而非立刻报错 |
+| `REPO_ROOT` 未转发进训练启动子进程 | 目前因默认值恰好一致而未触发，但存在潜在风险 |
+| 启动顺序（先起 gateway 还是先等 30000）| smoke/minitest 已改为先等 30000 |
+
+**修复：** 全部补齐；commit `ed0aa01`（gateway proxy + 断点续训 `--load` + 启动顺序）、`61903e4`（快速失败检测 + `REPO_ROOT`）
+
+---
+
+## [2026-07-06] rl_gateway_proxy.py 是基于误诊的绕过方案；真实根因是配置开关默认关闭
+
+**步骤：** 用户追问"能不能让 `openclaw gateway run` 自己有 workspace 工具能力"，触发重新排查
+
+**背景：** 2026-07-03 曾诊断 `openclaw gateway run` 完全不提供 `/v1/chat/completions` 路由（"设备连接层，非 API 路由"），据此实现了 `scripts/rl_gateway_proxy.py`——绕开 OpenClaw、直连 30000 端口的裸转发代理（手动注入 `X-Session-Id`/`X-Turn-Type: main`）。该方案让 smoke 首次跑通训练数据流，但存在已知缺陷：policy 完全没有 workspace 文件读写工具，homework 文件互动这一论文核心设计无法真正发生。
+
+**根因（本次查明）：** 本地发现 OpenClaw 本体源码克隆（`D:\MAO\Claude\openclaw`），读 `docs/gateway/openai-http-api.md` 确认：
+- `/v1/chat/completions` 内置在 `openclaw gateway run` 里，走"a normal Gateway agent run"（与 `openclaw agent` 同代码路径），天然带完整工具调用能力，`rl-training-headers` 插件挂的 `before_prompt_build` 钩子正是这条路径触发的
+- 该端点**默认禁用**，需 `gateway.http.endpoints.chatCompletions.enabled=true`
+- OpenAI `model` 字段必须是 agent-target 格式（`openclaw`/`openclaw/<agentId>`/兼容别名 `openclaw:<agentId>`、`agent:<agentId>`），官方 `openclaw-test/*.py` 硬编码的 `"model": "default"` 不在支持列表内
+
+服务器实测验证链条：
+1. `openclaw config get gateway.http.endpoints.chatCompletions.enabled` → `Config path not found`（确认默认未开）
+2. `openclaw config set ... true` + `openclaw config validate` → 通过
+3. 重启 `openclaw gateway run --allow-unconfigured --force`，`model: "openclaw/default"` → `401 Unauthorized`（新终端 `$OPENCLAW_GATEWAY_TOKEN` 未设置）→ 改用 Python 读取原始 JSON（绕开 `config get` 对敏感字段的脱敏 `__OPENCLAW_REDACTED__`）拿到真实 token → 认证通过，卡在 `upstream provider timeout`
+4. 确认 30000 端口当时确实无进程监听（`ps aux` 为空）→ 判定 timeout 是预期结果，非新 bug
+5. 用官方脚本实际发送的 `"model": "default"` 复测 → `400 Invalid model. Use openclaw or openclaw/<agentId>.`，坐实兼容性问题
+
+**结论：** 2026-07-03 的诊断不完整——404 根源是配置开关默认关闭，不是端点不存在。`rl_gateway_proxy.py` 方案虽然让训练队列跑通，但牺牲了论文要求的 agent 工具调用能力，是不必要的绕过。
+
+**修复：**
+- 撤掉 `scripts/rl_gateway_proxy.py`（已删除），三脚本（smoke/minitest/train_with_services.sh）改回真实 `openclaw gateway run --allow-unconfigured --force`
+- 服务器 `~/.openclaw/openclaw.json` 已设置 `gateway.http.endpoints.chatCompletions.enabled=true`（持久化，无需每次重设）
+- 新增 `scripts/prepare_openclaw_test_scripts.sh`：生成 `student_chat.py`/`TA_chat.py`/`teacher_chat.py` 的补丁副本（仅改 `"model": "default"` → `"model": "openclaw/default"` 一处），官方 `openclaw-test/` 目录本身不动；三脚本 `OPENCLAW_DIR` 改指向补丁副本
+- commit `ea19053`
+
+**待验证：** 重跑 smoke，确认（a）真实 agent 循环下 Student/TA/Teacher 对话里模型确有文件读写行为，（b）训练队列仍能正常累积（换成官方 `rl-training-headers` 插件注入 header 而非手工伪造）
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
