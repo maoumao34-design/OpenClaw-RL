@@ -232,6 +232,66 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 ---
 
+## [2026-07-07] smoke chatCompletions 配置未在新 job 环境生效（二次 404）
+
+**步骤：** 4 GPU smoke `scripts/smoke_train_with_services.sh`（承接 2026-07-06 gateway 修复后的验证）
+
+**现象：** 前一天已在交互式 shell 里确认 `gateway.http.endpoints.chatCompletions.enabled=true` 生效，但新提交的 smoke job 又复现了最初的 `404 Not Found`
+
+**根因：** `openclaw` 本体（`/usr/lib/node_modules/openclaw/`）是系统级安装，job 容器和交互式 shell 都能找到；但 `~/.openclaw/openclaw.json` 是用户配置，job 容器很可能是从早于这次手动配置改动的镜像/模板生成的，交互式 shell 里的临时改动不会传播到新 job
+
+**修复：** 不依赖"配置是否跨环境持久"这个不确定的前提，改为在 `launch_openclaw_gateway()` 里每次启动前强制 `openclaw config set gateway.http.endpoints.chatCompletions.enabled true`，并打印 `openclaw config get` 回读结果到日志验证；commit `9aa3c4a`
+
+---
+
+## [2026-07-07] OpenClaw 请求 max_completion_tokens=178220 导致 408
+
+**步骤：** 4 GPU smoke，上一条修复后的新 job
+
+**现象：** `student_chat.py` 报 `408 Client Error: Request Timeout`；`openclaw.log` 显示反复 `[agent/embedded] ... error=LLM request failed ... reason=timeout`，5 次重试后放弃
+
+**根因：** 用 CPU-only mock server（Python + FastAPI，监听 30000 端口顶替 sglang 后端，不需要 GPU/训练进程）单独抓包，发现 OpenClaw 实际转发的请求体里 `"max_completion_tokens": 178220`，远超 sglang `context_length=8192`，被 400 拒绝；`OpenClawOPDAPIServer` 把这个 400 转成 500 抛给 OpenClaw agent，agent 归类为 timeout，重试耗尽后 408 传导回客户端。根因是 `~/.openclaw/openclaw.json` 的 `models.providers.sglang` 从未显式声明 `models[]`（无 `contextWindow`/`maxTokens`），OpenClaw 走自动发现，不知道模型真实的输出上限
+
+**修复：** `launch_openclaw_gateway()` 里显式声明 `sglang.models=[{id:"qwen3-4b", contextWindow:8192, maxTokens:4096, ...}]`（maxTokens 明显小于 contextWindow 留出 prompt 空间，同 `PRM_MAX_NEW_TOKENS` 那次的道理）；commit `18fac58`
+
+---
+
+## [2026-07-07] smoke Teacher 第 4 轮 context overflow
+
+**步骤：** 4 GPU smoke，上两条修复后真实 agent 循环首次跑通
+
+**现象：** Teacher INIT 阶段第 4 轮（`--max-turns 4` 上限）返回 `Context overflow: prompt too large for the model. Try /reset...`；该题最终 `0/1 problems commented within turn limit`；脚本自身仍打印 `✅ SMOKE PASSED`（该判定只检查训练进程是否存活，见 2026-07-06 条目）
+
+**根因：** smoke 把 `--sglang-context-length` 缩到 8192（省显存）；真实 agent 循环（工具调用 schema、系统提示词、reasoning token）本身开销就不小，累积到第 3-4 轮很容易突破 8192。与本次 session 早前两个问题（`PRM_MAX_NEW_TOKENS`、`max_completion_tokens`）同源——都是 smoke 缩配 context 过紧带来的连锁反应，这是第三次发作
+
+**评估：** minitest/8GPU（context=32768）预期不受影响；未在 smoke 上追加修复（低优先级，smoke 本不要求跑完整对话）
+
+---
+
+## [2026-07-07] rl-training-headers 插件端到端失效（OpenClaw 内部实现问题，非论文/复现代码问题）
+
+**步骤：** 上一条 context overflow 修复后，`training.log` 里 `combine samples` 持续 `0/4`，全部请求日志显示 `[side] session=unknown`
+
+**排查过程**（全程用 CPU-only mock server 在 30000 端口直接抓包验证，不占 GPU 排队，不靠猜测）：
+
+1. 用 mock server 抓包确认 `X-Session-Id`/`X-Turn-Type` 完全没有出现在 OpenClaw 实际发出的请求头里
+2. `openclaw --log-level debug/trace gateway run` 确认 `rl-training-headers` 从未进入"尝试加载"列表（`loaded N plugin(s) (N attempted)` 里没有它），而单独执行 `openclaw plugins enable rl-training-headers` 能正常触发插件的 `register()`（打印 "activated (fetch patched)"）——说明插件代码本身没问题，问题在加载阶段
+3. 对比能加载的 `browser`/`sglang` 与不能加载的 `clickclack`/`rl-training-headers` 的 `openclaw.plugin.json`：能加载的都有 `"enabledByDefault": true`；**`clickclack` 是官方原生插件，同样缺这个字段、同样加载不了**——排除"手动装的插件才有问题"这个假设，确认是这个 OpenClaw 版本（2026.6.9）本身的加载器行为
+4. 给 `rl-training-headers` 的 manifest 补上 `"enabledByDefault": true` + `"activation": {"onStartup": true}`，插件成功加载（9 个插件里出现它），`register()` 正确触发，`before_prompt_build` 钩子也确认触发（`[hooks] running before_prompt_build (1 handlers, sequential)`）
+5. 用 mock server 复测——header **依然没有到达实际出站请求**。确认问题不在"是否加载"，而在"patch `globalThis.fetch`"这套注入机制本身，在这个 OpenClaw 版本里对实际的 provider 调用不起作用（请求头里 `user-agent: OpenAI/JS 6.39.1` 表明走的是官方 `openai` npm SDK 客户端，大概率在构造时就缓存了一份 `fetch` 引用，不会每次请求重新读 `globalThis.fetch`）
+
+**结论：** 这是 **OpenClaw 本体的内部实现问题**，跟论文设计、`OpenClaw-RL-official` 复现代码都无关。相关 manifest 补丁（`enabledByDefault`/`activation`）、调试补丁（`openclaw_opd_api_server.py` 里的临时 header 打印）已全部复原，不再依赖这个插件。
+
+**替代方案**（偏离论文原设计的 header 注入机制，明确记录）：
+- **`X-Turn-Type`**：改用 OpenClaw **官方**的 `models.providers.sglang.headers` 静态 header 配置，固定注入 `"main"`——这是官方支持的功能（`ModelProviderConfig.headers: Record<string, SecretInput>`），不是绕过；能用固定值是因为这条复现流水线里的调用全部是真实 main turn，从不触发 OpenClaw 的 heartbeat/memory/cron。实测确认 mock server 收到 `'x-turn-type': 'main'`
+- **`X-Session-Id`**：没有静态配置的等价物（按对话区分）。发现 OpenClaw 自己会把 `session=agent:<agentId>:openai-user:<user>` 嵌入每次调用的 system prompt "Runtime:" 行里，`<user>` 正好就是 `student_chat.py`/`TA_chat.py`/`teacher_chat.py` 传的 `user` 字段。新增 `scripts/prepare_patched_openclaw_opd.sh`，拷贝打补丁给 `openclaw_opd_api_server.py` 加这个兜底解析（官方 `openclaw-opd/` 目录不动），`PATCHED_OPD_DIR` 注入训练 job 的 `PYTHONPATH`（需排在官方 `openclaw-opd/` 之前）
+
+**修复：** commit `9aa3c4a`（配置强制设置）、`18fac58`（sglang provider 声明）、`2c1e851`（header workaround，含 `prepare_patched_openclaw_opd.sh`）
+
+**待验证：** 真实 smoke job 里 `X-Session-Id` 解析是否生效（本地已单测通过正则提取、补丁文件语法检查）
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

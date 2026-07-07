@@ -389,9 +389,59 @@
 
 ---
 
-## 当前状态（2026-07-06）
+## 2026-07-07
+
+**目标：** 排查 smoke 训练队列持续为 0 的根因；确认论文原设计的 header 注入机制是否真的可行
+
+**完成内容：**
+- 修复 smoke job 内 `chatCompletions` 配置未跨环境生效（新 job 复现最初 404）→ 改为每次启动前强制 `config set` 并回读验证 → commit `9aa3c4a`
+- 定位 OpenClaw 对未声明 `models[]` 的 sglang provider 请求了离谱大的 `max_completion_tokens`（178220），导致 408 → 显式声明 provider models（`contextWindow`/`maxTokens`）→ commit `18fac58`
+- 修复后 smoke 首次让真实 agent 循环跑通（模型真的会调用文件工具），但训练队列仍为 0，日志显示全部请求 `[side] session=unknown`
+- **全程用 CPU-only mock server 抓包排查**（不靠猜测、不占 GPU 排队）确认 `rl-training-headers` 插件端到端失效：manifest 缺 `enabledByDefault` 导致插件从未被尝试加载（对比 `browser`/`sglang`/`clickclack` 找到规律，`clickclack` 官方插件同样中招）；补上字段后插件确实加载、钩子确实触发、`fetch` 确实被 patch，但 header 依然传不到实际出站请求——确认是 **OpenClaw 本体的内部实现问题**，与论文设计、`OpenClaw-RL-official` 复现代码无关 → 细节见 [`issues_log.md`](issues_log.md)
+- 相关调试/manifest 补丁全部复原；实现替代方案：`X-Turn-Type` 改用 OpenClaw 官方 `models.providers.sglang.headers` 静态配置（真官方功能，非绕过，已实测到达后端）；`X-Session-Id` 从 OpenClaw 自带的 system prompt "Runtime:" 行解析（明确记录为偏离论文设计），新增 `scripts/prepare_patched_openclaw_opd.sh`（拷贝打补丁，官方 `openclaw-opd/` 不动）→ commit `2c1e851`
+- 独立单测（无需 GPU）确认补丁语法与正则提取逻辑均正确
+
+**主要问题：**（细节见 [`issues_log.md`](issues_log.md) 2026-07-07 各条目）
+- smoke Teacher 第 4 轮 context overflow（smoke 缩配 context=8192 导致，与本次早前两个问题同源，评估 minitest/8GPU 不受影响，未追加修复）
+- `rl-training-headers` 端到端失效（本次最大排查成果，见上）
+
+**待 modelfactory 验证：** smoke（4 GPU）排队中，确认 `X-Session-Id` 解析在真实链路里生效、训练队列正常累积
+
+---
+
+## 当前状态（2026-07-07）
 
 ### 已就绪
+- [x] 环境 + GPU 编译依赖
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次 `launch_openclaw_gateway()` 强制设置，不依赖跨环境持久化）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow`/`maxTokens`）+ 静态 `headers.X-Turn-Type=main`（`launch_openclaw_gateway()` 里生成）
+- [x] `scripts/prepare_patched_openclaw_opd.sh`：`X-Session-Id` 从 Runtime 行解析的兜底补丁，官方 `openclaw-opd/` 不动，`PATCHED_OPD_DIR` 接入训练 job `PYTHONPATH`
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本统一用真实 `openclaw gateway run`
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + smoke `PRM_MAX_NEW_TOKENS`/`PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+
+### 已知限制
+- `rl-training-headers` 插件在当前 OpenClaw（2026.6.9）里端到端不生效，`X-Session-Id` 走的是从 system prompt 解析的替代方案，偏离论文原设计，已记录
+- smoke（context=8192）下真实 agent 多轮对话可能撞 context overflow；minitest/8GPU（context=32768）预期不受影响
+
+### 下一步
+1. smoke（4 GPU）排队结果确认：`X-Session-Id` 解析是否生效、训练队列是否正常累积
+2. smoke 通过后把 header workaround 传播到 minitest/train_with_services.sh（目前只在 smoke 里生效）
+3. 提交 8 GPU 正式 Table 3 训练
+
+### 未验证
+- [ ] `X-Session-Id` 解析在真实训练链路里的效果（本地已单测通过语法/正则，未跑通真实请求）
+- [ ] minitest 5 GPU 完整跑通
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-06，已被 7/7 header workaround 取代）
+
+### 已就绪（7/6 时点）
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist
 - [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（本次新增，是 18789 端点的真正开关）
@@ -401,15 +451,7 @@
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
-### 下一步
-1. minitest（5 GPU）排队结果确认
-2. smoke 用真实 gateway 重跑一次，确认 Student/TA/Teacher 对话里模型真的读写了 homework 文件（tool_calls），训练队列正常累积
-3. 上述通过后提交 8 GPU 正式 Table 3 训练
-
-### 未验证
-- [ ] 真实 `openclaw gateway run` + `chatCompletions` 开关下，policy 是否真的执行了文件读写 tool call
-- [ ] minitest 5 GPU 完整跑通（TP=2，`update_weights()` 是否仍 OOM）
-- [ ] 8 GPU 正式 Table 3 训练
+> 7/6 认为"插件+header"是正确方向，7/7 实测证实这套机制在当前 OpenClaw 版本里端到端不生效，已改用 headers 静态配置 + Runtime 行解析。
 
 ---
 
