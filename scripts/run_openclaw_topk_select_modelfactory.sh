@@ -99,6 +99,23 @@ new_ray = (
 if old_ray not in text:
     raise SystemExit("patch failed: ray job submit block not found in topk-select launcher")
 text = text.replace(old_ray, new_ray, 1)
+
+# PATCHED_OPD_DIR (optional, set by caller): prepend a directory containing a
+# patched openclaw_opd_api_server.py ahead of the official openclaw-opd/ so
+# `import openclaw_opd_api_server` resolves to the patched copy. See
+# scripts/prepare_patched_openclaw_opd.sh for why (rl-training-headers
+# X-Session-Id fallback). No-op when PATCHED_OPD_DIR is unset.
+old_pythonpath = (
+    '\\"PYTHONPATH\\": \\"${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
+)
+new_pythonpath = (
+    '\\"PYTHONPATH\\": \\"${PATCHED_OPD_DIR:+${PATCHED_OPD_DIR}:}'
+    '${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
+)
+if old_pythonpath not in text:
+    raise SystemExit("patch failed: PYTHONPATH line not found in topk-select launcher")
+text = text.replace(old_pythonpath, new_pythonpath, 1)
+
 path.write_text(text)
 PY
 

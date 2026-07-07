@@ -97,6 +97,13 @@ mkdir -p "${LOGS_DIR}"
 # 会直接 400。生成一份改了这一个字段的补丁副本，官方目录本身不动。
 bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLAW_DIR}"
 
+# rl-training-headers 插件的 X-Session-Id 注入在这个 OpenClaw 版本里不生效（实测：
+# 钩子触发、fetch 被 patch，但出站请求收不到 header）。X-Session-Id 没有静态配置
+# 等价物（按对话区分），从 OpenClaw 自己嵌在 system prompt 里的 Runtime 行解析
+# session_id 作为兜底。详见 scripts/prepare_patched_openclaw_opd.sh 顶部注释。
+PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
+
 echo ""
 echo "============================================================"
 echo "  OpenClaw-RL SMOKE TEST (4 GPU) — NOT production training"
@@ -203,6 +210,11 @@ cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
 d = json.loads(cfg.read_text())
 sg = d.setdefault('models', {}).setdefault('providers', {}).setdefault('sglang', {})
 sg['api'] = 'openai-completions'
+# rl-training-headers 插件（X-Session-Id/X-Turn-Type 注入）在这个 OpenClaw 版本里
+# 加载和钩子都正常，但 fetch patch 传不到实际出站请求（OpenAI JS SDK 客户端不会
+# 每次请求重新读 globalThis.fetch），已实测证实。X-Turn-Type 用官方 headers 静态
+# 配置代替：这条流水线里的调用全部是真实 main turn，从不触发 heartbeat/memory/cron。
+sg['headers'] = {'X-Turn-Type': 'main'}
 sg['models'] = [{
     'id': 'qwen3-4b',
     'name': 'Qwen3-4B-Thinking (RL policy, smoke)',
@@ -285,6 +297,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   USE_WANDB=0 \
+  PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
   bash "${SMOKE_TOPK_SELECT_LAUNCHER}" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
