@@ -182,9 +182,17 @@ wait_for_external_simulator() {
 }
 
 launch_openclaw_gateway() {
+    # 这个 job 容器的 ~/.openclaw/openclaw.json 可能是从早于本次修复的镜像/模板
+    # 生成的（openclaw 本体在 /usr/lib/node_modules/ 是系统级安装，job 容器都有；
+    # 但 ~/.openclaw/openclaw.json 是用户配置，不保证和交互式 shell 同步）。
+    # 每次起 gateway 前强制确保这个开关是开着的，不依赖持久化是否跨环境生效。
+    echo "确保 chatCompletions 端点已启用..." | tee -a "${LOGS_DIR}/openclaw.log"
+    openclaw config set gateway.http.endpoints.chatCompletions.enabled true \
+        >> "${LOGS_DIR}/openclaw.log" 2>&1
+    echo "[verify] gateway.http.endpoints.chatCompletions.enabled = $(openclaw config get gateway.http.endpoints.chatCompletions.enabled 2>&1 | tail -1)" \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+
     echo "启动 OpenClaw gateway（port 18789）..."
-    echo "前提：~/.openclaw/openclaw.json 需已设 gateway.http.endpoints.chatCompletions.enabled=true"
-    echo "（openclaw config set gateway.http.endpoints.chatCompletions.enabled true），否则 /v1/chat/completions 404。"
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
     openclaw gateway run --allow-unconfigured --force \
         >> "${LOGS_DIR}/openclaw.log" 2>&1 &
