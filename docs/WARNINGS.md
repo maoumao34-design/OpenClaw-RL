@@ -40,22 +40,31 @@
 
 ## 关键事实速查
 
-**论文主方法的训练脚本（二选一）：**
-```
-# 论文原版（faithful reproduction，用于复现 Table 3）：
-openclaw-combine/run_qwen3_4b_openclaw_combine.sh
+**⚠️ 2026-07-07 更正：下面这条曾经写反过（曾导致 2026-06-29 用错脚本），已核对
+`paper_index.md` 的 Table 3/5 数据修正——Table 3 "Hybrid RL (Ours)" 平均 10.3，
+与 Table 5 k=4 这一列完全一致，`run_qwen3_4b_openclaw_topk_select.sh` 才是复现
+Table 3 的正确脚本，`run_qwen3_4b_openclaw_combine.sh`（不带 k 的 basic combine）
+在 Table 3/4/5/7 里都没有对应的消融列，已作为死代码删除
+（`scripts/run_openclaw_combine_modelfactory.sh` / `smoke_run_qwen3_4b_openclaw_combine.sh`
+一并删除，见 git log `c40619b`）。**
 
-# README 推荐版（post-paper 改进，top-K hint selection）：
+**论文主方法的训练脚本：**
+```
 openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh
+# k=4, m=3, seq-optimal hint selection；Table 3 "Hybrid RL (Ours)" 平均 10.3
+# 即 Table 5（p.14）k=4 这一列，复现首选
 ```
 
 **完整三端口架构（缺一不可）：**
 ```
 port 30001 → Simulator LLM（Qwen3-32B，SGLang）
     ↕ 扮演 student/TA/teacher
-port 18789 → OpenClaw 应用 gateway（workspace 文件工具 + rl-training-headers 扩展）
-    ↕ 添加 X-Session-Id / X-Turn-Type 训练头
-port 30000 → RL 训练代理服务器（运行 run_qwen3_4b_openclaw_combine.sh 后自动启动）
+port 18789 → OpenClaw 应用 gateway（workspace 文件工具，真正的 openclaw gateway run）
+    ↕ X-Turn-Type 靠 models.providers.sglang.headers 静态配置；
+      X-Session-Id 靠解析 system prompt 里的 Runtime 行
+      （rl-training-headers 插件在当前 OpenClaw 版本里端到端不生效，
+      2026-07-07 实测证实，详见 work_log.md/issues_log.md 同日条目）
+port 30000 → RL 训练代理服务器（运行 run_qwen3_4b_openclaw_topk_select.sh 后自动启动）
 ```
 
 **客户端编排脚本（直连 port 18789，非 port 30000）：**

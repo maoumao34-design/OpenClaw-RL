@@ -338,6 +338,10 @@ OpenClaw gateway（port 18789，rl-training-headers 扩展）→
 RL proxy server（port 30000，由 openclaw-combine/run_*.sh 启动）
 ```
 
+> 2026-07-07 更新：`rl-training-headers` 扩展在当前 OpenClaw 版本里端到端不生效
+> （实测证实，非论文/代码问题），已改用官方 headers 静态配置 + system prompt
+> Runtime 行解析的替代方案，见 `work_log.md`/`issues_log.md` 2026-07-07 条目。
+
 正确训练脚本：`openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh`（k=4, m=3, seq-optimal）  
 正确客户端：`openclaw-test/student_chat.py` / `TA_chat.py` / `teacher_chat.py`
 
