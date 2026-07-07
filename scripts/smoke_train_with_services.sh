@@ -192,6 +192,30 @@ launch_openclaw_gateway() {
     echo "[verify] gateway.http.endpoints.chatCompletions.enabled = $(openclaw config get gateway.http.endpoints.chatCompletions.enabled 2>&1 | tail -1)" \
         | tee -a "${LOGS_DIR}/openclaw.log"
 
+    # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，不知道
+    # 真实的 contextWindow/maxTokens，会用过大的默认值请求 max_completion_tokens
+    # （实测 178210），被 sglang 400 拒绝（本模型 context_length=8192，smoke 缩配）。
+    # 显式声明，maxTokens 明显小于 contextWindow 留出 prompt 空间（同 PRM_MAX_NEW_TOKENS 的道理）。
+    echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
+    python3 -c "
+import json, pathlib
+cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
+d = json.loads(cfg.read_text())
+sg = d.setdefault('models', {}).setdefault('providers', {}).setdefault('sglang', {})
+sg['api'] = 'openai-completions'
+sg['models'] = [{
+    'id': 'qwen3-4b',
+    'name': 'Qwen3-4B-Thinking (RL policy, smoke)',
+    'reasoning': True,
+    'input': ['text'],
+    'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+    'contextWindow': 8192,
+    'maxTokens': 4096,
+}]
+cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+print('patched models.providers.sglang.models')
+" 2>&1 | tee -a "${LOGS_DIR}/openclaw.log"
+
     echo "启动 OpenClaw gateway（port 18789）..."
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
     openclaw gateway run --allow-unconfigured --force \
