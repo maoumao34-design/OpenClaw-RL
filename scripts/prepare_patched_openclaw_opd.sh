@@ -71,16 +71,25 @@ def _extract_session_id_from_system_prompt(messages):
     stable per-conversation id). Independent of the rl-training-headers plugin.
     """
     if not isinstance(messages, list):
+        logger.warning("[SESSION-ID-DEBUG] messages is not a list: %r", type(messages))
         return None
+    system_contents = []
     for msg in messages:
         if not isinstance(msg, dict) or msg.get("role") != "system":
             continue
         content = msg.get("content")
         if not isinstance(content, str):
+            system_contents.append(f"<non-str:{type(content)!r}>")
             continue
+        system_contents.append(content)
         match = _RUNTIME_SESSION_RE.search(content)
         if match:
             return match.group(1)
+    logger.warning(
+        "[SESSION-ID-DEBUG] no Runtime session match; %d system message(s), tail=%r",
+        len(system_contents),
+        system_contents[-1][-500:] if system_contents else None,
+    )
     return None
 
 '''
