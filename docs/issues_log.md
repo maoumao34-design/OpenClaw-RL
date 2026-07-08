@@ -292,6 +292,51 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 ---
 
+## [2026-07-08] smoke job 静默失败（无 traceback）——残留进程触发 cgroup OOM
+
+**步骤：** 提交 smoke（4 GPU）验证 07-07 的 header workaround
+
+**现象：** 训练进程在模型加载阶段（日志停在 `> number of parameters on (tensor, pipeline) model parallel rank (0, 0): 4022468096`）之后再无任何输出；`ps aux` 确认训练进程已不存在；`training.log` 全文（1524 行）搜索 `error|traceback|killed|oom|exception|fatal` 均无匹配——不是 Python 异常崩溃
+
+**根因：** `dmesg`/`journalctl -k` 确认系统级 OOM killer 杀掉了一个 **16GB RSS 的 `node` 进程**，触发 cgroup `memory.oom.group`，把整个容器里的所有进程（包括这次训练进程）一起杀掉。进一步查当前存活进程发现两个 07-07 遗留、一直没清干净的进程：`/tmp/mock_sglang_server.py`（07-07 验证 `X-Turn-Type` header 时起的假后端，仍占着 30000 端口）和一个手动测试用的 `openclaw gateway run`。之前清理时只删了 `.py` 文件（`rm -f`），没有真正 `kill` 掉正在跑的进程，导致它们一直挂着（此时已跑了 41 分钟）
+
+**修复：** 按 PID 手动 `kill -9` 两个残留进程，确认端口释放后重新提交 job 恢复正常。**教训**：以后清理测试产物时，删文件和杀进程是两件事，必须都做（`ps aux | grep` 确认没有残留后再提交新 job）
+
+---
+
+## [2026-07-08] smoke job 资源配置错误（1 GPU/16GB 而非 4 GPU）
+
+**步骤：** 清理残留进程后重新提交 smoke，仍然卡在等待 port 30000
+
+**现象：** 跟上一条现象类似（`等待 RL training proxy (port 30000)` 一直不就绪），但这次不是残留进程问题
+
+**根因：** 用户核实发现这次 job 提交参数误设为 1 GPU / 16GB 内存。smoke（topk-select）硬性需要 4 GPU：官方脚本内置断言 `if (( ACTOR_GPUS + ROLLOUT_GPUS + PRM_GPUS + PRM_TEACHER_GPUS > NUM_GPUS )); then exit 1; fi`，四个角色（Actor×1 + Rollout×1 + PRM SGLang×1 + PRM Teacher×1）之和恰好是 4，PRM Teacher 必须有独立 GPU（Megatron 路径不能共享），无法压缩到 3 GPU 以下
+
+**修复：** 用户自行修正 job 提交参数为 4 GPU、≥128GB 内存，重新排队
+
+**附带确认：** 换用非 H 系列 GPU 测试是否可行——理论上 bf16 训练不是 H 系列专属，但（a）smoke 用 TP=1 单卡需扛下整个 4B 模型+KV cache，实测占用约 77GB/95GB，换成更小显存的卡大概率 OOM；（b）flash-attn/TransformerEngine/apex/flashinfer 等扩展是针对当前 GPU 架构专门编译的，换架构大概率需要重新编译，不是简单换卡就能跑。未做实际测试，仅为可行性评估。
+
+---
+
+## [2026-07-08] smoke 首次验证 header workaround：X-Turn-Type 生效，X-Session-Id 仍未生效
+
+**步骤：** 修复上述两个问题后，smoke job（`smoke_20260708_171455`）正常跑完，脚本打印 `✅ SMOKE PASSED`
+
+**验证结果：**
+- ✅ **`X-Turn-Type: main`（07-07 加的官方 `models.providers.sglang.headers` 静态配置）确认生效**：`training.log` 里 `[main]` 出现 12 次，不再是清一色 `[side]`
+- ✅ **训练队列首次真实累积样本**：`combine samples` 从 `0/4` 涨到 5 个真实样本被 `submitted`（`OPD+RL sample`/`RL sample`，`index=0` 到 `index=4`），PRM 评审也是真实投票（`eval_votes=[1]`/`eval_votes=[-1]`），不再全部 `fail`——这是本项目第一次确认训练数据真实流入队列
+- ❌ **`X-Session-Id`（07-07 加的 Runtime 行解析 fallback）仍然全部是 `unknown`**（33 次）。逐项核对：
+  1. `training.log` 里确认 `PYTHONPATH` 正确把 `patched-openclaw-opd/` 排在官方 `openclaw-opd/` 之前
+  2. 补丁文件确实存在、确实被导入过（目录下有 `__pycache__`）
+  3. 补丁代码本身（`_extract_session_id_from_system_prompt` 函数定义 + `session_id = (...)` 拼接）逐行核对与预期一致
+  4. 但函数显然返回了 `None`（否则不会落到 `"unknown"` 兜底），说明真实请求的 system prompt 内容和 07-07 手动测试时用 mock server 抓到的样本不完全一致，具体差异未知
+
+**处理：** 不猜测原因，在 `_extract_session_id_from_system_prompt` 里加调试日志——没匹配到 Runtime 行时打印最后一条 system message 内容的尾部（500 字符）；commit `593a0e0`
+
+**待验证：** 下一次 smoke 跑完后查 `training.log` 里的 `[SESSION-ID-DEBUG]` 输出，确认真实 system prompt 内容到底长什么样，定位解析失败的具体原因
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

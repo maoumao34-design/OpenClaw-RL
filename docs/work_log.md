@@ -409,9 +409,58 @@
 
 ---
 
-## 当前状态（2026-07-07）
+## 2026-07-08
+
+**目标：** 提交 smoke（4 GPU）验证 07-07 的 header workaround 是否真的解决问题；排查 job 中途静默失败的原因
+
+**完成内容：**
+- 修复 smoke job 静默失败（无 Python traceback，进程直接消失）：系统级 OOM killer 因残留进程触发 cgroup 级联杀掉整个容器——07-07 手动测试时启动的 `/tmp/mock_sglang_server.py`（仍占着 30000 端口）和一个 `openclaw gateway run` 一直没有真正 kill 掉（当时只删了文件，没杀进程），清理后恢复正常 → 细节见 [`issues_log.md`](issues_log.md)
+- 另一次提交失败是资源配置问题（误设 1 GPU/16GB，smoke 硬性需要 4 GPU），用户自行核实修正后重新排队
+- **smoke 首次真正验证了 07-07 header workaround**：`X-Turn-Type: main` 静态 header 配置确认生效（`[main]` 出现 12 次，不再全是 `[side]`），训练队列首次真实累积样本（5 个真实样本被提交，PRM 评审也是真实投票而非全部失败）；但 `X-Session-Id` 的 Runtime 行解析**仍然全部返回 `unknown`**——PYTHONPATH、补丁文件、代码逻辑逐项核对都没问题，说明真实请求的 system prompt 内容和 07-07 手动测试时假设的不一致，具体原因还不清楚，加了调试日志（不猜测，直接打印真实内容）→ commit `593a0e0`
+
+**主要问题：**（细节见 [`issues_log.md`](issues_log.md) 2026-07-08 各条目）
+- job 静默失败：残留进程触发 cgroup OOM killer
+- `X-Session-Id` Runtime 行解析在真实链路里不匹配，原因待查（已加调试日志，等下次结果）
+
+**待明天验证：** smoke（4 GPU）排队中，等结果看 `[SESSION-ID-DEBUG]` 输出确认真实 system prompt 内容，定位为什么解析不到 Runtime 行
+
+---
+
+## 当前状态（2026-07-08）
 
 ### 已就绪
+- [x] 环境 + GPU 编译依赖
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次 `launch_openclaw_gateway()` 强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow`/`maxTokens`）+ 静态 `headers.X-Turn-Type=main`——**已实测确认生效**（`[main]` 出现在 training.log 里，训练队列真实累积样本）
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本统一用真实 `openclaw gateway run`
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + smoke `PRM_MAX_NEW_TOKENS`/`PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+
+### 已知限制 / 未解决
+- `scripts/prepare_patched_openclaw_opd.sh` 的 `X-Session-Id` Runtime 行解析**实测未生效**（一直是 `unknown`），已加调试日志（`[SESSION-ID-DEBUG]`），原因待明天的 smoke 结果确认
+- `rl-training-headers` 插件在当前 OpenClaw（2026.6.9）里端到端不生效，已放弃依赖
+- smoke（context=8192）下真实 agent 多轮对话可能撞 context overflow；minitest/8GPU（context=32768）预期不受影响
+- 提交 job 前务必确认没有残留的手动测试进程（`openclaw gateway run`、mock server 等）占用端口/内存，否则可能触发 cgroup OOM 级联杀掉整个 job
+
+### 下一步
+1. 明天查 smoke 的 `[SESSION-ID-DEBUG]` 输出，定位 `X-Session-Id` 解析失败的真实原因并修复
+2. 确认训练队列能稳定累积样本（`X-Turn-Type` 这部分已验证，只差 session_id）
+3. header workaround 全部验证通过后传播到 minitest/train_with_services.sh（目前只在 smoke 里生效）
+4. 提交 8 GPU 正式 Table 3 训练
+
+### 未验证
+- [ ] `X-Session-Id` 解析为什么在真实链路里不匹配（已加调试日志）
+- [ ] minitest 5 GPU 完整跑通
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-07，已被 7/8 实测结果部分取代）
+
+### 已就绪（7/7 时点）
 - [x] 环境 + GPU 编译依赖
 - [x] Qwen3-4B-Thinking HF + torch_dist
 - [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次 `launch_openclaw_gateway()` 强制设置，不依赖跨环境持久化）
@@ -423,19 +472,7 @@
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
-### 已知限制
-- `rl-training-headers` 插件在当前 OpenClaw（2026.6.9）里端到端不生效，`X-Session-Id` 走的是从 system prompt 解析的替代方案，偏离论文原设计，已记录
-- smoke（context=8192）下真实 agent 多轮对话可能撞 context overflow；minitest/8GPU（context=32768）预期不受影响
-
-### 下一步
-1. smoke（4 GPU）排队结果确认：`X-Session-Id` 解析是否生效、训练队列是否正常累积
-2. smoke 通过后把 header workaround 传播到 minitest/train_with_services.sh（目前只在 smoke 里生效）
-3. 提交 8 GPU 正式 Table 3 训练
-
-### 未验证
-- [ ] `X-Session-Id` 解析在真实训练链路里的效果（本地已单测通过语法/正则，未跑通真实请求）
-- [ ] minitest 5 GPU 完整跑通
-- [ ] 8 GPU 正式 Table 3 训练
+> 7/7 这些改动当时都还没实测；7/8 实测确认 `X-Turn-Type` 部分生效，`X-Session-Id` 部分不生效，需要继续排查。
 
 ---
 
