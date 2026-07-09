@@ -74,20 +74,30 @@
 port 30001 ─── Simulator（Qwen3-32B / 替代，SGLang）
                     ↕ 扮演 student/TA/teacher
 port 18789 ─── OpenClaw gateway（真正的 openclaw gateway run，workspace 文件工具）
-                    ↕ X-Turn-Type 靠 models.providers.sglang.headers 静态配置；
-                      X-Session-Id 靠解析 system prompt 里的 Runtime 行（见下）
+                    ↕ rl-training-headers 插件的 before_prompt_build 钩子往
+                      system prompt 里塞 "[RL-TRAINING-META] session_id=...
+                      turn_type=..." 标记（见下）
 port 30000 ─── RL 训练代理（openclaw-combine 启动脚本负责启动）
 ```
 
-> 2026-07-07 更新：论文原设计靠 `rl-training-headers` 插件（patch `globalThis.fetch`）
-> 注入这两个 header，但实测证实该机制在当前 OpenClaw 版本（2026.6.9）里插件加载、
-> 钩子触发都正常，唯独 header 传不到实际出站请求——是 OpenClaw 本身的实现问题，
-> 不是论文或本仓库代码的问题。现改用：`X-Turn-Type` 走 OpenClaw 官方支持的
-> provider 静态 headers 配置（`models.providers.sglang.headers`）；`X-Session-Id`
-> 没有静态配置的等价物，改为从 OpenClaw 自动注入的 system prompt Runtime 行
-> （`session=agent:<id>:openai-user:<user>`）解析，`<user>` 正是
-> `student_chat.py` 等脚本传的 `user` 字段。实现见 `scripts/prepare_patched_openclaw_opd.sh`，
-> 详细排查过程见 `issues_log.md` 2026-07-07「rl-training-headers 插件端到端失效」条目。
+> 2026-07-09 更新：论文原设计靠 `rl-training-headers` 插件 patch `globalThis.fetch`
+> 往 HTTP header 里注入 `X-Session-Id`/`X-Turn-Type`。经过完整排查（`issues_log.md`
+> 2026-07-09 全部条目）确认：**这条路在当前 OpenClaw 版本（2026.6.9）上结构性走不通**
+> ——不管是 fetch 补丁还是更底层的 undici dispatcher 拦截，OpenClaw 都加了一层
+> 专门的 SSRF 安全机制，对真实请求（非 Vitest mock）一律绕开外部注入的
+> fetch/dispatcher，没有配置开关。用直接读取 2026 年 4 月版本 OpenClaw 源码确认了：
+> 论文写插件那会儿这道安全机制还不存在，插件当年确实是有效的，是 OpenClaw 后续
+> 迭代把这条路封死的，不是论文或本仓库代码的问题。
+>
+> 现改用：插件的 `before_prompt_build` 钩子改用 `appendSystemContext` 把
+> `ctx.trigger`/`ctx.sessionId` 编码成 `[RL-TRAINING-META] session_id=... turn_type=...`
+> 标记塞进 system prompt 正文（不受上述安全机制影响，因为改的是请求内容不是传输层）；
+> `openclaw_opd_api_server.py` 补丁负责解析这段标记，并且**在转发给 sglang / 计算
+> 训练样本之前把标记清理掉**，保证策略模型和训练数据都看不到它。实现见
+> `scripts/prepare_patched_rl_training_headers.sh`（插件）和
+> `scripts/prepare_patched_openclaw_opd.sh`（服务端解析+清理），两者的部署都已
+> 接入 `smoke_train_with_services.sh`/`minitest_train_with_services.sh` 的
+> `launch_openclaw_gateway()`。
 
 ### GPU 配置阶梯（三步走）
 
@@ -127,13 +137,13 @@ export ACTOR_GPUS=2
   - 8 GPU 分配：Actor×4 + Rollout×2 + PRM×1 + PRM Teacher×1
 - Simulator 机：1×H20 96 GB（托管 Simulator LLM，外部独立）
 
-**Step B：安装 OpenClaw + 配置**（已完成，方案已更新，见上方 2026-07-07 说明）
+**Step B：安装 OpenClaw + 配置**（已完成，方案已更新，见上方 2026-07-09 说明）
 - 动作：
   1. 安装 OpenClaw 应用（https://github.com/openclaw/openclaw）
-  2. ~~启用 rl-training-headers 扩展~~ —— 不再需要：该机制端到端不生效，改用官方
-     `models.providers.sglang.headers` 静态配置（X-Turn-Type）+ `prepare_patched_openclaw_opd.sh`
-     补丁（X-Session-Id），两者都在 `scripts/smoke_train_with_services.sh` 的
-     `launch_openclaw_gateway()` 里自动生成，无需手动装插件
+  2. `rl-training-headers` 插件改用 `appendSystemContext` 版本（`prepare_patched_rl_training_headers.sh`
+     生成，部署到 OpenClaw 系统安装目录）+ `openclaw_opd_api_server.py` 补丁
+     （`prepare_patched_openclaw_opd.sh`，解析标记+转发前清理），两者都在
+     `launch_openclaw_gateway()` 里自动生成部署，无需手动装插件
   3. 修改 `~/.openclaw/openclaw.json`，设置 `providers.baseUrl = "http://0.0.0.0:30000/v1"`，`apiKey` = `SGLANG_API_KEY` 的值，`gateway.http.endpoints.chatCompletions.enabled = true`
 - 验证：`curl http://localhost:18789/v1/chat/completions`（带正确 token + `model: "openclaw/default"`）能正常转发，而非 `openclaw gateway run` 本身没有 HTTP 健康检查端点可用
 
