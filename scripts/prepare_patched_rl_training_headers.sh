@@ -140,18 +140,34 @@ export default function register(api) {
   const rlHeaderInterceptor = (dispatch) => {
     return function InterceptedDispatch(opts, handler) {
       const scopedHeaders = headerStore.getStore();
+      api.logger.info(
+        "[RL-HEADERS-DEBUG] interceptor invoked: method=%s hasScopedHeaders=%s scopedHeaders=%s origin=%s path=%s",
+        opts.method,
+        !!scopedHeaders,
+        JSON.stringify(scopedHeaders),
+        opts.origin,
+        opts.path,
+      );
       if (scopedHeaders && opts.method?.toUpperCase() === "POST") {
         opts.headers = { ...(opts.headers || {}), ...scopedHeaders };
+        api.logger.info("[RL-HEADERS-DEBUG] headers merged into opts: %s", JSON.stringify(opts.headers));
       }
       return dispatch(opts, handler);
     };
   };
 
   setGlobalDispatcher(getGlobalDispatcher().compose(rlHeaderInterceptor));
+  api.logger.info("[RL-HEADERS-DEBUG] global dispatcher composed with interceptor");
 
   api.on("before_prompt_build", (_event, ctx) => {
     const sessionId = ctx.sessionId ?? "";
     const turnType = SIDE_TRIGGERS.has(ctx.trigger ?? "") ? "side" : "main";
+    api.logger.info(
+      "[RL-HEADERS-DEBUG] before_prompt_build fired: trigger=%s sessionId=%s turnType=%s",
+      ctx.trigger,
+      sessionId,
+      turnType,
+    );
     headerStore.enterWith({
       [config.sessionIdHeader]: sessionId,
       [config.turnTypeHeader]: turnType,
