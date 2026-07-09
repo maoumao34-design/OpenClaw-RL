@@ -426,7 +426,60 @@
 
 ---
 
-## 当前状态（2026-07-08）
+## 2026-07-09
+
+**目标：** 验证 07-08 的 header workaround 在真实数据下是否有效；判断能不能修复论文原版 `rl-training-headers` 插件机制；提交 smoke/minitest 验证完整链路
+
+**完成内容：**
+- smoke（context 8192→32768 修复后）首次用真实数据完整验证：`X-Turn-Type` 静态 header + `X-Session-Id` Runtime 行解析**都确认生效**（真实 `session_id`、真实 19K+ token 的 `prompt_tokens`、真实样本入训练队列），之前怀疑的"session_id 解析失败"其实是 context=8192 太小导致真实轮次从未跑通的假象 → [`issues_log.md`](issues_log.md) 2026-07-09 第一部分
+- 完整排查论文原版插件机制能不能用：`globalThis.fetch` 补丁、更底层的 undici `setGlobalDispatcher` 都试过，最终确认 **OpenClaw 加了一层专门的 SSRF 安全机制，对所有真实请求（非 Vitest mock）无条件绕开外部注入的 fetch/dispatcher，没有配置开关**；用直接拉取 2026 年 4 月版本 OpenClaw 源码验证，论文写插件那会儿这道机制还不存在，插件当年确实有效，是后续几个月的迭代把这条路封死的，不是论文或复现代码的问题 → [`issues_log.md`](issues_log.md) 2026-07-09 第二~五部分
+- 改用 `appendSystemContext` 正文注入方案：插件把 `ctx.trigger`/`ctx.sessionId` 编码成标记塞进 system prompt，服务端补丁解析后在转发给 sglang / 计算训练样本之前清理掉，模型和训练数据都看不到这段标记——不受 SSRF 机制影响（改的是正文不是传输层）。mock server + 本地单测双重验证标记注入和清理逻辑都正确 → [`issues_log.md`](issues_log.md) 2026-07-09 第六部分，commit `be25e8b`
+- 插件 + 服务端补丁部署逻辑接入 `smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三个脚本，保持一致，静态 `X-Turn-Type` header 已废弃 → commit `df22940` / `a7d1da6` / `73ccfef`
+- 清理三种机制切换过程中的孤儿文件（`test_undici_header_injection.mjs`）和过时文档（`implementation_path.md` 架构描述更新到最新方案）→ commit `fab9560`
+
+**主要问题：**
+- smoke/minitest 连续三次（2 次 smoke + 1 次 minitest，TP=1 和 TP=2 都有）在训练进行到中途（第一轮 rollout 完成后几分钟内）无预警断线，`training.log`/`openclaw.log`/`dmesg` 均无 traceback、无 OOM 记录；minitest 也复现排除了"smoke TP=1 显存吃紧"这个猜测，看起来是更系统性的基础设施问题；交互终端和实际计算节点分离（`/tmp/ray` 在这个 shell 里查不到），拿不到 Ray 节点本地日志做更深入诊断，需要 modelfactory 平台方协助或者继续重试判断是否偶发 → [`issues_log.md`](issues_log.md) 待补充完整记录
+
+**待验证：**
+- minitest 崩溃问题是偶发还是稳定复现（重新提交中）
+- `appendSystemContext` 标记会不会污染 OpenClaw 自己持久化的多轮对话历史（真实 GPU 链路里还未观察到异常，需要更长多轮对话验证）
+- context-summarization 内部调用是否触发 `before_prompt_build`（决定 Task 摘要污染问题是否顺带解决）
+
+---
+
+## 当前状态（2026-07-09）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow=32768`/`maxTokens=4096`），不再用静态 header
+- [x] `scripts/prepare_patched_rl_training_headers.sh`：`rl-training-headers` 插件 `appendSystemContext` 版本，**已用真实 GPU 数据验证生效**（真实动态 `session_id`/`turn_type` 标记到达请求正文）
+- [x] `scripts/prepare_patched_openclaw_opd.sh`：解析标记 + 转发前清理，**已用真实 GPU 数据验证生效**
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+
+### 已知限制 / 未解决
+- **训练进行到中途无预警崩溃**（无 traceback、无 OOM 记录），连续三次复现，跟今天的改动无关，根因未查清，见上方「主要问题」
+- `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
+- context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
+
+### 下一步
+1. 重新提交 minitest，确认训练中途崩溃是偶发还是稳定复现
+2. 如稳定复现，需要 modelfactory 平台方协助拿到 Ray 节点本地日志定位根因
+3. minitest 完整跑通后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪）
+
+### 未验证
+- [ ] minitest 5 GPU 完整跑通（当前卡在中途崩溃问题）
+- [ ] `appendSystemContext` 标记多轮对话下的稳定性
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-08，已被 7/9 实测结果和机制切换取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
