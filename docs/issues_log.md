@@ -435,7 +435,7 @@ git grep -n "isMockedFetch|fetchWithRuntimeDispatcher|isAmbientGlobalFetch" FETC
 
 **处理：** 撤销所有临时调试改动，恢复到 `working-static-header-workaround` tag（`git checkout working-static-header-workaround`，服务器上手动删除临时的 `localService` 配置、恢复 `openai-completions-D8IP0i-n.js`/`openai-transport-stream-*.js`/插件 `index.js` 的 `.bak-original`/`.bak-clean-original` 备份），继续使用已验证有效的静态 header + Runtime 行解析方案。这份调查记录作为"为什么论文的 header 注入机制在当前 OpenClaw 版本上无法使用"的完整依据保留。
 
-### 第六部分（计划中）：改用 appendSystemContext 动态正文注入，替代已确认失效的 header 注入
+### 第六部分：改用 appendSystemContext 动态正文注入，替代已确认失效的 header 注入（已实现并验证）
 
 **动机：** header/dispatcher 两层注入机制均已确认结构性失效（第四、五部分），但今天早些时候已经验证过（见本文档更早的插件重写讨论）`before_prompt_build` 的 `appendSystemContext` 返回字段能把内容真实写入发给策略模型的 system prompt——这条路径完全不经过 `fetchWithSsrFGuardInternal`/`fetchWithRuntimeDispatcher` 这层，不受第五部分那道 SSRF 安全机制影响。
 
@@ -444,6 +444,33 @@ git grep -n "isMockedFetch|fetchWithRuntimeDispatcher|isAmbientGlobalFetch" FETC
 **两个未验证点（实现后必须用真实多轮对话测试确认，不能假设）：**
 1. `appendSystemContext` 追加的内容会不会被 OpenClaw 自己持久化进对话历史，导致后续轮次的 system prompt 里标记文字重复出现或者累积——如果会，需要额外处理（比如换一种更不容易被误存的写法，或者接受这个副作用但要记录清楚）
 2. OpenClaw 内部的 context-summarization 调用到底触不触发 `before_prompt_build`——如果不触发，标记天然缺失，`turn_type` 默认回落到 `"side"`，等于顺带解决了 2026-07-08/09 记录过的"内部摘要调用被误标成 main"问题；如果触发但 `ctx.trigger` 不是 `"user"`，也需要看它具体是什么值再决定要不要扩充 `SIDE_TRIGGERS`
+
+**实现 + 验证结果：**
+- `scripts/prepare_patched_rl_training_headers.sh`（插件）、`scripts/prepare_patched_openclaw_opd.sh`（服务端解析+清理）已按上述方案实现，commit `be25e8b`
+- **mock server 实测确认插件生效**：真实动态标记（`session_id='5077dd70-...' turn_type='main'`）到达了发给 sglang 的请求正文，完全绕开了第四/五部分那道 SSRF 安全机制
+- **本地单测确认服务端解析+清理逻辑正确**：用真实抓到的标记值验证，能正确解析出 `session_id`/`turn_type`，清理后 system message 内容干净（不含标记残留），无标记时正确返回 `None`/回退默认值，原始 `messages` 对象不会被意外修改
+- 部署逻辑接入 `smoke_train_with_services.sh`（commit `df22940`）、`minitest_train_with_services.sh`（commit `a7d1da6`）、`train_with_services.sh`（commit `73ccfef`），三脚本保持一致，废弃的静态 `X-Turn-Type` header workaround 已移除
+- 真实 GPU minitest 跑通期间（`session_id` 全程真实、`prompt_tokens` 正常增长）未观察到标记污染多轮历史的迹象（待验证点1），但训练本身反复中途崩溃（见第七部分），还没有跑够长的多轮对话做充分验证；待验证点2（context-summarization 是否触发 `before_prompt_build`）尚未专门验证
+
+---
+
+## [2026-07-09] minitest 训练进行到中途反复静默崩溃，根因未查明——已加 NCCL_DEBUG=INFO 诊断
+
+**现象：** 提交 minitest（5 GPU，TP=2）验证 header workaround 完整链路，连续多次在训练开始后几分钟内（第一轮 rollout 完成、进入真实梯度/优化器训练步不久）整个任务无预警断线，modelfactory 平台判定为失败。`training.log`/`openclaw.log` 均无 Python traceback，`dmesg -T`/`journalctl -k` 精确时间窗口查无 OOM killer 记录。累计复现 4 次（2 次 smoke + 2 次 minitest，TP=1 和 TP=2 都有），排除了"smoke TP=1 显存吃紧"这个最初的猜测（minitest TP=2 显存分摊更充分，同样复现）。
+
+**排查过程：**
+1. 一开始误判 `ps aux` 查不到训练进程 = 任务已死，后来发现这个交互终端和实际计算节点是分离的（`/tmp/ray` 在这个 shell 里完全不存在），`ps aux` 本来就看不到远程节点的进程，跟任务死没死无关。改用"`training.log` 最新时间戳是否还在跟系统时间同步更新"作为判断任务存活的可靠依据。
+2. 崩溃前的日志里，每次都能看到 `MegatronTrainRayActor` 打印 `rerun_state_machine.py:1300 - Implicit initialization of Rerun State Machine!` + `RerunStateMachine initialized in mode RerunMode.DISABLED`（TP=2 时两个 Actor 进程同时打印），一开始怀疑这是崩溃的直接原因。
+3. 直接查本地 `Megatron-LM` 源码（`rerun_state_machine.py`）确认：
+   - "Implicit initialization" 只是懒加载——`train_step()` 每次迭代第一行都调用 `get_rerun_state_machine()`，第一次调用时才初始化，纯粹是"第一次真正的训练步骤开始了"的时间标记，不是被异常触发的
+   - `RerunMode.DISABLED` 模式下，`validate_result()` 如果真检测到 NaN/Inf，依然会抛出 `RuntimeError`（有 traceback）——跟观察到的"完全静默、无 traceback"对不上，**这条线索被排除，不是崩溃的直接原因**
+4. 顺带查出一个真实存在、但与本次崩溃无直接关联的 bug：`slime`（RL 框架）从未调用 Megatron 官方的 `initialize_megatron()`/`initialize_rerun_state_machine()`，导致 `--rerun-mode` 参数（官方默认 `validate_results`）从未真正生效，`RerunStateMachine` 永远走隐式初始化的硬编码默认值 `DISABLED`。这是 `slime`/`Megatron-LM` 集成上的缺口，`CLAUDE.md` 里这两个目录标注为"可以读、改、使用"，理论上能修，但因为（a）不确定跟这次崩溃有没有关系，（b）改分布式训练初始化时机风险较高，暂缓修复，优先级排在下面的 NCCL 诊断之后。
+
+**当前最可能的方向（未确认）：** "完全静默、无 traceback、无 OOM、总在第一次真正的分布式梯度同步/优化器步骤开始后不久发生"这个模式，更符合 NCCL 层面的分布式通信挂起/死锁特征——这类问题通常不产生 Python 异常（进程卡住而不是崩溃）。
+
+**处理：** 在 `run_openclaw_topk_select_modelfactory.sh` 的 `RUNTIME_ENV_JSON` 里加 `NCCL_DEBUG=INFO`，对 smoke/minitest/8GPU 统一生效，commit `d84b71c`。这是临时诊断手段（日志会很啰嗦），目的是下次复现时拿到 NCCL 自己的诊断输出作为真实证据，而不是继续猜测。
+
+**待验证：** 下次 minitest 重跑，若再次复现同样的静默崩溃，检查 NCCL_DEBUG 输出定位真实原因。
 
 ---
 
