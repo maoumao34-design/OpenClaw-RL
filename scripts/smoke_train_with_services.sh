@@ -97,10 +97,13 @@ mkdir -p "${LOGS_DIR}"
 # 会直接 400。生成一份改了这一个字段的补丁副本，官方目录本身不动。
 bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLAW_DIR}"
 
-# rl-training-headers 插件的 X-Session-Id 注入在这个 OpenClaw 版本里不生效（实测：
-# 钩子触发、fetch 被 patch，但出站请求收不到 header）。X-Session-Id 没有静态配置
-# 等价物（按对话区分），从 OpenClaw 自己嵌在 system prompt 里的 Runtime 行解析
-# session_id 作为兜底。详见 scripts/prepare_patched_openclaw_opd.sh 顶部注释。
+# header/dispatcher 注入均已确认在这个 OpenClaw 版本上结构性失效——OpenClaw 加了
+# 一层 SSRF 安全机制，绕开所有外部注入的 fetch/dispatcher，无配置开关（详见
+# docs/issues_log.md 2026-07-09 第四/五部分）。改用 appendSystemContext 往
+# system prompt 正文里塞 "[RL-TRAINING-META] session_id=... turn_type=..." 标记，
+# 服务端解析后在转发给 sglang / 计算训练样本之前清理掉，模型和训练数据都看不到这段
+# 标记。详见 scripts/prepare_patched_rl_training_headers.sh 和
+# scripts/prepare_patched_openclaw_opd.sh 顶部注释。
 PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
 bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
 
@@ -199,6 +202,22 @@ launch_openclaw_gateway() {
     echo "[verify] gateway.http.endpoints.chatCompletions.enabled = $(openclaw config get gateway.http.endpoints.chatCompletions.enabled 2>&1 | tail -1)" \
         | tee -a "${LOGS_DIR}/openclaw.log"
 
+    # 部署 rl-training-headers 插件（appendSystemContext 版本，见上方 PATCHED_OPD_DIR
+    # 注释）。写入 OpenClaw 自己的系统安装目录（openclaw plugins list --verbose 确认的
+    # source 路径），不是插件扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里，
+    # 没有指向任意目录加载插件的机制。这台机器上这个目录跟其他服务（code-server 等）
+    # 共享，每次 smoke 都会覆盖，只影响这一个插件自己的文件。
+    echo "生成并部署 rl-training-headers 插件（appendSystemContext 版本）..." \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+    PATCHED_PLUGIN_DIR="${LOGS_DIR}/patched-rl-training-headers"
+    bash "${SCRIPTS_DIR}/prepare_patched_rl_training_headers.sh" "${REPO_ROOT}" "${PATCHED_PLUGIN_DIR}"
+    SYSTEM_PLUGIN_DIR="/usr/lib/node_modules/openclaw/dist/extensions/rl-training-headers"
+    mkdir -p "${SYSTEM_PLUGIN_DIR}"
+    cp "${PATCHED_PLUGIN_DIR}/index.js" "${SYSTEM_PLUGIN_DIR}/index.js"
+    cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.plugin.json"
+    cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
+    openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
+
     # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，不知道
     # 真实的 contextWindow/maxTokens，会用过大的默认值请求 max_completion_tokens
     # （实测 178210），被 sglang 400 拒绝。显式声明，maxTokens 明显小于
@@ -219,11 +238,9 @@ cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
 d = json.loads(cfg.read_text())
 sg = d.setdefault('models', {}).setdefault('providers', {}).setdefault('sglang', {})
 sg['api'] = 'openai-completions'
-# rl-training-headers 插件（X-Session-Id/X-Turn-Type 注入）在这个 OpenClaw 版本里
-# 加载和钩子都正常，但 fetch patch 传不到实际出站请求（OpenAI JS SDK 客户端不会
-# 每次请求重新读 globalThis.fetch），已实测证实。X-Turn-Type 用官方 headers 静态
-# 配置代替：这条流水线里的调用全部是真实 main turn，从不触发 heartbeat/memory/cron。
-sg['headers'] = {'X-Turn-Type': 'main'}
+# 不再用静态 X-Turn-Type header（写死 'main' 分不清真实轮次和 OpenClaw 内部的
+# context-summarization 兜底调用）。改用插件的 appendSystemContext 动态标记，
+# 见上方 PATCHED_OPD_DIR/插件部署那两处注释。
 sg['models'] = [{
     'id': 'qwen3-4b',
     'name': 'Qwen3-4B-Thinking (RL policy, smoke)',
