@@ -367,14 +367,33 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 **直接验证（关键）：** 本地 `openclaw` 仓库原本是浅克隆（只有最新一个 commit），用 `git fetch --depth=1 origin <2026-04-04 附近的具体 commit sha>`（sha 通过 GitHub API `https://api.github.com/repos/openclaw/openclaw/commits?until=2026-04-04T23:59:59Z` 查到）单独拉取了这个历史时间点的完整代码树，直接读当时的源码：
 
-- 当时的 OpenAI 传输代码在 `src/agents/openai-transport-stream.ts`（现在已经不存在于这个路径，说明中间发生过大重构），客户端构造函数 `createOpenAIResponsesClient` **显式传了 `fetch: buildGuardedModelFetch(model)`**，并且 `buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders)` **有一个显式的 `turnHeaders` 参数**会被合并进 `defaultHeaders`——每轮动态 header 在当时是官方代码里的第一等公民特性，不是要靠外部插件 hack 进去的东西。
+- 当时的 OpenAI 传输代码在 `src/agents/openai-transport-stream.ts`（**更正**：这次继续调查证实这个文件现在仍然存在，不是被移除了——见下方第四部分，当初这句判断是错的，是没有确认清楚就下的结论），客户端构造函数 `createOpenAIResponsesClient` **显式传了 `fetch: buildGuardedModelFetch(model)`**，并且 `buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders)` **有一个显式的 `turnHeaders` 参数**会被合并进 `defaultHeaders`——每轮动态 header 在当时是官方代码里的第一等公民特性，不是要靠外部插件 hack 进去的东西。
 - 追进 `buildGuardedModelFetch` → `fetchWithSsrFGuard`（`src/infra/net/fetch-guard.ts`），关键一行：`const fetcher: FetchLike | undefined = params.fetchImpl ?? globalThis.fetch;`——**当时 OpenClaw 自己的传输层代码，每次发请求都会动态重新读取一次 `globalThis.fetch`**。
 
-**结论（有源码证据，非推测）：** 论文写插件那会儿（约 2026.3-4 月），OpenClaw 自身的传输代码有意设计成动态读取 `globalThis.fetch`，所以插件的 `globalThis.fetch` 打补丁机制在当时是真实有效的。这套"动态重读"的架构在 4 月到 6 月之间被重构/移除——现在的 `createClient()`（`src/llm/providers/openai-completions.ts`）不再有这层封装，直接交给 `openai` SDK 自己的（大概率是静态、只读一次的）默认 fetch 解析。**不是我们装的版本有问题、也不是漏看了配置，是 OpenClaw 项目本身在这几个月的快速迭代（同期 CHANGELOG 显示单周合并 400+ PR）中，把论文依赖的这个底层机制改掉了。**
+**结论（有源码证据，非推测，2026-07-09 当天后续已修正细节，见第四部分）：** 论文写插件那会儿（约 2026.3-4 月），OpenClaw 自身的传输代码有意设计成动态读取 `globalThis.fetch`，所以插件的 `globalThis.fetch` 打补丁机制在当时是真实有效的。**不是我们装的版本有问题、也不是漏看了配置，是 OpenClaw 项目本身在这几个月的快速迭代（同期 CHANGELOG 显示单周合并 400+ PR）中，把论文依赖的这个底层机制改掉了**——但"改掉"的具体方式比最初判断的更精细，见下方第四部分。
 
-### 下一步（待验证）
+### 第四部分：修正——机制没有被移除，是被一道新加的门槛挡住了
 
-尝试针对性修复：给当前版本的 `createClient()`（编译后的 `openai-completions.js`，位置待确认）补一个动态读取 `globalThis.fetch` 的薄包装 `fetch` 参数（不需要复原整套 SSRF 防护架构），恢复官方插件机制原本依赖的行为。这需要直接改 OpenClaw 自己编译后的核心文件（不是插件扩展目录），风险和影响范围比之前的改动都大，需要谨慎验证。如果这个方向也不可行，回退到 `working-static-header-workaround` tag（已用真实数据验证过），并保留这份调查记录作为"为什么不能用官方机制"的依据。
+**背景：** 打算按上面的思路，在当前版本的 `createClient()`（`src/llm/providers/openai-completions.ts`，编译后 `dist/openai-completions-D8IP0i-n.js`）里补一个动态读取 `globalThis.fetch` 的 `fetch` 参数。备份原文件后插入调试日志（`console.error` 打印 `sessionId`/`compat.sendSessionAffinityHeaders`），部署到服务器，用真实请求测试。
+
+**关键发现（推翻了第三部分的部分结论）：** 调试日志**从未触发**——说明 `openai-completions.ts` 的 `createClient()` 根本没有被我们的 sglang provider 请求调用过。追下去发现：OpenClaw 有独立的 `extensions/sglang/` provider 插件，只注册了 `auth`/`catalog.run`/消息重放逻辑，**没有自己的 HTTP 客户端构造代码**；真正的请求分发是通过 `src/agents/provider-transport-stream.ts` 的 `hasOpenClawTransportRequirement(model)` 判断（检查 `request.proxy || request.tls || getModelProviderLocalService(model)`）：
+
+- 条件为真 → 走 `src/agents/openai-transport-stream.ts` 的 `createOpenAICompletionsClient()`——**这个函数现在依然存在，依然显式传 `fetch: buildGuardedModelFetch(model)`（动态读取 `globalThis.fetch`），一行没有被移除**
+- 条件为假（我们目前的情况）→ 走 `openai-completions.ts` 的 `createClient()`，也就是我们插了调试日志、确认从未被触发的那个函数
+
+**用户提出的关键问题：** 会不会是论文原作者的部署本来就配置了真的本地服务管理（`localService`），而不是我们漏看了什么？
+
+**验证（用已经拉取的 2026-04-04 附近历史代码）：**
+```
+git grep -n "hasOpenClawTransportRequirement" FETCH_HEAD -- '*.ts'   → 零匹配
+```
+**`hasOpenClawTransportRequirement` 这道门槛判断在 4 月版本里完全不存在**。当时 `createOpenAICompletionsClient`（动态读取 `globalThis.fetch` 那个版本）是被**无条件直接调用**的（`openai-transport-stream.ts:949`），不需要任何 `localService`/`proxy`/`tls` 配置。
+
+**修正后的结论：** 论文插件当年能用，不是因为默认配置里悄悄开了 `localService`，而是因为 4 月那会儿根本没有这道门槛——所有 OpenAI 兼容类型的 provider，默认都会走动态读取 `globalThis.fetch` 的那条路径。**这道门槛判断是 4 月到 6 月之间新加进去的**，把原本无条件的默认行为收窄成了需要满足特定条件才能触达——`globalThis.fetch` 动态读取这个机制本身**从未被移除**，只是现在默认路径不再通向它。
+
+**下一步（待验证，测试中）：** 给 `models.providers.sglang` 加一个 `localService` 配置块（`command` 指向一个无害的空操作可执行文件如 `/bin/true`，真实请求仍然走已配置的 `baseUrl`），让 `getModelProviderLocalService(model)` 返回真值，从而满足 `hasOpenClawTransportRequirement`，把请求引导到仍然保留着动态 `globalThis.fetch` 读取行为的 `openai-transport-stream.ts` 路径上——这样官方插件原始的 `globalThis.fetch` 补丁机制应该就能不做任何代码改动直接生效。**这不是滥用 `localService` 这个功能**（我们的 sglang 由训练框架自己管理生命周期，不能真的交给 OpenClaw spawn，所以用无害空操作命令只是为了满足这道后加的门槛判断，恢复到 4 月版本本来就有的无条件默认行为，性质上更接近"绕开一个新加的限制"，不是钻空子）。
+
+如果这条路验证通过：把之前的调试日志（`createClient()` 里的 `console.error`）从 `dist/openai-completions-D8IP0i-n.js` 移除，恢复到备份版本（`.bak-original`），确认不需要碰这个核心文件。如果不通过：回退到 `working-static-header-workaround` tag。
 
 ---
 
