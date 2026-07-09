@@ -1,27 +1,38 @@
 #!/bin/bash
-# Patch openclaw_opd_api_server.py's session_id derivation.
+# Patch openclaw_opd_api_server.py's session_id/turn_type derivation.
 #
 # Why: the paper's intended mechanism for X-Session-Id/X-Turn-Type is the
-# official `rl-training-headers` OpenClaw plugin (patches globalThis.fetch,
-# hooks before_prompt_build). Verified empirically on this OpenClaw build
-# (2026.6.9) that the hook fires and fetch is patched, but the headers never
-# reach the actual outbound HTTP call -- OpenClaw's provider transport (OpenAI
-# JS SDK client) does not re-read globalThis.fetch per request. This is an
-# OpenClaw-internal incompatibility, not something in the paper or in
-# OpenClaw-RL-official.
+# official `rl-training-headers` OpenClaw plugin, which injects HTTP headers
+# via a before_prompt_build hook. Confirmed via extensive source-level
+# investigation (2026-07-09, docs/issues_log.md) that on this OpenClaw build
+# (2026.6.9), NO header/dispatcher-based injection mechanism can reach a real
+# outbound request -- OpenClaw added a deliberate SSRF-safety layer
+# (fetchWithSsrFGuardInternal / fetchWithRuntimeDispatcher) that bypasses any
+# externally-patched fetch/dispatcher for all non-Vitest-mock requests, with
+# no config escape hatch. This is a structural, intentional security boundary
+# in the current OpenClaw version, not present when the paper's plugin was
+# written (~2026.3-4), confirmed by reading OpenClaw's actual source from
+# that era.
 #
-# X-Turn-Type is recovered via OpenClaw's own official static-header config
-# (models.providers.sglang.headers -> "X-Turn-Type": "main"; safe as a
-# constant here because this pipeline never triggers OpenClaw's
-# heartbeat/memory/cron "side" traffic -- every call is a real student/TA/
-# teacher turn). No code change needed for turn_type.
+# Working alternative: the patched plugin (scripts/prepare_patched_rl_training_headers.sh)
+# uses before_prompt_build's `appendSystemContext` return field instead --
+# this modifies request CONTENT, not transport, so it is unaffected by the
+# SSRF-safety bypass. It encodes ctx.trigger/ctx.sessionId as a
+# "[RL-TRAINING-META] session_id=... turn_type=..." marker appended to the
+# system prompt. This file's patch:
+#   1. Parses that marker out of `messages` as a fallback for session_id/turn_type
+#      (still lower priority than explicit X-Session-Id/X-Turn-Type headers or
+#      body fields, in case those ever start working again on a future OpenClaw
+#      version).
+#   2. Strips the marker text out of `messages` BEFORE forwarding to sglang and
+#      BEFORE computing training-sample prompt_ids -- so neither the policy
+#      model nor the training data ever sees the marker. Verified this keeps
+#      model-facing and training-facing content identical to what the paper's
+#      (never-working-here) header mechanism would have produced.
 #
-# X-Session-Id has no static equivalent (it's per-conversation). OpenClaw
-# embeds "session=agent:<agentId>:openai-user:<user>" in its own Runtime line
-# inside the first system message on every call, where <user> is exactly the
-# OpenAI `user` field student_chat.py/TA_chat.py/teacher_chat.py already set
-# to a stable per-session id. This patch extracts it as a fallback when the
-# header/body fields are absent.
+# The old Runtime-line session_id fallback (from OpenClaw's own "Runtime:"
+# line, unrelated to the plugin) is kept as a lower-priority fallback below
+# the marker -- harmless to keep, doesn't hurt if the marker is ever absent.
 #
 # This is a deviation from the paper's plugin-based design -- documented in
 # docs/issues_log.md. Official openclaw-opd/ directory is left untouched; this
@@ -47,11 +58,15 @@ import sys
 src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(src_path, encoding="utf-8").read()
 
-old_session_line = 'session_id = x_session_id or body.get("session_id") or "unknown"'
-if old_session_line not in text:
+old_block = (
+    '            body = await request.json()\n'
+    '            session_id = x_session_id or body.get("session_id") or "unknown"\n'
+    '            turn_type = (x_turn_type or body.get("turn_type") or "side").strip().lower()\n'
+)
+if old_block not in text:
     raise SystemExit(
-        "patch failed: expected session_id line not found in openclaw_opd_api_server.py "
-        "(official file may have changed upstream -- update this patch)"
+        "patch failed: expected chat_completions body/session_id/turn_type block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
     )
 
 class_marker = "class OpenClawOPDAPIServer"
@@ -60,10 +75,12 @@ if class_marker not in text:
 
 helper = '''
 _RUNTIME_SESSION_RE = re.compile(r"session=agent:[^:]+:openai-user:(\\S+)")
+_RL_META_RE = re.compile(r"\\[RL-TRAINING-META\\] session_id=(\\S*) turn_type=(\\S*)")
 
 
 def _extract_session_id_from_system_prompt(messages):
-    """Fallback session id when X-Session-Id/body.session_id are absent.
+    """Fallback session id when X-Session-Id/body.session_id/RL-TRAINING-META
+    marker are all absent.
 
     OpenClaw's own Runtime line (embedded in the first system message) carries
     "session=agent:<agentId>:openai-user:<user>", where <user> is exactly the
@@ -92,19 +109,67 @@ def _extract_session_id_from_system_prompt(messages):
     )
     return None
 
+
+def _extract_rl_meta_from_messages(messages):
+    """Read the (session_id, turn_type) pair the patched rl-training-headers
+    plugin appends to the system prompt via before_prompt_build's
+    appendSystemContext (header injection is confirmed structurally
+    impossible on this OpenClaw build -- see docs/issues_log.md). Either
+    element may be None if the marker is absent or a field is empty.
+    """
+    if not isinstance(messages, list):
+        return None, None
+    for msg in messages:
+        if not isinstance(msg, dict) or msg.get("role") != "system":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue
+        match = _RL_META_RE.search(content)
+        if match:
+            session_id = match.group(1) or None
+            turn_type = match.group(2) or None
+            return session_id, turn_type
+    return None, None
+
+
+def _strip_rl_meta_from_messages(messages):
+    """Remove the RL-TRAINING-META marker from system message content.
+
+    Must run before the messages are forwarded to sglang and before training
+    prompt_ids are computed, so neither the policy model nor the training
+    data ever sees this plugin-internal marker text.
+    """
+    if not isinstance(messages, list):
+        return messages
+    cleaned = []
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "system" and isinstance(msg.get("content"), str):
+            new_content = _RL_META_RE.sub("", msg["content"]).rstrip()
+            if new_content != msg["content"]:
+                msg = {**msg, "content": new_content}
+        cleaned.append(msg)
+    return cleaned
+
 '''
 
 text = text.replace(class_marker, helper + "\n" + class_marker, 1)
 
-new_session_lines = (
-    'session_id = (\n'
+new_block = (
+    '            body = await request.json()\n'
+    '            _rl_meta_session_id, _rl_meta_turn_type = _extract_rl_meta_from_messages(body.get("messages"))\n'
+    '            if isinstance(body.get("messages"), list):\n'
+    '                body["messages"] = _strip_rl_meta_from_messages(body["messages"])\n'
+    '            session_id = (\n'
     '                x_session_id\n'
     '                or body.get("session_id")\n'
+    '                or _rl_meta_session_id\n'
     '                or _extract_session_id_from_system_prompt(body.get("messages"))\n'
     '                or "unknown"\n'
-    '            )'
+    '            )\n'
+    '            turn_type = (x_turn_type or body.get("turn_type") or _rl_meta_turn_type or "side").strip().lower()\n'
 )
-text = text.replace(old_session_line, new_session_lines, 1)
+text = text.replace(old_block, new_block, 1)
 
 if "\nimport re\n" not in text:
     text = text.replace("import json\n", "import json\nimport re\n", 1)

@@ -1,32 +1,30 @@
 #!/bin/bash
 # Patch the official rl-training-headers OpenClaw plugin's injection mechanism.
 #
-# Why: the plugin's original injection technique -- monkey-patching
-# globalThis.fetch inside before_prompt_build -- is confirmed non-functional
-# on this OpenClaw build (2026.6.9): headers never reach the actual outbound
-# request (verified via CPU-only mock-server packet capture, 2026-07-07).
-# Root cause (verified via OpenClaw source tracing, 2026-07-09): OpenClaw's
-# provider transport constructs a brand-new `openai` SDK client on every
-# single completion call (openai-completions.ts createClient(), no caching),
-# and never passes an explicit `fetch` option -- it relies on the SDK's own
-# default fetch resolution, which most likely captures a `fetch` reference at
-# `openai` package module-load time, before any plugin code ever runs. This
-# makes patching globalThis.fetch permanently ineffective regardless of
-# plugin-registration timing.
+# Why: exhaustively investigated (docs/issues_log.md, 2026-07-09) two
+# transport-layer injection techniques -- the official plugin's
+# globalThis.fetch monkey-patch, and an undici setGlobalDispatcher variant --
+# and confirmed BOTH are structurally impossible on this OpenClaw build
+# (2026.6.9): OpenClaw added a deliberate SSRF-safety layer
+# (fetchWithSsrFGuardInternal / fetchWithRuntimeDispatcher) that bypasses any
+# externally-patched fetch/dispatcher for every real (non-Vitest-mock)
+# outbound request, with no config escape hatch. Confirmed via reading
+# OpenClaw's own source from ~2026-03/04 (when the paper's plugin was
+# authored) that this bypass layer did not exist then -- it's a security
+# hardening added between April and June 2026, not a config gap or bad
+# install.
 #
-# Fix: intercept one layer below the cached fetch reference, at undici's
-# global dispatcher (Node's built-in fetch is undici-based; the dispatcher is
-# resolved per-call from a global Symbol.for() registry, not baked into
-# whichever fetch function got cached). Verified working in isolation via
-# scripts/test_undici_header_injection.mjs (2026-07-09, PASS: headers reached
-# a freshly-constructed openai SDK client's outbound request).
-#
-# ONLY the injection mechanism changes. The classification logic --
-# before_prompt_build hook, ctx.trigger/ctx.sessionId, SIDE_TRIGGERS set -- is
-# left byte-for-byte identical to the official plugin. This is a deviation
-# from the paper's shipped plugin code, documented in docs/issues_log.md:
-# the official injection technique doesn't work on this OpenClaw version: we
-# swapped the transport-layer technique, not the design.
+# Fix: inject via request CONTENT instead of transport. before_prompt_build's
+# `appendSystemContext` return field writes into the system prompt that
+# actually gets sent -- this is unaffected by the SSRF-safety bypass since it
+# never touches fetch/dispatcher machinery at all. The classification logic
+# (ctx.trigger/ctx.sessionId, SIDE_TRIGGERS) is unchanged from the official
+# plugin. The counterpart patch (prepare_patched_openclaw_opd.sh) parses this
+# marker out of `messages` server-side AND strips it before forwarding to
+# sglang / before computing training prompt_ids, so neither the policy model
+# nor the training data ever sees it -- verified this keeps model-facing and
+# training-facing content identical to what the paper's (never-working-here)
+# header mechanism would have produced.
 #
 # Official OpenClaw-RL-official/extensions/rl-training-headers/ is left
 # untouched; this writes a patched copy (as plain JS, matching the
@@ -46,7 +44,6 @@ fi
 mkdir -p "${DEST_DIR}"
 
 python3 - "${SRC}" "${DEST_DIR}/index.js" <<'PY'
-import re
 import sys
 
 src_path, dest_path = sys.argv[1], sys.argv[2]
@@ -114,91 +111,32 @@ if old_block not in text:
         "(official plugin may have changed upstream -- update this patch)"
     )
 
-new_js = '''import { AsyncLocalStorage } from "node:async_hooks";
-import { getGlobalDispatcher, setGlobalDispatcher } from "undici";
-
-function resolveConfig(api) {
-  const cfg = api.pluginConfig ?? {};
-  return {
-    sessionIdHeader: cfg.sessionIdHeader ?? "X-Session-Id",
-    turnTypeHeader: cfg.turnTypeHeader ?? "X-Turn-Type",
-  };
-}
-
-// Triggers classified as "side" (non-user-facing housekeeping runs).
-// Identical to the official plugin -- only the injection mechanism below
-// (undici global dispatcher instead of globalThis.fetch) changed, because
-// globalThis.fetch patching is confirmed dead on this OpenClaw build: the
-// openai SDK's default fetch resolution never re-reads it (see
-// docs/issues_log.md 2026-07-09).
+new_js = '''// Triggers classified as "side" (non-user-facing housekeeping runs).
+// Identical to the official plugin's classification logic. Only the
+// injection mechanism changed: the official plugin patches globalThis.fetch
+// to add HTTP headers, confirmed structurally impossible on this OpenClaw
+// build (a deliberate SSRF-safety layer bypasses any externally-patched
+// fetch/dispatcher for real requests -- see docs/issues_log.md 2026-07-09).
+// This version instead appends a machine-parseable marker to the system
+// prompt via before_prompt_build's appendSystemContext field, which is
+// unaffected by that bypass since it modifies request content, not
+// transport. The server-side counterpart (openclaw_opd_api_server.py patch)
+// parses this marker out AND strips it before forwarding to the policy
+// model / before computing training data, so this marker never reaches the
+// model or the training set.
 const SIDE_TRIGGERS = new Set(["heartbeat", "memory", "cron"]);
-
-const RL_DISPATCHER_SYMBOL = Symbol.for("undici.globalDispatcher.2");
-const RL_LEGACY_DISPATCHER_SYMBOL = Symbol.for("undici.globalDispatcher.1");
-let rlRegisterCallCount = 0;
+const RL_META_PREFIX = "[RL-TRAINING-META]";
 
 export default function register(api) {
-  rlRegisterCallCount += 1;
-  const registerInstanceId = rlRegisterCallCount;
-  const config = resolveConfig(api);
-  const headerStore = new AsyncLocalStorage();
-
-  const rlHeaderInterceptor = (dispatch) => {
-    return function InterceptedDispatch(opts, handler) {
-      const scopedHeaders = headerStore.getStore();
-      api.logger.info(
-        `[RL-HEADERS-DEBUG#${registerInstanceId}] interceptor invoked: method=${opts.method} ` +
-        `hasScopedHeaders=${!!scopedHeaders} scopedHeaders=${JSON.stringify(scopedHeaders)} ` +
-        `origin=${opts.origin} path=${opts.path}`,
-      );
-      if (scopedHeaders && opts.method?.toUpperCase() === "POST") {
-        opts.headers = { ...(opts.headers || {}), ...scopedHeaders };
-        api.logger.info(`[RL-HEADERS-DEBUG#${registerInstanceId}] headers merged into opts: ${JSON.stringify(opts.headers)}`);
-      }
-      return dispatch(opts, handler);
-    };
-  };
-
-  // OpenClaw's own src/infra/net/undici-global-dispatcher.ts periodically
-  // calls forceResetGlobalDispatcher() (proxy-refresh lifecycle hook,
-  // independent of a fixed startup order -- confirmed via source tracing
-  // 2026-07-09) which replaces the global dispatcher with a fresh plain
-  // Agent, silently discarding whatever was composed onto it before,
-  // including ours. Rather than fight over who sets it last once, keep
-  // re-asserting our interceptor on top of whatever the current dispatcher
-  // is, on a short interval, so any reset gets covered within ~1s.
-  let ourDispatcher = null;
-
-  const reassertDispatcher = (label) => {
-    const current = globalThis[RL_DISPATCHER_SYMBOL];
-    if (current !== ourDispatcher) {
-      api.logger.info(
-        `[RL-HEADERS-DEBUG#${registerInstanceId}] ${label}: dispatcher changed externally ` +
-        `(was ${ourDispatcher?.constructor?.name ?? "none"}, now ${current?.constructor?.name}) -- recomposing`,
-      );
-      setGlobalDispatcher(current.compose(rlHeaderInterceptor));
-      ourDispatcher = globalThis[RL_DISPATCHER_SYMBOL];
-    }
-  };
-
-  reassertDispatcher("initial");
-  setInterval(() => reassertDispatcher("interval-recheck"), 1000);
-
   api.on("before_prompt_build", (_event, ctx) => {
     const sessionId = ctx.sessionId ?? "";
     const turnType = SIDE_TRIGGERS.has(ctx.trigger ?? "") ? "side" : "main";
-    api.logger.info(
-      `[RL-HEADERS-DEBUG#${registerInstanceId}] before_prompt_build fired: ` +
-      `trigger=${ctx.trigger} sessionId=${sessionId} turnType=${turnType}`,
-    );
-    headerStore.enterWith({
-      [config.sessionIdHeader]: sessionId,
-      [config.turnTypeHeader]: turnType,
-    });
-    return {};
+    return {
+      appendSystemContext: `\\n\\n${RL_META_PREFIX} session_id=${sessionId} turn_type=${turnType}`,
+    };
   });
 
-  api.logger.info("rl-training-headers: activated (undici dispatcher patched)");
+  api.logger.info("rl-training-headers: activated (appendSystemContext marker)");
 }
 '''
 
@@ -231,7 +169,7 @@ cat > "${DEST_DIR}/package.json" <<'JSON'
   "name": "@openclaw/rl-training-headers",
   "version": "1.0.0-patched",
   "private": true,
-  "description": "Injects X-Session-Id and X-Turn-Type HTTP headers into LLM API requests for RL training data classification (undici-dispatcher injection, patched for OpenClaw 2026.6.9 -- see docs/issues_log.md)",
+  "description": "Marks X-Session-Id/X-Turn-Type equivalent metadata via an appendSystemContext marker for RL training data classification (header/dispatcher injection confirmed structurally blocked on OpenClaw 2026.6.9 -- see docs/issues_log.md)",
   "type": "module",
   "openclaw": {
     "extensions": [
