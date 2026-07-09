@@ -181,7 +181,9 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 **根因：** smoke 把 Actor 从官方 TP=4 强行缩到 TP=1，整个 4B 模型 + 梯度 + 权重同步缓冲全部挤在一张卡，无张量并行分摊显存。此前从未真正走到 `update_weights()`（训练队列一直是 0），OOM 是链路修复后第一次暴露。
 
-**评估：** minitest（TP=2）/ 8GPU 正式（TP=4）显存分摊更充分，理论上不会复现；若 minitest 也 OOM 则需进一步排查 `update_weight_from_distributed.py` 是否有不必要的全量 gather。**未在 smoke 上追加修复**（低优先级，smoke 本不要求跑完整训练）。
+**评估（已被后续实测部分推翻，见下方更正）：** minitest（TP=2）/ 8GPU 正式（TP=4）显存分摊更充分，理论上不会复现；若 minitest 也 OOM 则需进一步排查 `update_weight_from_distributed.py` 是否有不必要的全量 gather。**未在 smoke 上追加修复**（低优先级，smoke 本不要求跑完整训练）。
+
+**更正（2026-07-09）：** 这条评估只针对 **GPU 显存**维度成立。minitest（TP=2）在 `update_weights()` 同一触发点确实复现了 OOM，但资源种类是**节点系统内存**（128GB 节点打满），跟这里说的 TP 显存分摊无关——是两种不同资源、同一个崩溃触发点。详见 [2026-07-09 update_weights() 节点内存 OOM] 条目。
 
 ---
 
@@ -454,7 +456,7 @@ git grep -n "isMockedFetch|fetchWithRuntimeDispatcher|isAmbientGlobalFetch" FETC
 
 ---
 
-## [2026-07-09] minitest 训练进行到中途反复静默崩溃，根因未查明——已加 NCCL_DEBUG=INFO 诊断
+## [2026-07-09] minitest 训练进行到中途反复静默崩溃——根因已确认：节点系统内存 OOM（非 GPU 显存、非 NCCL），与 [2026-07-06 update_weights() OOM] 同类问题
 
 **现象：** 提交 minitest（5 GPU，TP=2）验证 header workaround 完整链路，连续多次在训练开始后几分钟内（第一轮 rollout 完成、进入真实梯度/优化器训练步不久）整个任务无预警断线，modelfactory 平台判定为失败。`training.log`/`openclaw.log` 均无 Python traceback，`dmesg -T`/`journalctl -k` 精确时间窗口查无 OOM killer 记录。累计复现 4 次（2 次 smoke + 2 次 minitest，TP=1 和 TP=2 都有），排除了"smoke TP=1 显存吃紧"这个最初的猜测（minitest TP=2 显存分摊更充分，同样复现）。
 
@@ -470,7 +472,42 @@ git grep -n "isMockedFetch|fetchWithRuntimeDispatcher|isAmbientGlobalFetch" FETC
 
 **处理：** 在 `run_openclaw_topk_select_modelfactory.sh` 的 `RUNTIME_ENV_JSON` 里加 `NCCL_DEBUG=INFO`，对 smoke/minitest/8GPU 统一生效，commit `d84b71c`。这是临时诊断手段（日志会很啰嗦），目的是下次复现时拿到 NCCL 自己的诊断输出作为真实证据，而不是继续猜测。
 
-**待验证：** 下次 minitest 重跑，若再次复现同样的静默崩溃，检查 NCCL_DEBUG 输出定位真实原因。
+**待验证（已解决，见下方更新）：** ~~下次 minitest 重跑，若再次复现同样的静默崩溃，检查 NCCL_DEBUG 输出定位真实原因。~~
+
+### 更新（2026-07-09 当天，加 NCCL_DEBUG=INFO 后重跑）：真实根因浮出水面
+
+**现象：** 加 `NCCL_DEBUG=INFO` 后重新提交 minitest，这次训练推进得更远（INIT 阶段基本走完，进入 Joint round，`Final collected 16 samples from rollout to train`、`perf 1: {'rollout/prm_eval_score': 0.5, ...}` 均为真实数据），随后崩溃——但这次 `training.log` 第一次留下了完整 Python traceback（此前 4 次全部静默无 traceback）：
+
+```
+Traceback (most recent call last):
+  File ".../slime/train_async.py", line 156, in train
+    actor_model.update_weights()
+  File ".../slime/slime/ray/actor_group.py", line 125, in update_weights
+    return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+...
+ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update_weights()
+  File ".../update_weight_from_distributed.py", line 81, in update_weights
+    ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+ray.exceptions.OutOfMemoryError: Task was killed due to the node running low on memory.
+Memory on the node (IP: 172.18.250.100, ...) where the lease (name=SGLangEngine.__init__, pid=3719, memory used=0.68GB)
+was running was 126.63GB / 128.00GB (0.989315), which exceeds the memory usage threshold of 0.95.
+Ray killed this worker...
+Top 10 memory users:
+PID     MEM(GB) COMMAND
+3565    45.16   ray::MegatronTrainRayActor
+3312    31.83   ray::MegatronTrainRayActor.train
+3566    18.05   ray::MegatronTrainRayActor
+```
+
+**根因（有完整 traceback 证据，非推测）：** 节点系统内存（128GB，非 GPU 显存）在 `update_weights()` 的 `pause_generation` 阶段被打满到 98.9%，触发 Ray 自身的内存监控主动 kill 掉一个 worker（这次 kill 中的恰好是 `pause_generation.remote()` 依赖的 `SGLangEngine.__init__` lease，导致 `ray.get()` 抛出可捕获异常）。仅 3 个 `MegatronTrainRayActor` 相关进程就占了约 95GB，加上 sglang engine/PRM 等其余进程把 128GB 节点内存打满。
+
+**与此前 4 次"静默无 traceback"崩溃的关系（推断，未逐一验证）：** 很可能是同一个系统内存 OOM，只是每次 Ray 内存监控杀掉的具体进程不同——这次刚好杀在一个有 `ray.get()`/Python 异常捕获包裹的调用点上，所以能看到完整 traceback；若杀在某个底层 NCCL 集合通信调用中间（没有异常捕获），其余 rank 会一直卡等一个已死的 peer，表现为"静默挂起、无 traceback"，与此前 4 次观察到的症状一致。**NCCL_DEBUG=INFO 输出本身未发现异常**（channel/tree/P2P 建连全部正常完成），进一步排除了 NCCL 协议层本身的问题——挂起是内存 OOM 的下游后果，不是 NCCL 的锅。
+
+**与 [2026-07-06] `smoke update_weights() OOM（TP=1 缩配显存不足）` 的关系：** 同一个崩溃触发点（`update_weights()` 权重同步阶段），但资源种类不同——07-06 那次是 **GPU 显存**（TP=1 单卡挤爆），这次是 **节点系统内存**（TP=2，与 GPU 显存无关）。07-06 条目当时的评估"**minitest（TP=2）/8GPU（TP=4）显存分摊更充分，理论上不会复现**"——这个评估只覆盖了 GPU 显存维度，没有覆盖系统内存维度，**已被本次 minitest（TP=2）实测结果推翻**：系统内存 OOM 与 TP 并行度无关，是节点总内存预算（128GB）相对于 Megatron actor + rollout engine + PRM 等全部常驻进程的内存footprint 本身就不够用。
+
+**处理：** 提高 minitest 任务提交时申请的系统内存至 256GB，重新提交验证。若 256GB 下不再复现，说明是纯粹的资源申请不足（跟 07-08 "误设 1 GPU/16GB" 同类：任务提交参数问题，非代码 bug）；若仍复现，需要进一步定位是否 Megatron actor 本身内存泄漏/常驻内存过大。
+
+**待验证：** 256GB 内存重跑 minitest，确认是否解决；若解决，8GPU 正式提交时同步申请 256GB+（8GPU 版本进程数更多，可能需要更高）。
 
 ---
 

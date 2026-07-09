@@ -436,12 +436,15 @@
 - 改用 `appendSystemContext` 正文注入方案：插件把 `ctx.trigger`/`ctx.sessionId` 编码成标记塞进 system prompt，服务端补丁解析后在转发给 sglang / 计算训练样本之前清理掉，模型和训练数据都看不到这段标记——不受 SSRF 机制影响（改的是正文不是传输层）。mock server + 本地单测双重验证标记注入和清理逻辑都正确 → [`issues_log.md`](issues_log.md) 2026-07-09 第六部分，commit `be25e8b`
 - 插件 + 服务端补丁部署逻辑接入 `smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三个脚本，保持一致，静态 `X-Turn-Type` header 已废弃 → commit `df22940` / `a7d1da6` / `73ccfef`
 - 清理三种机制切换过程中的孤儿文件（`test_undici_header_injection.mjs`）和过时文档（`implementation_path.md` 架构描述更新到最新方案）→ commit `fab9560`
+- 排查 smoke/minitest 反复静默崩溃问题：先排除 `RerunStateMachine`（查 Megatron 源码证实 DISABLED 模式下真实 NaN/Inf 依然会抛可捕获异常，跟"完全静默"对不上），加 `NCCL_DEBUG=INFO` 诊断（commit `d84b71c`）；重新提交 minitest 后**首次拿到完整 Python traceback**，确认真实根因是 **节点系统内存 OOM**（128GB 节点打满到 98.9%，Ray 自身内存监控杀掉 worker），发生在 `update_weights()` 权重同步阶段，与 07-06 记录的 smoke `update_weights()` OOM 是同一崩溃触发点、但资源种类不同（07-06 是 GPU 显存，这次是系统内存）→ [`issues_log.md`](issues_log.md) 2026-07-09 条目更新
+- 决定：minitest 重新提交时把系统内存申请提高到 256GB 验证是否解决
 
 **主要问题：**
-- smoke/minitest 连续三次（2 次 smoke + 1 次 minitest，TP=1 和 TP=2 都有）在训练进行到中途（第一轮 rollout 完成后几分钟内）无预警断线，`training.log`/`openclaw.log`/`dmesg` 均无 traceback、无 OOM 记录；minitest 也复现排除了"smoke TP=1 显存吃紧"这个猜测，看起来是更系统性的基础设施问题；交互终端和实际计算节点分离（`/tmp/ray` 在这个 shell 里查不到），拿不到 Ray 节点本地日志做更深入诊断，需要 modelfactory 平台方协助或者继续重试判断是否偶发 → [`issues_log.md`](issues_log.md) 待补充完整记录
+- ~~smoke/minitest 连续三次...无 traceback、无 OOM 记录...根因未查清~~（已定位，见下）：反复静默崩溃的真实根因是**节点系统内存不足**（128GB 节点被 Megatron actor + rollout engine + PRM 等常驻进程打满），发生在 `update_weights()` 的 `pause_generation` 阶段；此前几次"静默无 traceback"很可能是同一个 OOM 杀在了没有异常捕获的 NCCL 集合通信调用中间，导致其余 rank 卡死，跟这次杀在 `ray.get()` 调用点上（有异常捕获、留下 traceback）是同一类问题的不同表现 → [`issues_log.md`](issues_log.md) 2026-07-09 条目更新
 
 **待验证：**
-- minitest 崩溃问题是偶发还是稳定复现（重新提交中）
+- minitest 256GB 内存重跑，确认 OOM 是否解决（重新提交中）
+- 若解决，8GPU 正式提交同步申请 256GB+ 系统内存
 - `appendSystemContext` 标记会不会污染 OpenClaw 自己持久化的多轮对话历史（真实 GPU 链路里还未观察到异常，需要更长多轮对话验证）
 - context-summarization 内部调用是否触发 `before_prompt_build`（决定 Task 摘要污染问题是否顺带解决）
 
@@ -463,17 +466,17 @@
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
 ### 已知限制 / 未解决
-- **训练进行到中途无预警崩溃**（无 traceback、无 OOM 记录），连续三次复现，跟今天的改动无关，根因未查清，见上方「主要问题」
+- **训练进行到中途崩溃，根因已确认**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；跟今天的 header 机制改动无关；已决定重新提交时把系统内存申请提到 256GB，待验证是否解决，见上方「主要问题」
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
 ### 下一步
-1. 重新提交 minitest，确认训练中途崩溃是偶发还是稳定复现
-2. 如稳定复现，需要 modelfactory 平台方协助拿到 Ray 节点本地日志定位根因
+1. minitest 提交时系统内存申请提高到 256GB，重新提交验证 OOM 是否解决
+2. 若解决，8GPU 正式提交同步申请更高系统内存
 3. minitest 完整跑通后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪）
 
 ### 未验证
-- [ ] minitest 5 GPU 完整跑通（当前卡在中途崩溃问题）
+- [ ] minitest 5 GPU 完整跑通（256GB 内存重跑中，验证 OOM 是否解决）
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性
 - [ ] 8 GPU 正式 Table 3 训练
 
