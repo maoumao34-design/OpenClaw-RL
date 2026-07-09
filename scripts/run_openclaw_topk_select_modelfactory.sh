@@ -39,20 +39,28 @@ sed -i \
 if [ "${SMOKE_PROFILE}" = "1" ]; then
     # topk-select 已经默认 PRM_GPUS=1 PRM_NUM_GPUS_PER_ENGINE=1，无需 sed
     # 额外缩配：PRM_M 3→1、OPENCLAW_TOPK_MAX_CAND 3→1（smoke 只需验证流通）
-    # PRM_MAX_NEW_TOKENS 8192→4096：PRM judge 引擎与 rollout 共用 sglang-context-length，
-    # smoke 把它缩到 8192 后 prompt_len+8192 必然超限（sglang 400），judge 永远拿不到有效票。
+    #
+    # sglang/rollout context 不再缩到 8192：2026-07-08 smoke 实测 8192 下
+    # student/TA/teacher 全部 100% context overflow（0/1 完成），training.log
+    # 里唯一能跑通、被当成 MAIN 样本提交的是 OpenClaw 内部的 275-token
+    # "context summarization" 兜底调用，session_id 也因此全是 unknown——
+    # 不是 header workaround 的 bug，是 smoke 本身没有一次真实对话跑得完，
+    # 无法验证 session_id 解析逻辑。改回官方值 32768（与 minitest/8GPU 一致，
+    # 论文原作者验证过对真实 agent 对话够用）。PRM_MAX_NEW_TOKENS 保留官方
+    # 默认 8192（当初缩到 4096 是为了避开 8192 context 下的 400，context
+    # 改回 32768 后不再需要）。
+    #
+    # --max-tokens-per-gpu 仍保留 8192（TP=1 单卡训练侧的显存预算，跟
+    # sglang context 无关，是否需要一起调大待用真实 run 的报错验证，
+    # 不提前假设）。
     sed -i \
         -e 's/--tensor-model-parallel-size 4/--tensor-model-parallel-size 1/' \
         -e 's/--rollout-num-gpus-per-engine 2/--rollout-num-gpus-per-engine 1/' \
         -e 's/--rollout-batch-size 16/--rollout-batch-size 4/' \
         -e 's/--max-tokens-per-gpu 32768/--max-tokens-per-gpu 8192/' \
-        -e 's/--rollout-max-context-len 32768/--rollout-max-context-len 8192/' \
-        -e 's/--sglang-context-length 32768/--sglang-context-length 8192/' \
         -e 's/^export TP="2"/export TP="1"/' \
-        -e 's/^export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="8192"/' \
         -e 's/export PRM_M="${PRM_M:-3}"/export PRM_M="${PRM_M:-1}"/' \
         -e 's/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-3}"/export OPENCLAW_TOPK_MAX_CAND="${OPENCLAW_TOPK_MAX_CAND:-1}"/' \
-        -e 's/--prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-8192}"/--prm-max-new-tokens "${PRM_MAX_NEW_TOKENS:-4096}"/' \
         "${PATCHED}"
 elif [ "${MINITEST_PROFILE}" = "1" ]; then
     # 5-GPU pre-test：仅减少并行度和数据量，其他与 8GPU 正式完全一致。

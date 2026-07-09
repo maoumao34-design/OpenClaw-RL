@@ -201,8 +201,17 @@ launch_openclaw_gateway() {
 
     # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，不知道
     # 真实的 contextWindow/maxTokens，会用过大的默认值请求 max_completion_tokens
-    # （实测 178210），被 sglang 400 拒绝（本模型 context_length=8192，smoke 缩配）。
-    # 显式声明，maxTokens 明显小于 contextWindow 留出 prompt 空间（同 PRM_MAX_NEW_TOKENS 的道理）。
+    # （实测 178210），被 sglang 400 拒绝。显式声明，maxTokens 明显小于
+    # contextWindow 留出 prompt 空间（同 PRM_MAX_NEW_TOKENS 的道理）。
+    #
+    # contextWindow 改回 32768（与 run_openclaw_topk_select_modelfactory.sh 里
+    # 官方 sglang-context-length 一致，不再缩到 8192）：2026-07-08 smoke 用
+    # 8192 时 student/TA/teacher 100% 命中 "Context overflow: prompt too large
+    # for the model"——这句提示语是 OpenClaw 自己的措辞，很可能是 OpenClaw
+    # 客户端拿这里配置的 contextWindow 做请求前检查、在打到 sglang 之前就直接
+    # 拒绝了，不是 sglang 400。8192 对真实 agent 系统提示词（工具 schema +
+    # 作业内容）明显不够，contextWindow 和 sglang 实际 context_length 必须一致
+    # 且足够大，否则两边有一个偏小都会复现这个问题。
     echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
     python3 -c "
 import json, pathlib
@@ -221,7 +230,7 @@ sg['models'] = [{
     'reasoning': True,
     'input': ['text'],
     'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
-    'contextWindow': 8192,
+    'contextWindow': 32768,
     'maxTokens': 4096,
 }]
 cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
