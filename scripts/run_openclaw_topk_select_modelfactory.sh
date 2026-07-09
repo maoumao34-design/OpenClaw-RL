@@ -124,6 +124,20 @@ if old_pythonpath not in text:
     raise SystemExit("patch failed: PYTHONPATH line not found in topk-select launcher")
 text = text.replace(old_pythonpath, new_pythonpath, 1)
 
+# NCCL_DEBUG=INFO: diagnostic for the recurring silent mid-training hang
+# (2026-07-09, docs/issues_log.md) -- training goes completely silent a few
+# minutes in, no Python traceback, no OOM killer signature, reproduced 4x
+# across smoke/minitest (TP=1 and TP=2). Suspected NCCL-level collective
+# hang during the first real distributed gradient sync. This surfaces NCCL's
+# own diagnostic output on the next run so we have real evidence instead of
+# guessing. Not a permanent config -- meant to be reverted once the actual
+# cause is identified (NCCL_DEBUG=INFO is very verbose).
+old_cuda_conn = '\\"CUDA_DEVICE_MAX_CONNECTIONS\\": \\"1\\",'
+new_cuda_conn = '\\"CUDA_DEVICE_MAX_CONNECTIONS\\": \\"1\\",\n    \\"NCCL_DEBUG\\": \\"INFO\\",'
+if old_cuda_conn not in text:
+    raise SystemExit("patch failed: CUDA_DEVICE_MAX_CONNECTIONS line not found in topk-select launcher")
+text = text.replace(old_cuda_conn, new_cuda_conn, 1)
+
 path.write_text(text)
 PY
 
