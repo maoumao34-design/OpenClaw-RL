@@ -102,6 +102,17 @@ echo "外部 Simulator: ${SIMULATOR_BASE_URL} (model=${EXTERNAL_MODEL})"
 # 会直接 400。生成一份改了这一个字段的补丁副本，官方目录本身不动。
 bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLAW_DIR}"
 
+# header/dispatcher 注入均已确认在这个 OpenClaw 版本上结构性失效——OpenClaw 加了
+# 一层 SSRF 安全机制，绕开所有外部注入的 fetch/dispatcher，无配置开关（详见
+# docs/issues_log.md 2026-07-09 第四/五部分）。改用 appendSystemContext 往
+# system prompt 正文里塞 "[RL-TRAINING-META] session_id=... turn_type=..." 标记，
+# 服务端解析后在转发给 sglang / 计算训练样本之前清理掉，模型和训练数据都看不到这段
+# 标记。已在 smoke/minitest 用真实数据验证过，同步到 8GPU 正式脚本。详见
+# scripts/prepare_patched_rl_training_headers.sh 和 scripts/prepare_patched_openclaw_opd.sh
+# 顶部注释。
+PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
+
 # =====================================================================
 # conda
 # =====================================================================
@@ -215,6 +226,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_MODEL_PATH="${POLICY_MODEL_PATH}" \
   PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
+  PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
   bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
@@ -243,12 +255,55 @@ echo "等待 RL training proxy (port 30000)..."
 wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
 
 echo ""
+# 每次起 gateway 前强制确保这个开关是开着的，不依赖持久化是否跨环境生效（同
+# smoke/minitest 的 launch_openclaw_gateway() 逻辑）。
+echo "确保 chatCompletions 端点已启用..." | tee -a "${LOGS_DIR}/openclaw.log"
+openclaw config set gateway.http.endpoints.chatCompletions.enabled true \
+    >> "${LOGS_DIR}/openclaw.log" 2>&1
+echo "[verify] gateway.http.endpoints.chatCompletions.enabled = $(openclaw config get gateway.http.endpoints.chatCompletions.enabled 2>&1 | tail -1)" \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+
+# 部署 rl-training-headers 插件（appendSystemContext 版本）。写入 OpenClaw 自己
+# 的系统安装目录（openclaw plugins list --verbose 确认的 source 路径），不是插件
+# 扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里。
+echo "生成并部署 rl-training-headers 插件（appendSystemContext 版本）..." \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+PATCHED_PLUGIN_DIR="${LOGS_DIR}/patched-rl-training-headers"
+bash "${SCRIPTS_DIR}/prepare_patched_rl_training_headers.sh" "${REPO_ROOT}" "${PATCHED_PLUGIN_DIR}"
+SYSTEM_PLUGIN_DIR="/usr/lib/node_modules/openclaw/dist/extensions/rl-training-headers"
+mkdir -p "${SYSTEM_PLUGIN_DIR}"
+cp "${PATCHED_PLUGIN_DIR}/index.js" "${SYSTEM_PLUGIN_DIR}/index.js"
+cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.plugin.json"
+cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
+openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
+
+# models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
+# 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
+echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
+python3 -c "
+import json, pathlib
+cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
+d = json.loads(cfg.read_text())
+sg = d.setdefault('models', {}).setdefault('providers', {}).setdefault('sglang', {})
+sg['api'] = 'openai-completions'
+sg.pop('headers', None)
+sg['models'] = [{
+    'id': 'qwen3-4b',
+    'name': 'Qwen3-4B-Thinking (RL policy)',
+    'reasoning': True,
+    'input': ['text'],
+    'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
+    'contextWindow': 32768,
+    'maxTokens': 4096,
+}]
+cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
+print('patched models.providers.sglang.models')
+" 2>&1 | tee -a "${LOGS_DIR}/openclaw.log"
+
 echo "启动 OpenClaw gateway（port 18789）..."
-echo "前提：~/.openclaw/openclaw.json 需已设 gateway.http.endpoints.chatCompletions.enabled=true"
-echo "（openclaw config set gateway.http.endpoints.chatCompletions.enabled true），否则 /v1/chat/completions 404。"
 OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
   openclaw gateway run --allow-unconfigured --force \
-  > "${LOGS_DIR}/openclaw.log" 2>&1 &
+  >> "${LOGS_DIR}/openclaw.log" 2>&1 &
 OPENCLAW_PID=$!
 
 wait_for_port "OpenClaw gateway" 18789 300 "${OPENCLAW_PID}" "${LOGS_DIR}/openclaw.log"
