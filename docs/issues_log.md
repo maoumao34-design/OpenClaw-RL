@@ -435,6 +435,16 @@ git grep -n "isMockedFetch|fetchWithRuntimeDispatcher|isAmbientGlobalFetch" FETC
 
 **处理：** 撤销所有临时调试改动，恢复到 `working-static-header-workaround` tag（`git checkout working-static-header-workaround`，服务器上手动删除临时的 `localService` 配置、恢复 `openai-completions-D8IP0i-n.js`/`openai-transport-stream-*.js`/插件 `index.js` 的 `.bak-original`/`.bak-clean-original` 备份），继续使用已验证有效的静态 header + Runtime 行解析方案。这份调查记录作为"为什么论文的 header 注入机制在当前 OpenClaw 版本上无法使用"的完整依据保留。
 
+### 第六部分（计划中）：改用 appendSystemContext 动态正文注入，替代已确认失效的 header 注入
+
+**动机：** header/dispatcher 两层注入机制均已确认结构性失效（第四、五部分），但今天早些时候已经验证过（见本文档更早的插件重写讨论）`before_prompt_build` 的 `appendSystemContext` 返回字段能把内容真实写入发给策略模型的 system prompt——这条路径完全不经过 `fetchWithSsrFGuardInternal`/`fetchWithRuntimeDispatcher` 这层，不受第五部分那道 SSRF 安全机制影响。
+
+**方案：** 插件在 `before_prompt_build` 里把 `ctx.trigger`/`ctx.sessionId` 编码成标记文字，通过 `appendSystemContext` 写入 system prompt；`openclaw_opd_api_server.py` 补丁从 `messages` 里解析出这段标记作为 `session_id`/`turn_type` 的兜底来源（`x_session_id`/`x_turn_type` header 仍然优先，标记只是兜底），**并且在转发给 sglang 之前、以及计算训练样本的 `prompt_ids` 之前，都要把这段标记文字从 `messages` 里清理掉**——保证策略模型和训练数据看到的都是干净版本，跟论文设计的效果等价（不是同一份代码，是我们另外实现的，需要如实记录）。`turn_type` 没有标记时的默认值会从现在写死的 `"main"` 改回官方默认的 `"side"`。
+
+**两个未验证点（实现后必须用真实多轮对话测试确认，不能假设）：**
+1. `appendSystemContext` 追加的内容会不会被 OpenClaw 自己持久化进对话历史，导致后续轮次的 system prompt 里标记文字重复出现或者累积——如果会，需要额外处理（比如换一种更不容易被误存的写法，或者接受这个副作用但要记录清楚）
+2. OpenClaw 内部的 context-summarization 调用到底触不触发 `before_prompt_build`——如果不触发，标记天然缺失，`turn_type` 默认回落到 `"side"`，等于顺带解决了 2026-07-08/09 记录过的"内部摘要调用被误标成 main"问题；如果触发但 `ctx.trigger` 不是 `"user"`，也需要看它具体是什么值再决定要不要扩充 `SIDE_TRIGGERS`
+
 ---
 
 <!-- 格式模板：
