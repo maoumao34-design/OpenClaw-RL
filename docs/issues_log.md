@@ -337,6 +337,47 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 ---
 
+## [2026-07-09] header 注入机制完整调查：确认是 OpenClaw 版本迭代破坏的架构问题，非配置/安装问题
+
+**背景：** 上一条遗留的 `X-Session-Id` 全为 `unknown` 问题，追查后发现根源比预想的更深，牵出一整条完整的调查链。记录完整过程和证据，即使最终仍用 workaround 方案，这份记录能说明"为什么不用官方机制"是有根据的判断，不是绕不过去就放弃。
+
+### 第一部分：smoke context 修复验证（真实数据首次证实 Runtime 行解析有效）
+
+`smoke_20260709_103410`（context 已从 8192 改回官方值 32768，见前一天 commit `b2fe9ea`）跑出真实数据：`session=ta-grade-0-5410`（真实会话 ID，不再是 `unknown`）、`prompt_tokens=19075`（真实 TA 批改轮次的大 prompt，不是内部摘要调用的 275 token）、`submitted OPD+RL sample ... prompt_len=18862`（真实样本入训练队列）。**结论：`X-Turn-Type` 静态 header workaround + `X-Session-Id` Runtime 行解析 workaround，在真实 context=32768 场景下确认完全生效**，之前怀疑的"session_id 解析失败"其实是 smoke context=8192 太小、真实轮次从未跑通导致的假象（见前一条 07-08 记录）。
+
+任务因残留进程触发的 cgroup OOM 级联杀而失败（同类问题第二次发作，`ps aux --sort=-rss`/`ps -eo pid,etime,rss,cmd` 排查后确认残留进程已被 OOM killer 自己清理，无需手动 kill，环境已干净），核心修复（context 大小、header workaround）已确认有效，不受这次失败影响。
+
+打了 git tag `working-static-header-workaround` 标记这个已验证可用的版本，作为后续任何进一步改动的回退点。
+
+### 第二部分：尝试用官方插件机制替代 workaround（undici dispatcher，最终判定不可行）
+
+**动机：** static header + Runtime 行解析是偏离论文设计的临时方案，`X-Turn-Type` 是写死的静态值（无法区分真实 main turn 和 OpenClaw 内部的 context-summarization 兜底调用）。想改用官方插件（`OpenClaw-RL-official/extensions/rl-training-headers/`）真正拿到 `ctx.trigger`/`ctx.sessionId`。
+
+**尝试 1（失败，根源已查清）：** 官方插件用 `globalThis.fetch` 打补丁注入 header——07-07 已确认这条路在当前 OpenClaw（2026.6.9）上完全不生效（mock server 抓包证实 header 从不到达）。本次进一步用源码追证：`src/llm/providers/openai-completions.ts` 的 `createClient()` **每次调用都全新构造** `new OpenAI({...})`（无缓存），但从不显式传 `fetch` 参数，依赖 SDK 自身默认解析——大概率是 `openai` npm 包自己在模块加载时就把 `fetch` 引用锁死，跟插件何时打补丁、`globalThis.fetch` 后来指向哪里都无关。
+
+**尝试 2（失败，根源已查清）：** 改用 `undici.setGlobalDispatcher()`，比 `globalThis.fetch` 更底层，理论上能绕开引用缓存问题。独立隔离测试（`scripts/test_undici_header_injection.mjs`）验证机制本身可行（mock server 收到注入的 header）。但部署到真实 OpenClaw gateway 后，用带调试日志的插件版本（多轮迭代：先怀疑 undici 版本不匹配——Node 内置 6.27.0 vs npm 装的 8.5.0，读 `undici` v8.5.0 源码确认它确实做了向后兼容桥接（`Symbol.for('undici.globalDispatcher.1')` legacy key + `Dispatcher1Wrapper`），排除版本不匹配这个假设）最终查到真实根因：**OpenClaw 自己的 `src/agents/embedded-agent-runner/run/attempt.ts:836` 每处理一轮 agent 交互都无条件调用 `ensureGlobalUndiciDispatcherStreamTimeouts()`**（强制设置 30 分钟流超时），设计上应该幂等（值不变就不重设 dispatcher），但实测每一轮都会真的触发 `setGlobalDispatcher`，把 dispatcher 换成全新的普通 `Agent`，覆盖掉插件设置的拦截链——怀疑是 `resolveUndiciAutoSelectFamily()` 返回值不稳定导致幂等检查失效。**这跟代理配置无关**（`config.proxy.enabled` 本来就是 false，代理相关分支本来就是空操作），是每轮对话都会触发的核心逻辑，无法通过配置关闭。
+
+用"每秒轮询、检测到被换就重新 compose"这种方式实测：日志显示每次检查都发现被换了（`was Agent, now Agent`），说明这个重置发生的频率至少跟我们的检查频率一样快，是持续性的，不是一次性的启动期竞态，用更高频轮询硬扛属于跟框架设计对抗，投入产出比不合适。
+
+### 第三部分：版本考古——确认论文当时的 OpenClaw 版本机制原本是有效的
+
+**动机：** 用户提出疑问——会不会是我们漏看了某个配置项，而不是 OpenClaw 真的把这条路封死了？
+
+**核查：** `OpenClaw-RL-official` 仓库全文搜索找不到任何 OpenClaw 版本锁定（`package.json`/`README`/CI 配置均无版本号）。但插件所在路径 `extensions/rl-training-headers/` 的 git 提交历史只有两次真实提交（作者 Yinjie Wang，均为 "Add files via upload"）：`2026-03-20` 和 `2026-04-04`。对照 OpenClaw 自己的 CHANGELOG，这个时间区间对应大约 OpenClaw `2026.3.22 ~ 2026.4.5` 版本，比我们现在跑的 `2026.6.9` 早 2-2.5 个月。
+
+**直接验证（关键）：** 本地 `openclaw` 仓库原本是浅克隆（只有最新一个 commit），用 `git fetch --depth=1 origin <2026-04-04 附近的具体 commit sha>`（sha 通过 GitHub API `https://api.github.com/repos/openclaw/openclaw/commits?until=2026-04-04T23:59:59Z` 查到）单独拉取了这个历史时间点的完整代码树，直接读当时的源码：
+
+- 当时的 OpenAI 传输代码在 `src/agents/openai-transport-stream.ts`（现在已经不存在于这个路径，说明中间发生过大重构），客户端构造函数 `createOpenAIResponsesClient` **显式传了 `fetch: buildGuardedModelFetch(model)`**，并且 `buildOpenAIClientHeaders(model, context, optionHeaders, turnHeaders)` **有一个显式的 `turnHeaders` 参数**会被合并进 `defaultHeaders`——每轮动态 header 在当时是官方代码里的第一等公民特性，不是要靠外部插件 hack 进去的东西。
+- 追进 `buildGuardedModelFetch` → `fetchWithSsrFGuard`（`src/infra/net/fetch-guard.ts`），关键一行：`const fetcher: FetchLike | undefined = params.fetchImpl ?? globalThis.fetch;`——**当时 OpenClaw 自己的传输层代码，每次发请求都会动态重新读取一次 `globalThis.fetch`**。
+
+**结论（有源码证据，非推测）：** 论文写插件那会儿（约 2026.3-4 月），OpenClaw 自身的传输代码有意设计成动态读取 `globalThis.fetch`，所以插件的 `globalThis.fetch` 打补丁机制在当时是真实有效的。这套"动态重读"的架构在 4 月到 6 月之间被重构/移除——现在的 `createClient()`（`src/llm/providers/openai-completions.ts`）不再有这层封装，直接交给 `openai` SDK 自己的（大概率是静态、只读一次的）默认 fetch 解析。**不是我们装的版本有问题、也不是漏看了配置，是 OpenClaw 项目本身在这几个月的快速迭代（同期 CHANGELOG 显示单周合并 400+ PR）中，把论文依赖的这个底层机制改掉了。**
+
+### 下一步（待验证）
+
+尝试针对性修复：给当前版本的 `createClient()`（编译后的 `openai-completions.js`，位置待确认）补一个动态读取 `globalThis.fetch` 的薄包装 `fetch` 参数（不需要复原整套 SSRF 防护架构），恢复官方插件机制原本依赖的行为。这需要直接改 OpenClaw 自己编译后的核心文件（不是插件扩展目录），风险和影响范围比之前的改动都大，需要谨慎验证。如果这个方向也不可行，回退到 `working-static-header-workaround` tag（已用真实数据验证过），并保留这份调查记录作为"为什么不能用官方机制"的依据。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
