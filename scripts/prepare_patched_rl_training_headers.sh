@@ -159,26 +159,30 @@ export default function register(api) {
     };
   };
 
-  setGlobalDispatcher(getGlobalDispatcher().compose(rlHeaderInterceptor));
-  const dispatcherAfterSet = globalThis[RL_DISPATCHER_SYMBOL];
-  const legacyAfterSet = globalThis[RL_LEGACY_DISPATCHER_SYMBOL];
-  api.logger.info(
-    `[RL-HEADERS-DEBUG#${registerInstanceId}] global dispatcher composed. ` +
-    `dispatcher.constructor=${dispatcherAfterSet?.constructor?.name} ` +
-    `legacy.constructor=${legacyAfterSet?.constructor?.name}`,
-  );
+  // OpenClaw's own src/infra/net/undici-global-dispatcher.ts periodically
+  // calls forceResetGlobalDispatcher() (proxy-refresh lifecycle hook,
+  // independent of a fixed startup order -- confirmed via source tracing
+  // 2026-07-09) which replaces the global dispatcher with a fresh plain
+  // Agent, silently discarding whatever was composed onto it before,
+  // including ours. Rather than fight over who sets it last once, keep
+  // re-asserting our interceptor on top of whatever the current dispatcher
+  // is, on a short interval, so any reset gets covered within ~1s.
+  let ourDispatcher = null;
 
-  // Re-check a few seconds later: did something else in OpenClaw's own
-  // startup sequence call setGlobalDispatcher again after us and silently
-  // replace our composed dispatcher?
-  setTimeout(() => {
-    const dispatcherNow = globalThis[RL_DISPATCHER_SYMBOL];
-    const stillOurs = dispatcherNow === dispatcherAfterSet;
-    api.logger.info(
-      `[RL-HEADERS-DEBUG#${registerInstanceId}] delayed recheck (3s later): ` +
-      `stillSameObject=${stillOurs} dispatcher.constructor=${dispatcherNow?.constructor?.name}`,
-    );
-  }, 3000);
+  const reassertDispatcher = (label) => {
+    const current = globalThis[RL_DISPATCHER_SYMBOL];
+    if (current !== ourDispatcher) {
+      api.logger.info(
+        `[RL-HEADERS-DEBUG#${registerInstanceId}] ${label}: dispatcher changed externally ` +
+        `(was ${ourDispatcher?.constructor?.name ?? "none"}, now ${current?.constructor?.name}) -- recomposing`,
+      );
+      setGlobalDispatcher(current.compose(rlHeaderInterceptor));
+      ourDispatcher = globalThis[RL_DISPATCHER_SYMBOL];
+    }
+  };
+
+  reassertDispatcher("initial");
+  setInterval(() => reassertDispatcher("interval-recheck"), 1000);
 
   api.on("before_prompt_build", (_event, ctx) => {
     const sessionId = ctx.sessionId ?? "";
