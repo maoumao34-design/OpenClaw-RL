@@ -133,7 +133,13 @@ function resolveConfig(api) {
 // docs/issues_log.md 2026-07-09).
 const SIDE_TRIGGERS = new Set(["heartbeat", "memory", "cron"]);
 
+const RL_DISPATCHER_SYMBOL = Symbol.for("undici.globalDispatcher.2");
+const RL_LEGACY_DISPATCHER_SYMBOL = Symbol.for("undici.globalDispatcher.1");
+let rlRegisterCallCount = 0;
+
 export default function register(api) {
+  rlRegisterCallCount += 1;
+  const registerInstanceId = rlRegisterCallCount;
   const config = resolveConfig(api);
   const headerStore = new AsyncLocalStorage();
 
@@ -141,32 +147,45 @@ export default function register(api) {
     return function InterceptedDispatch(opts, handler) {
       const scopedHeaders = headerStore.getStore();
       api.logger.info(
-        "[RL-HEADERS-DEBUG] interceptor invoked: method=%s hasScopedHeaders=%s scopedHeaders=%s origin=%s path=%s",
-        opts.method,
-        !!scopedHeaders,
-        JSON.stringify(scopedHeaders),
-        opts.origin,
-        opts.path,
+        `[RL-HEADERS-DEBUG#${registerInstanceId}] interceptor invoked: method=${opts.method} ` +
+        `hasScopedHeaders=${!!scopedHeaders} scopedHeaders=${JSON.stringify(scopedHeaders)} ` +
+        `origin=${opts.origin} path=${opts.path}`,
       );
       if (scopedHeaders && opts.method?.toUpperCase() === "POST") {
         opts.headers = { ...(opts.headers || {}), ...scopedHeaders };
-        api.logger.info("[RL-HEADERS-DEBUG] headers merged into opts: %s", JSON.stringify(opts.headers));
+        api.logger.info(`[RL-HEADERS-DEBUG#${registerInstanceId}] headers merged into opts: ${JSON.stringify(opts.headers)}`);
       }
       return dispatch(opts, handler);
     };
   };
 
   setGlobalDispatcher(getGlobalDispatcher().compose(rlHeaderInterceptor));
-  api.logger.info("[RL-HEADERS-DEBUG] global dispatcher composed with interceptor");
+  const dispatcherAfterSet = globalThis[RL_DISPATCHER_SYMBOL];
+  const legacyAfterSet = globalThis[RL_LEGACY_DISPATCHER_SYMBOL];
+  api.logger.info(
+    `[RL-HEADERS-DEBUG#${registerInstanceId}] global dispatcher composed. ` +
+    `dispatcher.constructor=${dispatcherAfterSet?.constructor?.name} ` +
+    `legacy.constructor=${legacyAfterSet?.constructor?.name}`,
+  );
+
+  // Re-check a few seconds later: did something else in OpenClaw's own
+  // startup sequence call setGlobalDispatcher again after us and silently
+  // replace our composed dispatcher?
+  setTimeout(() => {
+    const dispatcherNow = globalThis[RL_DISPATCHER_SYMBOL];
+    const stillOurs = dispatcherNow === dispatcherAfterSet;
+    api.logger.info(
+      `[RL-HEADERS-DEBUG#${registerInstanceId}] delayed recheck (3s later): ` +
+      `stillSameObject=${stillOurs} dispatcher.constructor=${dispatcherNow?.constructor?.name}`,
+    );
+  }, 3000);
 
   api.on("before_prompt_build", (_event, ctx) => {
     const sessionId = ctx.sessionId ?? "";
     const turnType = SIDE_TRIGGERS.has(ctx.trigger ?? "") ? "side" : "main";
     api.logger.info(
-      "[RL-HEADERS-DEBUG] before_prompt_build fired: trigger=%s sessionId=%s turnType=%s",
-      ctx.trigger,
-      sessionId,
-      turnType,
+      `[RL-HEADERS-DEBUG#${registerInstanceId}] before_prompt_build fired: ` +
+      `trigger=${ctx.trigger} sessionId=${sessionId} turnType=${turnType}`,
     );
     headerStore.enterWith({
       [config.sessionIdHeader]: sessionId,
