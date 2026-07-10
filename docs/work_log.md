@@ -464,9 +464,10 @@
 - INIT 阶段网关短暂不可达导致 TA/Teacher 数据静默丢失（已确认根因并修复，见上）
 - A800 这次 minitest 进度明显比 07-09 那次"更慢"，但对比基准（07-09 那次）本身 INIT 不完整，不能直接下"A800 慢"的结论，需要等这次（网关修复后）真正跑完 INIT 才能做有效对比
 
-**待验证：**
-- 这次 A800 minitest 完整跑完 INIT（Student/TA/Teacher 各 72 题）+ 进入 Joint round + 第一次 `update_weights()`，确认系统内存 OOM 是否解决、网关断连是否不再发生
-- 8GPU 正式提交时同步应用 `run_one_persona()` 修复（`train_with_services.sh` 已同步改，无需额外操作）
+**待验证（内存 OOM 已确认解决，见下）：**
+- ~~这次 A800 minitest 完整跑完 INIT...确认系统内存 OOM 是否解决~~ → 已确认：`training.log` 连续跑过 10 次 `update_weights()`（`perf 23`-`perf 32`，全部成功，无 OOM），此前每次都卡在第一次就死，提高系统内存这个修复确认有效
+- 网关断连重试修复（`run_one_persona()`）尚未在真实 A800/H20 job 上验证——当前这次跑的是旧脚本，需要另外提交一次拉了最新代码的 minitest 才能验证
+- 8GPU 正式提交时同步应用 `run_one_persona()` 修复（`train_with_services.sh` 已同步改，无需额外操作）+ 申请更高系统内存
 
 ---
 
@@ -486,7 +487,8 @@
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
 ### 已知限制 / 未解决
-- **训练进行到中途崩溃，根因已确认**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；跟今天的 header 机制改动无关；决定先申请 192GB 重新提交验证（256GB 排队困难，作为不够时的后备），CPU（当前 16 核）是否一并提高尚未决定，见上方「主要问题」
+- ~~训练进行到中途崩溃~~ **已解决**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；A800 提高系统内存后连续跑过 10 次 `update_weights()` 无 OOM，确认修复有效；8GPU 正式提交同步申请更高系统内存
+- INIT 阶段网关断连（`run_one_persona()` 重试修复）尚未在真实 job 上验证，见上方「主要问题」
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
