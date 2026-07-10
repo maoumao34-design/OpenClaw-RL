@@ -458,20 +458,58 @@
 **完成内容：**
 - 补充 `paper_understanding.md` 第十一节：加回真正的 `openclaw gateway run` 提供的文件读写等工具执行职责（之前只列了 RL 数据管道那层职责）；顺带用官方源码核实修正了一处端口归属错误（18789=真正的 openclaw gateway，30000=`openclaw_combine_select_api_server.py`，此前标反了）；`implementation_path.md` 架构图同步更正 → commit `dc46261`/`168fa51`
 - A800 提交 minitest（已申请更高内存），验证过程中追查"进度是否异常慢"：用 `minitest_20260709_172118`（上条 OOM 记录那次）做对比基准时发现该基准本身不干净——查 `simulation.log` 发现 INIT 阶段 TA/Teacher 都遇到过 `Connection refused`（网关 18789 中途短暂不可达），被脚本当"警告"静默跳过，`results_TA_init.txt`/`results_teacher_init.txt` 全是 0 字节，说明那次 homework1/homework2 数据本身不完整；确认这个网关断连问题和后面真正杀死任务的系统内存 OOM 是两个独立问题，不是同一根因 → [`issues_log.md`](issues_log.md) 2026-07-10 条目
-- 修复：`run_one_persona()`（`minitest_train_with_services.sh` / `train_with_services.sh` 共用）改为每次调用前先复查网关是否可达，单次失败最多重试 3 次，不再一次失败就静默放过（`smoke_train_with_services.sh` 不用这个函数，不受影响）；确认此修复只改本地脚本源码，不影响当前已提交的 A800 job（提交时已拷贝脚本到自己的日志目录）→ commit（待补）
+- 修复：`run_one_persona()`（`minitest_train_with_services.sh` / `train_with_services.sh` 共用）改为每次调用前先复查网关是否可达，单次失败最多重试 3 次，不再一次失败就静默放过（`smoke_train_with_services.sh` 不用这个函数，不受影响）；确认此修复只改本地脚本源码，不影响当前已提交的 A800 job（提交时已拷贝脚本到自己的日志目录）→ commit `6324c18`
+- 确认 A800 能跑真正的 Megatron 训练步（`training.log` 里 `Timer train start` 正常触发，无 kernel/import 报错）；顺带更正 07-06 `issues_log.md` 一条旧评估——"换 GPU 架构需要重新编译 flash-attn/TE/apex/flashinfer" 当时只是未经测试的猜测，现已被 A800 实测推翻；项目里唯一真正要求 sm_90 的是 DeepEP，但 Qwen3-4B 稠密模型不依赖它，环境搭建阶段就确认跳过没装（06-22 条目）→ commit `7e72777`
+- 内存 OOM 修复确认有效：A800 minitest（已申请更高内存）连续跑过 10 次 `update_weights()`（`perf 23`-`perf 32`，无 OOM），此前每次都卡在第一次就死 → [`issues_log.md`](issues_log.md) 2026-07-10 条目，commit `c6ee638`
+- 讨论 GPU 选型对 Table 3 复现数字的影响：架构差异（A800 vs H20）不会带来系统性偏差，但会像换随机种子一样引入正常的 run-to-run 数值波动（RL 训练本身依赖采样，对微小数值扰动敏感）；结论——A800 验证/H20 正式跑的策略没问题，但正式用来对比的数字要保持硬件一致，不要混用
+- 决定：当前 A800 minitest 已达成验证目的（OOM 修复确认有效），停掉重新提交一次拉了 `6324c18` 之后代码的新 minitest，从 INIT 阶段直接验证网关断连重试修复是否生效
 
 **主要问题：**
 - INIT 阶段网关短暂不可达导致 TA/Teacher 数据静默丢失（已确认根因并修复，见上）
-- A800 这次 minitest 进度明显比 07-09 那次"更慢"，但对比基准（07-09 那次）本身 INIT 不完整，不能直接下"A800 慢"的结论，需要等这次（网关修复后）真正跑完 INIT 才能做有效对比
+- A800 这次 minitest 进度明显比 07-09 那次"更慢"，但对比基准（07-09 那次）本身 INIT 不完整，不能直接下"A800 慢"的结论；已决定停掉重跑，不再纠结这个对比
 
-**待验证（内存 OOM 已确认解决，见下）：**
-- ~~这次 A800 minitest 完整跑完 INIT...确认系统内存 OOM 是否解决~~ → 已确认：`training.log` 连续跑过 10 次 `update_weights()`（`perf 23`-`perf 32`，全部成功，无 OOM），此前每次都卡在第一次就死，提高系统内存这个修复确认有效
-- 网关断连重试修复（`run_one_persona()`）尚未在真实 A800/H20 job 上验证——当前这次跑的是旧脚本，需要另外提交一次拉了最新代码的 minitest 才能验证
+**待验证：**
+- 网关断连重试修复（`run_one_persona()`）——重新提交的 minitest 验证 `results_TA_init.txt`/`results_teacher_init.txt` 是否不再是 0 字节
 - 8GPU 正式提交时同步应用 `run_one_persona()` 修复（`train_with_services.sh` 已同步改，无需额外操作）+ 申请更高系统内存
 
 ---
 
-## 当前状态（2026-07-09）
+## 当前状态（2026-07-10）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测，flash-attn/APEX/TE/flashinfer 非 H20 专属编译）
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow=32768`/`maxTokens=4096`），不再用静态 header
+- [x] `scripts/prepare_patched_rl_training_headers.sh`：`rl-training-headers` 插件 `appendSystemContext` 版本，**已用真实 GPU 数据验证生效**（真实动态 `session_id`/`turn_type` 标记到达请求正文）
+- [x] `scripts/prepare_patched_openclaw_opd.sh`：解析标记 + 转发前清理，**已用真实 GPU 数据验证生效**
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
+- [x] `run_one_persona()` 网关断连重试修复（`minitest_train_with_services.sh` / `train_with_services.sh`），代码已就绪，待真实 job 验证
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+- [x] 系统内存 OOM 修复：提高任务提交时申请的系统内存，A800 minitest 实测连续跑过 10 次 `update_weights()` 无 OOM
+
+### 已知限制 / 未解决
+- INIT 阶段网关断连重试修复尚未在真实 job 上验证（代码已就绪，见上，正在重新提交 minitest 验证）
+- `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
+- context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
+
+### 下一步
+1. 停掉当前 A800 minitest（已达成验证目的），拉最新代码重新提交，验证网关断连重试修复
+2. minitest 完整跑通（INIT 数据完整 + 无 OOM）后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存）
+3. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
+
+### 未验证
+- [ ] `run_one_persona()` 网关断连重试修复（重新提交验证中）
+- [ ] minitest 5 GPU 完整跑通（INIT 数据完整 + 300 步不再需要跑完，OOM 已确认解决）
+- [ ] `appendSystemContext` 标记多轮对话下的稳定性
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-09，已被 7/10 A800 实测结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖
@@ -487,8 +525,7 @@
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
 ### 已知限制 / 未解决
-- ~~训练进行到中途崩溃~~ **已解决**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；A800 提高系统内存后连续跑过 10 次 `update_weights()` 无 OOM，确认修复有效；8GPU 正式提交同步申请更高系统内存
-- INIT 阶段网关断连（`run_one_persona()` 重试修复）尚未在真实 job 上验证，见上方「主要问题」
+- 训练进行到中途崩溃：节点系统内存 OOM，发生在 `update_weights()` 权重同步阶段（7/10 已解决，见上）
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
@@ -498,7 +535,7 @@
 3. minitest 完整跑通后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪）
 
 ### 未验证
-- [ ] minitest 5 GPU 完整跑通（A800 已提交，验证 OOM/网关断连修复是否解决，见 2026-07-10 条目）
+- [ ] minitest 5 GPU 完整跑通
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性
 - [ ] 8 GPU 正式 Table 3 训练
 
