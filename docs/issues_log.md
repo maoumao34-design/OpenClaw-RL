@@ -318,6 +318,8 @@ ray.exceptions.RayTaskError(OutOfMemoryError): ray::MegatronTrainRayActor.update
 
 **附带确认：** 换用非 H 系列 GPU 测试是否可行——理论上 bf16 训练不是 H 系列专属，但（a）smoke 用 TP=1 单卡需扛下整个 4B 模型+KV cache，实测占用约 77GB/95GB，换成更小显存的卡大概率 OOM；（b）flash-attn/TransformerEngine/apex/flashinfer 等扩展是针对当前 GPU 架构专门编译的，换架构大概率需要重新编译，不是简单换卡就能跑。未做实际测试，仅为可行性评估。
 
+**更正（2026-07-10）：** (b) 这条猜测已被实测推翻。A800（Ampere，sm_80）minitest 上 Megatron 训练步正常触发（`training.log` 里 `Timer train start` 顺利执行，无任何 kernel/import 报错），说明当时装的 flash-attn/TE/apex/flashinfer 构建产物并不是 H20（sm_90）专属编译，本来就支持多架构（或默认构建配置本就覆盖了 Ampere）。项目里唯一真正要求 sm_90 的是 DeepEP（`work_log.md` 06-22 条目），但 Qwen3-4B 是稠密模型不依赖 DeepEP，当时就没装，从未被本项目实际用上。
+
 ---
 
 ## [2026-07-08] smoke 首次验证 header workaround：X-Turn-Type 生效，X-Session-Id 仍未生效
