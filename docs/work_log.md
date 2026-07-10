@@ -437,14 +437,15 @@
 - 插件 + 服务端补丁部署逻辑接入 `smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三个脚本，保持一致，静态 `X-Turn-Type` header 已废弃 → commit `df22940` / `a7d1da6` / `73ccfef`
 - 清理三种机制切换过程中的孤儿文件（`test_undici_header_injection.mjs`）和过时文档（`implementation_path.md` 架构描述更新到最新方案）→ commit `fab9560`
 - 排查 smoke/minitest 反复静默崩溃问题：先排除 `RerunStateMachine`（查 Megatron 源码证实 DISABLED 模式下真实 NaN/Inf 依然会抛可捕获异常，跟"完全静默"对不上），加 `NCCL_DEBUG=INFO` 诊断（commit `d84b71c`）；重新提交 minitest 后**首次拿到完整 Python traceback**，确认真实根因是 **节点系统内存 OOM**（128GB 节点打满到 98.9%，Ray 自身内存监控杀掉 worker），发生在 `update_weights()` 权重同步阶段，与 07-06 记录的 smoke `update_weights()` OOM 是同一崩溃触发点、但资源种类不同（07-06 是 GPU 显存，这次是系统内存）→ [`issues_log.md`](issues_log.md) 2026-07-09 条目更新
-- 决定：minitest 重新提交时把系统内存申请提高到 256GB 验证是否解决
+- 权衡系统内存申请量：256GB 排队困难，改为先申请 192GB（128GB 峰值 126.63GB 之上留约 64GB 余量，比 256GB 好排很多）验证是否解决，不够再升级
+- 顺带评估 CPU：当前 16 核，不是这次 OOM 的直接原因（不同资源），但崩溃日志里 top 进程列表显示 5 GPU 任务同时有 sglang scheduler/detokenizer、multiprocessing.spawn、gcs_server 等多个 CPU 侧进程，16 核偏紧；建议按比例一并提高，暂未做最终决定
 
 **主要问题：**
 - ~~smoke/minitest 连续三次...无 traceback、无 OOM 记录...根因未查清~~（已定位，见下）：反复静默崩溃的真实根因是**节点系统内存不足**（128GB 节点被 Megatron actor + rollout engine + PRM 等常驻进程打满），发生在 `update_weights()` 的 `pause_generation` 阶段；此前几次"静默无 traceback"很可能是同一个 OOM 杀在了没有异常捕获的 NCCL 集合通信调用中间，导致其余 rank 卡死，跟这次杀在 `ray.get()` 调用点上（有异常捕获、留下 traceback）是同一类问题的不同表现 → [`issues_log.md`](issues_log.md) 2026-07-09 条目更新
 
 **待验证：**
-- minitest 256GB 内存重跑，确认 OOM 是否解决（重新提交中）
-- 若解决，8GPU 正式提交同步申请 256GB+ 系统内存
+- minitest 192GB 内存重跑，确认 OOM 是否解决（尚未排上队）
+- 若不够，升级到 256GB；若解决，8GPU 正式提交同步申请更高系统内存
 - `appendSystemContext` 标记会不会污染 OpenClaw 自己持久化的多轮对话历史（真实 GPU 链路里还未观察到异常，需要更长多轮对话验证）
 - context-summarization 内部调用是否触发 `before_prompt_build`（决定 Task 摘要污染问题是否顺带解决）
 
@@ -466,13 +467,13 @@
 - [x] `scripts/launch_simulator.sh`（context 32768）
 
 ### 已知限制 / 未解决
-- **训练进行到中途崩溃，根因已确认**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；跟今天的 header 机制改动无关；已决定重新提交时把系统内存申请提到 256GB，待验证是否解决，见上方「主要问题」
+- **训练进行到中途崩溃，根因已确认**：节点系统内存 OOM（128GB 节点打满，非 GPU 显存、非 NCCL），发生在 `update_weights()` 权重同步阶段；跟今天的 header 机制改动无关；决定先申请 192GB 重新提交验证（256GB 排队困难，作为不够时的后备），CPU（当前 16 核）是否一并提高尚未决定，见上方「主要问题」
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
 ### 下一步
-1. minitest 提交时系统内存申请提高到 256GB，重新提交验证 OOM 是否解决
-2. 若解决，8GPU 正式提交同步申请更高系统内存
+1. minitest 提交时系统内存申请提高到 192GB（不够再升 256GB），重新提交验证 OOM 是否解决
+2. 若解决，8GPU 正式提交同步申请更高系统内存（+ 视情况提高 CPU 核数）
 3. minitest 完整跑通后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪）
 
 ### 未验证
