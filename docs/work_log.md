@@ -451,6 +451,25 @@
 
 ---
 
+## 2026-07-10
+
+**目标：** 用新到的 A800 资源先验证 pipeline（H20 留给排队的正式跑）；确认 minitest 是否卡在网关/内存问题
+
+**完成内容：**
+- 补充 `paper_understanding.md` 第十一节：加回真正的 `openclaw gateway run` 提供的文件读写等工具执行职责（之前只列了 RL 数据管道那层职责）；顺带用官方源码核实修正了一处端口归属错误（18789=真正的 openclaw gateway，30000=`openclaw_combine_select_api_server.py`，此前标反了）；`implementation_path.md` 架构图同步更正 → commit `dc46261`/`168fa51`
+- A800 提交 minitest（已申请更高内存），验证过程中追查"进度是否异常慢"：用 `minitest_20260709_172118`（上条 OOM 记录那次）做对比基准时发现该基准本身不干净——查 `simulation.log` 发现 INIT 阶段 TA/Teacher 都遇到过 `Connection refused`（网关 18789 中途短暂不可达），被脚本当"警告"静默跳过，`results_TA_init.txt`/`results_teacher_init.txt` 全是 0 字节，说明那次 homework1/homework2 数据本身不完整；确认这个网关断连问题和后面真正杀死任务的系统内存 OOM 是两个独立问题，不是同一根因 → [`issues_log.md`](issues_log.md) 2026-07-10 条目
+- 修复：`run_one_persona()`（`minitest_train_with_services.sh` / `train_with_services.sh` 共用）改为每次调用前先复查网关是否可达，单次失败最多重试 3 次，不再一次失败就静默放过（`smoke_train_with_services.sh` 不用这个函数，不受影响）；确认此修复只改本地脚本源码，不影响当前已提交的 A800 job（提交时已拷贝脚本到自己的日志目录）→ commit（待补）
+
+**主要问题：**
+- INIT 阶段网关短暂不可达导致 TA/Teacher 数据静默丢失（已确认根因并修复，见上）
+- A800 这次 minitest 进度明显比 07-09 那次"更慢"，但对比基准（07-09 那次）本身 INIT 不完整，不能直接下"A800 慢"的结论，需要等这次（网关修复后）真正跑完 INIT 才能做有效对比
+
+**待验证：**
+- 这次 A800 minitest 完整跑完 INIT（Student/TA/Teacher 各 72 题）+ 进入 Joint round + 第一次 `update_weights()`，确认系统内存 OOM 是否解决、网关断连是否不再发生
+- 8GPU 正式提交时同步应用 `run_one_persona()` 修复（`train_with_services.sh` 已同步改，无需额外操作）
+
+---
+
 ## 当前状态（2026-07-09）
 
 ### 已就绪
@@ -477,7 +496,7 @@
 3. minitest 完整跑通后提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪）
 
 ### 未验证
-- [ ] minitest 5 GPU 完整跑通（256GB 内存重跑中，验证 OOM 是否解决）
+- [ ] minitest 5 GPU 完整跑通（A800 已提交，验证 OOM/网关断连修复是否解决，见 2026-07-10 条目）
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性
 - [ ] 8 GPU 正式 Table 3 训练
 

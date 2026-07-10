@@ -513,6 +513,36 @@ PID     MEM(GB) COMMAND
 
 ---
 
+## [2026-07-10] INIT 阶段 TA/Teacher 与网关连接中途被拒绝，静默跳过导致 homework 数据不完整（与上条 OOM 是同一次跑，但相互独立的两个问题）
+
+**背景：** 追查"这次 A800 minitest 进度是不是异常慢"时，用 `minitest_20260709_172118`（就是上一条 OOM traceback 那次）作对比基准，结果发现这个基准本身就不干净。
+
+**现象：** `training.log` 里完全没有 INIT 阶段的记录——`grep "INIT"` / `grep "Problem.*session"` 都是 0 条，说明 INIT 阶段的输出根本不写进 `training.log`，而是写进同目录下的 `simulation.log`。查 `simulation.log` 发现：
+
+```
+results_TA_init.txt / results_TA_all.txt / results_teacher_init.txt / results_teacher_all.txt 均为 0 字节
+```
+
+`simulation.log` 里 TA 和 Teacher 的 INIT 阶段都各自重试 3-4 次后报同样的错：
+
+```
+requests.exceptions.ConnectionError: HTTPConnectionPool(host='localhost', port=18789): Max retries exceeded with url: /v1/chat/completions
+(Caused by NewConnectionError("HTTPConnection(host='localhost', port=18789): Failed to establish a new connection: [Errno 111] Connection refused"))
+警告：TA 模拟未完全完成，继续训练
+...
+警告：Teacher 模拟未完全完成，继续训练
+```
+
+**根因：** `openclaw.log` 显示网关本身 17:24:31 就已经 `ready`，晚于 TA/Teacher 尝试连接的时间，且同一次跑里 Joint round 阶段 Student 的后续请求又能正常打通网关、真实样本也正常提交——说明网关不是没启动、也没有彻底挂掉，是中途有一段短暂不可达的窗口，TA/Teacher 的 INIT 恰好撞上了这段窗口。`run_one_persona()`（`minitest_train_with_services.sh` / `train_with_services.sh` 共用同一份逻辑）只在整个脚本最开始 `wait_for_port` 检查一次网关就绪，之后 Student/TA/Teacher 依次调用时不再复查；单次调用失败就直接把 stderr 打成"警告...继续训练"放过，不重试。
+
+**影响：** 这次 Joint round 收集到的"16 个真实样本"是在 TA 没有真正批改 homework1、Teacher 没有真正评论 homework2 的情况下产生的——`homework1`/`homework2` 数据本身不完整，不是一次干净的训练信号。跟同一次跑里后面发生的 `update_weights()` 系统内存 OOM 是两个独立问题：网关断连发生在 INIT 阶段（~17:24-17:31），没有让任务崩溃，任务是后面才被系统内存 OOM 真正杀死的（~17:37 之后，见上条）。
+
+**修复：** `run_one_persona()` 改为每次调用前先用 `wait_for_port` 复查网关是否仍可达（已就绪时开销接近零），网关确认可达后再执行；单次 Python 脚本调用失败时不再直接放过，最多重试 3 次（每次间隔 10s），3 次都失败才保留原有的"警告...继续训练"兜底（措辞加了"数据可能不完整"提示）。`smoke_train_with_services.sh` 不用 `run_one_persona`（不受影响）。commit（待补）。已确认此次修复只改本地脚本源码，不影响当前正在跑的 A800 minitest job（该 job 提交时已经把脚本拷贝/生成到自己的日志目录，不会读取后续修改）。
+
+**待验证：** 下次提交的 minitest/8GPU 如果再遇到 18789 中途不可达，观察是否能在重试窗口内自愈，`results_TA_init.txt`/`results_teacher_init.txt` 是否不再是 0 字节。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

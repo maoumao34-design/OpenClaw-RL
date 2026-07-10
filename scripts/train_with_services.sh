@@ -323,16 +323,33 @@ TEACHER_ALL="${LOGS_DIR}/results_teacher_all.txt"
 # 单角色调用封装（$1=名称 $2=脚本 $3=题数 $4=输出文件）
 run_one_persona() {
     local name=$1 script=$2 num=$3 output=$4
-    OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-    OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
-    OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
-    EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-    OPENCLAW_GATEWAY_URL=http://localhost:18789 \
-    python "${OPENCLAW_DIR}/${script}" \
-        --dataset "${DATASET}" \
-        --num-problems "${num}" \
-        --output "${output}" \
-    || echo "警告：${name} 模拟未完全完成，继续训练"
+    local attempt
+    for attempt in 1 2 3; do
+        # 2026-07-10 修复：网关中途短暂不可达时（issues_log.md 同日条目，
+        # 18789 Connection refused），旧版本只在整个 wait_for_port 启动时
+        # 检查一次网关就绪，之后 Student/TA/Teacher 各自失败就被当"警告"
+        # 静默跳过，导致 homework1/homework2 数据不完整却继续训练。这里
+        # 每次尝试前先确认网关仍可达（已就绪时 wait_for_port 几乎零开销），
+        # 不可达则等它恢复，最多重试 3 次。
+        wait_for_port "OpenClaw gateway" 18789 120 "${OPENCLAW_PID:-}" "${LOGS_DIR}/openclaw.log" || {
+            echo "错误：${name} 模拟第 ${attempt} 次尝试前网关不可达" >&2
+            continue
+        }
+        if OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+           OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
+           OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
+           EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
+           OPENCLAW_GATEWAY_URL=http://localhost:18789 \
+           python "${OPENCLAW_DIR}/${script}" \
+               --dataset "${DATASET}" \
+               --num-problems "${num}" \
+               --output "${output}"; then
+            return 0
+        fi
+        echo "  [${name}] 模拟失败（尝试 ${attempt}/3）"
+        [ "${attempt}" -lt 3 ] && sleep 10
+    done
+    echo "警告：${name} 模拟重试 3 次后仍未完全完成，继续训练（数据可能不完整，见 issues_log.md）" >&2
 }
 
 # ─────────────────────────────────────────────────────────────────
