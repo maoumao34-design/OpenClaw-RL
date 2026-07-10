@@ -73,12 +73,20 @@
 ```
 port 30001 ─── Simulator（Qwen3-32B / 替代，SGLang）
                     ↕ 扮演 student/TA/teacher
-port 18789 ─── OpenClaw gateway（真正的 openclaw gateway run，workspace 文件工具）
+port 18789 ─── 真正的 openclaw gateway run（真实产品，含 workspace 文件工具）
                     ↕ rl-training-headers 插件的 before_prompt_build 钩子往
                       system prompt 里塞 "[RL-TRAINING-META] session_id=...
-                      turn_type=..." 标记（见下）
-port 30000 ─── RL 训练代理（openclaw-combine 启动脚本负责启动）
+                      turn_type=..." 标记（见下）；负责给 Policy 提供实际的
+                      文件读写等工具能力，解析/执行模型的工具调用请求
+                    ↓ 出站 LLM 请求转发给 30000
+port 30000 ─── openclaw_combine_select_api_server.py（官方仓库自建的 RL
+                训练数据代理，openclaw-combine 启动脚本负责启动；本身不执行
+                任何工具调用，只负责路由/buffering/PRM 打分/样本组装，内部
+                再转发给真正的 SGLang 引擎生成 Qwen3-4B Policy 回复）
 ```
+
+> 端口归属曾经标反过（一度把 18789/30000 的进程搞混），已用官方源码核实修正，
+> 详见 [`paper_understanding.md`](paper_understanding.md) 第十一节。
 
 > 2026-07-09 更新：论文原设计靠 `rl-training-headers` 插件 patch `globalThis.fetch`
 > 往 HTTP header 里注入 `X-Session-Id`/`X-Turn-Type`。经过完整排查（`issues_log.md`
