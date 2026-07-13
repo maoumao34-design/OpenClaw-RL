@@ -46,7 +46,16 @@ if [ -n "${SINGBOX_PORT:-}" ]; then
 else
     echo "警告：未能从 sing-box 输出解析出端口，wandb 可能上报不了"
 fi
-curl -I https://www.google.com || echo "警告：代理连通性检查失败，继续"
+# sing-box 打印"启动成功"时后台进程可能还没真正绑定端口，重试几次再判定
+proxy_ok=0
+for _ in 1 2 3 4 5; do
+    if curl -sI --max-time 3 https://www.google.com > /dev/null 2>&1; then
+        proxy_ok=1
+        break
+    fi
+    sleep 1
+done
+[ "${proxy_ok}" = "1" ] && echo "[proxy] 连通性检查通过" || echo "警告：代理连通性检查失败（重试 5 次），继续"
 
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
