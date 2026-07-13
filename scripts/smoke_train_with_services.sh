@@ -20,6 +20,14 @@
 
 set -euo pipefail
 
+# 2026-07-13：wandb.ai 在这个环境里直连不通，需要先起代理才能上报。这几行
+# 不应该让整个训练 job 失败（代理偶尔起不来不该阻塞训练本身），所以都不用
+# set -e 的严格模式处理，失败只打日志、不中断。
+bash /dfs/share-groups/foundationmodelgroup/LRM/proxy/sing-box.sh start || echo "警告：代理启动失败，继续（wandb 可能上报不了）"
+source ~/.bashrc || true
+pon || echo "警告：pon 未生效，继续"
+curl -I https://www.google.com || echo "警告：代理连通性检查失败，继续"
+
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
 if [ ! -f "${SIMULATOR_ENV}" ]; then
