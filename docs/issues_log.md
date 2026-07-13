@@ -583,9 +583,29 @@ estimatedPromptTokens=13611  promptBudgetBeforeReserve=12768  reserveTokens=2000
 
 **根因：** smoke 的训练规模很小（只有 `perf 0`/`perf 1` 两步），训练进程比 INIT 阶段的 Student→TA→Teacher 顺序模拟更快跑完；外层脚本一见训练进程（`TRAINING_PID`）退出就立即执行清理、杀掉网关，**没有等 INIT 模拟循环也跑完**，正好在 TA 写最后一条评论时把网关杀了。这是脚本收尾时序上的一个真实 bug，跟 `reserveTokens`/context overflow 无关（TA 前 3 轮已经证明能正常生成，第 4 轮失败纯粹是被提前杀掉）。
 
-**为什么 minitest/8GPU 上不太会撞见同一个问题：** 07-10 的 A800 minitest 实测里，训练本身耗时远超过 INIT 阶段（INIT 216 个 session 走完才进入 Joint round），时间差够大，不容易撞上这种"训练比 INIT 先跑完"的时序竞争；smoke 恰恰是训练规模被缩得很小，容易触发。
+**更正（2026-07-13，minitest 上也复现了）：** 原以为"minitest 训练耗时远超 INIT，不容易撞上"，`minitest_20260713_112908` 证明这个判断错了——这次训练在 `perf 300`（`--num-rollout` 目标）达成后 6 秒内网关就被 SIGTERM，跟 smoke 是同一个 bug，只是触发时机不同：smoke 是训练规模小、比 INIT 先跑完；minitest 这次是训练**提前跑完了全部目标步数**（原因见下一条：checkpoint 复用导致训练几乎没跑新步数就"完成"），本质上都是"训练进程一退出就立刻清理，不管模拟循环还在不在跑"。
 
-**处理：** 已记录，暂不修——smoke 本来就只是流水线联调，不需要 INIT 完整跑完，`reserveTokens` 修复这个目的已经用前 3 轮数据验证达成；且这个问题优先级低（8GPU/minitest 上不容易复现）。如果之后 minitest/8GPU 也出现同样症状（训练比模拟循环先结束、服务被提前杀掉），再回来修：让清理逻辑等 `simulation_loop`/`SIM_LOOP_PID` 也退出再杀网关，而不是只等 `TRAINING_PID`。
+**处理：** 已记录，暂不修——问题本身没有直接损害数据有效性（网关关闭前的真实数据仍然有效），优先级仍然不高。如果后续 8GPU 正式训练也复现（训练进程提前退出、模拟循环没跑完就被打断），需要修：让清理逻辑等 `simulation_loop`/`SIM_LOOP_PID` 也退出再杀网关，而不是只等 `TRAINING_PID`。
+
+---
+
+## [2026-07-13] minitest 复用了旧 checkpoint，"续训"到接近目标直接完成，本次验证结果无效
+
+**背景：** 排查 `minitest_20260713_112908`为什么能在 7 分钟内就跑到 `perf 300`（不合理——A800 实测一步要 5-6 分钟）。
+
+**根因：** `run_openclaw_topk_select_modelfactory.sh` 里我们自己加的断点续训补丁（`--load "${SAVE_CKPT}"`，07-08 条目）会在 `SAVE_CKPT` 目录已有 checkpoint 时自动续训。但 **minitest 每次都写到同一个固定路径**（`/dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk-select`），查该目录 `latest_checkpointed_iteration.txt` = 299，保存时间 `Jul 13 01:56`，正好对应上一次跑（`minitest_20260711_003159`，跑了两天才到 299 步）。这次新提交的 minitest 自动接上了这个几乎跑满的 checkpoint，几乎没做任何新训练就达成 `--num-rollout 300` 目标，7 分钟就"完成"了。
+
+**影响：** 这次 minitest 的"训练 300 步无 OOM"结论无效（不是真跑的）；TA/Teacher 也没有意义（7 分钟内 INIT 还没轮到 TA 就被收尾逻辑打断，见上一条）。内存 OOM 修复的有效性仍以 07-10 A800 那次连续 10 次全新 `update_weights()` 的实测为准，不受影响；`reserveTokens` 修复的有效性以同一天 smoke 的结果为准，不受影响。
+
+**这是一个通用陷阱**：断点续训对 8GPU 正式训练是有意设计的功能（防止意外中断丢进度），但对 minitest 这种"每次都要验证一遍完整流水线"的场景是有害的——一旦某次 minitest 的 checkpoint 攒够了 `--num-rollout` 步数，之后所有指向同一路径的 minitest 都会"续训到快完成直接结束"，失去验证意义，且不会有任何报错提示这个情况，容易被误判为"这次跑通过了"。
+
+**处理：** 清空 minitest 专用的 checkpoint 目录后重新提交：
+```bash
+rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk-select
+```
+清空后 `--load` 找不到有效 checkpoint 会自动回退到 `--ref-load` 从预训练权重重新开始（断点续训补丁本身的设计行为）。不影响 8GPU 正式训练的 checkpoint（路径不同）。当前选择手动清空而不是改脚本让每次 minitest 用独立路径——如果以后经常忘记清空导致重复踩坑，再考虑把 `SAVE_CKPT` 绑定到 minitest 各自的 `LOGS_DIR`。
+
+**待验证：** 清空 checkpoint 后重新提交的 minitest，确认能不能观察到真正从头开始的 INIT + Joint round + 训练全过程。
 
 ---
 
