@@ -569,7 +569,23 @@ estimatedPromptTokens=13611  promptBudgetBeforeReserve=12768  reserveTokens=2000
 
 **修复：** 不再深究 20000 具体从哪算出来的，直接在三个训练脚本的网关启动阶段显式设置 `openclaw config set agents.defaults.compaction.reserveTokens 16384`（跟 `chatCompletions.enabled` 那个强制设置是同一个模式），把它拉回官方默认值——论文本身没有理由用非默认配置，16384 应该就是论文实际用的值。已加入 `smoke_train_with_services.sh`/`minitest_train_with_services.sh`/`train_with_services.sh` 三脚本，commit（待补）。
 
-**待验证：** 下次提交 minitest，确认 `[verify] agents.defaults.compaction.reserveTokens = 16384` 生效、TA/Teacher 的 `results_*_init.txt`/`results_*_all.txt` 不再是错误占位文本，且都能正常收敛或至少产生真实回复。
+**待验证（已在 smoke 上确认修复生效，见下）：** ~~下次提交 minitest，确认...~~
+
+**更新（2026-07-13，smoke 验证）：** `smoke_20260713_110306` 确认修复生效——`openclaw.log` 里 `[verify] agents.defaults.compaction.reserveTokens = 16384`；`results_TA_smoke.txt` 里 TA 第一次产生真实回复（`"The solution section is empty. The correct answer is 36."`），不再是错误占位文本。TA 后续 turn 4 又失败了，但那是另一个独立问题（网关被提前 SIGTERM，见下一条），不是 context overflow 复发。minitest/8GPU 上仍建议留意确认，但根因已确认解决，风险很低。
+
+---
+
+## [2026-07-13] smoke 训练一结束就立刻杀网关，没等 INIT 模拟循环跑完——TA 最后一轮被打断（已记录，暂不修）
+
+**背景：** 验证上一条 `reserveTokens=16384` 修复时，用 smoke 快速测试（`smoke_20260713_110306`），确认修复生效（TA 前 3 轮都是真实回复），但 TA 第 4 轮（也是 INIT 流程最后一轮，写入批改评论）撞上新问题。
+
+**现象：** `simulation.log` 显示 TA turn 4/4 先是 `408 Client Error: Request Timeout`，内部重试 3 次（1s/2s/4s backoff）全部失败，`TA_chat.py` 抛未捕获异常直接退出进程；`openclaw.log` 同一时间窗口显示网关收到 `SIGTERM`、开始关闭。
+
+**根因：** smoke 的训练规模很小（只有 `perf 0`/`perf 1` 两步），训练进程比 INIT 阶段的 Student→TA→Teacher 顺序模拟更快跑完；外层脚本一见训练进程（`TRAINING_PID`）退出就立即执行清理、杀掉网关，**没有等 INIT 模拟循环也跑完**，正好在 TA 写最后一条评论时把网关杀了。这是脚本收尾时序上的一个真实 bug，跟 `reserveTokens`/context overflow 无关（TA 前 3 轮已经证明能正常生成，第 4 轮失败纯粹是被提前杀掉）。
+
+**为什么 minitest/8GPU 上不太会撞见同一个问题：** 07-10 的 A800 minitest 实测里，训练本身耗时远超过 INIT 阶段（INIT 216 个 session 走完才进入 Joint round），时间差够大，不容易撞上这种"训练比 INIT 先跑完"的时序竞争；smoke 恰恰是训练规模被缩得很小，容易触发。
+
+**处理：** 已记录，暂不修——smoke 本来就只是流水线联调，不需要 INIT 完整跑完，`reserveTokens` 修复这个目的已经用前 3 轮数据验证达成；且这个问题优先级低（8GPU/minitest 上不容易复现）。如果之后 minitest/8GPU 也出现同样症状（训练比模拟循环先结束、服务被提前杀掉），再回来修：让清理逻辑等 `simulation_loop`/`SIM_LOOP_PID` 也退出再杀网关，而不是只等 `TRAINING_PID`。
 
 ---
 

@@ -484,16 +484,17 @@
 - 排查这个限制是不是像 SSRF 那次一样最近两个月新加的：查本地 `openclaw` 源码确认官方默认值是 16384（不是 20000），查 `CHANGELOG.md` 确认 precheck 机制可追溯到 2026.4.29，跟论文写插件同期甚至更早——**不是最近新加的限制**，是我们环境里这个值不知为何被设成了 20000（来源未查清，`openclaw.json` 里也搜不到）
 - 修复：三个训练脚本网关启动阶段强制 `openclaw config set agents.defaults.compaction.reserveTokens 16384`，跟 `chatCompletions.enabled` 那个强制设置同一个模式 → commit `dec7ec2`
 - 顺带确认 8GPU 正式脚本本来就有完整 wandb 支持（官方默认 `USE_WANDB=1`，读 `WANDB_KEY`/`WANDB_API_KEY`），不用改；minitest/smoke 之前把 `USE_WANDB` 写死成 0，改成可以被外部环境变量覆盖 → commit `36d0a9d`
+- smoke（`smoke_20260713_110306`，`USE_WANDB=1`）验证：**`reserveTokens=16384` 修复确认生效**——`[verify] agents.defaults.compaction.reserveTokens = 16384`，TA 首次产生真实回复（不再是错误占位文本）；但发现一个新的独立问题：smoke 训练跑得比 INIT 模拟循环快，外层脚本一见训练进程退出就立刻杀网关，没等 INIT 跑完，TA 最后一轮被打断——已记录暂不修（minitest/8GPU 训练耗时远超 INIT，不易复现这个时序竞争）→ [`issues_log.md`](issues_log.md) 2026-07-13 第二条
 
 **主要问题：**
-- TA/Teacher 全程 context overflow（已确认根因并修复，见上）
+- ~~TA/Teacher 全程 context overflow~~ **已确认修复生效**（见上）
+- smoke 训练一结束就杀网关不等模拟循环跑完（新发现，已记录暂不修）
 - 网关断连重试修复（`run_one_persona()`，commit `6324c18`）仍未被干净验证——07-11 那次虽然带着这个修复跑，但 TA/Teacher 全程失败是 reserveTokens 问题（确定性失败，重试没用），把网关断连这条线完全盖住了，没法看出重试修复本身有没有生效
 
-**待验证（用户即将提交 smoke 确认）：**
-- `reserveTokens=16384` 修复是否生效（`openclaw.log` 里 `[verify] agents.defaults.compaction.reserveTokens = 16384`）
-- TA/Teacher 是否不再 context overflow，能产生真实回复
-- wandb 是否能正常上报（`USE_WANDB=1` + `WANDB_API_KEY` 已设置）
-- 网关断连重试修复（`run_one_persona()`）——这个是偶发问题，这次 smoke 不一定能撞上，撞上了才能验证，撞不上不代表没修好
+**待验证：**
+- wandb 是否能正常上报（`USE_WANDB=1` + `WANDB_API_KEY` 已设置，待去网页确认这次 smoke run 有没有出现）
+- 网关断连重试修复（`run_one_persona()`）——偶发问题，需要真的撞上才能验证
+- minitest 完整跑通，确认 reserveTokens 修复在更长的真实多轮对话下依然有效
 
 ---
 
@@ -509,7 +510,7 @@
 - [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
 - [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
 - [x] `run_one_persona()` 网关断连重试修复，代码已就绪，**尚未被干净验证**（07-11 那次被 reserveTokens 问题盖住，见下）
-- [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置修复（TA/Teacher context overflow 根因），代码已就绪，待验证
+- [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置修复（TA/Teacher context overflow 根因），**已在 smoke 上验证生效**（TA 产生真实回复，不再是错误占位文本）
 - [x] `USE_WANDB` 可覆盖（minitest/smoke 默认仍关，8GPU 正式脚本默认开），代码已就绪，待验证
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
 - [x] `scripts/check_convergence.py`
@@ -517,20 +518,19 @@
 - [x] 系统内存 OOM 修复：提高任务提交时申请的系统内存，A800 minitest 实测连续跑过 10 次 `update_weights()` 无 OOM
 
 ### 已知限制 / 未解决
-- TA/Teacher context overflow：根因已确认（`reserveTokens` 20000 vs 官方默认 16384），修复已提交但未验证
+- smoke 训练一结束就立刻杀网关，不等 INIT 模拟循环跑完（新发现，已记录暂不修，minitest/8GPU 上因训练耗时远超 INIT 不易复现，见 [`issues_log.md`](issues_log.md) 2026-07-13 条目）
 - 网关断连重试修复尚未被干净验证（偶发问题，需要真的撞上才能确认）
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
 ### 下一步
-1. 提交 smoke（`USE_WANDB=1` + `WANDB_API_KEY` 已设置）验证 reserveTokens 修复 + wandb 上报，同时留意是否偶然撞上网关断连场景
-2. 确认 TA/Teacher 能正常产生真实回复后，minitest 完整跑通（INIT 数据完整 + 无 OOM）
+1. 确认 wandb 上报是否正常（这次 smoke 已开 `USE_WANDB=1`，去 wandb 网页确认 `openclaw_rl` 项目里有没有这次 run）
+2. TA/Teacher context overflow 修复已在 smoke 上验证生效，minitest 完整跑通（INIT 数据完整 + 无 OOM）作为下一步确认
 3. 提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存，wandb 默认开）
 4. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
 
 ### 未验证
-- [ ] `agents.defaults.compaction.reserveTokens=16384` 是否解决 TA/Teacher context overflow（smoke 验证中）
-- [ ] wandb 上报是否正常（smoke 验证中）
+- [ ] wandb 上报是否正常（smoke 已跑，待去网页确认）
 - [ ] `run_one_persona()` 网关断连重试修复（偶发问题，待真实撞上验证）
 - [ ] minitest 5 GPU 完整跑通（INIT 数据完整 + 无 OOM，300 步不再需要跑完）
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性
