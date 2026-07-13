@@ -138,6 +138,38 @@ if old_cuda_conn not in text:
     raise SystemExit("patch failed: CUDA_DEVICE_MAX_CONNECTIONS line not found in topk-select launcher")
 text = text.replace(old_cuda_conn, new_cuda_conn, 1)
 
+# 2026-07-13: 官方脚本把 --wandb-key ${WANDB_KEY_VALUE} 当成命令行参数传给
+# train_async.py，wandb 会把完整启动命令记到 run 的 "Command" 字段里，项目一旦
+# 公开这个 key 就跟着明文暴露（真实发生过，见 issues_log.md 2026-07-13 条目）。
+# wandb SDK 在没有显式 key 时会自动读 WANDB_API_KEY 环境变量完成登录（见
+# slime/utils/wandb_utils.py:40，args.wandb_key is None 时跳过显式 login，
+# 后续 wandb.init() 自己兜底），所以只需要把 key 从 CLI 参数改成走 Ray runtime
+# env 的环境变量，不影响功能。
+old_nccl_env = '\\"NCCL_DEBUG\\": \\"INFO\\",'
+new_nccl_env = '\\"NCCL_DEBUG\\": \\"INFO\\",\n    \\"WANDB_API_KEY\\": \\"${WANDB_API_KEY:-}\\",'
+if old_nccl_env not in text:
+    raise SystemExit("patch failed: NCCL_DEBUG line not found in topk-select launcher")
+text = text.replace(old_nccl_env, new_nccl_env, 1)
+
+old_wandb_args = (
+    "  WANDB_ARGS=(\n"
+    "    --use-wandb\n"
+    "    --wandb-project ${WANDB_PROJECT}\n"
+    "    --wandb-group qwen3-4b-openclaw-topk-select\n"
+    "    --wandb-key ${WANDB_KEY_VALUE}\n"
+    "  )"
+)
+new_wandb_args = (
+    "  WANDB_ARGS=(\n"
+    "    --use-wandb\n"
+    "    --wandb-project ${WANDB_PROJECT}\n"
+    "    --wandb-group qwen3-4b-openclaw-topk-select\n"
+    "  )"
+)
+if old_wandb_args not in text:
+    raise SystemExit("patch failed: WANDB_ARGS block not found in topk-select launcher")
+text = text.replace(old_wandb_args, new_wandb_args, 1)
+
 path.write_text(text)
 PY
 
