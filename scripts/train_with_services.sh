@@ -8,7 +8,10 @@
 # 说明见 docs/smoke_test.md
 #
 # modelfactory job 提交：
-#   代码解释器: bash
+#   代码解释器: /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i
+#              （2026-07-13 起：wandb.ai 需要走代理，start_tools.sh 负责
+#              起代理，-i 让 pon 这个 alias 能展开；纯 `bash` 提交代理会
+#              连不上，wandb 上报不了）
 #   代码路径:   /dfs/data/openclaw-rl-project/openclaw-rl/scripts/train_with_services.sh
 #   GPU 数量:   8
 #
@@ -24,34 +27,9 @@
 
 set -euo pipefail
 
-# 2026-07-13：wandb.ai 在这个环境里直连不通，需要先起代理才能上报。这几行
-# 不应该让整个训练 job 失败（代理偶尔起不来不该阻塞训练本身），所以都不用
-# set -e 的严格模式处理，失败只打日志、不中断。
-SINGBOX_OUT=$(bash /dfs/share-groups/foundationmodelgroup/LRM/proxy/sing-box.sh start 2>&1) \
-    && echo "${SINGBOX_OUT}" \
-    || echo "警告：代理启动失败，继续（wandb 可能上报不了）：${SINGBOX_OUT}"
-set +u; source ~/.bashrc || true; set -u  # 拿 ~/.bashrc 里的 WANDB_API_KEY 等；.bashrc 引用未设置的 $PS1，set -u 下会报错，临时关闭
-# 2026-07-13：pon/poff 在提交的 job 容器里查不到（跟交互式 workspace 终端不是
-# 同一个环境，job 每次都是全新安装 sing-box），放弃依赖它，改成从 sing-box.sh
-# 自己的启动输出里动态解析实际监听端口，不硬编码。
-SINGBOX_PORT=$(echo "${SINGBOX_OUT:-}" | grep -oP 'Proxy listening on port:\s*\K[0-9]+' | head -1)
-if [ -n "${SINGBOX_PORT:-}" ]; then
-    export http_proxy="http://127.0.0.1:${SINGBOX_PORT}"
-    export https_proxy="http://127.0.0.1:${SINGBOX_PORT}"
-    echo "[proxy] 检测到端口 ${SINGBOX_PORT}，http_proxy=${http_proxy}"
-else
-    echo "警告：未能从 sing-box 输出解析出端口，wandb 可能上报不了"
-fi
-# sing-box 打印"启动成功"时后台进程可能还没真正绑定端口，重试几次再判定
-proxy_ok=0
-for _ in 1 2 3 4 5; do
-    if curl -sI --max-time 3 https://www.google.com > /dev/null 2>&1; then
-        proxy_ok=1
-        break
-    fi
-    sleep 1
-done
-[ "${proxy_ok}" = "1" ] && echo "[proxy] 连通性检查通过" || echo "警告：代理连通性检查失败（重试 5 次），继续"
+# wandb.ai 代理改由提交时的 start_tools.sh（bash -i 链式提交）负责起，见
+# work_log.md 2026-07-13 条目；脚本内不再重复处理，避免和 start_tools.sh
+# 冲突/重复启动。
 
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
 SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
