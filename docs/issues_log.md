@@ -628,6 +628,28 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待验证：** 用新的提交方式重新跑一次 smoke/minitest，确认 wandb 项目 `openclaw_rl` 里能看到对应 run。
 
+**更新（同一天，验证成功但暴露新的安全问题）：** 新提交方式确认有效，wandb run 正常出现（`qwen3-4b-openclaw-topk-select_kl2fceaf-RANK_0`）。用户为了让我能查看图表，把 `openclaw_rl` 项目设成了 Public。查看 run 的 Overview 页面时发现 **"Command" 字段（wandb 自动记录的启动命令）里明文包含了 `--wandb-key <API_KEY>`**——项目公开后这个字段任何人不用登录都能看到，key 第二次暴露（第一次是在对话里贴 `.bashrc`）。
+
+---
+
+## [2026-07-13] wandb key 从 CLI 参数暴露在 Command 字段——改走环境变量
+
+**背景：** 上一条发现 wandb run 的 "Command" 字段公开可见，且里面有明文 API key。
+
+**根因：** 官方 `run_qwen3_4b_openclaw_topk_select.sh` 把 `--wandb-key ${WANDB_KEY_VALUE}` 作为命令行参数传给 `train_async.py`；wandb SDK 会自动把完整的 `sys.argv` 记录到 run 的 "Command" 字段用于可复现性——这是 wandb 的标准行为，不是 bug，但意味着任何用 CLI flag 传的敏感值都会被公开记录，且**没有"只隐藏这个字段"的官方开关**（查过 wandb 社区确认）。
+
+**修复：** 查 `slime/utils/wandb_utils.py:40` 确认 `args.wandb_key is None` 时会跳过显式 `wandb.login()`，后续 `wandb.init()` 自己会读 `WANDB_API_KEY` 环境变量完成认证，不影响功能。改法：
+1. 在 `run_openclaw_topk_select_modelfactory.sh` 的 `RUNTIME_ENV_JSON.env_vars` 里加 `WANDB_API_KEY`（Ray runtime env 传递，不是 CLI 参数）
+2. 从 `WANDB_ARGS` 里去掉 `--wandb-key ${WANDB_KEY_VALUE}` 这一行
+
+本地测试两处字符串替换均正确匹配官方脚本原文、patch 后 bash 语法通过。commit `781b602`。
+
+**用户需要手动做的两件事（不是脚本能解决的）：**
+1. 把 `openclaw_rl` 项目 visibility 改回 Team/Private，直到确认新 run 的 Command 字段不再有 key
+2. 去 wandb 网站撤销当前这个已经暴露两次的 key，重新生成一个新的
+
+**待验证：** 下次提交后检查新 run 的 "Command" 字段确认不再包含 `--wandb-key`，且 wandb 登录/上报依然正常（验证 `WANDB_API_KEY` 环境变量兜底生效）。
+
 ---
 
 <!-- 格式模板：
