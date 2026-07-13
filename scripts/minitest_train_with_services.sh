@@ -31,14 +31,21 @@ set -euo pipefail
 # 2026-07-13：wandb.ai 在这个环境里直连不通，需要先起代理才能上报。这几行
 # 不应该让整个训练 job 失败（代理偶尔起不来不该阻塞训练本身），所以都不用
 # set -e 的严格模式处理，失败只打日志、不中断。
-bash /dfs/share-groups/foundationmodelgroup/LRM/proxy/sing-box.sh start || echo "警告：代理启动失败，继续（wandb 可能上报不了）"
+SINGBOX_OUT=$(bash /dfs/share-groups/foundationmodelgroup/LRM/proxy/sing-box.sh start 2>&1) \
+    && echo "${SINGBOX_OUT}" \
+    || echo "警告：代理启动失败，继续（wandb 可能上报不了）：${SINGBOX_OUT}"
 set +u; source ~/.bashrc || true; set -u  # 拿 ~/.bashrc 里的 WANDB_API_KEY 等；.bashrc 引用未设置的 $PS1，set -u 下会报错，临时关闭
-# 2026-07-13：pon/poff 在这个 job 容器里查不到（不在 PATH、.bashrc 也没有），
-# .bashrc 里声称的 "Adding proxy configuration" 没有真正生效，放弃依赖它，
-# 直接用已确认的固定端口 7893 设置代理环境变量。
-export http_proxy="http://127.0.0.1:7893"
-export https_proxy="http://127.0.0.1:7893"
-echo "[proxy] http_proxy=${http_proxy} https_proxy=${https_proxy}"
+# 2026-07-13：pon/poff 在提交的 job 容器里查不到（跟交互式 workspace 终端不是
+# 同一个环境，job 每次都是全新安装 sing-box），放弃依赖它，改成从 sing-box.sh
+# 自己的启动输出里动态解析实际监听端口，不硬编码。
+SINGBOX_PORT=$(echo "${SINGBOX_OUT:-}" | grep -oP 'Proxy listening on port:\s*\K[0-9]+' | head -1)
+if [ -n "${SINGBOX_PORT:-}" ]; then
+    export http_proxy="http://127.0.0.1:${SINGBOX_PORT}"
+    export https_proxy="http://127.0.0.1:${SINGBOX_PORT}"
+    echo "[proxy] 检测到端口 ${SINGBOX_PORT}，http_proxy=${http_proxy}"
+else
+    echo "警告：未能从 sing-box 输出解析出端口，wandb 可能上报不了"
+fi
 curl -I https://www.google.com || echo "警告：代理连通性检查失败，继续"
 
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
