@@ -487,15 +487,18 @@
 - smoke（`smoke_20260713_110306`，`USE_WANDB=1`）验证：**`reserveTokens=16384` 修复确认生效**——`[verify] agents.defaults.compaction.reserveTokens = 16384`，TA 首次产生真实回复（不再是错误占位文本）；但发现一个新的独立问题：smoke 训练跑得比 INIT 模拟循环快，外层脚本一见训练进程退出就立刻杀网关，没等 INIT 跑完，TA 最后一轮被打断——已记录暂不修 → [`issues_log.md`](issues_log.md) 2026-07-13 第二条
 - 重新提交 minitest（`minitest_20260713_112908`）复查，发现同一个"训练一结束就杀网关"问题也在这里出现（更正了之前"minitest 不易复现"的判断），且顺带挖出一个更严重的独立问题：这次 7 分钟就跑到 `perf 300`，查 checkpoint 目录 `latest_checkpointed_iteration.txt`=299（对应上一次跑了两天的 07-11 minitest 留下的进度）——**minitest 每次共用同一个 checkpoint 路径，`--load` 自动续训导致这次几乎没跑新训练就"续训完成"，这次结果无效**（不是真验证）→ [`issues_log.md`](issues_log.md) 2026-07-13 第三条
 - 处理：清空 minitest 专用 checkpoint 目录（`rm -rf .../checkpoints/minitest-qwen3-4b-openclaw-topk-select`），确保下次 minitest 真正从头跑；不影响 8GPU 正式训练的 checkpoint（路径不同）
+- 排查 wandb 一直不上报的原因：wandb.ai 需要走代理。中途踩了两个坑——① 脚本内 `source ~/.bashrc` 在 `set -u` 下被 `.bashrc` 里引用未设置的 `$PS1` 直接报错中断；② 绕过后 `pon` 报 `command not found`，最后定位到根因是同一个：**`pon` 是 alias，非交互式 bash 不展开 alias，也就不会触发 bashrc 里给 `$PS1` 兜底默认值的交互式初始化逻辑**。用户提供了同事的标准做法：`start_tools.sh`（`sing-box.sh start` + `source ~/.bashrc` + `pon`）配合 modelfactory 提交时 `代码解释器 = /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i`（`-i` 是关键，让整条链路在交互式 shell 下跑）。三脚本移除内置代理处理逻辑，改为要求用这种方式提交，头部注释同步更新 → [`issues_log.md`](issues_log.md) 2026-07-13 第四条，commit `89a27b4`
+- ⚠️ 排查过程中用户不慎在对话里贴出了 `~/.bashrc` 里的明文 `WANDB_API_KEY`，已提醒去 wandb 网站撤销重新生成
 
 **主要问题：**
 - ~~TA/Teacher 全程 context overflow~~ **已确认修复生效**（见上，用 smoke 结果为准）
 - 训练一结束就杀网关不等模拟循环跑完（smoke 和 minitest 都复现了，已记录暂不修）
 - **minitest 复用旧 checkpoint 导致"续训到快完成直接结束"，验证结果失效**（已清空，需重新提交）
 - 网关断连重试修复（`run_one_persona()`，commit `6324c18`）仍未被干净验证——两次都被别的问题盖住（07-11 是 reserveTokens 确定性失败，07-13 这次是 checkpoint 复用导致根本没跑够时间）
+- wandb 代理问题（`pon` 是 alias、需要 `bash -i` 提交）已定位并改了提交方式，但还没用新方式实际验证过能不能上报成功
 
 **待验证：**
-- wandb 是否能正常上报（`USE_WANDB=1` + `WANDB_API_KEY` 已设置，待去网页确认这次 smoke run 有没有出现）
+- 用新的 `start_tools.sh + bash -i` 提交方式重新跑，确认 wandb 项目 `openclaw_rl` 里能看到对应 run
 - 网关断连重试修复（`run_one_persona()`）——偶发问题，需要真的撞上才能验证
 - 清空 checkpoint 后重新提交的 minitest，确认能不能观察到真正从头开始的完整流水线（INIT + Joint round + 训练）
 
@@ -514,7 +517,7 @@
 - [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
 - [x] `run_one_persona()` 网关断连重试修复，代码已就绪，**尚未被干净验证**（07-11 那次被 reserveTokens 问题盖住，见下）
 - [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置修复（TA/Teacher context overflow 根因），**已在 smoke 上验证生效**（TA 产生真实回复，不再是错误占位文本）
-- [x] `USE_WANDB` 可覆盖（minitest/smoke 默认仍关，8GPU 正式脚本默认开），代码已就绪，待验证
+- [x] `USE_WANDB` 可覆盖（minitest/smoke 默认仍关，8GPU 正式脚本默认开）+ wandb.ai 走代理需求已定位（`pon` 是 alias，需要 `代码解释器=/bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i` 提交），脚本已同步简化，待用新提交方式验证
 - [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
 - [x] `scripts/check_convergence.py`
 - [x] `scripts/launch_simulator.sh`（context 32768）
@@ -528,13 +531,13 @@
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
 ### 下一步
-1. 确认 wandb 上报是否正常（这次 smoke 已开 `USE_WANDB=1`，去 wandb 网页确认 `openclaw_rl` 项目里有没有这次 run）
+1. 用 `代码解释器 = /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i` 的方式重新提交，确认 wandb 上报是否正常（去网页确认 `openclaw_rl` 项目里有没有对应 run）
 2. 清空 checkpoint 后重新提交 minitest，确认真正从头跑的完整流水线（INIT 数据完整 + 无 OOM）
-3. 提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存，wandb 默认开）
+3. 提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存 + 用新提交方式带上 wandb）
 4. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
 
 ### 未验证
-- [ ] wandb 上报是否正常（smoke 已跑，待去网页确认）
+- [ ] wandb 上报是否正常（新提交方式尚未实测）
 - [ ] `run_one_persona()` 网关断连重试修复（偶发问题，待真实撞上验证）
 - [ ] minitest 5 GPU 完整跑通（checkpoint 已清空，需重新提交，确认 INIT 数据完整 + 无 OOM）
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性

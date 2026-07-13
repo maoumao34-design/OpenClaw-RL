@@ -609,6 +609,27 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 ---
 
+## [2026-07-13] wandb.ai 连不上——需要代理，且必须用 bash -i 提交才能让 pon 生效
+
+**背景：** 开了 `USE_WANDB=1` 之后 wandb 一直没有在网页上出现对应的 run，怀疑是 wandb.ai 被墙、需要走代理（这个 modelfactory 环境访问境外服务通常要过内部代理）。
+
+**排查过程：**
+1. 一开始尝试在训练脚本开头加 `sing-box.sh start && source ~/.bashrc && pon`，跑起来先是报 `/root/.bashrc: line 6: PS1: unbound variable`——脚本用 `set -euo pipefail`，`.bashrc` 里判断交互式 shell 的写法引用了未设置的 `$PS1`，在非交互式脚本里直接触发 `set -u` 报错，`source` 提前中断，后面 sing-box 加进 `.bashrc` 的代理配置根本没机会执行。
+2. 用 `set +u; source ~/.bashrc || true; set -u` 绕过后，`PS1` 报错消失，但换成 `pon: command not found`——查 `/root/.local/bin/`、`.bashrc` 最后几十行都找不到 `pon` 相关内容。
+3. 用户提供了同事的 `start_tools.sh`（同样的 `sing-box.sh start` + `source ~/.bashrc` + `pon` 三步）和对应的 modelfactory 提交方式：`代码解释器` 填 `/bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i`（注意 `-i`）。这才定位到根本原因：**`pon` 是 `.bashrc`/`.bash_aliases` 里定义的 alias，bash 只在交互式模式下才展开 alias**，训练脚本用 `bash script.sh` 起的是非交互式 shell，`.bashrc` 哪怕跑完了，`pon` 这个 alias 也不会被识别成命令。这跟第 1 步的 `PS1` 报错是**同一个根因的两个症状**——真正交互式 shell 里 bash 会自动给 `$PS1` 设默认值，根本不会触发那个 unbound variable 错误。
+
+**中间尝试过的绕过方案（已废弃）：** 不依赖 `pon`，从 `sing-box.sh start` 自己的输出里 `grep` 出监听端口，直接 `export http_proxy`/`https_proxy`，配合重试的连通性检查。这个方案本身是可行的，但既然团队已经有标准化的 `start_tools.sh + bash -i` 提交方式，改用这个更统一、不用维护自己的一套代理解析逻辑。
+
+**修复：** 三个训练脚本移除内置的代理处理逻辑，改为要求提交时用 `代码解释器 = /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i`（`start_tools.sh` 路径：`/dfs/data/start_tools.sh`，同事提供，内容是 `sing-box.sh start` + `source ~/.bashrc` + `pon`，失败即 `exit 1`）。脚本头部注释同步更新提交说明。commit `89a27b4`。
+
+**⚠️ 安全提醒（已处理）：** 排查过程中用户贴出的 `~/.bashrc` 内容里包含了明文 `WANDB_API_KEY`，已提醒用户去 wandb 网站撤销重新生成。
+
+**注意：** 这种提交方式下代理失败会直接 `exit 1` 中断整个训练 job（`start_tools.sh` 自己的设计，不是"警告后继续"），跟之前脚本内建的"代理失败不阻断训练"的处理哲学不一样——如果代理经常不稳定导致训练 job 频繁提交失败，需要回头评估要不要恢复脚本内的非致命兜底逻辑。
+
+**待验证：** 用新的提交方式重新跑一次 smoke/minitest，确认 wandb 项目 `openclaw_rl` 里能看到对应 run。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
