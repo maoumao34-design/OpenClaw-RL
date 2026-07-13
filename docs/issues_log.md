@@ -547,6 +547,32 @@ requests.exceptions.ConnectionError: HTTPConnectionPool(host='localhost', port=1
 
 ---
 
+## [2026-07-13] TA/Teacher 全程 context overflow / 生成不了回复——根因：compaction.reserveTokens 实际生效值 20000，跟官方默认 16384 不一致
+
+**背景：** 2026-07-11 提交的 minitest（带 07-10 网关重试修复）在服务器上挂了近两天（`minitest_20260711_003159`），Ray 训练任务本身干净跑完（`Job succeeded`，`training.log` 里连续多次 `update_weights()` 无 OOM，确认内存修复持续有效），但外层编排脚本没能跑到 `check_convergence.py`（训练一结束网关就被 SIGTERM，`shutdown timed out`），手动用已有的 `results_*_all.txt` 补跑收敛检测：
+
+```
+Student : converged at session   3  (checked 228 sessions)
+TA      : NOT converged  (checked 228 sessions)
+Teacher : NOT converged  (checked 228 sessions)
+```
+
+**排查：** `results_TA_all.txt` 全部 228 条记录，`--verbose` 显示 `consec` 从未超过 0——查看原始内容发现全部是错误占位文本（`⚠️ Agent couldn't generate a response`／`Context overflow: prompt too large for the model`），不是真实模型输出。查具体 session（`ta-grade-0-198647`）在 `openclaw.log` 里的 `[context-overflow-precheck]` 日志：
+
+```
+estimatedPromptTokens=13611  promptBudgetBeforeReserve=12768  reserveTokens=20000  overflowTokens=843
+```
+
+`32768（总 context）- 20000（reserveTokens）= 12768（剩给 prompt 的预算）`，TA 批改任务的 prompt 稳定在 13.6K 左右，超预算约 843 token（约 6.6%），差一点点就撞上——不是"任务天然需要巨大 context"，是预算分配太紧。
+
+**关键疑问排查（用户问：这个限制是不是也像 SSRF 那次一样是最近两个月新加的）：** 查了本地 `openclaw` 源码（`src/agents/sessions/settings-manager.ts:721`）：`getCompactionReserveTokens(): number { return this.settings.compaction?.reserveTokens ?? 16384; }`——**官方代码默认值是 16384，不是 20000**。查 `CHANGELOG.md`，`preemptive overflow precheck`/`midTurnPrecheck` 机制可追溯到 **2026.4.29**，跟论文写插件的时间（约 2026.3-4 月）同期甚至更早——**不是像 SSRF 那次"最近两个月新加的限制"，precheck 机制本身一直都在**。真正的问题是我们环境里这个值不知为何被设成了 20000，不是官方默认，也不是我们自己的脚本设的（`~/.openclaw/openclaw.json` 里 grep 不到 `reserveTokens`/`compaction`，`openclaw config get agents.defaults.compaction` 显示路径未设置）——来源未查清，可能是运行时按 thinking 模式动态计算，不是简单读配置。
+
+**修复：** 不再深究 20000 具体从哪算出来的，直接在三个训练脚本的网关启动阶段显式设置 `openclaw config set agents.defaults.compaction.reserveTokens 16384`（跟 `chatCompletions.enabled` 那个强制设置是同一个模式），把它拉回官方默认值——论文本身没有理由用非默认配置，16384 应该就是论文实际用的值。已加入 `smoke_train_with_services.sh`/`minitest_train_with_services.sh`/`train_with_services.sh` 三脚本，commit（待补）。
+
+**待验证：** 下次提交 minitest，确认 `[verify] agents.defaults.compaction.reserveTokens = 16384` 生效、TA/Teacher 的 `results_*_init.txt`/`results_*_all.txt` 不再是错误占位文本，且都能正常收敛或至少产生真实回复。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

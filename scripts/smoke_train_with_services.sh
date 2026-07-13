@@ -202,6 +202,16 @@ launch_openclaw_gateway() {
     echo "[verify] gateway.http.endpoints.chatCompletions.enabled = $(openclaw config get gateway.http.endpoints.chatCompletions.enabled 2>&1 | tail -1)" \
         | tee -a "${LOGS_DIR}/openclaw.log"
 
+    # 2026-07-13 修复：这个环境里 compaction.reserveTokens 实际生效值是 20000（来源
+    # 不明，不是 openclaw.json 里显式设置的，也不是官方代码默认值），导致给模型输出
+    # 预留的 token 太多、留给 prompt 的预算被压缩，TA 批改任务的 prompt 稳定超预算
+    # 造成 context overflow（issues_log.md 2026-07-13 条目）。显式设回官方默认值 16384。
+    echo "确保 compaction.reserveTokens 为官方默认值 16384..." | tee -a "${LOGS_DIR}/openclaw.log"
+    openclaw config set agents.defaults.compaction.reserveTokens 16384 \
+        >> "${LOGS_DIR}/openclaw.log" 2>&1
+    echo "[verify] agents.defaults.compaction.reserveTokens = $(openclaw config get agents.defaults.compaction.reserveTokens 2>&1 | tail -1)" \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+
     # 部署 rl-training-headers 插件（appendSystemContext 版本，见上方 PATCHED_OPD_DIR
     # 注释）。写入 OpenClaw 自己的系统安装目录（openclaw plugins list --verbose 确认的
     # source 路径），不是插件扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里，
