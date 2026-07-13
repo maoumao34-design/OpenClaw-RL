@@ -24,9 +24,13 @@ set -euo pipefail
 # 不应该让整个训练 job 失败（代理偶尔起不来不该阻塞训练本身），所以都不用
 # set -e 的严格模式处理，失败只打日志、不中断。
 bash /dfs/share-groups/foundationmodelgroup/LRM/proxy/sing-box.sh start || echo "警告：代理启动失败，继续（wandb 可能上报不了）"
-set +u; source ~/.bashrc || true; set -u  # .bashrc 引用未设置的 $PS1，set -u 下会直接报错，临时关闭
-pon || echo "警告：pon 未生效，继续"
-echo "[proxy] http_proxy=${http_proxy:-<unset>} https_proxy=${https_proxy:-<unset>}"
+set +u; source ~/.bashrc || true; set -u  # 拿 ~/.bashrc 里的 WANDB_API_KEY 等；.bashrc 引用未设置的 $PS1，set -u 下会报错，临时关闭
+# 2026-07-13：pon/poff 在这个 job 容器里查不到（不在 PATH、.bashrc 也没有），
+# .bashrc 里声称的 "Adding proxy configuration" 没有真正生效，放弃依赖它，
+# 直接用已确认的固定端口 7893 设置代理环境变量。
+export http_proxy="http://127.0.0.1:7893"
+export https_proxy="http://127.0.0.1:7893"
+echo "[proxy] http_proxy=${http_proxy} https_proxy=${https_proxy}"
 curl -I https://www.google.com || echo "警告：代理连通性检查失败，继续"
 
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
