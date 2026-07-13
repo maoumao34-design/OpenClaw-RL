@@ -474,7 +474,71 @@
 
 ---
 
-## 当前状态（2026-07-10）
+## 2026-07-13
+
+**目标：** 检查 07-11 提交的 minitest（带网关重试修复）实际跑得怎么样；确认能不能开 wandb
+
+**完成内容：**
+- 排查 `minitest_20260711_003159`（跑了近两天）：`training.log` 显示 Ray 训练任务本身干净成功（`Job succeeded`），内存 OOM 修复持续有效（连续多次 `update_weights()` 无 OOM），但外层编排脚本没能跑到 `check_convergence.py`（训练一结束网关就被 SIGTERM、shutdown 超时）；手动用已有的 `results_*_all.txt` 补跑收敛检测 → [`issues_log.md`](issues_log.md) 2026-07-13 条目
+- 收敛结果显示 TA/Teacher 228 个 session **全部**是错误占位文本（`couldn't generate a response`/`context overflow`），不是训练没学会，是从未真正生成过回复；查 `openclaw.log` 的 `[context-overflow-precheck]` 定位根因：`compaction.reserveTokens` 实际生效值 20000，导致留给 prompt 的预算被压到 12768，TA 批改任务 prompt 稳定 13.6K，超预算约 843 token
+- 排查这个限制是不是像 SSRF 那次一样最近两个月新加的：查本地 `openclaw` 源码确认官方默认值是 16384（不是 20000），查 `CHANGELOG.md` 确认 precheck 机制可追溯到 2026.4.29，跟论文写插件同期甚至更早——**不是最近新加的限制**，是我们环境里这个值不知为何被设成了 20000（来源未查清，`openclaw.json` 里也搜不到）
+- 修复：三个训练脚本网关启动阶段强制 `openclaw config set agents.defaults.compaction.reserveTokens 16384`，跟 `chatCompletions.enabled` 那个强制设置同一个模式 → commit `dec7ec2`
+- 顺带确认 8GPU 正式脚本本来就有完整 wandb 支持（官方默认 `USE_WANDB=1`，读 `WANDB_KEY`/`WANDB_API_KEY`），不用改；minitest/smoke 之前把 `USE_WANDB` 写死成 0，改成可以被外部环境变量覆盖 → commit `36d0a9d`
+
+**主要问题：**
+- TA/Teacher 全程 context overflow（已确认根因并修复，见上）
+- 网关断连重试修复（`run_one_persona()`，commit `6324c18`）仍未被干净验证——07-11 那次虽然带着这个修复跑，但 TA/Teacher 全程失败是 reserveTokens 问题（确定性失败，重试没用），把网关断连这条线完全盖住了，没法看出重试修复本身有没有生效
+
+**待验证（用户即将提交 smoke 确认）：**
+- `reserveTokens=16384` 修复是否生效（`openclaw.log` 里 `[verify] agents.defaults.compaction.reserveTokens = 16384`）
+- TA/Teacher 是否不再 context overflow，能产生真实回复
+- wandb 是否能正常上报（`USE_WANDB=1` + `WANDB_API_KEY` 已设置）
+- 网关断连重试修复（`run_one_persona()`）——这个是偶发问题，这次 smoke 不一定能撞上，撞上了才能验证，撞不上不代表没修好
+
+---
+
+## 当前状态（2026-07-13）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测，flash-attn/APEX/TE/flashinfer 非 H20 专属编译）
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow=32768`/`maxTokens=4096`），不再用静态 header
+- [x] `scripts/prepare_patched_rl_training_headers.sh`：`rl-training-headers` 插件 `appendSystemContext` 版本，**已用真实 GPU 数据验证生效**（真实动态 `session_id`/`turn_type` 标记到达请求正文）
+- [x] `scripts/prepare_patched_openclaw_opd.sh`：解析标记 + 转发前清理，**已用真实 GPU 数据验证生效**
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
+- [x] `run_one_persona()` 网关断连重试修复，代码已就绪，**尚未被干净验证**（07-11 那次被 reserveTokens 问题盖住，见下）
+- [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置修复（TA/Teacher context overflow 根因），代码已就绪，待验证
+- [x] `USE_WANDB` 可覆盖（minitest/smoke 默认仍关，8GPU 正式脚本默认开），代码已就绪，待验证
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+- [x] 系统内存 OOM 修复：提高任务提交时申请的系统内存，A800 minitest 实测连续跑过 10 次 `update_weights()` 无 OOM
+
+### 已知限制 / 未解决
+- TA/Teacher context overflow：根因已确认（`reserveTokens` 20000 vs 官方默认 16384），修复已提交但未验证
+- 网关断连重试修复尚未被干净验证（偶发问题，需要真的撞上才能确认）
+- `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
+- context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
+
+### 下一步
+1. 提交 smoke（`USE_WANDB=1` + `WANDB_API_KEY` 已设置）验证 reserveTokens 修复 + wandb 上报，同时留意是否偶然撞上网关断连场景
+2. 确认 TA/Teacher 能正常产生真实回复后，minitest 完整跑通（INIT 数据完整 + 无 OOM）
+3. 提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存，wandb 默认开）
+4. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
+
+### 未验证
+- [ ] `agents.defaults.compaction.reserveTokens=16384` 是否解决 TA/Teacher context overflow（smoke 验证中）
+- [ ] wandb 上报是否正常（smoke 验证中）
+- [ ] `run_one_persona()` 网关断连重试修复（偶发问题，待真实撞上验证）
+- [ ] minitest 5 GPU 完整跑通（INIT 数据完整 + 无 OOM，300 步不再需要跑完）
+- [ ] `appendSystemContext` 标记多轮对话下的稳定性
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
+## 历史状态（2026-07-10，已被 7/13 结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测，flash-attn/APEX/TE/flashinfer 非 H20 专属编译）
@@ -492,7 +556,7 @@
 - [x] 系统内存 OOM 修复：提高任务提交时申请的系统内存，A800 minitest 实测连续跑过 10 次 `update_weights()` 无 OOM
 
 ### 已知限制 / 未解决
-- INIT 阶段网关断连重试修复尚未在真实 job 上验证（代码已就绪，见上，正在重新提交 minitest 验证）
+- INIT 阶段网关断连重试修复尚未在真实 job 上验证
 - `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
 - context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
 
@@ -502,8 +566,8 @@
 3. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
 
 ### 未验证
-- [ ] `run_one_persona()` 网关断连重试修复（重新提交验证中）
-- [ ] minitest 5 GPU 完整跑通（INIT 数据完整 + 300 步不再需要跑完，OOM 已确认解决）
+- [ ] `run_one_persona()` 网关断连重试修复
+- [ ] minitest 5 GPU 完整跑通
 - [ ] `appendSystemContext` 标记多轮对话下的稳定性
 - [ ] 8 GPU 正式 Table 3 训练
 
