@@ -677,6 +677,24 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 ---
 
+## [2026-07-14] 8GPU 正式训练 INIT 阶段三个角色全部失败（0 字节）——根因尚未定位，已排除多个假设
+
+**背景：** 8GPU H20 正式训练（`train_with_services.sh`），残留进程清理后重新提交，INIT 阶段（Student→TA→Teacher 各 72 题）全部以 0 字节告终：`results_student_init.txt`（mtime 11:41:12）、`results_TA_init.txt`（11:49:45）、`results_teacher_init.txt`（12:00:53），三个文件均为空。`openclaw.log` 显示 11:40-12:00 这段时间大量 `[agent/embedded] ... error=LLM request failed. rawError=503 status code (no body)`。
+
+**已排除的假设（按顺序，均有实测证据支持排除）：**
+1. ~~网关被训练进程抢占资源~~——`nvidia-smi`/进程状态显示网关本身运行正常，且同一窗口内 Student 早期（10:32）有过真实成功对话
+2. ~~SGLang `pause_generation` 暂停时间过长~~——查了 11:38-12:08 全部 `update_weights` 事件，每次 `pause_generation`→`continue_generation` 都在 1-2 秒内完成，跟论文"不干扰推理"的设计描述一致
+3. ~~SGLang 引擎容量不够/被挤爆~~——同一时间窗口 `token usage` 只有 1-2%，`#queue-req: 0`，引擎明显不忙（但后来发现可能查的不是 Student 实际请求经过的那个 SGLang 进程，这条本身也需要重新确认，见下）
+4. ~~`submission_enabled` 因为 checkpoint 保存/eval 被拖长暂停窗口~~——检查过 13:46-14:18 那次 31 分钟的训练步间隙，checkpoint 目录当时根本不存在（还没到 save-interval），eval 也没有触发记录；且那次间隙期间 `submission` 全程是开着的、模拟脚本日志里也没有报错——这 31 分钟纯粹是"没攒够真实样本"的正常等待，跟 11:40-12:00 那次 503 风暴是两个不相关的现象，之前误认为是同一件事
+
+**排查中发现的一个更深层次问题（架构层面，独立于上面的 503 根因排查）：** `run_init_phase()` 和 `run_joint_round()` 调用 `student_chat.py`/`TA_chat.py`/`teacher_chat.py` 的方式完全一样（只有题目数量不同），**没有任何机制告诉底层训练管道"当前是 INIT 阶段，还不该把这些对话当训练样本消费"**。实测证据：第一次 `update_weights()` 发生在 11:38:17，此时 Student 的 INIT 还在进行（直到 11:41:12 才结束）——说明训练循环在 INIT 尚未完成时就已经开始拿 INIT 产生的对话当训练样本、并据此更新了策略权重。这意味着 `homework1`（Student 解题产出）可能不是论文描述的"单一策略版本生成的冻结快照"，而是**由多个不同权重版本的策略混合生成的**——TA 后续基于这个不一致的 homework1 做批改，跟论文"先冻结 homework1 再开始联合优化"的设计顺序不符。这个问题不会导致训练报错/崩溃，但可能影响训练数据的正确性，需要单独评估要不要修、怎么修。
+
+**待查：**
+1. 官方论文/代码库对"INIT 阶段该不该跟训练并发、homework1 该不该是单一策略快照"这件事是怎么处理的——`train_with_services.sh`（我们自己写的编排脚本）目前是训练 job 提交后立刻并发跑 INIT，这个时序选择是不是我们自己的设计缺陷，官方有没有对应的参考做法
+2. 11:40-12:00 那次 503 风暴的真正根因——需要重新确认 Student 实际请求经过的是哪个 SGLang 进程（这次跑起了 `pid=34571`/`pid=36012` 两个 SGLang 进程，之前查健康状态时不确定看的是不是对的那个），精确到秒对比失败时刻和 SGLang/`submission_enabled` 状态
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
