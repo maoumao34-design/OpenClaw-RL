@@ -93,7 +93,8 @@ fi
 
 SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk-select}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
-NUM_PROBLEMS_PER_ROUND=${NUM_PROBLEMS_PER_ROUND:-6}
+# 见 train_with_services.sh 同日注释：官方脚本一次性设计，无分轮次编排依据
+JOINT_NUM_PROBLEMS=${JOINT_NUM_PROBLEMS:-1319}
 DATASET=${DATASET:-${REPO_ROOT}/openclaw-test/GSM8K.json}
 SESSION_LIMIT=${SESSION_LIMIT:-72}
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
@@ -403,48 +404,52 @@ run_init_phase() {
     echo "=== INIT 完成：homework1/ homework2/ 已固定，进入 Joint 阶段 ==="
 }
 
-run_joint_round() {
-    local round=$1
-    echo "--- Joint round ${round} 开始（${NUM_PROBLEMS_PER_ROUND} 题 × 三角色并行）---"
+# 2026-07-14：Joint 阶段改为跟 train_with_services.sh 一致的做法，见该文件
+# 同日注释——官方 student_chat.py/TA_chat.py/teacher_chat.py 是一次性脚本，
+# 官方仓库没有"分轮次反复调用"的编排参考，之前的循环设计没有官方依据。
+run_joint_phase() {
+    echo "--- Joint 阶段开始（${JOINT_NUM_PROBLEMS} 题 × 三角色并发，持续到训练结束）---"
 
-    local round_s="${LOGS_DIR}/results_student_round${round}.txt"
-    local round_ta="${LOGS_DIR}/results_TA_round${round}.txt"
-    local round_t="${LOGS_DIR}/results_teacher_round${round}.txt"
+    local joint_s="${LOGS_DIR}/results_student_joint.txt"
+    local joint_ta="${LOGS_DIR}/results_TA_joint.txt"
+    local joint_t="${LOGS_DIR}/results_teacher_joint.txt"
 
-    run_one_persona "Student" "student_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_s}" \
+    run_one_persona "Student" "student_chat.py" "${JOINT_NUM_PROBLEMS}" "${joint_s}" \
         >> "${LOGS_DIR}/sim_student.log" 2>&1 &
     local pid_s=$!
 
-    run_one_persona "TA" "TA_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_ta}" \
+    run_one_persona "TA" "TA_chat.py" "${JOINT_NUM_PROBLEMS}" "${joint_ta}" \
         >> "${LOGS_DIR}/sim_ta.log" 2>&1 &
     local pid_ta=$!
 
-    run_one_persona "Teacher" "teacher_chat.py" "${NUM_PROBLEMS_PER_ROUND}" "${round_t}" \
+    run_one_persona "Teacher" "teacher_chat.py" "${JOINT_NUM_PROBLEMS}" "${joint_t}" \
         >> "${LOGS_DIR}/sim_teacher.log" 2>&1 &
     local pid_t=$!
 
-    wait "${pid_s}" "${pid_ta}" "${pid_t}"
+    while kill -0 "${TRAINING_PID}" 2>/dev/null; do
+        if ! kill -0 "${pid_s}" 2>/dev/null \
+            && ! kill -0 "${pid_ta}" 2>/dev/null \
+            && ! kill -0 "${pid_t}" 2>/dev/null; then
+            break
+        fi
+        sleep 5
+    done
+    kill "${pid_s}" "${pid_ta}" "${pid_t}" 2>/dev/null || true
+    wait "${pid_s}" "${pid_ta}" "${pid_t}" 2>/dev/null || true
 
-    cat "${round_s}"  >> "${STUDENT_ALL}"
-    cat "${round_ta}" >> "${TA_ALL}"
-    cat "${round_t}"  >> "${TEACHER_ALL}"
+    cat "${joint_s}"  >> "${STUDENT_ALL}" 2>/dev/null || true
+    cat "${joint_ta}" >> "${TA_ALL}" 2>/dev/null || true
+    cat "${joint_t}"  >> "${TEACHER_ALL}" 2>/dev/null || true
 
-    echo "--- Joint round ${round} 完成 ---"
+    echo "--- Joint 阶段结束 ---"
 }
 
 simulation_loop() {
     run_init_phase 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
 
-    local round=0
+    run_joint_phase 2>&1 | tee -a "${LOGS_DIR}/simulation.log"
 
-    while kill -0 "${TRAINING_PID}" 2>/dev/null; do
-        round=$((round + 1))
-        echo "Joint round ${round}"
-        run_joint_round ${round} \
-            2>&1 | tee -a "${LOGS_DIR}/simulation.log" || true
-    done
-
-    echo "模拟循环结束（INIT 1 次 + Joint ${round} 轮）"
+    echo "模拟循环结束（INIT 1 次 + Joint 阶段 1 次）"
     echo ""
     echo "=== 收敛检测（Table 3 指标）==="
     python "${SCRIPTS_DIR}/check_convergence.py" \
