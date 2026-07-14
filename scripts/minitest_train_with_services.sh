@@ -353,33 +353,29 @@ TEACHER_ALL="${LOGS_DIR}/results_teacher_all.txt"
 
 run_one_persona() {
     local name=$1 script=$2 num=$3 output=$4
-    local attempt
-    for attempt in 1 2 3; do
-        # 2026-07-10 修复：网关中途短暂不可达时（issues_log.md 同日条目，
-        # 18789 Connection refused），旧版本只在整个 wait_for_port 启动时
-        # 检查一次网关就绪，之后 Student/TA/Teacher 各自失败就被当"警告"
-        # 静默跳过，导致 homework1/homework2 数据不完整却继续训练。这里
-        # 每次尝试前先确认网关仍可达（已就绪时 wait_for_port 几乎零开销），
-        # 不可达则等它恢复，最多重试 3 次。
-        wait_for_port "OpenClaw gateway" 18789 120 "${OPENCLAW_PID:-}" "${LOGS_DIR}/openclaw.log" || {
-            echo "错误：${name} 模拟第 ${attempt} 次尝试前网关不可达" >&2
-            continue
-        }
-        if OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
-           OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
-           OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
-           EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
-           OPENCLAW_GATEWAY_URL=http://localhost:18789 \
-           python "${OPENCLAW_DIR}/${script}" \
-               --dataset "${DATASET}" \
-               --num-problems "${num}" \
-               --output "${output}"; then
-            return 0
-        fi
-        echo "  [${name}] 模拟失败（尝试 ${attempt}/3）"
-        [ "${attempt}" -lt 3 ] && sleep 10
-    done
-    echo "警告：${name} 模拟重试 3 次后仍未完全完成，继续训练（数据可能不完整，见 issues_log.md）" >&2
+    # 2026-07-14 修复：之前"失败整个重跑"的外层重试（07-10 加的）会让
+    # student_chat.py/TA_chat.py/teacher_chat.py 每次重新调用时清空自己的
+    # 输出文件重新开始——如果第一次已经做完一部分真实题目才失败，重跑不仅
+    # 浪费时间、还会把这部分已经拿到手的真实数据一起清空覆盖掉，比"只跑
+    # 一次不重试"保留的数据更少。官方 README 参考流程也是只跑一次，不做
+    # 整体重来。改成只跑之前确认一次网关可达（07-10 那次真实问题的修复，
+    # 保留），脚本本身只调用一次，失败就是失败，交给脚本自己内部的重试
+    # （send_to_openclaw 的几次重试）处理瞬时失败，不再由编排层重来。
+    wait_for_port "OpenClaw gateway" 18789 120 "${OPENCLAW_PID:-}" "${LOGS_DIR}/openclaw.log" || {
+        echo "错误：${name} 模拟开始前网关不可达" >&2
+    }
+    if OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+       OPENAI_API_KEY="${SIMULATOR_API_KEY}" \
+       OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
+       EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
+       OPENCLAW_GATEWAY_URL=http://localhost:18789 \
+       python "${OPENCLAW_DIR}/${script}" \
+           --dataset "${DATASET}" \
+           --num-problems "${num}" \
+           --output "${output}"; then
+        return 0
+    fi
+    echo "警告：${name} 模拟未完全完成，继续训练（数据可能不完整，见 issues_log.md）" >&2
 }
 
 run_init_phase() {
