@@ -699,7 +699,15 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待验证：** 用这个修复重新提交 8GPU 训练，确认 INIT 阶段 `results_*_init.txt` 是否不再是 0 字节（哪怕不能 100% 跑完 72 题，至少应该保留部分真实进度，不会被重跑清空）。
 
-**后续可选改进（当前不做）：** `train_with_services.sh` 里"INIT 全部跑完才开始 Joint round"这道顺序等待，官方设计不要求（训练全程开着、模拟脚本随时跑），去不去掉不影响复现正确性，纯粹是我们自己加的更保守的顺序。当前目标是复现论文，这个先不动，留作以后有余力再考虑的优化项。
+**更新（同一天，发现 Joint round 的"重复小批次循环"结构本身也没有官方依据）：** 排查过程中用户指出既然"INIT 全部跑完才进 Joint round"这道等待官方没有要求，我们也不需要照搬——于是回头查了一下"Joint round"这个循环本身是不是官方设计。查证结果（只在论文期允许目录内查找，`openclaw-tinker`/`openclaw-fireworks`/`openclaw-rl/oel` 均未涉及）：
+
+1. `student_chat.py`/`TA_chat.py`/`teacher_chat.py`（`openclaw-test/`）的 `argparse` 只有 `--dataset`/`--num-problems`/`--max-turns`/`--max-retries`/`--output`，**没有** `--loop`/`--continuous`/`--num-rounds` 这类参数，`main()` 就是 `for i in range(count)` 处理完指定数量题目就退出进程——脚本设计上是**一次性**的，不是可以反复调用小批次的常驻服务
+2. `openclaw-combine/`、`openclaw-opd/` 目录下搜索 `student_chat|TA_chat|teacher_chat` **零命中**——没有任何官方脚本组织"INIT + 反复循环跑 Joint round"这套编排
+3. `openclaw-test/README.md` 唯一提到 joint 的原话："The test consists of three sequential phases (**you can also run them together**, but you need to obtain homework1 and homework2 first if you want to try this joint optimization)"——只要求"先有 homework1/2"，没有"之后循环跑很多轮小批次"这个说法
+
+**结论：`train_with_services.sh` 里 `run_joint_round()` 那个"每轮 6 题、`while kill -0 TRAINING_PID` 反复循环直到训练结束"的结构，是我们自己发明的，官方代码里找不到对应实现可以直接抄，也没有文档依据。**最符合官方"three sequential phases...run them together"字面意思、也最符合三个脚本本身"一次性处理完给定题目退出"设计的实现，应该是：INIT（Student→TA→Teacher 依次各跑一次全部 72 题，建好 homework1/2，这部分不变，官方明确要求）之后，Joint 阶段是**三个脚本各自传完整题目数、同时后台启动一次**，不是分成一轮一轮的小批次反复循环。
+
+**待确认后再动手：** 用户要求先确认清楚这个结论没有跟之前确认过的其他事实冲突（已核对 `paper_understanding.md` 547-558 行，不冲突），并且要确认官方是不是真的没有可以直接复用的编排代码（不是自己瞎写），确认完再决定要不要改、怎么改。
 
 ---
 
