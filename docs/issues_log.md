@@ -699,6 +699,8 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待验证：** 用这个修复重新提交 8GPU 训练，确认 INIT 阶段 `results_*_init.txt` 是否不再是 0 字节（哪怕不能 100% 跑完 72 题，至少应该保留部分真实进度，不会被重跑清空）。
 
+**后续可选改进（当前不做）：** `train_with_services.sh` 里"INIT 全部跑完才开始 Joint round"这道顺序等待，官方设计不要求（训练全程开着、模拟脚本随时跑），去不去掉不影响复现正确性，纯粹是我们自己加的更保守的顺序。当前目标是复现论文，这个先不动，留作以后有余力再考虑的优化项。
+
 ---
 
 <!-- 格式模板：
