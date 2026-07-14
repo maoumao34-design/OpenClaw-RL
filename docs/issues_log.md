@@ -652,6 +652,31 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 ---
 
+## [2026-07-14] 8GPU 正式训练首次尝试：update_weights() 时 GPU 显存 calloc 失败——根因是 workspace 残留僵尸进程，非参数问题
+
+**背景：** 8GPU H20 正式训练（`train_with_services.sh`）第一次真正提交（跳过了完整 minitest 验证，直接上 8GPU，见前一天讨论），提交前有过一次手动 Ctrl-C 中断。重新提交后训练正常起步（Ray 42 进程、gateway 就绪、INIT 阶段开始），第一次 `update_weights()` 时失败。
+
+**报错：**
+```
+(SGLangEngine) Failed to CUDA calloc 268435456 bytes. The full weights of the ModelRunner are partially updated. Please discard the whole weights.
+(SGLangEngine) [TP0] Failed to update parameter online: NCCL error in: .../NCCLUtils.cpp:94, unhandled cuda error
+(SGLangEngine) ncclUnhandledCudaError: Call to CUDA function failed.
+(SGLangEngine) "POST /update_weights_from_distributed HTTP/1.1" 400 Bad Request
+[Rank 3] Some NCCL operations have failed or timed out...
+```
+
+**排查：** GPU 显存报错（256MB calloc 失败）+ 后续 NCCL 通信卡死超时，看起来像是 `--sglang-mem-fraction-static 0.8`（官方默认值，未改动）在这次 `--rollout-num-gpus-per-engine 2`（rollout 引擎自己也做 2 卡 TP，minitest/smoke 从未测过这个场景，一直用的是单卡引擎）配置下显存余量不够。但下结论前先用 `nvidia-smi` 排查了一遍——**真实原因是之前那次 Ctrl-C 中断后，`trap cleanup` 没能杀干净 SGLang 进程**，3 个残留的 `sglang::scheduler`/`sglang::scheduler_TP0`/`sglang::scheduler_TP1` 进程分别占着 GPU 4/5/6 各 80GB+ 显存（对应 `--sglang-mem-fraction-static 0.8` 的静态预留量），这次新训练的进程被分配到部分重叠的 GPU 上，实际可用显存远低于预期，NCCL 权重广播需要的临时缓冲区分配失败。
+
+**根因确认：** `kill -9` 杀掉三个残留 PID 后 `nvidia-smi` 确认 8 张卡全部恢复空闲（4MiB），不是 `sglang-mem-fraction-static` 参数问题，是 **workspace 模式下手动 Ctrl-C 中断的清理不彻底**——这是持久化 workspace 相比一次性 job 容器的一个新风险点（跟同一天早些时候发现的"reserveTokens 没生效是因为 workspace 里残留网关进程"是同一类问题：workspace 状态会在多次尝试之间残留，job 容器每次是全新的）。
+
+**处理：** 手动 `kill -9` 清理残留进程后确认 GPU 全部空闲，重新提交。
+
+**经验（记录下来，避免以后重犯）：** 在 workspace 模式下（跟提交 job 不一样），每次训练中断/失败后重新提交前，都要先 `nvidia-smi` 确认 8 张卡显存干净、`ps aux | grep "openclaw gateway"` 确认没有残留网关进程，两者都要检查，不能想当然认为环境是干净的。
+
+**待验证：** 清理后重新提交的 8GPU 训练，确认 `update_weights()` 能正常完成，不再复现这个 CUDA calloc 失败。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
