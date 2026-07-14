@@ -508,6 +508,105 @@
 
 ---
 
+## 2026-07-14
+
+**目标：** 验证前一天的修复；提交 8GPU H20 正式 Table 3 训练；排查训练中途遇到的问题
+
+**完成内容：**
+- 发现前一天提交的 minitest（`minitest_20260714_000203`）用的是 `git pull` 之前的旧代码，`reserveTokens`/wandb-key 两个修复都没生效，TA 又复现了 context overflow——确认是"提交时代码没更新"而不是新 bug，提醒以后提交前务必先 `git pull` 确认 `git log -1` 是最新 commit
+- 提交首次 8GPU H20 正式训练，中途撞上 `update_weights()` 时 GPU 显存 `CUDA calloc` 失败 + NCCL 通信超时——排查后确认根因是 workspace 模式下前一次 Ctrl-C 中断没清理干净，3 个残留 `sglang::scheduler` 进程占着 GPU 4/5/6 各 80GB+ 显存，`kill -9` 清理后 8 卡恢复空闲，重新提交后训练正常推进（`rollout/step: 2`）→ [`issues_log.md`](issues_log.md) 2026-07-14 条目
+- wandb 公开项目核实 key 修复生效：新 run（`8v8xutl0`）的 Command 字段确认不再包含 `--wandb-key`；确认此前暴露过 key 的旧 run 已删除
+- 8GPU 训练继续跑后，INIT 阶段（Student/TA/Teacher 各 72 题）**全部以 0 字节告终**，`openclaw.log` 显示 11:40-12:00 持续大量 503。排查过程排除了四个假设（网关资源争抢、SGLang pause 时间过长、SGLang 容量不够、`submission_enabled` 被 checkpoint/eval 拖长——checkpoint 目录当时根本不存在，31 分钟训练步空档纯粹是没攒够样本的正常等待，跟 503 风暴是两个不相关的现象）→ [`issues_log.md`](issues_log.md) 2026-07-14 条目
+- 排查中确认一个架构事实：训练循环不区分 INIT/Joint 阶段，INIT 还没跑完就已经开始拿 INIT 产生的对话当训练样本更新权重（`update_weights()` 11:38:17 发生时 Student 的 INIT 还在跑）。用官方 `openclaw-test/README.md` + 源码核实：**这是官方设计的常态**（官方参考流程本身训练 job 先起、模拟脚本后跑），不是 bug，不需要修
+- 找到并修复一个真实设计缺陷：`run_one_persona()` 07-10 加的"失败整个重跑"逻辑，会让 `student_chat.py` 等脚本每次重新调用时清空自己的输出文件重新开始——如果第一次已经做出部分真实数据才失败，重跑反而把这部分数据也清空覆盖掉，比不重试保留得还少。改回只调用一次（保留"跑前确认网关可达"的检查），匹配官方参考流程的单次调用设计 → commit `0b25005`
+- 进一步查证：Joint 阶段"每轮 6 题反复循环直到训练结束"这个结构本身也没有官方依据——`student_chat.py`/`TA_chat.py`/`teacher_chat.py` 是一次性脚本（无 `--loop` 参数），扩大到全部论文期允许目录搜索也确认没有官方编排脚本可以直接复用。改成 `run_joint_phase()`：INIT 建好 homework1/2 后三角色各自传 `JOINT_NUM_PROBLEMS=1319`（GSM8K 全量）同时并发启动一次，训练自然消耗真实样本直到自己结束 → commit `4be24ab`
+- 讨论了 Joint 阶段三角色并发从题目 0 开始跑，TA/Teacher 有没有可能"超车"到 Student 还没写出的文件——查证 `TA_chat.py` 源码确认文件读取是模型自己的工具调用、不是 Python 检查，超车不会导致脚本崩溃，只会产生"对着不存在的文件对话"这种低质量轮次；官方代码没有任何防超车机制。决定不额外加保险措施，先跑起来实测观察
+
+**主要问题：**
+- INIT 阶段 503 风暴根因仍未 100% 精确定位到触发机制，但推测跟 Joint round 循环结构无关（该结构已经改掉，待验证问题是否随之缓解）
+- Joint 阶段三角色并发可能存在"超车读空文件"的数据质量风险，官方无防护，已知不改，靠实测观察
+
+**待验证：**
+- 用改完 `run_one_persona()` 单次调用 + `run_joint_phase()` 一次性并发的新版本重新提交 8GPU 训练，确认 INIT 能正常保留数据、Joint 阶段能否持续产出、训练能否正常推进
+- Joint 阶段是否出现明显的"超车"现象（TA/Teacher 对话里频繁出现"文件不存在"）
+
+---
+
+## 当前状态（2026-07-14）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`
+- [x] `rl-training-headers` 插件 + `openclaw_opd_api_server.py` 标记解析：**已用真实 GPU 数据验证生效**
+- [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置：**已验证生效**（TA 产生真实回复）
+- [x] wandb 集成：**已验证成功**，key 已改走环境变量不再暴露在 Command 字段
+- [x] 系统内存 OOM 修复：**已验证**，A800/H20 上多次 `update_weights()` 无 OOM
+- [x] `run_one_persona()` 改回单次调用（不再整体重跑丢数据）→ commit `0b25005`，待新 run 验证
+- [x] Joint 阶段改为一次性并发启动（不再是无官方依据的分轮次循环）→ commit `4be24ab`，待新 run 验证
+- [x] `scripts/check_convergence.py`
+
+### 已知限制 / 未解决
+- INIT 阶段 503 风暴根因未 100% 精确定位（已排除四个假设，见 [`issues_log.md`](issues_log.md)）
+- Joint 阶段三角色并发可能"超车"读到空文件，官方无防护，已知不改，靠实测观察
+- workspace 模式下手动中断（Ctrl-C）清理不彻底会残留 GPU 进程，每次重新提交前必须手动 `nvidia-smi` + `ps aux | grep "openclaw gateway"` 确认干净
+- 训练一结束就杀网关不等模拟循环跑完（已记录暂不修）
+- `appendSystemContext` 标记多轮对话下的稳定性、context-summarization 是否触发 `before_prompt_build`，仍待验证
+
+### 下一步
+1. 用今天改完的新版本（单次调用 + 一次性并发 Joint 阶段）重新提交 8GPU 训练
+2. 确认 INIT 数据完整、Joint 阶段持续产出、训练正常推进后，观察 wandb 曲线 + 最终 `check_convergence.py` 结果
+3. 8GPU 正式训练固定用同一种 GPU 架构，不与其他方法/基线混用硬件
+
+### 未验证
+- [ ] 新版 `run_one_persona()` + `run_joint_phase()` 在真实 8GPU 训练上的完整效果
+- [ ] Joint 阶段"超车"现象是否显著影响数据质量
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-13，已被 7/14 结果取代）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测，flash-attn/APEX/TE/flashinfer 非 H20 专属编译）
+- [x] Qwen3-4B-Thinking HF + torch_dist
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`（`contextWindow=32768`/`maxTokens=4096`），不再用静态 header
+- [x] `scripts/prepare_patched_rl_training_headers.sh`：`rl-training-headers` 插件 `appendSystemContext` 版本，**已用真实 GPU 数据验证生效**（真实动态 `session_id`/`turn_type` 标记到达请求正文）
+- [x] `scripts/prepare_patched_openclaw_opd.sh`：解析标记 + 转发前清理，**已用真实 GPU 数据验证生效**
+- [x] `scripts/prepare_openclaw_test_scripts.sh`：`openclaw-test/*.py` 的 `model` 字段兼容补丁
+- [x] `scripts/smoke_train_with_services.sh` / `minitest_train_with_services.sh` / `train_with_services.sh` 三脚本已统一接入上述所有 workaround
+- [x] `run_one_persona()` 网关断连重试修复，代码已就绪，**尚未被干净验证**（07-11 那次被 reserveTokens 问题盖住，见下）
+- [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置修复（TA/Teacher context overflow 根因），**已在 smoke 上验证生效**（TA 产生真实回复，不再是错误占位文本）
+- [x] wandb 集成**已实测验证成功**（新提交方式 `代码解释器=/bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i`，minitest/smoke 默认开启 `USE_WANDB=1`），wandb key 已改走环境变量不再暴露在 run 的 Command 字段里
+- [x] `scripts/run_openclaw_topk_select_modelfactory.sh`：断点续训 `--load` + `PATCHED_OPD_DIR` PYTHONPATH 注入
+- [x] `scripts/check_convergence.py`
+- [x] `scripts/launch_simulator.sh`（context 32768）
+- [x] 系统内存 OOM 修复：提高任务提交时申请的系统内存，A800 minitest 实测连续跑过 10 次 `update_weights()` 无 OOM
+
+### 已知限制 / 未解决
+- 训练一结束就立刻杀网关，不等模拟循环跑完（smoke、minitest 都复现过，已记录暂不修，见 [`issues_log.md`](issues_log.md) 2026-07-13 条目）
+- minitest 共用同一个 checkpoint 路径，`--load` 自动续训会导致后续跑"续训到快完成直接结束"、验证结果失效——已清空 checkpoint，需要注意以后再犯（见 [`issues_log.md`](issues_log.md) 2026-07-13 第三条）
+- 网关断连重试修复尚未被干净验证（偶发问题，需要真的撞上才能确认）
+- ⚠️ **用户待办**：`openclaw_rl` wandb 项目当前是 Public，需要手动改回 Private；已暴露两次的 WANDB_API_KEY 需要去 wandb 网站撤销重新生成
+- `appendSystemContext` 标记是否会污染 OpenClaw 自己持久化的对话历史，待更长多轮对话验证
+- context-summarization 内部调用是否触发 `before_prompt_build`，待验证（决定是否顺带解决 main turn 误标问题）
+
+### 下一步
+1. 用户手动处理 wandb 项目权限 + 撤销重新生成 key（见上）
+2. 清空 checkpoint 后重新提交 minitest，确认真正从头跑的完整流水线（INIT 数据完整 + 无 OOM），顺带确认新 run 的 Command 字段不再有 key
+3. 提交 8 GPU 正式 Table 3 训练（`train_with_services.sh` 已就绪，需申请更高系统内存，wandb 集成已验证可用）
+4. 8GPU 正式训练建议固定用同一种 GPU 架构（H20 或 A800 二选一，不要跟其他方法/基线的对比数字混用不同硬件）
+
+### 未验证
+- [ ] `run_one_persona()` 网关断连重试修复（偶发问题，待真实撞上验证）
+- [ ] minitest 5 GPU 完整跑通（checkpoint 已清空，需重新提交，确认 INIT 数据完整 + 无 OOM）
+- [ ] 新 run 的 Command 字段确认不再包含 `--wandb-key`
+- [ ] `appendSystemContext` 标记多轮对话下的稳定性
+- [ ] 8 GPU 正式 Table 3 训练
+
+---
+
 ## 当前状态（2026-07-13）
 
 ### 已就绪
