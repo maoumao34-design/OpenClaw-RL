@@ -521,14 +521,20 @@
 - 找到并修复一个真实设计缺陷：`run_one_persona()` 07-10 加的"失败整个重跑"逻辑，会让 `student_chat.py` 等脚本每次重新调用时清空自己的输出文件重新开始——如果第一次已经做出部分真实数据才失败，重跑反而把这部分数据也清空覆盖掉，比不重试保留得还少。改回只调用一次（保留"跑前确认网关可达"的检查），匹配官方参考流程的单次调用设计 → commit `0b25005`
 - 进一步查证：Joint 阶段"每轮 6 题反复循环直到训练结束"这个结构本身也没有官方依据——`student_chat.py`/`TA_chat.py`/`teacher_chat.py` 是一次性脚本（无 `--loop` 参数），扩大到全部论文期允许目录搜索也确认没有官方编排脚本可以直接复用。改成 `run_joint_phase()`：INIT 建好 homework1/2 后三角色各自传 `JOINT_NUM_PROBLEMS=1319`（GSM8K 全量）同时并发启动一次，训练自然消耗真实样本直到自己结束 → commit `4be24ab`
 - 讨论了 Joint 阶段三角色并发从题目 0 开始跑，TA/Teacher 有没有可能"超车"到 Student 还没写出的文件——查证 `TA_chat.py` 源码确认文件读取是模型自己的工具调用、不是 Python 检查，超车不会导致脚本崩溃，只会产生"对着不存在的文件对话"这种低质量轮次；官方代码没有任何防超车机制。决定不额外加保险措施，先跑起来实测观察
+- 用改完的新版本重新提交 8GPU 正式训练（run `8yn4i8ml`，16:07:25 开始）。通过 wandb Overview 页确认：Command 字段已不含 `--wandb-key`（key 修复再次验证生效）、8×H20、`rollout/step` 正常推进、response 长度无截断/复读
+- 全面核对了 wandb `train`（21 项）/`rollout`（22 项）全部指标的确切含义，对照官方 loss 源码 `openclaw_topk_select_loss.py`/`hint_opd_loss.py` 逐一确认，区分出训练健康度哨兵、配置常数、以及本次配置下架构上必然恒定的值，并在 wandb 上搭建了 10 张核心图的 "important" 固定分组（`train/loss`、`grpo_pg_loss`、`opd_loss`、`grad_norm`、`rollout/prm_eval_score`、`advantages`、`zero_std/count_1.0`、`zero_std/count_-1.0`、`response_len/mean`、`ref_log_probs`）；确认 wandb 自带的 "Save personal workspace template" 功能可以让这个布局自动套用到后续新 run，不需要改代码
+- 排查 `train/opd_loss` 长期显示为常数 -1.0 的现象：先用 `training.log` 实测确认真实 OPD 教师信号样本占比 67%（118 条 OPD+RL + 6 条 OPD-only vs 60 条 RL-only），排除"没有真实教师数据流入"的假设；再从源码确认 `--num-steps-per-rollout 1` 导致 `rho_v`（PPO 比率）架构上精确恒等于 1，进而 `ppo_kl_sampled`/`opd_pg_clipfrac`/`grpo_pg_clipfrac` 三个指标恒为 0（wandb 图上逐一验证属实）。结论：这是早期训练阶段的正常数学性质，不是数据链路或代码 bug，预期会随训练步数增加、policy 与初始权重逐渐拉开距离后自然出现波动，暂不需要修复，记为待观察
+- 用 `training.log`/`simulation.log`/`results_student_init.txt` 实测确认两处修复已生效：① GPU calloc/残留进程问题彻底解决，`update_weights()` 已成功执行 30+ 次无崩溃；② `run_one_persona()` 单次调用修复生效，Student INIT 正常推进到第 43/72 题，产出真实完整的多轮对话数据，未再复现"跑 70 分钟后 0 字节放弃"的问题
+- 收到联想 IT 安全团队邮件，称本机检测到未授权 OpenClaw/hermes-agent 运行。现场排查本机（`~/.openclaw` 配置目录、npm/pip 安装记录、进程列表、18789 端口监听、磁盘可执行文件）均无任何痕迹；本项目设计上本地机器全程只做代码编辑和 git 操作，OpenClaw 网关/训练/模拟全部在 modelfactory 服务器由用户本人在服务器终端执行，本机从未安装或运行过 OpenClaw，判断为误报，后续由用户自行联系联想 IT 反馈
 
 **主要问题：**
 - INIT 阶段 503 风暴根因仍未 100% 精确定位到触发机制，但推测跟 Joint round 循环结构无关（该结构已经改掉，待验证问题是否随之缓解）
 - Joint 阶段三角色并发可能存在"超车读空文件"的数据质量风险，官方无防护，已知不改，靠实测观察
+- 截至记录时 Joint 阶段（TA/Teacher）仍未开始，Student INIT 还在第 43/72 题——`run_joint_phase()` 设计和"超车"风险都还没有真实数据可验证
 
 **待验证：**
-- 用改完 `run_one_persona()` 单次调用 + `run_joint_phase()` 一次性并发的新版本重新提交 8GPU 训练，确认 INIT 能正常保留数据、Joint 阶段能否持续产出、训练能否正常推进
-- Joint 阶段是否出现明显的"超车"现象（TA/Teacher 对话里频繁出现"文件不存在"）
+- Joint 阶段启动后：TA/Teacher 能否正常产出数据、训练能否持续推进、有无"超车"读空文件现象（TA/Teacher 对话里频繁出现"文件不存在"）
+- `train/opd_loss`、`train/opd_teacher_student_logp_topk_abs_mean` 等目前卡在常数的指标，是否会在训练步数增多、Joint 阶段介入、样本更多样后开始正常波动，确认"早期训练巧合"这个判断成立
 
 ---
 
@@ -542,13 +548,16 @@
 - [x] `agents.defaults.compaction.reserveTokens=16384` 强制设置：**已验证生效**（TA 产生真实回复）
 - [x] wandb 集成：**已验证成功**，key 已改走环境变量不再暴露在 Command 字段
 - [x] 系统内存 OOM 修复：**已验证**，A800/H20 上多次 `update_weights()` 无 OOM
-- [x] `run_one_persona()` 改回单次调用（不再整体重跑丢数据）→ commit `0b25005`，待新 run 验证
-- [x] Joint 阶段改为一次性并发启动（不再是无官方依据的分轮次循环）→ commit `4be24ab`，待新 run 验证
+- [x] GPU calloc / workspace 残留进程问题：**已验证解决**，`update_weights()` 已成功执行 30+ 次无崩溃（run `8yn4i8ml`）
+- [x] `run_one_persona()` 改回单次调用（不再整体重跑丢数据）→ commit `0b25005`，**已用真实数据验证生效**（Student INIT 正常推进到 43/72 题，产出真实完整对话）
+- [x] Joint 阶段改为一次性并发启动（不再是无官方依据的分轮次循环）→ commit `4be24ab`，**Joint 阶段本身尚未开始，仍待验证**（截至记录时 Student INIT 还在第 43/72 题）
+- [x] `train/opd_loss` 常数 -1.0 现象排查完毕：确认真实教师信号占比 67%、`rho_v=1` 是架构必然，判定为早期训练正常现象，非 bug
+- [x] wandb "important" 图表分组（10 张核心图）+ 个人工作区模板，后续新 run 自动套用
 - [x] `scripts/check_convergence.py`
 
 ### 已知限制 / 未解决
 - INIT 阶段 503 风暴根因未 100% 精确定位（已排除四个假设，见 [`issues_log.md`](issues_log.md)）
-- Joint 阶段三角色并发可能"超车"读到空文件，官方无防护，已知不改，靠实测观察
+- Joint 阶段三角色并发可能"超车"读到空文件，官方无防护，已知不改，靠实测观察，Joint 阶段尚未开始所以还没有真实数据
 - workspace 模式下手动中断（Ctrl-C）清理不彻底会残留 GPU 进程，每次重新提交前必须手动 `nvidia-smi` + `ps aux | grep "openclaw gateway"` 确认干净
 - 训练一结束就杀网关不等模拟循环跑完（已记录暂不修）
 - `appendSystemContext` 标记多轮对话下的稳定性、context-summarization 是否触发 `before_prompt_build`，仍待验证
