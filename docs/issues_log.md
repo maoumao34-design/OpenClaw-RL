@@ -709,6 +709,12 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待确认后再动手：** 用户要求先确认清楚这个结论没有跟之前确认过的其他事实冲突（已核对 `paper_understanding.md` 547-558 行，不冲突），并且要确认官方是不是真的没有可以直接复用的编排代码（不是自己瞎写），确认完再决定要不要改、怎么改。
 
+**更新（同一天，已确认无冲突、无官方代码可复用，已实施修复）：** 扩大范围搜遍论文期允许的全部目录（仓库根目录、`openclaw-test/` 完整文件列表、`Megatron-LM/`、`slime/`、全部允许目录的 `.md` 文档）确认没有遗漏的官方编排脚本；`openclaw-test/README.md` 原话"three sequential phases (you can also run them together, but you need homework1/2 first)"本身就说明联合运行是留给用户自己组织的，官方没有配套自动化编排。同时核对了论文原文逐字引用（`paper_index.md` p.21 Appendix A.1，与之前理解一致，无新信息）。
+
+**修复：** `train_with_services.sh`/`minitest_train_with_services.sh` 的 `run_joint_round()`（每轮 6 题、`while kill -0 TRAINING_PID` 反复循环）改为 `run_joint_phase()`——INIT 建好 homework1/2 后，三角色各自传 `JOINT_NUM_PROBLEMS=1319`（GSM8K 全量数据集）、同时后台启动一次，训练循环自然消耗真实样本直到自己结束（num-rollout 跑完或被手动停止），模拟进程跟着训练进程一起收尾（谁先结束就收尾，避免互相干等）。`smoke_train_with_services.sh` 本来就只做 1 轮 Joint 验证并发，不受影响。commit `4be24ab`。
+
+**待验证：** 用这个新设计重新提交 8GPU 训练，确认 INIT 阶段能正常建好 homework1/2，Joint 阶段三角色能持续产出真实数据、训练能正常推进，最终 `check_convergence.py` 能拿到有意义的 Table 3 收敛数字。
+
 ---
 
 <!-- 格式模板：
