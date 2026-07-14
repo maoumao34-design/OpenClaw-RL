@@ -693,6 +693,12 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 1. 官方论文/代码库对"INIT 阶段该不该跟训练并发、homework1 该不该是单一策略快照"这件事是怎么处理的——`train_with_services.sh`（我们自己写的编排脚本）目前是训练 job 提交后立刻并发跑 INIT，这个时序选择是不是我们自己的设计缺陷，官方有没有对应的参考做法
 2. 11:40-12:00 那次 503 风暴的真正根因——需要重新确认 Student 实际请求经过的是哪个 SGLang 进程（这次跑起了 `pid=34571`/`pid=36012` 两个 SGLang 进程，之前查健康状态时不确定看的是不是对的那个），精确到秒对比失败时刻和 SGLang/`submission_enabled` 状态
 
+**更新（同一天，待查 1 已确认）：** 用官方 `openclaw-test/README.md` 的 Step-by-Step 流程核实——官方参考流程本身就是训练 job 先提交、Student/TA/Teacher 后跑，边跑边训练，`_maybe_submit_ready_samples()`（`openclaw_combine_api_server.py:151-213`）完全不区分 INIT/joint 阶段，谁的对话先评估完就先入训练队列，没有等 homework1/2 建好才开始训练的逻辑。**结论：homework1 由多个策略版本混合生成是官方设计的常态，不是 bug**，`train_with_services.sh` 里"INIT 全部跑完才进 Joint round"是我们自己额外加的更严格顺序，不是必需的，但也不算错，不需要改。这一条排查到此结束。
+
+**更新（同一天，待查 2 有新进展，修了一个真实设计缺陷）：** 排查过程中发现 `run_one_persona()` 的外层重试（07-10 加的，网关中途不可达时最多重试 3 次）有一个副作用——`student_chat.py`/`TA_chat.py`/`teacher_chat.py` 每次被重新调用都会**清空自己的输出文件重新开始**，如果第一次已经做完一部分真实题目才失败，外层重跑会把这部分已经拿到的真实数据一起清空覆盖掉，比"只跑一次不重试"保留的数据反而更少；而且 Student 的 INIT 从约 10:32（网关就绪）持续到 11:41:12 才彻底放弃，耗时超过一小时，对于"72 题、最多重试 3 次"这种设计来说明显偏长，符合"多次整体重来"的迹象。核实官方 `openclaw-test/README.md` 参考流程本身也是每个角色只跑一次，没有整体重来的机制。**修复：`run_one_persona()` 改回只调用一次**（保留 07-10 那次"跑之前先确认网关可达"的前置检查，去掉"失败重跑整个脚本"），commit `0b25005`。
+
+**待验证：** 用这个修复重新提交 8GPU 训练，确认 INIT 阶段 `results_*_init.txt` 是否不再是 0 字节（哪怕不能 100% 跑完 72 题，至少应该保留部分真实进度，不会被重跑清空）。
+
 ---
 
 <!-- 格式模板：
