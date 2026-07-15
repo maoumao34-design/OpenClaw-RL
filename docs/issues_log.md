@@ -717,6 +717,33 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 ---
 
+## [2026-07-15] 8GPU 正式训练（run `8yn4i8ml`）跑了约 7 小时后无声消失——根因已确认：TA 生成失败链式导致 rollout 饥饿，GPU 空闲触发平台自动回收
+
+**背景：** 用 07-14 修复过的新版本（`run_one_persona()` 单次调用 + `run_joint_phase()` 一次性并发）重新提交的 8GPU 正式训练，16:07:25 开始，Student INIT 阶段这次验证正常（进度推进到 43/72 题，产出真实完整数据，`run_one_persona()` 修复确认生效，见 `work_log.md` 2026-07-14 条目）。但训练在 23:12:39 前后彻底停止响应，wandb 上该 run 状态变为 `Crashed`。
+
+**排查过程（按顺序，每一步都有实测证据）：**
+1. 确认不是磁盘写满（`df -h /dfs/data` 仅用 6%）、不是系统 OOM（`dmesg` 里的 OOM 记录是 7/9 的旧记录，进程名 `cicc`/`VLLM::EngineCor`，跟本次训练无关）、不是 workspace 会话断连（用户确认未断连）
+2. `training.log` 结尾显示：22:22-23:12 这 50 分钟里，`[OpenClawCombineSelectWorker] waiting for combine samples: 11/16, queue=0` 反复打印、样本数字卡住不再增长，SGLang 健康检查全程 200 OK；23:12:39 后彻底没有任何输出，无报错、无 Traceback、无 NCCL 错误
+3. `grep error/exception` 在故障时刻附近无真实匹配（只有启动阶段配置项里带"error"字样的参数名，属误报）
+4. 查 `simulation.log`，第一次出现 `⚠️ Agent couldn't generate a response. Please try again.` 早在 Student INIT 第 1 题（Turn 3，请求内容是"append that to homework/1.txt"，重试一次后 Turn 4 即成功）——说明这个故障从训练一开始就存在，不是 Joint 阶段才出现的新问题
+5. `openclaw.log` 确认这个报错的技术信号是 `stopReason=length` + `[model-fallback/decision] decision=candidate_failed reason=format`——模型生成回复过程中，还没输出完整、可解析的结果就把输出长度预算耗尽，被判定失败，跟"文件读/写"这个动作本身无关（Student 那次是写入请求、TA 那次是读取+生成评语请求，共同点更可能是"turn 内需要先完成一次工具调用"，而不是具体是读还是写）
+6. 按小时统计 `openclaw.log` 里这个报错的出现次数：16点 21次，17-21点稳定在 70-96次/小时（撑了 5 小时以上系统仍正常运作，说明这个故障本身是可以被重试机制扛住的，不是它直接杀死训练），22点骤降到 17次，23点归零——不是故障变少了，是系统 22点后基本停止发起新请求
+7. `simulation.log` 显示：22点左右 TA 在批改第 23 题时连续 8 轮全部命中这个故障，`Reached max turns (8) for problem 23`，随后第 24 题 Turn 1、Turn 2 也连续失败——TA 这个角色被这个故障"钉住"了，产不出新的合格批改样本
+8. wandb Logs 面板（`train_async.py` 进程自己独立上报的 stdout，跟本地 `training.log` 是完全不同的两条日志链路）拉到最后确认：**最后一条日志同样精确停在 23:12:39**，内容也是普通的健康检查 `GET /health 200 OK`，跟本地 `training.log` 完全吻合。两条独立链路精确同时归零，且都没有任何报错/退出信息，排除了"进程内部报错/崩溃"（那样至少会有一条链路先记录到异常），指向"整个容器从外部被一次性杀掉"
+
+**根因确认：** TA 反复遇到 `stopReason=length` 生成失败（这个故障本身从训练一开始就存在，是个长期慢性问题）→ 22点左右在批改第 23、24 题时命中率突然变得极高，TA 用完所有重试机会仍产不出合格样本 → `RolloutManager` 拿不到新的合格样本，卡在 `waiting for combine samples: 11/16` 长达 50 分钟不动 → 这段时间里 SGLang 引擎除了应答健康检查，没有真正的生成任务在跑，8 张 GPU 实际处于空闲状态 → GPU 空闲持续超过 modelfactory 平台的自动回收阈值（约 1 小时）→ 平台强制关闭整个 workspace → 容器内所有进程（本地日志写入 + wandb 上报）瞬间同时终止，不留报错痕迹。**不是代码 bug、不是 OOM、不是磁盘问题，是"训练进程仍在但 GPU 真实空闲"触发了平台层面的资源回收。**
+
+**仍未查清的子问题：** TA 为什么会在批改第 23、24 题时突然从"偶发、重试能救回来"变成"连续命中率极高、8 次重试全部失败"——这个具体触发点还没有找到解释（`stopReason=length` 本身从训练一开始就存在，为什么这一批集中爆发未知）。
+
+**处理方向（讨论中，未定案）：**
+1. 给 `waiting for combine samples` 这种长时间卡住的状态加一个超时/报警机制，避免静默卡住半小时以上都没人发现
+2. 加一个低频、极小显存占用的 GPU keepalive 进程作为兜底，防止 rollout 饥饿期间被平台误判为空闲回收（跟第 1 点是互补关系，不是二选一：keepalive 治标，防止"卡住了还被平台顺手杀掉"进一步放大问题；真正要治本还是得搞清楚 TA 为什么会集中爆发失败）
+3. TA `stopReason=length` 这个慢性故障本身要不要修（比如加大 TA 场景下的 maxTokens 预算，减少长 `<think>` 推理被截断的概率）——目前只是观察到现象，还没有确定修复方案
+
+**待验证：** 同步跑的 minitest 结果，看能否复现同样的"TA 卡住→GPU 空闲→被回收"链条，进一步定位 TA 集中失败的触发条件。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
