@@ -289,6 +289,22 @@ openclaw config set agents.defaults.compaction.reserveTokens 16384 \
 echo "[verify] agents.defaults.compaction.reserveTokens = $(openclaw config get agents.defaults.compaction.reserveTokens 2>&1 | tail -1)" \
     | tee -a "${LOGS_DIR}/openclaw.log"
 
+# 2026-07-15 修复：上面这个 reserveTokens 从 07-13 设到现在，实际运行时的
+# context-overflow precheck 日志（[agent/embedded][context-overflow-precheck]）
+# 一直显示 effectiveReserveTokens=20000，跟设置的 16384 对不上——查了官方
+# GitHub issue #66830（"reserveTokens vs reserveTokensFloor asymmetry"），
+# 确认这是 OpenClaw 自身的已知问题：memoryFlush/preflight 这两条阈值计算路径
+# 根本不读 reserveTokens 字段，读的是另一个从未配置过的 reserveTokensFloor
+# （不读的话就用它自己的内部默认值，找到的证据显示落在 20000），不分 provider/
+# 模型都会复现。同样显式设置 reserveTokensFloor=16384，跟 reserveTokens 保持
+# 一致。见 docs/issues_log.md 2026-07-15 条目。
+echo "确保 compaction.reserveTokensFloor 为 16384（reserveTokens 单独设置对 precheck 阈值计算无效，见 issues_log.md 2026-07-15）..." \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+openclaw config set agents.defaults.compaction.reserveTokensFloor 16384 \
+    >> "${LOGS_DIR}/openclaw.log" 2>&1
+echo "[verify] agents.defaults.compaction.reserveTokensFloor = $(openclaw config get agents.defaults.compaction.reserveTokensFloor 2>&1 | tail -1)" \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+
 # 部署 rl-training-headers 插件（appendSystemContext 版本）。写入 OpenClaw 自己
 # 的系统安装目录（openclaw plugins list --verbose 确认的 source 路径），不是插件
 # 扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里。

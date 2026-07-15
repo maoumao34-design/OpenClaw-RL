@@ -297,6 +297,16 @@ openclaw config set agents.defaults.compaction.reserveTokens 16384 \
 echo "[verify] agents.defaults.compaction.reserveTokens = $(openclaw config get agents.defaults.compaction.reserveTokens 2>&1 | tail -1)" \
     | tee -a "${LOGS_DIR}/openclaw.log"
 
+# 2026-07-15 修复：reserveTokens 单独设置对实际 context-overflow precheck 阈值
+# 计算无效（官方 GitHub issue #66830，memoryFlush/preflight 读的是 reserveTokensFloor
+# 不是 reserveTokens，不分 provider/模型都会复现），同样显式设置。见 train_with_services.sh
+# 同日注释和 docs/issues_log.md 2026-07-15 条目。
+echo "确保 compaction.reserveTokensFloor 为 16384..." | tee -a "${LOGS_DIR}/openclaw.log"
+openclaw config set agents.defaults.compaction.reserveTokensFloor 16384 \
+    >> "${LOGS_DIR}/openclaw.log" 2>&1
+echo "[verify] agents.defaults.compaction.reserveTokensFloor = $(openclaw config get agents.defaults.compaction.reserveTokensFloor 2>&1 | tail -1)" \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+
 # 部署 rl-training-headers 插件（appendSystemContext 版本）。写入 OpenClaw 自己
 # 的系统安装目录（openclaw plugins list --verbose 确认的 source 路径），不是插件
 # 扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里。

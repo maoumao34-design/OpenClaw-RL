@@ -219,6 +219,14 @@ launch_openclaw_gateway() {
     echo "[verify] agents.defaults.compaction.reserveTokens = $(openclaw config get agents.defaults.compaction.reserveTokens 2>&1 | tail -1)" \
         | tee -a "${LOGS_DIR}/openclaw.log"
 
+    # 2026-07-15：reserveTokens 单独设置对 precheck 阈值无效（官方 issue #66830），
+    # 同样显式设置 reserveTokensFloor，见 train_with_services.sh 同日注释。
+    echo "确保 compaction.reserveTokensFloor 为 16384..." | tee -a "${LOGS_DIR}/openclaw.log"
+    openclaw config set agents.defaults.compaction.reserveTokensFloor 16384 \
+        >> "${LOGS_DIR}/openclaw.log" 2>&1
+    echo "[verify] agents.defaults.compaction.reserveTokensFloor = $(openclaw config get agents.defaults.compaction.reserveTokensFloor 2>&1 | tail -1)" \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+
     # 部署 rl-training-headers 插件（appendSystemContext 版本，见上方 PATCHED_OPD_DIR
     # 注释）。写入 OpenClaw 自己的系统安装目录（openclaw plugins list --verbose 确认的
     # source 路径），不是插件扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里，

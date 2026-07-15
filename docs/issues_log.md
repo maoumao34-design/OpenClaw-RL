@@ -741,6 +741,21 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待验证：** 同步跑的 minitest 用这个修复验证 TA 能否正常产出真实批改结果（不再 100% 命中 `stopReason=length`）；确认后再重新提交 8GPU 正式训练，同时观察是否还需要处理"处理方向"里提到的另外两点（`waiting for combine samples` 超时报警、GPU keepalive 兜底）——如果这次 maxTokens 修复能让 TA 恢复正常，rollout 饥饿的根源就解决了，那两个可能就不再是必须做的事，视 minitest 结果决定。
 
+**更新（2026-07-15，maxTokens 修复不够，找到真正根因）：** 用改完 `maxTokens=8192` 的版本重新提交 8GPU 训练（run `8yn4i8ml` 之后的新 run，log 目录 `20260715_130612`），仍然反复失败：
+
+1. Student INIT **只跑到第 35 题就崩溃**（`results_student_init.txt` 只有 36 个 session，非 72），TA INIT 也**只跑到第 11 题左右**（同一个流水线里两个角色都提前中断）——`run_init_phase()`/`run_one_persona()` 在任一角色失败时只打印警告就放行、不阻塞，导致"INIT 完成"这个标志本质上只代表"三个角色的脚本各自被调用过一次"，不代表真的跑完了全部 72 题。Teacher 的 `ensure_homework_dir()` 会在这个不完整的 `homework1/` 基础上直接复制出 `homework2/`，导致 Teacher 面对大部分题目时根本没有 TA 评语可用
+2. 逐条排查失败原因：Student 报 `requests.exceptions.ReadTimeout`（客户端自己 180 秒等超时，服务端根本没回复），TA 报服务端明确返回的 `408`——看起来像两种不同的超时，但深挖 `openclaw.log` 发现两边都是同一件事：`[agent/embedded][context-overfow-precheck]` 反复报 `Context overflow: prompt too large for the model (precheck)`，卡在这个 precheck 失败重试循环里空转 2 分钟左右，最后才被包装成"LLM request timed out"抛出来——**表面是超时，真正根因是 context overflow precheck 循环**，不是生成变慢
+3. 关键异常：precheck 日志里 `reserveTokens=20000 effectiveReserveTokens=20000`，跟脚本里设置的 `16384` 完全对不上；核实 `openclaw config get`/`~/.openclaw/openclaw.json` 都确认配置文件里明明白白是 `16384`，且当时只有一个网关进程在跑（排除残留进程用旧配置的可能）
+4. 对比昨晚崩溃的 run（`maxTokens` 还是旧的 4096）的 `openclaw.log`，发现 `effectiveReserveTokens=20000` **早就存在**，不是这次 maxTokens 改动引入的新问题——说明 07-13 那次"改配置为 16384"的修复从一开始就没有真正在这条 OpenAI 兼容请求路径上生效过，配置层面看着对，实际运行时一直在用 20000
+5. WebSearch 官方 GitHub 找到确切原因：[Issue #66830](https://github.com/openclaw/openclaw/issues/66830)（"reserveTokens vs reserveTokensFloor asymmetry"，不分 provider/模型都会复现）——**`memoryFlush`/`preflight` 这两条阈值计算路径根本不读 `reserveTokens` 字段，读的是另一个从未配置过的 `reserveTokensFloor`**，没设置就用 OpenClaw 自己的内部默认值。（另外查到一个高度相似但已 Closed 的 [Issue #65465](https://github.com/openclaw/openclaw/issues/65465)，一开始误判为同一个根因，但那次是 Ollama provider 专属且已在我们当前版本 2026.6.9 之前修复完，逻辑上不该是这次问题的原因，已排除，改用 #66830 这个更贴合"不分模型都复现"描述的版本）
+6. `openclaw config get agents.defaults.compaction.reserveTokensFloor` 确认这个字段**从未配置过**（"Config path not found"）；手动 `openclaw config set agents.defaults.compaction.reserveTokensFloor 16384` 后 `config get agents.defaults.compaction` 显示两个字段都是 16384，确认设置本身有效
+
+**修复：** 三个脚本（`train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh`）在原有 `reserveTokens 16384` 设置之后，追加 `openclaw config set agents.defaults.compaction.reserveTokensFloor 16384`（每次启动网关前都强制设置 + 回读验证，跟 `reserveTokens` 同一套模式）。
+
+**未采纳的方案：** 升级 OpenClaw 到 2026.6.10——搜了官方 release notes 没有确认这个版本包含针对性修复，而且当前整套流水线是针对 2026.6.9 反复调好的，换版本风险大于收益，先不做。
+
+**待验证：** 用这个修复重新提交一次干净的 8GPU 训练（当前跑到一半、数据已不完整的这次直接放弃重跑），确认 `effectiveReserveTokens` 终于变成 16384、Student/TA 能否完整跑完 72 题不再中途崩溃。
+
 ---
 
 <!-- 格式模板：
