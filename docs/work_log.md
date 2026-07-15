@@ -549,12 +549,16 @@
 - 评估过升级 OpenClaw（2026.6.9→2026.6.10）绕开这个 bug，但官方 release notes 无法确认包含针对性修复，且当前流水线是针对现有版本反复调好的，升级风险大于收益，未采纳；改为显式设置 `agents.defaults.compaction.reserveTokensFloor=16384`，三个脚本均已加上这个设置 → commit `d205fc7`
 - 丢弃了改 `maxTokens` 那次 run 的不完整数据（Student/TA/Teacher 分别只检查了 36/23/11 个 session，"Table 3" 收敛数字没有参考价值），清理残留 GPU 进程（`sglang::scheduler`，Ctrl-C 未能完全清理，本次两次撞上），重新提交一次干净的 8GPU 训练（run 目录 `20260715_162015`）
 - 用一次手动构造的诊断探测请求（直接发给正在跑的网关，绕开等待真实对话攒够长度）**确认 `reserveTokensFloor` 修复在真实运行时生效**：`effectiveReserveTokens` 终于变回 16384，不再是 20000
+- 上面这次重新提交的训练（`20260715_162015`）仍然在第 40 题左右开始持续性失败（Student 最终只到 51/72、Teacher 同样崩溃）——排查确认这次根因完全不同：是 `update_weights()` 触发 `pause_generation`/清空 KV 缓存时，正好打断了"正在处理中"的对话请求（`Provider finish_reason: abort`/503），且缓存清空后长对话需要整段重新预填充，之后同一批 session 反复出现"生成结束但内容为空"（`stopReason=stop, emptyRetries=1/1`）的持续性故障，不会自己恢复
+- 一开始怀疑显存/GPU 资源，`nvidia-smi` 排除；改查系统内存，`free -h` 一开始查到宿主机 1.5TB/健康，被用户指出应该查的是申请 workspace 时选的资源额度（cgroup 限额），不是宿主机总量——查 `/sys/fs/cgroup/memory.max` 确认这次 workspace 的内存限额其实是 **256GB**，当时已用到约 200GB（78%），且还在持续爬升（对话历史、Ray 缓存不断累积）。对比 07-09 那次 5GPU minitest（128GB 限额、被打到 98.9%）的历史经验，这次 8GPU（进程数是 5GPU 配置的 1.6 倍）明显需要比 256GB 更多，建议下次至少申请 512GB 起步（未采纳原有的"一步到位申请最大值"思路，沿用 07-09"实测峰值+余量，不够再加"的做法）
+- 准备关闭当前 workspace 重新申请更大内存时，触发了 workspace 自己的持久化存储配额告警（"已用存储已超过最大限制（2GB）"）——确认这是跟训练内存完全独立的另一个配额（只管"已安装软件包/环境设置"这类会被保存的内容，`/dfs/data` 不受影响），排查后清理了 460MB 历史 session 转录文件（`~/.openclaw/agents/main/sessions/`，都是今天已经决定丢弃的几次失败 run 留下的对话记录）和 460MB npm 缓存，两者均确认不影响 OpenClaw 本体（`/usr/lib/node_modules/openclaw`，613MB）
+- 用户重新申请了 **64 CPU / 1024GB 内存**的新 workspace，`start_tools.sh` 起代理 → `git pull` 拉到最新代码 → 确认 8 卡干净 → 重新提交训练（run 目录 `20260715_180549`），并在新 workspace 里重跑一次诊断探测请求，**再次确认 `reserveTokensFloor` 修复在新环境下同样生效**（`effectiveReserveTokens=16384`）
 
 **主要问题：**
-- TA 在第 23/24 题附近命中率骤增的具体触发点仍不明确，但已不是阻塞 INIT 跑完 72 题的主要矛盾（`reserveTokensFloor` 才是，已修复）
-- 新提交的这次训练（`20260715_162015`）INIT 阶段能否完整跑完 72 题，要等结果出来才知道
+- TA/Student 在跑到第 10-40 题这个区间（不同 run 不完全一致）会开始持续性失败，根因是 `update_weights()` 的 pause/缓存清空打断在途请求，且暂无法从代码层面根治（属于异步 RL 架构本身的竞态，官方设计假设"训练不干扰推理"多数时候成立，但偶发打断后的恢复行为不稳定）——这次换成 256GB→1024GB 内存后是否显著改善还需要观察，如果内存不是主因，这个问题可能仍会复现
+- `run_init_phase()`/`run_one_persona()` 对"角色没跑完 72 题就崩溃"没有阻塞机制的设计缺陷（07-14 就发现）今天又让两次 run 的数据作废，目前仍未修
 
-**待验证：** 明天查看 `20260715_162015` 这次训练 INIT 阶段是否正常跑完 72 题（不再中途因 context overflow 崩溃）、Joint 阶段能否正常持续、训练是否正常推进。
+**待验证：** 明天查看 `20260715_180549` 这次训练（64CPU/1024GB 新 workspace）INIT 阶段能否完整跑完 72 题、Joint 阶段能否正常持续，判断内存是不是今天反复出现"持续性失败"的真正主因。
 
 ---
 
@@ -575,21 +579,24 @@
 - [x] `scripts/check_convergence.py`
 
 ### 已知限制 / 未解决
-- workspace 模式下 GPU 长时间空闲（比如 rollout 饥饿）会触发 modelfactory 平台自动回收整个 workspace，训练进程和日志会毫无征兆地一起消失，本地日志查不出任何报错——`reserveTokensFloor` 修复预期能大幅降低这个触发概率（context overflow 是这次已知的饥饿诱因），但没有别的诱因也会导致同样问题，暂无系统性预防手段（讨论过 GPU keepalive 兜底，暂未实施）
-- `run_init_phase()`/`run_one_persona()` 目前对"某个角色没跑完 72 题就崩溃"没有阻塞机制，只警告后放行，导致下一阶段可能建立在不完整数据上——07-15 两次 run 都因此产生了不完整/需要丢弃的数据，这个设计缺陷本身还没有修
-- TA 在特定题目附近失败率骤增的具体触发条件未查清（次要，已不是主要矛盾）
+- **8GPU 正式训练的 workspace 内存额度，之前一直是按 256GB 申请的，实测跑到 INIT 中途就用掉 78%、仍在爬升**——已改成 64CPU/1024GB 重新申请，但还没有一次完整 run 验证这个新额度是否真的够用
+- `update_weights()` 触发的 pause/KV 缓存清空偶尔会打断"正在处理中"的对话请求，之后同一批 session 可能陷入持续性"生成结束但内容为空"的故障，不会自己恢复——怀疑跟内存压力有关联但未最终证实，是目前"跑到一半开始连续失败"的头号嫌疑
+- workspace 模式下 GPU 长时间空闲（比如 rollout 饥饿）会触发 modelfactory 平台自动回收整个 workspace，训练进程和日志会毫无征兆地一起消失，本地日志查不出任何报错——`reserveTokensFloor` 修复降低了 context overflow 这个已知饥饿诱因，但内存压力也可能导致同样的饥饿链条，暂无系统性预防手段（讨论过 GPU keepalive 兜底，暂未实施）
+- `run_init_phase()`/`run_one_persona()` 目前对"某个角色没跑完 72 题就崩溃"没有阻塞机制，只警告后放行，导致下一阶段可能建立在不完整数据上——07-15 三次 run 都因此产生了不完整/需要丢弃的数据，这个设计缺陷本身还没有修
 - Joint 阶段三角色并发"超车"读空文件的风险仍未获得真实数据验证（至今没有一次 run 完整走到 Joint 阶段）
 - 训练一结束就杀网关不等模拟循环跑完（已记录暂不修）
 - `appendSystemContext` 标记多轮对话下的稳定性、context-summarization 是否触发 `before_prompt_build`，仍待验证
+- workspace 自己的持久化存储配额只有 2GB（跟训练用的系统内存是完全独立的两个概念），关闭 workspace 前如果快超了要记得清理 `~/.openclaw/agents/main/sessions/`（历史对话转录）和 `~/.npm`（缓存），不要动 `/usr/lib/node_modules/openclaw`（本体）
 
 ### 下一步
-1. 查看 `20260715_162015` 这次训练结果：INIT 能否完整跑完 72 题、Joint 阶段能否正常推进
-2. 如果这次仍有角色跑不完 72 题，需要考虑给 `run_init_phase()` 加阻塞/重试机制（目前是已知设计缺陷，暂未修）
+1. 查看 `20260715_180549` 这次训练结果（64CPU/1024GB 新 workspace）：INIT 能否完整跑完 72 题、Joint 阶段能否正常推进，判断内存是否是根本瓶颈
+2. 如果新内存额度下仍有角色跑不完 72 题，说明内存不是唯一原因，需要考虑给 `run_init_phase()` 加阻塞/重试机制（目前是已知设计缺陷，暂未修）
 3. INIT+Joint 全部跑通后，观察 wandb 曲线 + 最终 `check_convergence.py` 结果
-4. 8GPU 正式训练固定用同一种 GPU 架构，不与其他方法/基线混用硬件
+4. 8GPU 正式训练固定用同一种 GPU 架构和内存额度，不与其他方法/基线混用硬件配置
 
 ### 未验证
-- [ ] `reserveTokensFloor` 修复能否让 INIT 阶段三个角色都完整跑完 72 题（诊断探测已确认运行时生效，但还没有一次完整 run 走完全程验证）
+- [ ] 64CPU/1024GB 新 workspace 能否让 INIT 阶段三个角色都完整跑完 72 题（这是今天第三次尝试，前两次分别卡在 maxTokens 和 reserveTokensFloor，这次换了内存额度）
+- [ ] `update_weights()` 打断在途请求导致的"持续性空回复"故障是否会因为内存余量变大而消失，还是内存无关、需要另外处理
 - [ ] Joint 阶段"超车"现象是否显著影响数据质量（至今没有真实数据）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
