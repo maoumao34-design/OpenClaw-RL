@@ -313,6 +313,10 @@ openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 |
 
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke 的问题）。
+#
+# 2026-07-15 修复：maxTokens 原为 4096（跟 train_with_services.sh 同源的历史
+# 遗留值，见该文件同日注释和 docs/issues_log.md 2026-07-15 条目），官方 README.md
+# 示例配置 contextWindow=32768 对应 maxTokens=8192，改成跟官方一致。
 echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
 python3 -c "
 import json, pathlib
@@ -328,7 +332,7 @@ sg['models'] = [{
     'input': ['text'],
     'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
     'contextWindow': 32768,
-    'maxTokens': 4096,
+    'maxTokens': 8192,
 }]
 cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
 print('patched models.providers.sglang.models')

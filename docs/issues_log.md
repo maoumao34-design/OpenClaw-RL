@@ -733,14 +733,13 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **根因确认：** TA 反复遇到 `stopReason=length` 生成失败（这个故障本身从训练一开始就存在，是个长期慢性问题）→ 22点左右在批改第 23、24 题时命中率突然变得极高，TA 用完所有重试机会仍产不出合格样本 → `RolloutManager` 拿不到新的合格样本，卡在 `waiting for combine samples: 11/16` 长达 50 分钟不动 → 这段时间里 SGLang 引擎除了应答健康检查，没有真正的生成任务在跑，8 张 GPU 实际处于空闲状态 → GPU 空闲持续超过 modelfactory 平台的自动回收阈值（约 1 小时）→ 平台强制关闭整个 workspace → 容器内所有进程（本地日志写入 + wandb 上报）瞬间同时终止，不留报错痕迹。**不是代码 bug、不是 OOM、不是磁盘问题，是"训练进程仍在但 GPU 真实空闲"触发了平台层面的资源回收。**
 
-**仍未查清的子问题：** TA 为什么会在批改第 23、24 题时突然从"偶发、重试能救回来"变成"连续命中率极高、8 次重试全部失败"——这个具体触发点还没有找到解释（`stopReason=length` 本身从训练一开始就存在，为什么这一批集中爆发未知）。
+**更新（同一天，子问题已查清并修复）：** 直接查 TA 那次 INIT 运行的原始输出文件 `results_TA_init.txt`（不是靠 `simulation.log` 片段推测）：**从第 0 题（`session: ta-grade-0-227040`）到崩溃前的第 37 题，每一题都是唯一一行 `⚠️ Agent couldn't generate a response. Please try again.`，无一例外，100% 失败率。** 这推翻了"TA 在第 23/24 题才开始集中爆发"的说法——TA 从 INIT 阶段第一题起就没有成功过一次，是从头到尾彻底失效，跟 Student 同期基本正常（43 题里只有 1 次可重试的失败）形成鲜明对比。之前按小时统计出来的"稳定 70-96 次/小时"，绝大部分应该就是 TA 在不停重试失败，不是 Student/TA 均摊的随机噪音。
 
-**处理方向（讨论中，未定案）：**
-1. 给 `waiting for combine samples` 这种长时间卡住的状态加一个超时/报警机制，避免静默卡住半小时以上都没人发现
-2. 加一个低频、极小显存占用的 GPU keepalive 进程作为兜底，防止 rollout 饥饿期间被平台误判为空闲回收（跟第 1 点是互补关系，不是二选一：keepalive 治标，防止"卡住了还被平台顺手杀掉"进一步放大问题；真正要治本还是得搞清楚 TA 为什么会集中爆发失败）
-3. TA `stopReason=length` 这个慢性故障本身要不要修（比如加大 TA 场景下的 maxTokens 预算，减少长 `<think>` 推理被截断的概率）——目前只是观察到现象，还没有确定修复方案
+**根因定位（对照官方配置发现的真实原因）：** 查官方 `README.md`（[第 312-344 行](../../OpenClaw-RL-official/README.md)，"Slime-based RL server" 配置示例）给出的标准 OpenClaw 模型 provider 配置是 `contextWindow: 32768` 配 `maxTokens: 8192`。我们三个脚本（`train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh`）实际用的是 `maxTokens: 4096`——只有官方值的一半。追溯这个 4096 的来历：最早是 07-07 那次修复引入的，当时 smoke 的 `contextWindow` 被临时缩到 8192（省显存），`maxTokens=4096` 是"设成 contextWindow 一半、给 prompt 留空间"这个逻辑下算出来的，在那个场景里合理；但后来（07-09）`contextWindow` 已经改回官方的 32768，`maxTokens` 却没有跟着重新计算，就这样原封不动地被复制进了 minitest 和 8GPU 正式训练脚本，形成了"`contextWindow=32768` 配 `maxTokens=4096`"这个不匹配组合，一直没人发现。TA 的批改任务比 Student 复杂得多（先要读文件工具调用，再要求生成结构化多点评语，Qwen3-Thinking 生成前还会先输出一大段 `<think>` 推理），系统性地更容易撞到这个偏小的输出预算触底；Student 的任务通常更短，大多数时候能在 4096 内说完，所以基本没事——这个不对称完全解释了"Student 正常、TA 100% 失败"的现象。
 
-**待验证：** 同步跑的 minitest 结果，看能否复现同样的"TA 卡住→GPU 空闲→被回收"链条，进一步定位 TA 集中失败的触发条件。
+**修复：** 三个脚本里的 `maxTokens` 从 `4096` 改为跟官方一致的 `8192`（`contextWindow` 不变，仍是 32768）。`train_with_services.sh`、`minitest_train_with_services.sh`、`smoke_train_with_services.sh` 均已修改。
+
+**待验证：** 同步跑的 minitest 用这个修复验证 TA 能否正常产出真实批改结果（不再 100% 命中 `stopReason=length`）；确认后再重新提交 8GPU 正式训练，同时观察是否还需要处理"处理方向"里提到的另外两点（`waiting for combine samples` 超时报警、GPU keepalive 兜底）——如果这次 maxTokens 修复能让 TA 恢复正常，rollout 饥饿的根源就解决了，那两个可能就不再是必须做的事，视 minitest 结果决定。
 
 ---
 

@@ -248,6 +248,8 @@ launch_openclaw_gateway() {
     # 拒绝了，不是 sglang 400。8192 对真实 agent 系统提示词（工具 schema +
     # 作业内容）明显不够，contextWindow 和 sglang 实际 context_length 必须一致
     # 且足够大，否则两边有一个偏小都会复现这个问题。
+    # 2026-07-15：maxTokens 从 4096 改为 8192，跟官方 README.md 示例配置一致
+    # （contextWindow=32768 对应 maxTokens=8192），见 docs/issues_log.md 同日条目。
     echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
     python3 -c "
 import json, pathlib
@@ -265,7 +267,7 @@ sg['models'] = [{
     'input': ['text'],
     'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
     'contextWindow': 32768,
-    'maxTokens': 4096,
+    'maxTokens': 8192,
 }]
 cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
 print('patched models.providers.sglang.models')

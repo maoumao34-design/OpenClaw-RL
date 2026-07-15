@@ -305,6 +305,18 @@ openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 |
 
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
+#
+# 2026-07-15 修复：maxTokens 原为 4096，是 smoke 早期 contextWindow 还缩在 8192
+# 时（07-07）"maxTokens = contextWindow 一半留 prompt 空间"这个逻辑下的产物；
+# 后来 contextWindow 改回官方 32768，maxTokens 没有跟着重新计算，就这样被复制
+# 到 minitest/8GPU 正式训练脚本里，形成了 contextWindow=32768 配 maxTokens=4096
+# 这个不匹配组合。官方 README.md（Slime-based RL server 配置示例）contextWindow
+# =32768 对应 maxTokens=8192，我们这里明显偏小。TA 批改任务比 Student 复杂得多
+# （先读文件，再要求生成结构化多点评语，Qwen3-Thinking 还要先输出一大段 <think>
+# 推理），系统性地更容易撞到这个偏小的输出预算——8GPU 正式训练（run 8yn4i8ml）
+# TA 从 INIT 第 0 题到崩溃前的第 37 题，100% 命中 stopReason=length 截断失败，
+# 一次没成功过，Student 同期基本正常，符合这个不对称的解释。改成跟官方一致的
+# 8192，见 docs/issues_log.md 2026-07-15 条目。
 echo "声明 sglang/qwen3-4b 的 contextWindow/maxTokens..." | tee -a "${LOGS_DIR}/openclaw.log"
 python3 -c "
 import json, pathlib
@@ -320,7 +332,7 @@ sg['models'] = [{
     'input': ['text'],
     'cost': {'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0},
     'contextWindow': 32768,
-    'maxTokens': 4096,
+    'maxTokens': 8192,
 }]
 cfg.write_text(json.dumps(d, indent=2, ensure_ascii=False))
 print('patched models.providers.sglang.models')
