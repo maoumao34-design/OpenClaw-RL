@@ -525,7 +525,6 @@
 - 全面核对了 wandb `train`（21 项）/`rollout`（22 项）全部指标的确切含义，对照官方 loss 源码 `openclaw_topk_select_loss.py`/`hint_opd_loss.py` 逐一确认，区分出训练健康度哨兵、配置常数、以及本次配置下架构上必然恒定的值，并在 wandb 上搭建了 10 张核心图的 "important" 固定分组（`train/loss`、`grpo_pg_loss`、`opd_loss`、`grad_norm`、`rollout/prm_eval_score`、`advantages`、`zero_std/count_1.0`、`zero_std/count_-1.0`、`response_len/mean`、`ref_log_probs`）；确认 wandb 自带的 "Save personal workspace template" 功能可以让这个布局自动套用到后续新 run，不需要改代码
 - 排查 `train/opd_loss` 长期显示为常数 -1.0 的现象：先用 `training.log` 实测确认真实 OPD 教师信号样本占比 67%（118 条 OPD+RL + 6 条 OPD-only vs 60 条 RL-only），排除"没有真实教师数据流入"的假设；再从源码确认 `--num-steps-per-rollout 1` 导致 `rho_v`（PPO 比率）架构上精确恒等于 1，进而 `ppo_kl_sampled`/`opd_pg_clipfrac`/`grpo_pg_clipfrac` 三个指标恒为 0（wandb 图上逐一验证属实）。结论：这是早期训练阶段的正常数学性质，不是数据链路或代码 bug，预期会随训练步数增加、policy 与初始权重逐渐拉开距离后自然出现波动，暂不需要修复，记为待观察
 - 用 `training.log`/`simulation.log`/`results_student_init.txt` 实测确认两处修复已生效：① GPU calloc/残留进程问题彻底解决，`update_weights()` 已成功执行 30+ 次无崩溃；② `run_one_persona()` 单次调用修复生效，Student INIT 正常推进到第 43/72 题，产出真实完整的多轮对话数据，未再复现"跑 70 分钟后 0 字节放弃"的问题
-- 收到联想 IT 安全团队邮件，称本机检测到未授权 OpenClaw/hermes-agent 运行。现场排查本机（`~/.openclaw` 配置目录、npm/pip 安装记录、进程列表、18789 端口监听、磁盘可执行文件）均无任何痕迹；本项目设计上本地机器全程只做代码编辑和 git 操作，OpenClaw 网关/训练/模拟全部在 modelfactory 服务器由用户本人在服务器终端执行，本机从未安装或运行过 OpenClaw，判断为误报，后续由用户自行联系联想 IT 反馈
 
 **主要问题：**
 - INIT 阶段 503 风暴根因仍未 100% 精确定位到触发机制，但推测跟 Joint round 循环结构无关（该结构已经改掉，待验证问题是否随之缓解）
