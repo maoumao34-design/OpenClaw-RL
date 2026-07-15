@@ -537,7 +537,65 @@
 
 ---
 
-## 当前状态（2026-07-14）
+## 2026-07-15
+
+**目标：** 排查 07-14 提交的 8GPU 训练（run `8yn4i8ml`）为何跑了约 7 小时后无声消失；解决根因，重新跑通 INIT 阶段
+
+**完成内容：**
+- 排查 `8yn4i8ml` 消失的根因：TA 从 INIT 第 0 题起就持续遇到生成失败（`stopReason=length`），在第 23/24 题命中率骤增、用尽重试仍产不出样本，导致 `RolloutManager` 卡在 `waiting for combine samples` 长达 50 分钟，GPU 实际空闲触发了 modelfactory 平台的自动回收——本地 `training.log` 与 wandb 独立上报的日志精确同时断在 23:12:39、均无报错痕迹，证实是平台强制终止而非代码崩溃 → [`issues_log.md`](issues_log.md) 2026-07-15 条目
+- 对照官方 `README.md` 标准配置（`contextWindow=32768` 配 `maxTokens=8192`），发现我们三个脚本一直用的是 `maxTokens=4096`——是 07-07 那次 smoke 专用修复的历史遗留值，`contextWindow` 后来改回官方值时没有同步重新计算。改成官方一致的 8192，`train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh` 均已修改 → commit `5c8c323`
+- 用改完 `maxTokens` 的版本重新提交 8GPU 训练，仍然失败：Student INIT 只跑到第 35 题、TA 只跑到约第 11 题就崩溃（`ReadTimeout`/`408`）。深挖发现两者本质是同一件事——反复卡在 `[context-overflow-precheck]` 失败重试循环里空转 2 分钟左右，最后才被包装成"timeout"抛出，不是生成变慢
+- 定位到真正根因：`effectiveReserveTokens` 实际生效值一直是 20000，跟脚本设置的 `reserveTokens=16384` 完全对不上；对比昨晚崩溃 run 的日志确认这个问题在改 `maxTokens` 之前就已存在，不是本次改动引入的。WebSearch 官方 GitHub 找到确切原因：[Issue #66830](https://github.com/openclaw/openclaw/issues/66830)——OpenClaw 的 `memoryFlush`/`preflight` 阈值计算逻辑根本不读 `reserveTokens` 字段，读的是另一个我们从未配置过的 `reserveTokensFloor`，不分 provider/模型都会复现（一开始误判为另一个长得很像但已修复的 Ollama 专属 issue #65465，经用户追问逻辑漏洞后排除，重新定位到 #66830）
+- 评估过升级 OpenClaw（2026.6.9→2026.6.10）绕开这个 bug，但官方 release notes 无法确认包含针对性修复，且当前流水线是针对现有版本反复调好的，升级风险大于收益，未采纳；改为显式设置 `agents.defaults.compaction.reserveTokensFloor=16384`，三个脚本均已加上这个设置 → commit `d205fc7`
+- 丢弃了改 `maxTokens` 那次 run 的不完整数据（Student/TA/Teacher 分别只检查了 36/23/11 个 session，"Table 3" 收敛数字没有参考价值），清理残留 GPU 进程（`sglang::scheduler`，Ctrl-C 未能完全清理，本次两次撞上），重新提交一次干净的 8GPU 训练（run 目录 `20260715_162015`）
+- 用一次手动构造的诊断探测请求（直接发给正在跑的网关，绕开等待真实对话攒够长度）**确认 `reserveTokensFloor` 修复在真实运行时生效**：`effectiveReserveTokens` 终于变回 16384，不再是 20000
+
+**主要问题：**
+- TA 在第 23/24 题附近命中率骤增的具体触发点仍不明确，但已不是阻塞 INIT 跑完 72 题的主要矛盾（`reserveTokensFloor` 才是，已修复）
+- 新提交的这次训练（`20260715_162015`）INIT 阶段能否完整跑完 72 题，要等结果出来才知道
+
+**待验证：** 明天查看 `20260715_162015` 这次训练 INIT 阶段是否正常跑完 72 题（不再中途因 context overflow 崩溃）、Joint 阶段能否正常持续、训练是否正常推进。
+
+---
+
+## 当前状态（2026-07-15）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `~/.openclaw/openclaw.json`：`gateway.http.endpoints.chatCompletions.enabled=true`（每次起 gateway 前强制设置）
+- [x] `models.providers.sglang`：显式声明 `models[]`，`maxTokens` 已改为官方值 8192（原 4096 是历史遗留）
+- [x] `rl-training-headers` 插件 + `openclaw_opd_api_server.py` 标记解析：**已用真实 GPU 数据验证生效**
+- [x] `agents.defaults.compaction.reserveTokens=16384` + **新增 `reserveTokensFloor=16384`**：**已用诊断探测请求验证运行时真正生效**（此前 `reserveTokens` 单独设置对实际 precheck 无效，是 OpenClaw 官方已知 bug #66830）
+- [x] wandb 集成：**已验证成功**，key 已改走环境变量不再暴露在 Command 字段
+- [x] 系统内存 OOM 修复：**已验证**，A800/H20 上多次 `update_weights()` 无 OOM
+- [x] GPU calloc / workspace 残留进程问题：机制已确认（Ctrl-C/中断后必须手动清理 `sglang::scheduler` 残留，07-15 又复现两次）
+- [x] `run_one_persona()` 单次调用 + Joint 阶段一次性并发：设计已确认，但截至目前还没有一次 run 完整跑完 72 题验证到 Joint 阶段
+- [x] `train/opd_loss` 常数 -1.0 现象排查完毕：确认真实教师信号占比 67%、`rho_v=1` 是架构必然，判定为早期训练正常现象，非 bug
+- [x] wandb "important" 图表分组（10 张核心图）+ 个人工作区模板，后续新 run 自动套用
+- [x] `scripts/check_convergence.py`
+
+### 已知限制 / 未解决
+- workspace 模式下 GPU 长时间空闲（比如 rollout 饥饿）会触发 modelfactory 平台自动回收整个 workspace，训练进程和日志会毫无征兆地一起消失，本地日志查不出任何报错——`reserveTokensFloor` 修复预期能大幅降低这个触发概率（context overflow 是这次已知的饥饿诱因），但没有别的诱因也会导致同样问题，暂无系统性预防手段（讨论过 GPU keepalive 兜底，暂未实施）
+- `run_init_phase()`/`run_one_persona()` 目前对"某个角色没跑完 72 题就崩溃"没有阻塞机制，只警告后放行，导致下一阶段可能建立在不完整数据上——07-15 两次 run 都因此产生了不完整/需要丢弃的数据，这个设计缺陷本身还没有修
+- TA 在特定题目附近失败率骤增的具体触发条件未查清（次要，已不是主要矛盾）
+- Joint 阶段三角色并发"超车"读空文件的风险仍未获得真实数据验证（至今没有一次 run 完整走到 Joint 阶段）
+- 训练一结束就杀网关不等模拟循环跑完（已记录暂不修）
+- `appendSystemContext` 标记多轮对话下的稳定性、context-summarization 是否触发 `before_prompt_build`，仍待验证
+
+### 下一步
+1. 查看 `20260715_162015` 这次训练结果：INIT 能否完整跑完 72 题、Joint 阶段能否正常推进
+2. 如果这次仍有角色跑不完 72 题，需要考虑给 `run_init_phase()` 加阻塞/重试机制（目前是已知设计缺陷，暂未修）
+3. INIT+Joint 全部跑通后，观察 wandb 曲线 + 最终 `check_convergence.py` 结果
+4. 8GPU 正式训练固定用同一种 GPU 架构，不与其他方法/基线混用硬件
+
+### 未验证
+- [ ] `reserveTokensFloor` 修复能否让 INIT 阶段三个角色都完整跑完 72 题（诊断探测已确认运行时生效，但还没有一次完整 run 走完全程验证）
+- [ ] Joint 阶段"超车"现象是否显著影响数据质量（至今没有真实数据）
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-14，已被 7/15 结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
