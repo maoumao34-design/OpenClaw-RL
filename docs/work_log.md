@@ -562,7 +562,60 @@
 
 ---
 
-## 当前状态（2026-07-15）
+## 2026-07-16
+
+**目标：** 排查 `20260715_180549` 训练 `train/grad_norm` 爆炸的根因并修复；解决 workspace 代理服务故障；重新提交训练验证
+
+**完成内容：**
+- 精确核对样本-index 到训练-step 的映射，确认单步跳变最大的一次（step21→22）实际消费的 16-18 条样本里至少 7 条是 `response_len=7~8` token 的退化样本、全部 `reward=-1.0`——不是时间上巧合关联，是这一步梯度爆炸所用的训练数据本身被这类样本主导 → [`issues_log.md`](issues_log.md) 2026-07-16 条目
+- 抓取实际文本内容确认退化样本本质：一个跨两次独立训练复现的乱码字符 `𬣳`（Qwen3 词表 token id=122362）。embedding 范数检查排除"固有异常权重"假设（正常，14.76 百分位）；确认 Megatron 数据侧种子、SGLang 生成侧种子均固定为 1234（`args.seed + rank`），部分解释跨 run 复现同一 token 的现象，但外部 Simulator 不受控，无法完全证实
+- 补上顶格截断（`finish_reason=="length"`）时的 `reasoning_text` 完整日志（此前只记字符数），确认这是真实的"卡死循环"（反复重复车轱辘话），不是正常推理超预算——本次不过滤，先攒诊断材料
+- 实施并修正生成/数据管线补丁（`prepare_patched_openclaw_opd.sh`）：用 `logit_bias` 在生成阶段直接屏蔽已知乱码 token（首版实现搞错成"生成后检测丢弃"，只保护训练数据、对话本身仍会收到坏回复，经指出后修正为生成时屏蔽）→ commit `ad56d7c`/`52c4fc6`
+- 用新修复重新提交训练（run `20260716_143407`）：乱码 token 确认 0 次复现，但 grad_norm 仍缓慢爬升，且发现新问题——TA 批改作业时反复调用 OpenClaw 自带的 `memory_get`（读取按日期命名的记忆文件）或 `HEARTBEAT.md`，完全不回应批改指令。量化统计：27 道题里 **37% 撞 8 轮上限失败、30% 出现过这类干扰**
+- 查证论文/官方代码均未提及如何避免这类干扰（`rl-training-headers` 插件只处理外部 heartbeat/memory/cron **触发器**发起的对话，管不到模型在正常 main turn 内**主动调用**这些工具）；查 OpenClaw 产品自身源码定位到 `memory_get` 属于 `memory-core` 插件，跟 homework 读写工具架构无关、可安全禁用，`HEARTBEAT.md` 等"agent 身份文件"属于核心代码（`src/agents/bootstrap-files.ts`）无法禁用 → `openclaw plugins disable memory-core`
+- 重新评估过滤规则，去掉按 `content` 长度过滤（`<5` 字符）——像"25"这种被判 -1 的短数字回复是正常有效的 RL 训练信号（教模型"这样答不满足要求"），不该被当坏样本剔除；只保留官方原有的"完全空内容"检查 + 已知乱码 token 兜底
+- 给 `tool_calls:` 日志补上 `session_id`，解决此前"并发日志天然交错、事后无法按 session 可靠关联"的分析障碍 → commit `cae49ec`/`00d9195`
+- 用全部修复重新提交训练（run `20260716_182012`），当前在 INIT 阶段，结果留待明天查看
+
+**主要问题：**
+- workspace 自带的 `sing-box` 代理服务（`127.0.0.1:7893`）中途失效，`git pull`/wandb 上报连不上；排查发现 `.bashrc` 无条件导出代理环境变量，但底层代理进程没启动，跟存储配额清理无关（家目录只有 243M，远低于 2GB 配额）——`bash /dfs/data/start_tools.sh` 重新拉起代理解决；另发现 git 远程地址被配置成走 `ghproxy.net` 镜像重写，实测网络能直连 GitHub，改回直连更简单可靠
+- 一开始把"退化样本过滤"方案搞错——该在生成时用 `logit_bias` 屏蔽，却做成了生成后检测丢弃，被指出后修正
+
+**待验证：** 明天查看 `20260716_182012` 这次训练：(a) memory_get/HEARTBEAT 干扰是否消失、TA 撞轮次上限失败率是否显著下降；(b) grad_norm 是否能保持稳定，不再重演早期爬升；(c) 顶格截断的 `reasoning_text` 日志如果再次触发，能否确认是不是同类"卡死循环"。
+
+---
+
+## 当前状态（2026-07-16）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `maxTokens=8192`、`reserveTokensFloor=16384`：已验证生效（07-15）
+- [x] wandb 集成：确认今天的连不上是 workspace 代理服务故障，不是训练本身问题，`start_tools.sh` 修复后正常
+- [x] `logit_bias` 屏蔽已知乱码 token（id=122362）：生成阶段直接屏蔽，**已用真实 GPU 数据验证 0 次复现**（run `20260716_143407`）
+- [x] 退化样本过滤规则：简化为只拦真正空内容（跟官方一致）+ 已知乱码 token 兜底，不再按 `content` 长度过滤
+- [x] `memory-core` 插件禁用：解决 `memory_get` 工具干扰，**尚未验证新 run 实际效果**
+- [x] `tool_calls` 日志补 `session_id`：支持事后按 session 可靠关联分析
+- [x] Git 远程地址改回直连 GitHub（不再依赖易失效的 `ghproxy.net` 镜像）
+
+### 已知限制 / 未解决
+- `HEARTBEAT.md`/`AGENTS.md` 等 OpenClaw 核心自带"agent 身份文件"无法禁用（不是插件），只能靠退化过滤兜底，模型仍可能偶尔读到但预期影响远小于 `memory_get` 的卡循环模式
+- grad_norm 缓慢爬升的**最初触发点**仍未 100% 定位——乱码 token、`memory_get` 卡循环只是两个已确认会放大问题的"下游因素"，是否还有更早的触发原因尚不清楚
+- `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修（07-14 起多次提及）
+- workspace 的 `sing-box` 代理服务偶发失效，需要手动 `start_tools.sh` 重启，暂无自动恢复机制
+
+### 下一步
+1. 查看 `20260716_182012` 训练结果，确认这批修复是否让训练稳定跑过之前失控的窗口
+2. 如果 grad_norm 依然爬升，需要继续往前找最初触发点（不只是已知的两个放大器）
+3. INIT+Joint 全部跑通后，观察 wandb 曲线 + `check_convergence.py` 结果
+
+### 未验证
+- [ ] `20260716_182012` 训练能否稳定跑完 INIT+Joint，不再复现 grad_norm 失控
+- [ ] `memory-core` 禁用后 TA 撞轮次上限失败率是否显著下降
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-15，已被 7/16 结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
