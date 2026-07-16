@@ -185,14 +185,43 @@ if "\nimport re\n" not in text:
 # id=122362，跨两次独立训练复现；以及顶格跑满 max_tokens 却从未闭合
 # <think> 的情况）被当正常样本喂回了训练队列。
 #
-# 这次只做两件事：
-#   1. 拦截"最终答案字段异常短"（哪怕 thinking 正常也可能坍缩成 1 个字符）
-#      或命中已知乱码 token 的生成，不让它们进训练队列。
-#   2. 顶格截断（finish_reason=="length"）*不*拦截——是否是真实的"卡死
+# 这次做三件事：
+#   1. 生成时用 logit_bias 直接屏蔽已知乱码 token（id=122362），让对话
+#      本身就不会再收到这条坏回复——不是等生成完再丢弃样本，那样对话
+#      历史里还是会留着这条坏回复，只是不计入训练数据（2026-07-16 第
+#      一版实现搞错成了事后过滤，已修正为生成时屏蔽，见 issues_log.md）。
+#   2. 拦截"最终答案字段异常短"（哪怕 thinking 正常也可能坍缩成 1 个字符）
+#      的生成，不让它进训练队列；同时保留一道 token 检查作为兜底（SGLang
+#      logit_bias 并非 100% 可靠，见 issues_log.md 记录的已知 issue）。
+#   3. 顶格截断（finish_reason=="length"）*不*拦截——是否是真实的"卡死
 #      循环"bug 还没查清（此前的日志只记录了 thinking 的字符数，从没
 #      记录过原文，没法判断内容是循环还是没写完的正常推理），先把
 #      reasoning 原文完整记下来，供下次复现时诊断，再决定要不要处理。
 # ---------------------------------------------------------------------
+
+forward_body_old = (
+    '        tools = body.get("tools")\n'
+    '        forward_body = {k: v for k, v in body.items() if k not in _NON_STANDARD_BODY_KEYS}\n'
+    '        forward_body["stream"] = False\n'
+    '        forward_body.pop("stream_options", None)\n'
+    '        forward_body["logprobs"] = True\n'
+    '        forward_body["top_logprobs"] = 1\n'
+    '        if "model" not in forward_body:\n'
+    '            forward_body["model"] = self.served_model_name\n'
+)
+if forward_body_old not in text:
+    raise SystemExit(
+        "patch failed: expected forward_body construction block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+forward_body_new = forward_body_old + (
+    '        # 2026-07-16: 生成时直接屏蔽已知乱码 token（id=122362，"𬣳"），\n'
+    '        # 不是等生成完再丢弃样本——那样对话本身还是会看到这条坏回复，\n'
+    '        # 只是不计入训练数据。见 issues_log.md 2026-07-16。\n'
+    '        forward_body.setdefault("logit_bias", {})\n'
+    '        forward_body["logit_bias"]["122362"] = -100\n'
+)
+text = text.replace(forward_body_old, forward_body_new, 1)
 
 thinking_log_old = (
     '        logger.info(\n'
@@ -244,7 +273,13 @@ if empty_response_old not in text:
     )
 empty_response_new = empty_response_old + (
     '\n'
-    '            _KNOWN_GLITCH_TOKEN_IDS = {122362}  # "𬣳"，见 issues_log.md 2026-07-16\n'
+    '            # 2026-07-16: 拦截最终答案异常短的退化生成（哪怕 thinking 正常\n'
+    '            # 也可能坍缩成 1 个字符），不让它进训练队列。已知乱码 token\n'
+    '            # （id=122362）主要靠上面 forward_body 的 logit_bias 在生成阶段\n'
+    '            # 就屏蔽掉；这里的 token 检查只是兜底（SGLang logit_bias 在个别\n'
+    '            # 版本上不是 100% 可靠，见 issues_log.md 2026-07-16 WebSearch 记录\n'
+    '            # 的已知 issue），正常情况下不应该再命中。\n'
+    '            _KNOWN_GLITCH_TOKEN_IDS = {122362}  # "𬣳"\n'
     '            if len(content.strip()) < 5 or any(_tid in _KNOWN_GLITCH_TOKEN_IDS for _tid in response_ids):\n'
     '                logger.info(\n'
     '                    "[OpenClaw-OPD] MAIN session=%s -> degenerate response (content=%r), skipping",\n'

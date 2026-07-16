@@ -811,6 +811,14 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 **待验证：** 下次提交 8GPU 正式训练后确认：(a) 退化样本过滤生效（日志里能看到 "degenerate response...skipping"）、grad_norm 不再因这类样本雪崩；(b) 如果再次出现顶格截断，`TRUNCATED...reasoning_text` 日志能打印出完整推理原文，供判断是否为卡死循环——如果确认是循环，再决定是否需要单独修复或过滤。
 
+**更新（同一天，纠正一个实现错误：乱码 token 的屏蔽方式搞反了）：** 上面"已实施"部分描述的乱码 token 拦截，第一版实现成了**生成完之后检测 `response_ids` 里有没有这个 token、有就丢弃样本**——但这只保护了训练数据，`return {"response": output}` 返回给调用方（真实 OpenClaw 网关→模拟对话）的仍然是 SGLang 原始生成内容，**对话本身依然会收到这条坏回复**，只是不会被算作训练样本。用户指出这跟最初说的"生成时候就屏蔽"不是一回事，确认是实现错误。
+
+WebSearch 确认 SGLang 的 `/v1/chat/completions` 支持标准 OpenAI 兼容的 `logit_bias` 参数（-100~100，-100 视为基本不会再被采样到），但也有已知 issue（[sgl-project/sglang#6171](https://github.com/sgl-project/sglang/issues/6171)、[#3059](https://github.com/sgl-project/sglang/issues/3059)）显示个别版本上 `logit_bias` 不是 100% 可靠。
+
+**修正：** 在 `forward_body` 构造之后（发给 SGLang 之前）加 `forward_body["logit_bias"]["122362"] = -100`，真正做到生成阶段就屏蔽，对话本身也不会再看到这条坏回复；原来事后检测 `response_ids` 的 token 检查**保留**，降级为兜底（防 `logit_bias` 在个别 SGLang 版本上失效），不再是主力机制。三处改动都在 `scripts/prepare_patched_openclaw_opd.sh` 里，commit 见下。
+
+这个修正提醒了一件事：generation-time token 屏蔽本身也不是完全没代价的操作——用 `logit_bias` 人为压低某个 token 的概率，意味着实际采样分布不完全是模型自己的原始策略分布，跟 RL 训练"log-prob 要真实反映模型策略"这个前提有一点张力（类似需要 off-policy 修正的情况）。对这一个几乎不会被正常任务用到的生僻 token 而言影响应该极小，但记录下来供以后类似决策参考。
+
 ---
 
 <!-- 格式模板：
