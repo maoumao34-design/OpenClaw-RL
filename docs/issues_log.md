@@ -758,6 +758,36 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 
 ---
 
+## [2026-07-16] 8GPU 正式训练（run `20260715_180549`，maxTokens+reserveTokensFloor 修复后）train/grad_norm 爆炸——根因确认：模型崩坏输出乱码字符，被当正常样本喂回训练形成雪崩
+
+**背景：** 用 07-15 两个修复（`maxTokens=8192` + `reserveTokensFloor=16384`）后、64CPU/1024GB workspace 重新提交的 8GPU 正式训练（log 目录 `20260715_180549`）。Student INIT 阶段这次 72/72 全部跑完（过程中出现 121 次可自愈的 `stopReason=length` 重试，均恢复），但 TA 从第 0 题起 100% 失败（`⚠️ Agent couldn't generate a response. Please try again.`，连续多轮无一例外）。当晚 wandb `train/grad_norm` 从 step 0-12 稳定的 3-8 区间，在 step 13 首次跳变到 22.30，之后持续攀升，step 26 达到 1776、step 34 达到 2243，`train/train_rollout_logprob_abs_diff` 同步从 0.02 涨到 233+；训练最终因同样的 GPU 空闲超时被平台回收。这次的排查目标是回应一个更早的、更根本的问题："我们的训练数据管线、训练超参、GPU 布局都已核对过跟论文一致，那这个不稳定到底是我们环境里哪里跟论文验证过的环境不一样"。
+
+**排查过程（按顺序，每一步都有实测证据）：**
+
+1. **排除"陈旧化单独致因"和"批次同构单独致因"两个过早假设**：
+   - 核对论文 Appendix A.1 对 Personal Agent 训练方法的原文描述（INIT 顺序一次性 + Joint 并行持续两阶段设计、`rollout_batch_size=16` 按 session turn 计数、`lr=1e-5`/`KL系数=0`/`w_RL=w_OPD=1.0` 等超参），确认我们 `train_with_services.sh` 的 `run_init_phase()`+`run_joint_phase()` 实现与论文描述的两阶段结构完全一致，INIT 用 72 题、Joint 用 GSM8K 全量 1319 题也都是论文文档里明确记录的数字，不是我们自己定的偏差——如果"INIT 阶段单一 persona 顺序跑、batch 同构"本身就会导致训坏，论文自己的 Table 3 结果不该收敛，所以这个结构差异被排除为唯一根因
+   - 核实 `openclaw_opd_api_server.py:722-726` 的 `_handle_request()`：SGLang 返回非 200 状态时代理直接 `raise_for_status()` 抛异常，不会走到 `_submit_turn_sample`——证明"网关兜底文案 `couldn't generate a response` 被当训练样本提交"这个猜测是错的，硬失败（后端 500/超时）确实会被正确拦截，不会污染训练队列
+
+2. **对齐 `train/grad_norm`/`train/train_rollout_logprob_abs_diff` 逐 step 数值与训练耗时**：发现 step 0-23 每步稳定 4-6 分钟，**step 24 起单步耗时暴涨到 15-29 分钟**（21:41→22:02→22:25→22:43→23:12...），说明从这附近开始"攒够 16 条 session turn"本身变得极慢——是生成侧卡住，不是 Megatron 训练变慢
+
+3. **直接抓取 `_submit_turn_sample`/`_submit_rl_turn_sample` 提交日志（`[OpenClaw-Combine-Select] submitted ... sample`）逐条核对 index/response_len/reward**：在 index 363-399（对应 19:54-20:20，正好是 grad_norm 从 step 20 的 188.87 冲到 step 23 的 415.61 那个窗口），发现两种截然不同的畸形生成扎堆出现：
+   - 近乎空的回复：`response_len=7~8` token，多个不同 session（`da498b53`/`34c3ea5c`/`6c895508`）反复出现，全部 `reward=-1.0`
+   - 顶格跑满的超长回复：`response_len=8197`（正好卡在 `maxTokens=8192` 上限），同样全部 `reward=-1.0`/`0.0`，且每条要 1-3 分钟才生成完，直接解释了上一步发现的单步耗时暴涨
+
+4. **最初误判"短回复=坏样本"是凭 response_len 推断，未看实际文本内容**——用户指出这个推断不严谨（可能是模型学会了简洁但有效的回复），于是回查 `openclaw_opd_api_server.py:742-750` 确认生成阶段本身有把 `content` 原文打进日志（`thinking=%d chars, response:\n%s`），据此抓取这几个 session 的实际文本：
+
+   **确认这些短回复不是"简洁但有效"，而是模型输出崩坏**——`thinking=8~9 chars`（推理内容几乎是空的），正文只有孤零零一个字符 `𬣳`（一个跟教育对话场景毫无关系的生僻 CJK 扩展汉字）。更关键的是这个**完全相同的乱码字符跨越三个互不相关的 session 反复出现**：`da498b53` 从 turn 5 开始第一次出现，紧接着的下一个 session `34c3ea5c` 从 turn 1 起就直接吐这个字符，再下一个 session `6c895508` 除了继续吐这个字符，turn 7 起还出现另一种畸形（`thinking=8198 chars`，卡进 8197 token 顶格胡言乱语，两种畸形交替出现）。跨 session 复现同一个具体字符，说明这不是单次生成抽风，是**模型权重本身已经坏了**，且没有任何机制拦截，这些技术上"非空"（`response_text.strip()` 非空、`response_ids` 非空）但语义完全退化的样本被 `_submit_turn_sample` 正常提交进了训练队列。
+
+**根因确认：** 模型在训练早期（grad_norm 首次跳变发生在 step 13，19:18:39；目前确认的乱码首次出现在 19:35:37 附近，晚于 step 13，说明还有更早的、尚未定位的初始触发点）某个节点开始输出退化内容（重复乱码字符 / 顶格跑满两种模式交替），**这些退化样本没有被任何环节过滤，被当作正常训练样本喂回了训练队列**。Personal Agent 用的简化版 GRPO 没有组内归一化（`A_t = r_t` 直接取 ±1/0），一个 16 条一批的训练 batch 里混进几条语义退化但同方向、且顶格超长（8197 token）的极端样本，聚合梯度自然远超正常范围，形成"退化样本 → 梯度爆炸 → 模型进一步退化 → 更多退化样本、生成更慢 → 攒批更久、陈旧化更严重"的自我强化雪崩，与 wandb 上 grad_norm 和 train_rollout_logprob_abs_diff 同步失控的曲线完全吻合。**"陈旧化"和"梯度爆炸"不是两个互斥的根因，是同一条因果链的下游表现，真正的根因是"退化生成没有被过滤就被喂进了训练队列"。**
+
+**待查（根源尚未完全定位）：**
+1. 乱码字符 `𬣳` 最早出现的确切时刻和触发它的具体样本——目前只确认了 19:35:37 这次，但 grad_norm 从 step 13（19:18:39）就已经开始跳变，中间还有近 17 分钟、约 4-5 个 step 的窗口没有查过，需要往前追这段时间提交的样本，找到真正意义上"第一次"退化发生的位置
+2. 这个具体的乱码字符 `𬣳`（或者这一类退化模式）本身有没有已知成因——是否与 Qwen3-4B-Thinking 在某类数值不稳定状态下的已知 tokenizer/精度问题有关，还是纯粹由某次异常大的梯度更新触发的权重级坍塌，需要进一步查证（社区/已知 issue 层面）
+
+**待做（解决方向，尚未实施）：** 需要在 RL 数据代理层（`_submit_turn_sample`/`_submit_rl_turn_sample` 提交前）加一道样本级过滤，拦截明显退化的生成（比如 response 顶格卡在 `max_tokens` 上限、或 `response_ids` 极短但内容跟上下文/任务要求明显不符），不让这类样本进入训练队列——具体过滤规则、加在哪个文件哪个函数，下一步继续设计。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
