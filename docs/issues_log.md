@@ -819,6 +819,22 @@ WebSearch 确认 SGLang 的 `/v1/chat/completions` 支持标准 OpenAI 兼容的
 
 这个修正提醒了一件事：generation-time token 屏蔽本身也不是完全没代价的操作——用 `logit_bias` 人为压低某个 token 的概率，意味着实际采样分布不完全是模型自己的原始策略分布，跟 RL 训练"log-prob 要真实反映模型策略"这个前提有一点张力（类似需要 off-policy 修正的情况）。对这一个几乎不会被正常任务用到的生僻 token 而言影响应该极小，但记录下来供以后类似决策参考。
 
+**更新（2026-07-16，重新提交后发现新问题：模型被 OpenClaw 自带的"记忆/心跳"工具带偏）：** 用上述修复（logit_bias 屏蔽 + 退化过滤 + wandb 代理修好）重新提交 8GPU 训练（run `20260716_143407`）。乱码 token 确认 0 次出现（logit_bias 生效），退化过滤也在正常拦截（224 次）。但 grad_norm 仍缓慢爬升（step 0 的 2.3 到 step 10 的 41.8），且用户从实时日志里发现一种新的畸形模式：TA 批改作业时反复调用 `{"name": "memory_get", "arguments": {"path": "2026-07-16.md", ...}}`，或读取 `HEARTBEAT.md`，完全不回应 TA"请读 homework1/N.txt 并写批改意见"的明确指令，连续多轮卡死，最终撞 8 轮上限失败。
+
+**量化影响：** 截至排查时 TA 已处理 27 道题，其中 **10 道（37%）撞 8 轮上限失败**，**8 道（30%）过程中出现过 memory_get/HEARTBEAT 干扰**；且已确认至少一例（问题17）全部 8 轮都在调 memory_get、从未真正读过 homework1，但因为撞到轮次上限，日志仍显示"TA confirmed grading...done"——说明"正常完成"的计数里可能还混有这种空壳完成，实际受干扰比例只会更高。
+
+**根因排查（用户要求先查论文/官方代码，确认不是我们独有的偏离）：** 用 Explore 子代理查证 `paper_index.md`/`paper_understanding.md`/`paper_reproduction_scope.md` 和整个官方仓库克隆，确认论文和官方代码均未提及如何避免模型被这类工具干扰。唯一相关机制（`extensions/rl-training-headers/index.ts:18,44-51`）解决的是不同问题——把 `heartbeat`/`memory`/`cron` **外部触发器**发起的对话标记为 `side`（不算训练数据），管不到模型在正常 main turn **内部主动调用**这些工具的情况。`TA_chat.py`/`README.md` 均无工具白名单配置，也没有 workspace 清理步骤。结论：这是论文和官方代码都未覆盖的真实空白，最可能的解释是论文原始跑法也暴露在同样的环境风险下，只是那次训练轨迹没有偶然走到"模型开始探索这些无关工具"这条路（跟乱码 token 的性质类似——环境隐患是否被触发看运气）。
+
+**定位工具来源：** 直接查了 OpenClaw 产品自身源码（`D:\MAO\Claude\openclaw`，CLI 本体，非训练仓库）。`memory_get` 定义在 `extensions/memory-core/src/tools.ts:661`，描述是"从 MEMORY.md 或 memory/*.md 读取片段"，属于 `memory-core` 插件（`openclaw plugins list` 确认当前是 enabled），跟 homework 读写用的 `read`/`write`/`append` 工具是完全不同的代码路径，架构上互不依赖，禁用安全。`HEARTBEAT.md` 及同一批"agent 自我身份"文件（`AGENTS.md`/`IDENTITY.md`/`SOUL.md`/`TOOLS.md`/`USER.md`）属于 OpenClaw **核心**代码（`src/agents/bootstrap-files.ts`、`src/auto-reply/heartbeat.ts`），不是插件，没法用 `plugins disable` 关闭，workspace 初始化时会自动生成。
+
+**修复：** `openclaw plugins disable memory-core`（提示"Restart the gateway to apply"，训练重新提交时网关自然重启生效）。`HEARTBEAT.md` 类核心文件关不掉，继续靠已有过滤兜底。
+
+**同时补的诊断日志：** `tool_calls:` 这行日志原本不带 `session_id`，事后分析时没法跟同一请求的其他日志行可靠关联（并发场景下日志天然交错，多次尝试按行号/时间邻近关联都因为交错出错）。在 `prepare_patched_openclaw_opd.sh` 里补上 `session=%s`，供以后分析用。
+
+**更新（同一天，重新评估过滤规则，去掉按 content 长度过滤）：** 用户指出一个此前没意识到的问题——`content.strip()<5` 这条规则会把"TA 要求展开、模型只回复个位数字（比如'25'）"这种情况也当退化样本过滤掉，但**这类样本被判 -1 恰恰是正常、有效的 RL 训练信号**（教模型"这样答不满足格式要求"），不是需要剔除的损坏数据；只有真正空的内容（`content=''`）才需要拦截。之前把"内容异常短"和"内容完全损坏（乱码/空）"这两类混在一起处理是错的。**修复：** 去掉 `len(content.strip())<5` 这条判断，只保留已知乱码 token 的兜底检查（防 logit_bias 万一失效）+ 官方原有的"完全空回复"检查，不再额外按长度过滤。三处改动（disable memory-core、tool_calls 加 session_id、过滤规则简化）均已提交。
+
+**待验证：** 停掉旧的 `20260716_143407` run（GPU 已清理干净），用上述全部修复重新提交训练，观察：(a) memory_get/HEARTBEAT 干扰是否消失；(b) TA 撞轮次上限失败率是否显著下降；(c) grad_norm 是否能保持稳定，不再重演早期爬升。
+
 ---
 
 <!-- 格式模板：

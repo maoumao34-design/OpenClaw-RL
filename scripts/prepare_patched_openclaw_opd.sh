@@ -190,9 +190,10 @@ if "\nimport re\n" not in text:
 #      本身就不会再收到这条坏回复——不是等生成完再丢弃样本，那样对话
 #      历史里还是会留着这条坏回复，只是不计入训练数据（2026-07-16 第
 #      一版实现搞错成了事后过滤，已修正为生成时屏蔽，见 issues_log.md）。
-#   2. 拦截"最终答案字段异常短"（哪怕 thinking 正常也可能坍缩成 1 个字符）
-#      的生成，不让它进训练队列；同时保留一道 token 检查作为兜底（SGLang
-#      logit_bias 并非 100% 可靠，见 issues_log.md 记录的已知 issue）。
+#   2. 已知乱码 token 的兜底检查（SGLang logit_bias 并非 100% 可靠，见
+#      issues_log.md 记录的已知 issue）——不再按 content 长度过滤，短数字
+#      回复被判 -1 是正常有效的 RL 训练信号，不是需要剔除的坏样本（2026-07-16
+#      同一天内二次更新，见 issues_log.md）。
 #   3. 顶格截断（finish_reason=="length"）*不*拦截——是否是真实的"卡死
 #      循环"bug 还没查清（此前的日志只记录了 thinking 的字符数，从没
 #      记录过原文，没法判断内容是循环还是没写完的正常推理），先把
@@ -290,14 +291,16 @@ if empty_response_old not in text:
     )
 empty_response_new = empty_response_old + (
     '\n'
-    '            # 2026-07-16: 拦截最终答案异常短的退化生成（哪怕 thinking 正常\n'
-    '            # 也可能坍缩成 1 个字符），不让它进训练队列。已知乱码 token\n'
-    '            # （id=122362）主要靠上面 forward_body 的 logit_bias 在生成阶段\n'
-    '            # 就屏蔽掉；这里的 token 检查只是兜底（SGLang logit_bias 在个别\n'
-    '            # 版本上不是 100% 可靠，见 issues_log.md 2026-07-16 WebSearch 记录\n'
-    '            # 的已知 issue），正常情况下不应该再命中。\n'
+    '            # 2026-07-16: 只兜底拦截已知乱码 token（id=122362，"𬣳"）——主要\n'
+    '            # 靠上面 forward_body 的 logit_bias 在生成阶段就屏蔽掉，这里只是\n'
+    '            # 防 SGLang logit_bias 在个别版本上失效（见 issues_log.md 2026-07-16\n'
+    '            # WebSearch 记录的已知 issue），正常情况下不应该再命中。\n'
+    '            # 不再按 content 长度过滤——像"25"这种被 TA 判 -1 的短数字回复\n'
+    '            # 是正常、有效的 RL 训练信号（教模型"这样答不满足要求"），不是\n'
+    '            # 需要剔除的坏样本；只有真正空的内容才需要拦（跟官方一致，见\n'
+    '            # 上面的 empty_response 检查），见 issues_log.md 2026-07-16 更新。\n'
     '            _KNOWN_GLITCH_TOKEN_IDS = {122362}  # "𬣳"\n'
-    '            if len(content.strip()) < 5 or any(_tid in _KNOWN_GLITCH_TOKEN_IDS for _tid in response_ids):\n'
+    '            if any(_tid in _KNOWN_GLITCH_TOKEN_IDS for _tid in response_ids):\n'
     '                logger.info(\n'
     '                    "[OpenClaw-OPD] MAIN session=%s -> degenerate response (content=%r), skipping",\n'
     '                    session_id, content[:50],\n'
