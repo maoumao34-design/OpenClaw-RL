@@ -1,7 +1,10 @@
 #!/bin/bash
-# Patch openclaw_opd_api_server.py's session_id/turn_type derivation.
+# Patch openclaw_opd_api_server.py's session_id/turn_type derivation, plus
+# (2026-07-16) a degenerate-response filter and truncation-diagnostic logging
+# -- see that patch block near the bottom of this file's Python heredoc for
+# details, and docs/issues_log.md 2026-07-16 for the investigation behind it.
 #
-# Why: the paper's intended mechanism for X-Session-Id/X-Turn-Type is the
+# Why (session_id/turn_type patch): the paper's intended mechanism for X-Session-Id/X-Turn-Type is the
 # official `rl-training-headers` OpenClaw plugin, which injects HTTP headers
 # via a before_prompt_build hook. Confirmed via extensive source-level
 # investigation (2026-07-09, docs/issues_log.md) that on this OpenClaw build
@@ -173,6 +176,84 @@ text = text.replace(old_block, new_block, 1)
 
 if "\nimport re\n" not in text:
     text = text.replace("import json\n", "import json\nimport re\n", 1)
+
+# ---------------------------------------------------------------------
+# 2026-07-16 补丁：拦截退化生成 + 记录顶格截断时的推理原文
+#
+# 背景（docs/issues_log.md 2026-07-16 条目）：run 20260715_180549 的
+# train/grad_norm 爆炸根因确认是模型退化输出（同一乱码字符 "𬣳"，token
+# id=122362，跨两次独立训练复现；以及顶格跑满 max_tokens 却从未闭合
+# <think> 的情况）被当正常样本喂回了训练队列。
+#
+# 这次只做两件事：
+#   1. 拦截"最终答案字段异常短"（哪怕 thinking 正常也可能坍缩成 1 个字符）
+#      或命中已知乱码 token 的生成，不让它们进训练队列。
+#   2. 顶格截断（finish_reason=="length"）*不*拦截——是否是真实的"卡死
+#      循环"bug 还没查清（此前的日志只记录了 thinking 的字符数，从没
+#      记录过原文，没法判断内容是循环还是没写完的正常推理），先把
+#      reasoning 原文完整记下来，供下次复现时诊断，再决定要不要处理。
+# ---------------------------------------------------------------------
+
+thinking_log_old = (
+    '        logger.info(\n'
+    '            "%s[OpenClaw-OPD] [%s] session=%s thinking=%d chars, response:\\n%s%s",\n'
+    '            _RED,\n'
+    '            turn_type,\n'
+    '            session_id,\n'
+    '            len(reasoning),\n'
+    '            content,\n'
+    '            _RESET,\n'
+    '        )\n'
+    '        if tool_calls:\n'
+)
+if thinking_log_old not in text:
+    raise SystemExit(
+        "patch failed: expected thinking=%d chars logging block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+thinking_log_new = (
+    '        logger.info(\n'
+    '            "%s[OpenClaw-OPD] [%s] session=%s thinking=%d chars, response:\\n%s%s",\n'
+    '            _RED,\n'
+    '            turn_type,\n'
+    '            session_id,\n'
+    '            len(reasoning),\n'
+    '            content,\n'
+    '            _RESET,\n'
+    '        )\n'
+    '        _finish_reason = choice.get("finish_reason", "stop")\n'
+    '        if _finish_reason == "length":\n'
+    '            logger.info(\n'
+    '                "[OpenClaw-OPD] [%s] session=%s TRUNCATED (finish_reason=length) reasoning_text:\\n%s",\n'
+    '                turn_type, session_id, reasoning,\n'
+    '            )\n'
+    '        if tool_calls:\n'
+)
+text = text.replace(thinking_log_old, thinking_log_new, 1)
+
+empty_response_old = (
+    '            if not response_ids and not response_text.strip():\n'
+    '                logger.info("[OpenClaw-OPD] MAIN session=%s -> empty response, skipping", session_id)\n'
+    '                output["session_id"] = session_id\n'
+    '                return {"response": output}\n'
+)
+if empty_response_old not in text:
+    raise SystemExit(
+        "patch failed: expected empty-response-skip block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+empty_response_new = empty_response_old + (
+    '\n'
+    '            _KNOWN_GLITCH_TOKEN_IDS = {122362}  # "𬣳"，见 issues_log.md 2026-07-16\n'
+    '            if len(content.strip()) < 5 or any(_tid in _KNOWN_GLITCH_TOKEN_IDS for _tid in response_ids):\n'
+    '                logger.info(\n'
+    '                    "[OpenClaw-OPD] MAIN session=%s -> degenerate response (content=%r), skipping",\n'
+    '                    session_id, content[:50],\n'
+    '                )\n'
+    '                output["session_id"] = session_id\n'
+    '                return {"response": output}\n'
+)
+text = text.replace(empty_response_old, empty_response_new, 1)
 
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)

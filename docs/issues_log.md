@@ -794,6 +794,23 @@ rm -rf /dfs/data/openclaw-rl-project/checkpoints/minitest-qwen3-4b-openclaw-topk
 1. **数据管线防御性过滤（治标，优先级更高、改动小）：** 在 `_submit_turn_sample`/`_submit_rl_turn_sample` 提交前检测明显退化的生成——比如 `thinking` 很长但最终 `content` 异常短、或 `response_ids` 顶格卡在 `max_tokens`——直接丢弃，不让这类样本进入训练队列，阻断"退化样本 → 梯度雪崩 → 更多退化样本"这条正反馈链路。不需要动训练超参，风险最低。
 2. **训练侧根源缓解（治本，改动更大、需评估是否偏离论文默认配置）：** 如果确认是 Adam + 稀有 token 的已知交互问题，可以考虑对 embedding/输出层单独做梯度裁剪或使用更保守的 Adam epsilon，但这类改动会偏离论文/官方脚本的默认超参配置，需要先评估对复现有效性的影响，不能贸然改。
 
+**更新（同一天，因果关系已用直接证据核实，非仅时间重合）：** 精确核对了 `rollout_batch_size=16` 的样本-index 到训练-step 的映射（`data.py:480 Dynamic batching: num_samples=16` 逐段核对），确认 step 21→22（19:58:07→20:04:54，grad_norm 224.90→556.07，单步跳变最大的一次）实际消费的 16-18 条样本（index 361-378）里，**至少 7 条是 `response_len=7~8` token 的退化样本，全部 `reward=-1.0`，接近半个 batch**——不再是时间上的巧合关联，是这一步梯度爆炸所用的训练数据本身就被这类样本主导。
+
+**更新（同一天，排查"顶格截断"是不是能查清根源，发现关键日志缺口）：** 用户追问顶格截断（`finish_reason=="length"`）到底该不该一并过滤、要不要先查根源。拉取了具体一条顶格截断样本（session `6c895508` turn 7/8，`thinking=8198 chars`）的完整原文尝试判断是"卡死循环"还是"正常推理没写完"，发现两个关键事实：
+1. `content`（最终答案字段）是**完全空的**——模型耗尽整个 8192 token 预算，从未写出 `</think>` 闭合标签和最终答案，不是"内容超长被截断显示"而是真的没写出结果
+2. 同一 session 的 turn 7/8/9/10**连续四轮**，`thinking` 长度精确停在同一个数字（8198 字符）——如果是"题目难、需要更多推理空间"这种正常情况，每次卡住的长度该有波动，连续精确撞在同一天花板更像是卡死不收敛
+3. 但**无法进一步判断**——`openclaw_opd_api_server.py:742-750` 的日志只记录了 `reasoning_content` 的字符数（`len(reasoning)`），从未把推理原文打印出来，且 `OPENCLAW_RECORD_ENABLED` 未开、没有完整转录留存，现有日志material 不足以判断这 8192 token 内容到底是重复车轱辘话还是发散但不重复的无效探索
+
+**决策（用户拍板）：** 本次只过滤"最终答案异常短"和"命中已知乱码 token（id=122362）"这两类已确认的退化样本，**不过滤顶格截断**——根因未查清前不能确定这是不是真实 bug，贸然过滤会丢失诊断材料。同时把 `reasoning_content` 原文补进日志（仅在 `finish_reason=="length"` 时记录全文，避免正常场景日志膨胀），供下次复现时判断顶格截断到底是不是卡死循环。
+
+**已实施：** 沿用既有的"补丁副本"机制（`scripts/prepare_patched_openclaw_opd.sh`，官方 `openclaw-opd/` 目录本身不动，训练时通过 `PATCHED_OPD_DIR` 优先加载补丁副本），在这个脚本的 Python 补丁块里追加两处改动（commit 见下）：
+1. `thinking=%d chars` 日志之后，新增：`finish_reason=="length"` 时把 `reasoning` 原文完整打进日志（`TRUNCATED (finish_reason=length) reasoning_text:\n%s`）
+2. 已有的"空回复跳过"检查之后，新增：`content.strip()` 长度 `<5` 字符，或 `response_ids` 命中 `{122362}`（"𬣳"），直接判定退化、不提交训练样本
+
+改动只影响 `openclaw-opd/openclaw_opd_api_server.py`（Personal Agent OPD/Combine/Combine-Select 共用的基类），General Agent 各 track（Terminal/GUI/SWE/Tool-call）用完全独立的代码路径，不受影响。
+
+**待验证：** 下次提交 8GPU 正式训练后确认：(a) 退化样本过滤生效（日志里能看到 "degenerate response...skipping"）、grad_norm 不再因这类样本雪崩；(b) 如果再次出现顶格截断，`TRUNCATED...reasoning_text` 日志能打印出完整推理原文，供判断是否为卡死循环——如果确认是循环，再决定是否需要单独修复或过滤。
+
 ---
 
 <!-- 格式模板：
