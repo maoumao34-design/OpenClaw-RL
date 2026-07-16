@@ -260,6 +260,23 @@ thinking_log_new = (
 )
 text = text.replace(thinking_log_old, thinking_log_new, 1)
 
+# 2026-07-16: tool_calls 日志原本不带 session_id，没法跟同一请求的其他日志行
+# 关联（并发场景下日志行天然交错，事后分析时无法可靠配对）。加上 session_id。
+tool_calls_log_old = (
+    '        if tool_calls:\n'
+    '            logger.info("[OpenClaw-OPD] tool_calls: %s", str(tool_calls)[:500])\n'
+)
+if tool_calls_log_old not in text:
+    raise SystemExit(
+        "patch failed: expected tool_calls logging block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+tool_calls_log_new = (
+    '        if tool_calls:\n'
+    '            logger.info("[OpenClaw-OPD] session=%s tool_calls: %s", session_id, str(tool_calls)[:500])\n'
+)
+text = text.replace(tool_calls_log_old, tool_calls_log_new, 1)
+
 empty_response_old = (
     '            if not response_ids and not response_text.strip():\n'
     '                logger.info("[OpenClaw-OPD] MAIN session=%s -> empty response, skipping", session_id)\n'
