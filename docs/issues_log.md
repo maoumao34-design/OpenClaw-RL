@@ -1060,6 +1060,33 @@ url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
 **结论：** "OpenClaw 这条路的请求被拒绝 → 空出容量 → 训练自己的 rollout 变快（对应 perf 13/14 异常）"这个因果方向，从"架构上说得通但没实锤"变成**架构上已确认成立**（两者本就共用资源）。但**还没查清楚的是：为什么熔断/拒绝只打在 OpenClaw 这条路上，训练自己的 rollout 请求不但没被拒，反而变快**——如果是同一个 Router 的同一个熔断器，理论上应该无差别拒绝所有调用方，不该看请求来源区别对待。这需要 SGLang Router 内部实现细节（`policy='cache_aware'` 路由策略是否按 worker 分别统计失败率、熔断器统计维度是按 Router 全局还是按 worker/client 分组）才能查清，静态读代码到这已经是本地能查到的极限，需要 SGLang 包自己的源码或运行时状态才能继续。
 
+**最终更新（彻底找到真正根因——不是 SGLang Router 熔断器，是我们自己代码里一个正常设计好的暂停机制，且找到了具体触发原因）：** 用户要求"先加日志能抓到这个问题，再重新跑"。检查加日志之前，先看 `openclaw_opd_api_server.py` 里已有的诊断日志（`_handle_request` 里 `if sglang_resp.status_code != 200: logger.error("[OpenClaw-OPD] SGLang returned %d: %s", ...)`），查 `training.log` 里这条日志——**零匹配**。说明这次的 503 根本没有走到"SGLang 返回了非 200 响应"这一步，是在更早的地方就被拦下了。
+
+顺着这个线索查同一个文件的 `/v1/chat/completions` 入口（`openclaw_opd_api_server.py:334-345`），找到真正的根源：
+
+```python
+@app.post("/v1/chat/completions")
+async def chat_completions(...):
+    ...
+    if not owner.submission_enabled.is_set():
+        raise HTTPException(status_code=503, detail="submission paused for weight update")
+```
+
+这是**我们自己代码里明确设计好的行为**：`openclaw_combine_select_rollout.py:85-94` 的 `pause_submission()`/`resume_submission()`，在**每一轮训练步骤里，rollout 攒够样本之后、训练计算（log_probs+反向传播+权重同步）完成之前**，会主动暂停接受新的 `/v1/chat/completions` 请求，直接秒返回 503。训练自己的 rollout `generate()` 函数（`openclaw_opd_api_server.py:232`）是 slime 进程内直接 Python 调用，根本不走这个 HTTP 端点、不受这个开关影响——**这才是"为什么只拒绝 OpenClaw、训练自己完全不受影响"的真正原因，跟 SGLang Router 的熔断器/队列容量完全无关，之前那条排查方向整体排除**。
+
+**精确定位这次的暂停时长（查 `"submission paused"`/`"submission resumed"` 这两行 print 日志的时间戳）：**
+
+| 暂停 | 开始 | 结束（下一次 `update_weights_from_distributed` 完成后立即触发 resume）| 时长 | 对应失败 |
+|---|---|---|---|---|
+| 第一次 | 15:06:56（`perf 13` 收集完成后）| 15:07:34 | **~38 秒** | Student 49题、TA 0题、Teacher 0题turn3（INIT 阶段）|
+| 第二次 | 15:09:52（`perf 14` 收集完成后）| 15:11:47 | **~115 秒** | student-hw-0-83882（Joint 阶段）|
+
+之前以为是一次连续 3.5 分钟的风暴，实际是**两次独立的暂停**，中间有约 2 分钟正常运行的间隙——因为最初只看了全部 503 的最早/最晚时间戳，没有按暂停周期拆开看。
+
+**为什么这次会触发、之前 8 小时的 run 没触发：** 这个暂停机制是**每一步训练都会发生的正常设计**（这次 run 里已经有十几次同样的 pause/resume 配对），不是新问题。但 Student/TA/Teacher 脚本（`student_chat.py`/`TA_chat.py`/`teacher_chat.py`）的重试预算只有 **3 次、1s+2s+4s=7 秒**——平时如果暂停只有几秒钟，这个重试预算早就悄悄扛过去了，请求最终成功，不会有任何可见异常。**这次这两次暂停异常地长（38秒、115秒），远超 7 秒的重试预算，才第一次把这个一直存在、平时被重试悄悄掩盖掉的机制暴露成了可见的崩溃**——所谓"这次运行本身有特殊情况"，特殊之处就是这两步训练计算耗时明显偏长（原因待查：可能是这两步本身样本更难/更长，或者服务器资源竞争，暂不深究，不影响修复方向）。
+
+**修复方向（待用户确认）：** 加长 Student/TA/Teacher 脚本的重试预算/退避策略，让它能扛住这类正常但偶尔偏长的暂停窗口（比如把重试总窗口从 7 秒拉长到 2-3 分钟）。这不是"绕开问题的保险措施"，是**直接针对这个已经查清楚、且是官方设计本身自带的暂停机制做的合理适配**——暂停期间收到 503 是预期行为，客户端理应能扛住，扛不住才是真正的缺陷。
+
 ---
 
 <!-- 格式模板：
