@@ -603,15 +603,13 @@
 ### 决策犹豫循环根因定位与修复
 
 **完成内容：**
-- 查 Problem 33 完整 session（`training.log` 视角）：未真正顶格截断，全程收敛正常；发现一个弱信号——负反馈（PRM eval -1.0）后 thinking 长度会跳升（20260 字符，约为 Problem 36 严重程度的 54%）但自行收敛，与 33/34/35 均无向 36 过渡的渐进恶化迹象 → [`issues_log.md`](issues_log.md) 2026-07-16 条目更新
-- 挖出 Problem 36 turn=2 完整 344 行 `reasoning_text` 原文：确认是**纯输出格式判定困惑**（回复内容前 10% 就已确定且从未改变，反复纠结的是这段纯文本要不要包 `tool_call` XML 标签），不是内容/决策困惑，纠正此前的错误猜测
-- **版本考古**：复用 07-09 已验证方法（GitHub API + `git fetch --depth=1`）直接查证论文提交前（2026.3.8/3.10）的 OpenClaw 源码，确认触发循环的 `## Execution Bias` 章节（`buildExecutionBiasSection()`）是论文提交后约 1.5 个月（2026-04-15~04-30 之间）才新加入的，论文原始实验版本不可能触发这个循环——跟 07-09 `rl-training-headers` 机制被破坏是同一类"版本断层"问题的第二次发作
-- 评估回退到 2026.3.8 版本的可行性：技术上无硬阻塞项（Node 版本要求更低、`hasOpenClawTransportRequirement` 门槛也不存在，回退能顺带恢复论文原版 header 机制），但代价是整套流水线要在从未跑过的旧版本上重新验证稳定性，本次决定暂缓，先做定点修复
-- 用 Explore 子代理扫描 March→June 完整版本差异（17333 文件/370万行，规模上不可能查全），核实到两个更新的机制（PR #92191/#93073，2026-06-14/15 合并，比 Execution Bias 还新）：June 版本会自动重试"只有 thinking 没输出"或"工具调用后回复为空"的轮次，March 没有这个机制，可能复合放大循环伤害，留作后续排查方向
-- 修复实现两版：第一版用 `before_prompt_build`+`appendSystemContext` 追加消歧规则（不删除原文字，只追加解释）；用户要求修复必须可靠（不能导致整个训练失效），指出 append 不算真正解决，已 revert。改用**内容层直接 patch**：新脚本 `prepare_patched_sglang_execution_bias.sh` 直接改内置 `extensions/sglang` 扩展（通过 `resolveSystemPromptContribution` 真正替换 Execution Bias 章节内容，删掉导致循环的那一行），已用真实服务器文件内容本地验证（语法校验、幂等性、已打补丁文件的拒绝保护均通过）
-- **8GPU 正式训练（run `20260717_133740`）已提交，patch 确认真实生效**：`openclaw.log` 查到 `[execution-bias-fix] resolveSystemPromptContribution invoked` 确认日志，Problem 0 顺利完成无循环迹象
+- Problem 33/36 排查：定位 Problem 36 循环的精确机制是纯输出格式判定困惑（`tool_call` 标签要不要包），不是内容困惑 → [`issues_log.md`](issues_log.md) 2026-07-16/17 条目
+- 版本考古确认触发循环的 Execution Bias 章节是论文提交后 1.5 个月才加入 OpenClaw；评估版本回退可行性后暂缓，先做定点修复
+- 版本差异扫描顺带发现两个更新的 retry 机制（PR #92191/#93073），影响待验证
+- 修复：先用 append 方案（已 revert，用户要求更高可靠性），改用内容层直接 patch 内置 sglang 扩展 → `scripts/prepare_patched_sglang_execution_bias.sh`
+- **8GPU 正式训练（run `20260717_133740`）已提交，patch 确认真实生效**（`openclaw.log` 有确认日志，Problem 0 无循环迹象）
 
-**待验证：** 持续观察这次训练顶格截断次数是否显著下降、Problem 36 那类决策犹豫循环是否还会出现；PR #92191/#93073 这类更新的 retry 机制对本次问题的实际影响暂未验证。
+**待验证：** 这次训练顶格截断次数是否显著下降、循环是否还会出现。
 
 ---
 
