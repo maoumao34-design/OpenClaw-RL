@@ -585,7 +585,52 @@
 
 ---
 
-## 当前状态（2026-07-16）
+## 2026-07-17
+
+**目标：** 查看 `20260716_182012` 训练结果；排查"决策犹豫循环"（顶格截断）根源
+
+**完成内容：**
+- 确认 `20260716_182012` 跑了 8 小时后无声消失，但 wandb 显示 `train/grad_norm` 全程 2-8 波动、整体下降，**没有**复现乱码 token/memory_get 那次的爆炸式增长——两个已知根因（乱码 token、memory_get）确认修复有效：全程 0 次复现，退化过滤触发 0 次，训练数据干净 → [`issues_log.md`](issues_log.md) 2026-07-16 条目更新
+- 定位新的主导性问题：`rollout/response_len/mean` 从 step 20 起顶在 7000 附近不再下降，`waiting for combine samples: 6/16` 卡住 10+ 分钟——之前特意保留只做诊断日志的"顶格截断"这次高达 298 次。抽查 `reasoning_text` 确认是同一种"决策犹豫循环"（反复重新分析同一情况、从不真正推进，直到耗尽 8192 token 预算被截断），推理原文提到 `"Non-final turn: use tools to advance, or ask for the one missing decision that blocks safe progress."`
+- 定位这句话来源：OpenClaw 产品自身源码 `src/agents/system-prompt.ts:456`（`buildExecutionBiasSection()`），是产品内置、面向所有 agent 会话默认注入的工具使用指南，跟训练代码/我们的脚本无关（跟 AGENTS.md/memory_get 同一类"产品自带默认值"）。顺着 Qwen3.x 社区已知问题（`reasoning_content` 跨轮丢失导致模型"失忆"）查了 OpenClaw 的 `shouldPreserveReasoningContentReplay()` 判断逻辑，确认我们 `qwen3-4b` 模型声明已带 `"reasoning": true`，按代码逻辑推理内容应该被正常保留传回——这条线索被排除，不是根因
+- 确认这次训练结束的机制还是已知的老问题：顶格截断拖慢生成速度（每条 1-3 分钟）→ 攒批跟不上 → GPU 空闲 → 触发 modelfactory 平台自动回收 workspace，只是这次的诱因从 TA 的 `stopReason=length` 换成了这个"决策犹豫循环"
+- 训练结束后查 `homework/`/`homework1/`，一度怀疑内容陈旧（07-15 的旧版本）导致 TA 一直在批改过期素材，用 `stat` 核实是 workspace 2GB 配额区在"GPU空闲→平台自动回收→重启"这条路径触发后，从上次保存的快照（07-15 17:41）静默回滚导致的——只反映训练**结束后**的状态，不代表训练**进行中** TA 实际看到的也是陈旧内容（`simulation.log` 里"Written: homework/34.txt"证明进行中写入是正常的）
+- 排查过程中发现一个独立的官方设计空白：Problem 34 有一次真实的"假成功"——Student 让模型写入 `homework/34.txt` 失败（`⚠️ 📝 Edit ... failed`），但模拟器在能看到这条失败警告的情况下依然生成了 `DONE_SENTINEL`（`"HOMEWORK_DONE"`），判定完成。查证 `student_chat.py:205-207` 确认官方"完成"判定完全只看模拟器文字里有没有这个哨兵字符串，不检查任何工具调用是否真的成功——这是官方原装设计，不是我们复现引入的偏差
+- 提出新假设待验证：这类"写入失败但被判定完成"是否会导致对应题目的 `homework1` 素材残缺，进而在 TA 后续批改时因为素材本身矛盾/不完整而触发"决策犹豫循环"——即 Problem 34 的假成功可能是循环问题的上游诱因之一
+
+**待验证：** 统计这次训练里所有"Student 侧工具调用失败但被误判完成"的题目，与所有触发"决策犹豫循环"的 TA session 做交叉比对，验证两者是否显著相关；如果相关，需要评估修复方向（在 `DONE_SENTINEL` 判定前加工具调用成功校验，但这会偏离官方原装代码，需先评估对复现有效性的影响）。
+
+---
+
+## 当前状态（2026-07-17）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `maxTokens=8192`、`reserveTokensFloor=16384`：已验证生效（07-15）
+- [x] `logit_bias` 屏蔽已知乱码 token（id=122362）：**已用真实 GPU 数据验证 0 次复现**（run `20260716_182012` 全程 0 次）
+- [x] `memory-core` 插件禁用：**已用真实 GPU 数据验证 0 次复现**（run `20260716_182012` 全程 0 次 `memory_get`）
+- [x] 退化样本过滤规则（只拦真正空内容 + 已知乱码 token 兜底）：**已验证生效**，全程 0 次误触发
+- [x] `tool_calls` 日志补 `session_id`：支持事后按 session 可靠关联分析
+- [x] Git 远程地址改回直连 GitHub
+
+### 已知限制 / 未解决
+- **"决策犹豫循环"（顶格截断，`finish_reason=="length"`）成为唯一剩下的主导性问题**——298 次/run，会拖垮生成吞吐、最终触发 GPU 空闲→workspace 被平台自动回收。根源尚未定位（已排除：reasoning_content 跨轮丢失）
+- workspace 的 2GB 配额区（`~/.openclaw/workspace/`）在"GPU 空闲→平台自动回收→重启"后会静默回滚到上次保存的快照，是一个独立于本次问题的平台层风险，训练**结束后**查看 workspace 文件状态时需要注意这一点，不能直接当作训练进行中的真实状态
+- 官方 `DONE_SENTINEL` 完成判定不校验工具调用是否真的成功，是官方设计本身的空白，可能是"决策犹豫循环"的上游诱因之一（假设，待验证）
+- `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修（07-14 起多次提及）
+
+### 下一步
+1. 交叉比对"Student 假成功"题目与"TA 决策犹豫循环"session，验证因果关系假设
+2. 如果假设成立，评估是否要在 `DONE_SENTINEL` 判定前加工具调用校验（需评估对复现有效性的影响）
+3. 如果假设不成立，需要继续排查"决策犹豫循环"的其他可能根源
+
+### 未验证
+- [ ] "Student 假成功"与"TA 决策犹豫循环"的因果关系
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-16，已被 7/17 结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）

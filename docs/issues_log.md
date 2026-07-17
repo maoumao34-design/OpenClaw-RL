@@ -835,6 +835,28 @@ WebSearch 确认 SGLang 的 `/v1/chat/completions` 支持标准 OpenAI 兼容的
 
 **待验证：** 停掉旧的 `20260716_143407` run（GPU 已清理干净），用上述全部修复重新提交训练，观察：(a) memory_get/HEARTBEAT 干扰是否消失；(b) TA 撞轮次上限失败率是否显著下降；(c) grad_norm 是否能保持稳定，不再重演早期爬升。
 
+**更新（重新提交后，run `20260716_182012`，跑 8 小时后无声消失，查明是同一个老问题的新触发方式）：** 用全部修复（logit_bias、memory-core 禁用、简化过滤、session_id 日志）重新提交训练。wandb 确认关键指标跟之前完全不同：`train/grad_norm` 全程在 2-8 之间波动、整体呈下降趋势，**没有**复现乱码 token/memory_get 那次的爆炸式增长——这两个根因确认修复有效（乱码 token 0 次、memory_get 0 次、退化过滤触发 0 次，训练数据很干净）。但 `rollout/response_len/mean` 从 step 20 起死死顶在 7000 附近（接近 8192 上限）不再下降，`training.log` 结尾显示 `waiting for combine samples: 6/16, queue=0` 反复打印超过 10 分钟纹丝不动——是吞吐被拖垮致死，不是梯度爆炸致死，两次是完全不同的死法。
+
+**新主因定位：** 之前特意保留、只做诊断日志不过滤的"顶格截断"（`finish_reason=="length"`）这次高达 **298 次**，成为唯一剩下的、明显主导性的问题。抽查这次的 `reasoning_text` 完整原文，确认是同一种"决策犹豫循环"——模型反复重新分析同一个情况（"用户说了别写文件"、"工具调用成功了"、"用户还没回复"），每次措辞略有不同但从不真正推进，直到耗尽 8192 token 预算被硬截断。推理原文里出现"Looking at the tooling guidelines: 'Non-final turn: use tools to advance, or ask for the one missing decision that blocks safe progress.'"这句话。
+
+**排查这句话的来源：** 查证论文/官方训练代码/我们自己的脚本均无此表述，精确定位到 OpenClaw 产品自身源码 `src/agents/system-prompt.ts:456`（`buildExecutionBiasSection()` 函数），是 OpenClaw CLI 产品内置、面向所有 agent 会话默认注入的"Execution Bias"工具使用指南，与训练用哪个模型/数据集无关——跟 AGENTS.md/memory_get 是同一类"产品自带默认值"，不是我们训练代码引入的。WebSearch 未找到专门针对这句话本身的已知 issue，但查到 Qwen3.x 系列模型在 agentic 多轮工具调用场景下的相似报告，常见根因是 `reasoning_content` 在多轮之间未被正确保留/回传导致模型"失忆"式反复重新分析——顺着这个线索查了 OpenClaw 源码 `openai-transport-stream.ts` 里 `shouldPreserveReasoningContentReplay()` 的判断逻辑，**排除**：我们当前 `openclaw.json` 里 `qwen3-4b` 模型声明已经带了 `"reasoning": true`，按代码逻辑推理内容应该是被正常保留传回的，这条线索没有成立。
+
+**训练结束机制确认：** 8 小时后消失的根因还是**已知的老机制**——顶格截断样本拖慢生成速度（每条 1-3 分钟）→ 攒够 16 条样本的速度跟不上 → `RolloutManager` 卡在 `waiting for combine samples` → GPU 实际空闲 → 触发 modelfactory 平台自动回收 workspace（跟 07-15 第一次遇到的死法本质相同，这次的诱因从 TA 的 `stopReason=length` 卡死换成了这个"决策犹豫循环"）。
+
+**意外发现：workspace 2GB 配额区在中断重启后会静默回滚（独立于本次问题，但值得记录）：** 训练结束后查 `homework/`/`homework1/` 目录，发现内容像是两天前（07-15 17:41）的旧版本，一度怀疑是"TA 一直在批改陈旧内容"导致的连锁问题。用 `stat` 核实：文件 `Birth`（inode 诞生时间）是当天早上、但 `Modify`（内容修改时间）停留在两天前——这是典型的"从快照恢复、且恢复过程保留了原始 mtime"的特征。用户指出原因：**workspace 中断后重新启动时，2GB 配额区（`~/.openclaw/workspace/` 所在的持久化区域，跟 `/dfs/data/` 完全独立）会从上次保存的快照恢复**——这次训练结束触发的正是"GPU 空闲→平台自动回收→重启"这条路径，回收重启后配额区被打回了 07-15 那次存储清理时保存的状态。`/dfs/data/` 下的日志、checkpoint、代码仓库完全不受影响（训练日志能完整还原整个过程）。**结论：查到的"陈旧内容"只反映训练结束后、workspace 被回收重启之后的状态，不代表训练进行中 TA 实际看到的内容也是陈旧的**（`simulation.log` 里"Written: homework/34.txt"这行日志证明训练进行中 `prepare_homework_files()` 确实执行了）——"TA 批改陈旧内容导致连锁问题"这个猜测目前证据不支持，暂不作为主因。
+
+**发现的独立缺陷（官方设计本身的空白，不是这次训练失败的直接原因，但值得记录）：** 排查过程中发现 Problem 34（`20260716_182012` 训练进行中，非事后回滚状态）有一次真实的"假成功"——Student 让 policy 模型把答案追加到 `homework/34.txt`，日志显示 `⚠️ 📝 Edit: in homework/34.txt failed`（工具调用真实失败），但 policy 模型的文字回复没有承认这个失败（"The solution is already in the file"），且 Qwen3-32B 模拟器**在能看到这条失败警告的情况下**依然生成了包含 `DONE_SENTINEL`（`student_chat.py:66` 定义为字符串 `"HOMEWORK_DONE"`）的消息，判定"Turn 3: Student confirmed problem 34 is done!"。查证 `student_chat.py:205-207` 确认"完成"判定**完全只看模拟器自己的文字里有没有这个哨兵字符串，不检查任何工具调用是否真的成功**——这是官方原装代码的设计，不是我们复现引入的偏差。当场核实 `homework/34.txt` 实际内容确认 Solution 部分确实是空的，写入确实没有成功。
+
+**待查（用户提出的新假设，尚未验证）：** 这类"写入实际失败但被判定成功"的情况，是否会导致该问题的 `homework1/*.txt` 内容不完整（Solution 部分为空或缺失），进而在 TA 后续批改这道题时，因为素材本身就残缺/矛盾，触发了"决策犹豫循环"这类困惑行为——即 Problem 34 的假成功可能是循环问题的**上游诱因**之一，不只是一个独立现象。需要检查：(a) 其他触发了顶格截断/决策循环的 session，是否也对应着某个 Student 侧写入失败但被判"完成"的问题；(b) 这次训练里 Student 侧"Edit/Append 失败但被确认完成"的问题总共发生了多少次，占顶格截断 298 次的比例有多大。
+
+---
+
+## [2026-07-17] 待续：排查"决策犹豫循环"根源——Student 侧写入失败但被误判完成是否为上游诱因
+
+**背景：** 承接上一条目。`20260716_182012` 训练 8 小时后因顶格截断（298 次，"决策犹豫循环"模式）拖垮吞吐、GPU 空闲被平台回收而结束。用户观察到 Problem 34 存在一次真实的"Edit 失败但被 `DONE_SENTINEL` 误判完成"的案例，提出假设：这类问题产生的**残缺/矛盾 homework1 素材**，可能是后续 TA 批改时触发"决策犹豫循环"的上游诱因。
+
+**下一步：** 统计这次训练里所有"Student 侧工具调用失败但被 `DONE_SENTINEL` 判定完成"的题目，与所有触发"决策犹豫循环"（顶格截断）的 TA session 做交叉比对，验证两者是否显著相关。如果相关性成立，需要考虑修复方向（比如在 `DONE_SENTINEL` 判定前增加工具调用成功与否的校验——但这会偏离官方原装代码，需要先评估这类改动对复现有效性的影响）。
+
 ---
 
 <!-- 格式模板：
