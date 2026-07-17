@@ -319,6 +319,15 @@ cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.p
 cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
 openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
 
+# Patch 内置 sglang 扩展，移除 Execution Bias 章节里导致决策犹豫循环的那一行
+# （见 scripts/prepare_patched_sglang_execution_bias.sh 顶部完整说明、
+# docs/issues_log.md 2026-07-16/17 条目）。第一次运行会自动备份未修改原文件。
+echo "生成并部署 sglang execution-bias 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SGLANG_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/extensions/sglang/index.js"
+PATCHED_SGLANG_DIR="${LOGS_DIR}/patched-sglang"
+bash "${SCRIPTS_DIR}/prepare_patched_sglang_execution_bias.sh" "${SGLANG_LIVE_FILE}" "${PATCHED_SGLANG_DIR}"
+cp "${PATCHED_SGLANG_DIR}/index.js" "${SGLANG_LIVE_FILE}"
+
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
 #
