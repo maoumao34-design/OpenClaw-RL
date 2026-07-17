@@ -19,11 +19,14 @@
 // appendSystemContext instead -- the same mechanism already proven to work
 // for the rl-training-headers plugin on this OpenClaw build.
 const DISAMBIGUATION_RULE =
-  "\n\nPlain-text replies are not function calls: never wrap a plain-text " +
-  "reply in <tool_call> tags. Only an actual tool invocation (name + " +
-  "arguments) uses <tool_call> format. If you have already decided what to " +
-  "say and it does not call a tool, output that text directly as your reply " +
-  "and stop -- do not re-analyze whether it needs <tool_call> wrapping.";
+  "\n\nThe Execution Bias guideline \"Non-final turn: use tools to advance, " +
+  "or ask for the one missing decision that blocks safe progress\" is fully " +
+  "satisfied by sending a plain-text reply -- it does NOT require wrapping " +
+  "that reply in <tool_call> tags. Plain-text replies are not function " +
+  "calls: only an actual tool invocation (name + arguments) uses " +
+  "<tool_call> format. If you have already decided what to say and it does " +
+  "not call a tool, output that text directly as your reply and stop -- do " +
+  "not re-analyze whether it needs <tool_call> wrapping.";
 
 export default function register(api) {
   api.on("before_prompt_build", () => {

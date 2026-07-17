@@ -981,6 +981,27 @@ re-analyze whether it needs <tool_call> wrapping.
 
 **待验证：** 下次跑 smoke/minitest 时先确认插件正常加载（`openclaw plugins list --verbose` 能看到 `execution-bias-fix` 已启用、日志里有 `execution-bias-fix: activated`），再跑真实训练观察顶格截断（`TRUNCATED`）次数是否显著下降、Problem 36 那类决策犹豫循环是否还会出现。这个问题本质是概率性的模型行为，小规模 smoke/minitest 大概率验证不出"循环消失"，只能验证插件部署机制本身没坏；真正的效果验证要等一次真实规模训练。
 
+**更新（用户追问：能不能直接让模型"忽略"Execution Bias 这个章节，效果是不是等价于章节不存在）：**
+
+两点回应：
+
+1. **技术上做不到完全等价**——append 机制没法从上下文里"擦除"已经存在的 token，"Non-final turn: use tools to advance..."这句话依然完整留在提示词里、依然会被模型看到并影响注意力分布，追加的内容只是接在它后面，不是把它抹掉。字面意义上不可能达到"这段文字根本不存在"的效果。
+
+2. **不采用"让模型忽略某章节/某句话"这个说法，改为直接点名冲突的具体表述、当场给出它已被满足的结论**——不用"忽略"是刻意的：告诉模型"这里有条规则你要忽略"，等于是在提示词里明摆着暴露一个指令冲突，需要模型自己先识别"忽略"的适用范围、再执行抑制，这恰好是这次观察到的失败模式本身（对指令解读过度较真、反复权衡怎么调和冲突指令）最容易复现的场景，多一道认知步骤就多一个重新陷入循环的入口。改成直接点名那句具体的话、告诉模型这句话在纯文本回复场景下已经被满足，不需要它自己去发现和调和这个矛盾：
+
+```
+The Execution Bias guideline "Non-final turn: use tools to advance, or ask
+for the one missing decision that blocks safe progress" is fully satisfied
+by sending a plain-text reply -- it does NOT require wrapping that reply in
+<tool_call> tags. Plain-text replies are not function calls: only an actual
+tool invocation (name + arguments) uses <tool_call> format. If you have
+already decided what to say and it does not call a tool, output that text
+directly as your reply and stop -- do not re-analyze whether it needs
+<tool_call> wrapping.
+```
+
+已更新 `scripts/openclaw-plugin-execution-bias-fix/index.js`。
+
 ---
 
 <!-- 格式模板：
