@@ -177,6 +177,33 @@ Hybrid RL 四条路径（来自 `openclaw_combine_api_server.py`）：
 
 ---
 
+### 每个 turn 的反馈到底从哪来（代码级实现，`openclaw_opd_api_server.py`）
+
+**核心机制：不等真实的"下一轮"自然发生后被动观察结果，而是每轮结束后，立刻用同一个 PRM 模型（跟 policy 同架构，独立一张卡）扮演"评委"角色，把"这一轮说了什么"+"紧接着发生了什么"喂给它，当场生成打分和 hint。** 这个流程对"工具调用轮"和"最终文字回复轮"一视同仁——不区分处理，`next_state` 既可以是工具返回结果（`role='tool'`），也可以是对话下一句（`role='user'`）。
+
+**触发时机**（`_handle_request`，line 754-760）：只有当**下一个** `turn_type=="main"` 的请求进来、带着新的 `messages[-1]` 时，才会拿这条新消息当作上一轮（`prev_turn_num`）的 `next_state`，触发对上一轮的异步评估（`_fire_opd_task`）——评估天然是"慢一拍"的，不是实时的。
+
+**评委分两次独立调用 PRM 模型，做两件不同的事**（`_opd_evaluate`，line 586）：
+
+1. **RL 评分（决定 GRPO 的 reward/advantage）**——`_build_prm_eval_prompt`（line 159）构造的 system prompt 明确写了打分规则：
+   - `\boxed{1}`（好）：下一状态显示任务按预期推进——用户说"谢谢"/环境确认成功/工具返回无错误结果
+   - `\boxed{-1}`（差）：用户要求**重做/重试**，或要求**修改纠正**，或**换种说法重复同一个请求**（说明没听懂/没做对），或环境返回错误
+   - `\boxed{0}`（中性）：下一状态含糊不清，无法判断
+   - 明确强调："修改请求本身就是负反馈，不要当成一个中性的新指令"（`## Important` 段）
+   - 独立采样 `_prm_m` 次（这次配置 m=3），多数投票得出最终 `eval_score`——这就是训练日志里 `PRM eval session=... eval_votes=[1, 1, 1] -> eval_score=1.0` 这行的来源
+
+2. **Hint 提取（决定 OPD 蒸馏信号）**——`_build_hint_judge_messages`（line 89）用另一套 system prompt，让 PRM 判断"下一状态有没有透露出能帮助改进上一轮回复的事后信息"：
+   - 同样输出 `\boxed{1}`/`\boxed{-1}`，为 1 时必须在 `[HINT_START]...[HINT_END]` 之间给一段 1-3 句、具体可操作的改进建议
+   - 同样独立采样 `_prm_m` 次，temperature>0 使得同一次调用的 m 个样本给出的 hint 文本各不相同（一个可能聚焦语气、一个聚焦格式）
+
+**Hint 候选的筛选是两阶段的，不是一步到位：**
+- **第一阶段（API server 层，`openclaw_combine_select_api_server.py`）**：只保留 `score==1` 且 `len(hint)>10` 字符的有效投票，按 hint 文本去重、按长度从短到长排序，取前 `OPENCLAW_TOPK_MAX_CAND` 个（默认 3，即训练日志里 `K_i=3` 的来源）作为候选，分别拼接进原回复后面构造出 K 个"teacher_tokens"候选序列
+- **第二阶段（训练侧，slime/Megatron，`openclaw_topk_select_loss` 相关代码）**：上面"信号二"小节里已经写过的 **Overlap-Guided Hint Selection**（`seq-optimal`）在这一步才真正发生——用 student 当前的实际 log-prob 分布，从这 K 个候选里选出跟 student 支撑集重叠最多的那一个（`h* = argmax_h Σ|S_i^g ∩ S_i,h^p|`），只有这一个候选真正参与 OPD loss 计算
+
+**如果一票 hint 都没通过筛选（`score` 全部 ≠1，或长度不够）**：这一轮的 OPD 信号直接放弃（日志里的 `no valid hint (votes=[...]), sample dropped`），但 RL 评分是独立算的，只要 RL 评分有效，样本仍会作为纯 RL 样本提交（`submitted RL sample ... score=...`）——对应上面表格里"❌ opd_accepted / ✅ has_valid_rl → GRPO only"这条路径。
+
+---
+
 ## 五、四类环境
 
 | 环境 | 数据来源 | Next-state Signal | 并行度 |
