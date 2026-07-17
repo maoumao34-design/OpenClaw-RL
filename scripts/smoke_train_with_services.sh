@@ -408,7 +408,8 @@ run_smoke_chat() {
         --dataset "${DATASET}" \
         --num-problems "${NUM_PROBLEMS_PER_ROUND}" \
         --max-turns 4 \
-        --output "${output_path}"
+        --output "${output_path}" \
+        --max-retries 8
 }
 
 # INIT 阶段：顺序建立 homework1/ homework2/（与正式训练架构一致）

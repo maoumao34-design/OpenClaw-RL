@@ -385,6 +385,11 @@ run_one_persona() {
     # 整体重来。改成只跑之前确认一次网关可达（07-10 那次真实问题的修复，
     # 保留），脚本本身只调用一次，失败就是失败，交给脚本自己内部的重试
     # （send_to_openclaw 的几次重试）处理瞬时失败，不再由编排层重来。
+    #
+    # 2026-07-17 修复：加大 --max-retries 到 8，理由同 train_with_services.sh
+    # 同名函数的完整注释（openclaw_combine_select_rollout.py 的正常训练步
+    # 暂停机制实测可达 38~115 秒，远超官方默认 7 秒重试预算，见
+    # docs/issues_log.md 2026-07-17 条目）。
     wait_for_port "OpenClaw gateway" 18789 120 "${OPENCLAW_PID:-}" "${LOGS_DIR}/openclaw.log" || {
         echo "错误：${name} 模拟开始前网关不可达" >&2
     }
@@ -396,7 +401,8 @@ run_one_persona() {
        python "${OPENCLAW_DIR}/${script}" \
            --dataset "${DATASET}" \
            --num-problems "${num}" \
-           --output "${output}"; then
+           --output "${output}" \
+           --max-retries 8; then
         return 0
     fi
     echo "警告：${name} 模拟未完全完成，继续训练（数据可能不完整，见 issues_log.md）" >&2

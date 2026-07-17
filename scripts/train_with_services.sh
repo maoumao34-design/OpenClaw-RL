@@ -394,6 +394,18 @@ run_one_persona() {
     # 整体重来。改成只跑之前确认一次网关可达（09-10 那次真实问题的修复，
     # 保留），脚本本身只调用一次，失败就是失败，交给脚本自己内部的重试
     # （send_to_openclaw 的几次重试）处理瞬时失败，不再由编排层重来。
+    #
+    # 2026-07-17 修复：官方 --max-retries 默认 3（1s+2s+4s=7 秒总重试预算），
+    # 查明我们自己训练代码里 openclaw_combine_select_rollout.py 的
+    # pause_submission()/resume_submission() 每一步训练（rollout 攒够样本后
+    # 到权重同步完成前）都会主动暂停接受新的 /v1/chat/completions 请求、直接
+    # 返回 503（openclaw_opd_api_server.py:344-345），这是正常设计、不是 bug。
+    # 平时暂停只有几秒钟，7 秒预算够扛；但这次实测到暂停时长可达 38~115 秒
+    # （见 docs/issues_log.md 2026-07-17 条目），远超预算，导致 Student/TA/
+    # Teacher 未捕获异常直接崩溃、这个角色接下来几小时都没有任何数据。
+    # 加大 --max-retries 到 8（1+2+4+8+16+32+64+128=255 秒总预算，覆盖实测
+    # 最长 115 秒暂停约 2.2 倍余量），不改官方重试逻辑本身（退避算法不变），
+    # 只是给正常的暂停窗口留够扛住的时间。
     wait_for_port "OpenClaw gateway" 18789 120 "${OPENCLAW_PID:-}" "${LOGS_DIR}/openclaw.log" || {
         echo "错误：${name} 模拟开始前网关不可达" >&2
     }
@@ -405,7 +417,8 @@ run_one_persona() {
        python "${OPENCLAW_DIR}/${script}" \
            --dataset "${DATASET}" \
            --num-problems "${num}" \
-           --output "${output}"; then
+           --output "${output}" \
+           --max-retries 8; then
         return 0
     fi
     echo "警告：${name} 模拟未完全完成，继续训练（数据可能不完整，见 issues_log.md）" >&2

@@ -1087,6 +1087,10 @@ async def chat_completions(...):
 
 **修复方向（待用户确认）：** 加长 Student/TA/Teacher 脚本的重试预算/退避策略，让它能扛住这类正常但偶尔偏长的暂停窗口（比如把重试总窗口从 7 秒拉长到 2-3 分钟）。这不是"绕开问题的保险措施"，是**直接针对这个已经查清楚、且是官方设计本身自带的暂停机制做的合理适配**——暂停期间收到 503 是预期行为，客户端理应能扛住，扛不住才是真正的缺陷。
 
+**已实施：** `student_chat.py`/`TA_chat.py`/`teacher_chat.py` 官方自带 `--max-retries` CLI 参数（默认 3），不需要碰 Python 源码，只在调用处多传一个参数即可。改成 `--max-retries 8`（退避算法不变，仍是 `2**attempt` 秒，总预算 1+2+4+8+16+32+64+128=255 秒，覆盖实测最长 115 秒暂停约 2.2 倍余量）。三处调用点都已更新：`train_with_services.sh`/`minitest_train_with_services.sh` 的共用函数 `run_one_persona()`，以及 `smoke_train_with_services.sh` 的 `run_smoke_chat()`。
+
+**待验证：** 下次训练确认 `--max-retries 8` 生效后，类似时长的暂停窗口不再导致 Student/TA/Teacher 未捕获异常崩溃；同时继续观察这两步训练计算耗时异常偏长（38秒、115秒 vs 正常应该更短）的原因，虽然不影响这次的修复方向，但如果这类"异常慢的训练步"变得更频繁/更长，255 秒的新预算也可能不够用。
+
 ---
 
 <!-- 格式模板：
