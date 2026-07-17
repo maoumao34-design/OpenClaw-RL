@@ -319,6 +319,25 @@ cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.p
 cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
 openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
 
+# 部署 execution-bias-fix 插件（决策犹豫循环修复，见 docs/issues_log.md
+# 2026-07-16/17 条目）。OpenClaw 内置的"## Execution Bias"系统提示词章节
+# （2026-04-15~04-30 才加入，论文提交后新增，论文原始实验版本没有这段文字）
+# 里"Non-final turn: use tools to advance..."这句话，结合 Qwen chat template
+# 自带的 tool_call XML 格式指令，实测会让 Qwen3-4B-Thinking 陷入"这段纯文本
+# 回复要不要包 tool_call 标签"的循环判定、耗尽 8192 token 预算从不输出
+# （Problem 36 完整 reasoning_text 证据）。resolveSystemPromptContribution
+# 整段替换机制要求是 sglang provider 唯一绑定的插件（单一 owner，被内置
+# extensions/sglang 占用），不是零接触方案；改用同样已验证可用的
+# before_prompt_build + appendSystemContext 追加一条消歧规则。
+echo "生成并部署 execution-bias-fix 插件（appendSystemContext 消歧规则）..." \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+EXECUTION_BIAS_FIX_SYSTEM_DIR="/usr/lib/node_modules/openclaw/dist/extensions/execution-bias-fix"
+mkdir -p "${EXECUTION_BIAS_FIX_SYSTEM_DIR}"
+cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/index.js" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/index.js"
+cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/openclaw.plugin.json" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/openclaw.plugin.json"
+cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/package.json" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/package.json"
+openclaw plugins enable execution-bias-fix >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
+
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
 #
