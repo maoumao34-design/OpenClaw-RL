@@ -321,17 +321,6 @@ cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.p
 cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
 openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
 
-# 部署 execution-bias-fix 插件（决策犹豫循环修复，见 docs/issues_log.md
-# 2026-07-16/17 条目及 train_with_services.sh 同名代码块的完整说明）。
-echo "生成并部署 execution-bias-fix 插件（appendSystemContext 消歧规则）..." \
-    | tee -a "${LOGS_DIR}/openclaw.log"
-EXECUTION_BIAS_FIX_SYSTEM_DIR="/usr/lib/node_modules/openclaw/dist/extensions/execution-bias-fix"
-mkdir -p "${EXECUTION_BIAS_FIX_SYSTEM_DIR}"
-cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/index.js" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/index.js"
-cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/openclaw.plugin.json" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/openclaw.plugin.json"
-cp "${SCRIPTS_DIR}/openclaw-plugin-execution-bias-fix/package.json" "${EXECUTION_BIAS_FIX_SYSTEM_DIR}/package.json"
-openclaw plugins enable execution-bias-fix >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
-
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke 的问题）。
 #
