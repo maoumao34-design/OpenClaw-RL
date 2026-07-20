@@ -1171,6 +1171,16 @@ perf/actor_train_time: 54.0s
 
 **结论：context overflow 死循环、Execution Bias 决策犹豫循环，是同一类"OpenClaw 论文提交后快速迭代引入新行为、复现环境继承了这些新行为"问题的第三次发作**（第一次是 07-09 的 `rl-training-headers` header 注入机制被 `hasOpenClawTransportRequirement` 破坏）。修复方向：需要想办法让这次 context overflow 恢复走回 March 那种"优雅跳过/重试原提示词"的行为，而不是撞上新加的硬拒绝——具体怎么改（是否需要碰 OpenClaw 核心源码、有没有类似 sglang 那次的补丁点）还没评估。
 
+**更新（用户质疑"OpenClaw 自己两个机制怎么会互相冲突"——重新严格验证调用链，纠正措辞，然后实施修复）：**
+
+用户的质疑是对的，之前"两个机制互相冲突"这个说法不够严谨。重新查证：全代码库精确搜索 `"Already compacted"` 这个字符串，**只有一处**（`agent-session.ts` 的 `compact()` 方法，硬编码 `mode: "manual"`）。不是"两个独立机制凑巧互相冲突"，是**这一条恢复路径本身设计时没有考虑到"上一个 attempt 已经压缩过、这个新 attempt 又立刻需要恢复"这种边界情况**——`run.ts` 溢出恢复循环的 `hadAttemptLevelCompaction` 计数按 attempt 隔离，看不到上一个 attempt 的压缩记录，会误判"这次还没压缩过"进而尝试显式压缩，而这次显式压缩会被会话层（不分 attempt，只看 session 最后一条记录）直接拒绝。这类边界情况在正常人类对话节奏下大概率很少被触发（两次溢出之间通常有足够时间积累新内容），只有我们模拟器这种脚本自动高频重试（间隔十几秒）的用法才会稳定撞上。受限于代码库里"溢出恢复循环 → 真正执行压缩"之间隔着好几层插件注册表抽象，没能 100% 逐层追完整个间接调用链，但排除法确认：不管中间怎么绕，最终一定是走到了这一处硬拒绝，因为全库只有这一处能产生观察到的错误文本。
+
+**实施修复：** 在服务器上用几个日志里出现过的独特字符串（`"retrying prompt without additional compaction"`、`"Already compacted"`）反查实际部署的 bundle 文件，定位到 `/usr/lib/node_modules/openclaw/dist/embedded-agent-Cv16r2d1.js:3330` 附近的 `catch (compactErr)` 块。这个文件是内容哈希命名的 bundle（不是 `extensions/` 那种清晰对应源码的目录），OpenClaw 升级后文件名会变化。
+
+补丁思路：在 `catch (compactErr)` 里专门识别 `"Already compacted"` 这个具体错误文本，命中时直接当成"不压缩了、重试原提示词"处理（复用另一条本来就有的优雅路径 `hadAttemptLevelCompaction` 分支的同款行为——`continue` 循环，不落入"压缩失败→尝试截断工具结果→放弃"这条更长的失败路径），仍然受 `MAX_OVERFLOW_COMPACTION_ATTEMPTS` 约束不会死循环，只是给了 session 真正的重试机会而不是撞见这一个具体错误就立刻放弃。新脚本 `scripts/prepare_patched_embedded_agent_overflow_recovery.sh`，沿用 sglang 那次的补丁模式（找锚点插入、幂等备份、找不到锚点直接报错退出）。本地用真实贴出的 bundle 内容片段做了完整测试：语法校验通过、二次运行幂等、已打补丁文件的拒绝保护均通过。三个训练脚本（train/minitest/smoke）均已接入，部署顺序在 `openclaw gateway run` 启动之前。
+
+**待验证：** 下次训练确认这个补丁真实生效（需要真的撞上一次"Already compacted"才能在日志里看到确认文本 `openclaw-rl-overflow-recovery-patch`，不像 sglang 那次能在每轮都看到确认日志，这次只有真正命中死锁场景才会触发，验证会慢一些）；确认后续训练里 context overflow 是不是不再演变成永久死循环、Student/TA/Teacher 是不是不再因此撞上决策犹豫循环级联。
+
 ---
 
 <!-- 格式模板：

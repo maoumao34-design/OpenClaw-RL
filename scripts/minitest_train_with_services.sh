@@ -330,6 +330,14 @@ PATCHED_SGLANG_DIR="${LOGS_DIR}/patched-sglang"
 bash "${SCRIPTS_DIR}/prepare_patched_sglang_execution_bias.sh" "${SGLANG_LIVE_FILE}" "${PATCHED_SGLANG_DIR}"
 cp "${PATCHED_SGLANG_DIR}/index.js" "${SGLANG_LIVE_FILE}"
 
+# Patch 内置 embedded-agent-runner 的 context overflow 恢复逻辑，理由同
+# train_with_services.sh 同名代码块的完整说明。
+echo "生成并部署 embedded-agent overflow-recovery 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+EMBEDDED_AGENT_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/embedded-agent-Cv16r2d1.js"
+PATCHED_EMBEDDED_AGENT_DIR="${LOGS_DIR}/patched-embedded-agent"
+bash "${SCRIPTS_DIR}/prepare_patched_embedded_agent_overflow_recovery.sh" "${EMBEDDED_AGENT_LIVE_FILE}" "${PATCHED_EMBEDDED_AGENT_DIR}"
+cp "${PATCHED_EMBEDDED_AGENT_DIR}/embedded-agent-Cv16r2d1.js" "${EMBEDDED_AGENT_LIVE_FILE}"
+
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke 的问题）。
 #
