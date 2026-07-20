@@ -1163,6 +1163,14 @@ perf/actor_train_time: 54.0s
 
 **修复方向指向问题一（context overflow 死循环）才是真正的根源**，问题二/三（数学应用题反复自我重述、纯 token 退化）大概率是这次污染批次训练出来的**下游症状**，不是各自独立的诱因——如果能在源头堵住 context overflow 死循环（不让这类退化样本大量占满某一批训练数据），后面这两类循环可能根本不会被训练出来。待验证：下次训练如果 context overflow 死循环不再发生，后续是否也不再出现这种大范围、长时间的循环级联。
 
+**更新（用户追问：context overflow 死循环本身会不会也是 OpenClaw 版本漂移导致的——用同一套版本考古方法验证，确认是）：** 上面结论里"这不是 OpenClaw 版本问题"这句话需要修正——那句话说的是"污染训练批次导致模型训坏"这个**传导机制**不是版本问题（这部分是我们自己训练流水线的设计使然，论文原版环境下也会有同样的传导路径），但**触发这一切的最初诱因（context overflow 死循环本身）确认也是 OpenClaw 版本漂移问题**，跟 Execution Bias 是同一类。
+
+查源码定位到具体机制：`src/agents/sessions/agent-session.ts:1924-1930`——压缩前置检查 `prepareCompaction` 如果发现"session 最后一条记录已经是一次压缩"，直接 `throw new Error("Already compacted")`，判定为压缩失败。但溢出恢复重试循环（`src/agents/embedded-agent-runner/run.ts:2591` 附近）判断的是"这次 attempt 有没有压缩过"（`hadAttemptLevelCompaction`，按 attempt 计数，不跨 attempt），如果这次没压缩过就会去调用显式压缩——但如果**上一个 attempt** 已经压缩过（session 最后一条记录仍是那次压缩），这次显式压缩调用会被会话层直接拒绝，两层判断作用域不一致，形成死锁。
+
+**版本考古（复用 Execution Bias 那次验证过的方法）：** 精确字符串匹配 `"Already compacted"` 这行硬拒绝代码——论文提交时的版本（2026.3.8）、2026-04-15、**2026-05-15（2026.5.16）都不存在**，2026-06-01（2026.6.2）**首次出现**。这段硬拒绝逻辑是 **2026 年 5 月中到 6 月初之间**才加进 OpenClaw 的，比 4 月加入的 Execution Bias 章节还要晚，论文提交时压根不存在。**March 版本压缩失败时是优雅跳过/不压缩直接重试原提示词，不会死锁**（`src/agents/pi-embedded-runner/run.ts` 里"retrying prompt without additional compaction"这条路径当时就有，现在也还在，没被拿掉——问题是新加的会话层硬拒绝跟这条一直没变的重试逻辑之间产生了新的不兼容）。
+
+**结论：context overflow 死循环、Execution Bias 决策犹豫循环，是同一类"OpenClaw 论文提交后快速迭代引入新行为、复现环境继承了这些新行为"问题的第三次发作**（第一次是 07-09 的 `rl-training-headers` header 注入机制被 `hasOpenClawTransportRequirement` 破坏）。修复方向：需要想办法让这次 context overflow 恢复走回 March 那种"优雅跳过/重试原提示词"的行为，而不是撞上新加的硬拒绝——具体怎么改（是否需要碰 OpenClaw 核心源码、有没有类似 sglang 那次的补丁点）还没评估。
+
 ---
 
 <!-- 格式模板：
