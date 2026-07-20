@@ -1292,6 +1292,23 @@ grep -rl "Attach media in the final visible reply" /usr/lib/node_modules/opencla
 
 ---
 
+## [2026-07-20] 重要更正：8GPU 正式训练从未真正保存过 checkpoint，run `20260717_171106` 与 run `20260720_112802` 之间没有权重连续性
+
+**动机：** 用户追问"07-17 那次数学自我重述/纯token退化，是否通过训练把模型污染得更差，导致 07-20 续训后更容易触发 Assistant Output Directives 循环"——这个因果假设的前提是两次训练之间存在权重连续性（`--load` 真的加载到了 07-17 崩溃前的状态）。查证过程中发现这个前提本身不成立。
+
+**查证过程：**
+1. `20260720_112802` 的 `training.log` 确认命令行带 `--save "${SAVE_CKPT}" --load "${SAVE_CKPT}" --save-interval 100`，`SAVE_CKPT=/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-topk-select`
+2. `ls -la .../checkpoints/qwen3-4b-openclaw-topk-select/` → **`No such file or directory`**；`find .../checkpoints/` 只找到完全无关的 `minitest-qwen3-4b-openclaw-topk-select/`（minitest 自己的 checkpoint，前缀不同、目录不同）
+3. 统计 07-17 run（`20260717_171106`，18:43 启动到次日 00:09 最后一次记录）的 `Timer update_weights end` 次数：全程约 20 次，远未达到 `--save-interval 100` 要求的 100 步——**这次训练全程没有触发过一次 checkpoint 保存**
+
+**结论：** `qwen3-4b-openclaw-topk-select` 这个 checkpoint 目录从未被创建过，`--load` 每次都加载到空目录，Megatron 标准行为是退回 `--ref-load`/`--hf-checkpoint`（原始 base 模型）从头开始。**07-17 run 和 07-20 run 之间不存在任何权重层面的连续性，07-20 是从干净的 base 模型重新训练的，不是接着 07-17 崩溃前的（已被污染的）权重续训。**
+
+**对因果假设的影响：** 用户提出的"07-17 的污染通过训练带到了 07-20、导致 Assistant Output Directives 更容易触发"这条因果链**不成立**——没有物理机制支持权重跨这两次任务提交传递。07-20 这次的 Assistant Output Directives 循环只能是这次训练自己独立触发/自我强化的（大概率是这次运行早期某一批就已经被这个诱因污染，自我强化过程局限在这次训练内部，不是继承自上一次）。**这不影响"批次污染→同一次连续训练进程内持续数小时"这个机制本身**（07-17 run 内部 Problem 47 → 后续数学自我重述那条因果链，全程都在同一个 Ray job 生命周期内，权重更新连续不受影响）——被推翻的只是"跨越两次分开提交的训练任务"这一层。
+
+**衍生发现（独立的结构性问题，待用户决定优先级）：** 目前为止 8GPU "正式" 训练似乎从未有一次真正连续跑到第 100 步、从未真正保存过 checkpoint——每次任务提交事实上都是从零开始，此前几次训练的进展（不论好坏）都没有真正积累下来。是否需要调小 `--save-interval`（当前 100，minitest 用的似乎更小，落盘更频繁）来避免这个问题，需要评估：调小会增加磁盘 I/O 开销和存储占用，但能让训练在崩溃后真正断点续训，而不是每次都从头开始耗费数小时才能推进到当前进度。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
