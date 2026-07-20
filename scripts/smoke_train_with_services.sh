@@ -260,6 +260,14 @@ launch_openclaw_gateway() {
     bash "${SCRIPTS_DIR}/prepare_patched_embedded_agent_overflow_recovery.sh" "${EMBEDDED_AGENT_LIVE_FILE}" "${PATCHED_EMBEDDED_AGENT_DIR}"
     cp "${PATCHED_EMBEDDED_AGENT_DIR}/embedded-agent-Cv16r2d1.js" "${EMBEDDED_AGENT_LIVE_FILE}"
 
+    # Patch 内置 system-prompt 里的 "## Assistant Output Directives" 章节，理由同
+    # train_with_services.sh 同名代码块的完整说明。
+    echo "生成并部署 system-prompt output-directives 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+    SYSTEM_PROMPT_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/system-prompt-config-CLAPATdy.js"
+    PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
+    bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
+    cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+
     # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，不知道
     # 真实的 contextWindow/maxTokens，会用过大的默认值请求 max_completion_tokens
     # （实测 178210），被 sglang 400 拒绝。显式声明，maxTokens 明显小于

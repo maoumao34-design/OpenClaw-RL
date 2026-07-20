@@ -627,7 +627,55 @@
 
 ---
 
-## 当前状态（2026-07-17）
+## 2026-07-20
+
+**目标：** 排查上周五训练（run `20260717_171106`）跑 8 小时后自动关闭的原因；处理新发现的决策犹豫循环诱因
+
+**完成内容：**
+- 定位 run `20260717_171106` 崩溃根因：`agent-session.ts` 新增的 `"Already compacted"` 硬抛错（2026-05-15~06-01 之间加入 OpenClaw，论文版本不存在），与 `run.ts` overflow-recovery 循环的 attempt-scoped 重试计数不匹配，导致跨轮已压缩的 session 每轮必然触发 context overflow 死锁；单个 session 循环重试样本占满一批训练数据（Problem 47 占比 87.5%）→ 触发批次污染自我强化机制，是这次 8 小时后崩溃的真正诱因 → [`issues_log.md`](issues_log.md) 2026-07-17 条目
+- 修复：`prepare_patched_embedded_agent_overflow_recovery.sh` 直接 patch 核心 bundle，命中 `"Already compacted"` 时按已有的优雅路径重试而非放弃。重新提交训练（run `20260720_112802`）确认 0 次复现
+- 同一 run 里发现决策犹豫循环的第三个独立诱因：`## Assistant Output Directives` 章节（跟 Execution Bias 同一批 2026-04 系统提示词重构、此前一直没处理），批次污染机制再次复现（占比 37.5%）。确认批次污染不是 context overflow 独有，是这套异步训练流水线的结构性脆弱点 → issues_log.md 2026-07-20 条目
+- 修复：`prepare_patched_system_prompt_output_directives.sh`，在该章节标题后插入一句显式条件说明（"仅在适用时才需要遵守，都不适用就直接发纯文本回复"），思路上是把 March 版本 `## Reply Tags` 的条件框定加回来。本地测试通过（语法、锚点唯一性、幂等性），已接入三个训练脚本，尚未用真实训练验证效果 → issues_log.md 2026-07-20 条目
+
+**主要问题：**
+- 用户指出"两个 OpenClaw 机制自己冲突"这个初始框架不准确，要求重新严谨核实——重新核查后确认是单一恢复路径的一个边界情况（attempt-scoped vs session-scoped 状态不一致），不是两个独立机制冲突
+- 用户明确要求"训练数据批次污染拦截"这个通用兜底方案延后，先处理已确认的具体诱因（"做了反而会导致如果有问题发现不了"）
+
+---
+
+## 当前状态（2026-07-20）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `maxTokens=8192`、`reserveTokensFloor=16384`：已验证生效（07-15）
+- [x] `logit_bias` 屏蔽已知乱码 token（id=122362）：**已用真实 GPU 数据验证 0 次复现**
+- [x] `memory-core` 插件禁用：**已用真实 GPU 数据验证 0 次复现**
+- [x] 退化样本过滤规则（只拦真正空内容 + 已知乱码 token 兜底）：**已验证生效**
+- [x] "决策犹豫循环"诱因一：Execution Bias 章节 + 修复（`prepare_patched_sglang_execution_bias.sh`）：**已用真实训练数据验证钩子真实生效**
+- [x] "503 崩溃"根因（`submission_enabled` 暂停窗口 + 重试预算过短）+ 修复（`--max-retries 8`）：**已用真实训练数据验证生效**
+- [x] "决策犹豫循环"诱因二：context overflow 死锁（`agent-session.ts` "Already compacted"）+ 修复（`prepare_patched_embedded_agent_overflow_recovery.sh`）：**已用真实训练数据验证 0 次复现**（run `20260720_112802`）
+- [x] "决策犹豫循环"诱因三：Assistant Output Directives 章节 + 修复（`prepare_patched_system_prompt_output_directives.sh`）：本地测试通过，已接入三训练脚本，**真实训练效果待验证**
+
+### 已知限制 / 未解决
+- 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后），任何未来新出现的、能让某个 session 连续卡住的诱因都可能再次触发同样的训练级联损害
+- 数学应用题反复自我重述 / 纯 token 退化这两类模式，目前认为更可能是 Qwen3-Thinking 自身固有倾向而非 OpenClaw 版本问题，未做版本考古严格验证
+- workspace 的 2GB 配额区在"GPU 空闲→平台自动回收→重启"后会静默回滚到上次保存的快照，训练**结束后**查看 workspace 文件状态需注意
+- 官方 `DONE_SENTINEL` 完成判定不校验工具调用是否真的成功，是官方设计本身的空白
+- `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
+
+### 下一步
+1. 重新提交训练，验证 Assistant Output Directives 修复的实际效果（reasoning_text 里的重复检查模式是否消失）
+2. 确认这三个诱因是否已覆盖"决策犹豫循环"的全部已知来源，还是仍有其他未发现的诱因
+3. 视情况重新评估"训练数据批次污染拦截"这个通用兜底方案的优先级
+
+### 未验证
+- [ ] Assistant Output Directives 修复的实际效果
+- [ ] 是否还有其他未发现的决策犹豫循环诱因
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-17，已被 7/20 结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）

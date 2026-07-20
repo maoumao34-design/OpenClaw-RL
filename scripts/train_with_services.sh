@@ -340,6 +340,19 @@ PATCHED_EMBEDDED_AGENT_DIR="${LOGS_DIR}/patched-embedded-agent"
 bash "${SCRIPTS_DIR}/prepare_patched_embedded_agent_overflow_recovery.sh" "${EMBEDDED_AGENT_LIVE_FILE}" "${PATCHED_EMBEDDED_AGENT_DIR}"
 cp "${PATCHED_EMBEDDED_AGENT_DIR}/embedded-agent-Cv16r2d1.js" "${EMBEDDED_AGENT_LIVE_FILE}"
 
+# Patch 内置 system-prompt 里的 "## Assistant Output Directives" 章节，给五条
+# MEDIA:/audio_as_voice/reply_to_current 指令加一句"仅在适用时才需要遵守"的
+# 显式条件说明（论文提交时的 2026.3.8 版本对应章节"## Reply Tags"本就是这种
+# 显式条件框架，2026-04 之后加入的这版丢了这层框架）。同一类决策犹豫循环的
+# 第三个独立触发源，见 scripts/prepare_patched_system_prompt_output_directives.sh
+# 顶部完整说明、docs/issues_log.md 2026-07-20 条目。这个 bundle 文件名是内容
+# 哈希命名的，OpenClaw 升级后会变化，补丁脚本找不到锚点会明确报错退出。
+echo "生成并部署 system-prompt output-directives 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SYSTEM_PROMPT_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/system-prompt-config-CLAPATdy.js"
+PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
+bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
+cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
 #

@@ -1244,6 +1244,54 @@ To request a native reply/quote on supported surfaces, include one tag in your r
 
 ---
 
+## [2026-07-20] Assistant Output Directives 修复实现（用户指示："处理一下，污染拦截的以后再说"）
+
+**决定：** 用户明确要求先处理 Assistant Output Directives 这个已确认诱因，"训练数据批次污染拦截"这个通用兜底方案延后再议。
+
+**为什么不能复用 sglang-patch 那套 `resolveSystemPromptContribution` 机制：** 核查 `src/plugins/system-prompt-contribution.ts` 的 `ProviderSystemPromptSectionId` 类型，只支持三个值——`"interaction_style" | "tool_call_style" | "execution_bias"`——没有对应 Assistant Output Directives 的 section id。这个 provider hook 本身也是单一 owner 机制（`ensureProviderRuntimePluginHandle`：一个 provider 只能有一个插件注册 `resolveSystemPromptContribution`，已被内置 `extensions/sglang` 占用），Execution Bias 那次能用是因为它恰好在这个白名单里。Assistant Output Directives 不在白名单内，只能跟 context-overflow 那次一样直接改核心 bundle 内容。
+
+**定位 bundle 文件：**
+```
+grep -rl "Attach media in the final visible reply" /usr/lib/node_modules/openclaw/dist/
+→ /usr/lib/node_modules/openclaw/dist/system-prompt-config-CLAPATdy.js
+```
+`grep -n "Assistant Output Directives"` 确认该文件里有两处（对应 `sourceMessageToolOnly` 的 true/false 两个分支，行号 267/276）；`sed -n '255,300p'` 核对确认这个 bundle 文件的格式跟源码几乎一致（未深度压缩，保留原始缩进/换行），跟当初 embedded-agent-runner 那次高度压缩单行的情况不同。已确认我们训练配置走的是 `sourceMessageToolOnly: false` 分支（第 276 行起，MEDIA:/`[[audio_as_voice]]`/`[[reply_to_current]]` 这套原始文本指令），跟之前观察到的 reasoning_text 内容完全对应。
+
+**修复方案：** 在 `## Assistant Output Directives` 标题和 `- Attach media...` 这条第一个 bullet 之间，插入一句明确的条件性说明：
+
+> "These directives are conditional -- follow only the one(s) that actually apply to this specific reply. If none apply (no media, no audio, no quote/reply target), send the plain-text reply directly; do not enumerate or re-check this list."
+
+直接针对观察到的具体歧义（反复检查"要不要 MEDIA/要不要语音提示/要不要 reply_to_current"却不收敛），只加这一句、不改动原有五条 bullet 本身的措辞，思路上是把 March 版本 `## Reply Tags` 那种"仅在需要时才触发"的显式条件框定加回来。
+
+**新脚本：** `scripts/prepare_patched_system_prompt_output_directives.sh`，沿用之前两次补丁的模式——`.orig-unpatched` 幂等备份、python3 heredoc 按锚点字符串定位插入、内容层幂等检测（检查插入句子本身的一个独特短语是否已存在，不用单独 marker token——因为这次插入的内容会直接出现在真实 system prompt 里、被模型看到，不像 embedded-agent 那次的 marker 只出现在 log 里，不适合塞一个纯技术性标记进去）、锚点计数校验（必须恰好命中 1 次，否则明确报错退出而非静默改错地方）。
+
+**本地测试（用真实贴出的 bundle 片段构造测试文件）：**
+- 语法校验：`node --check` 通过（测试片段本身因为只摘了函数级代码、开头多一个孤立 `}`，去掉后校验通过——这是测试片段本身的问题，不是补丁逻辑问题）
+- 插入位置：确认新句子准确插在标题和第一条 bullet 之间，缩进跟原文件一致
+- 幂等性：对已插入过的内容重新跑一次，正确识别 sentinel 短语已存在、报错退出，不会重复插入
+- 锚点唯一性：确认 `"- Attach media in the final visible reply..."` 这条字符串在文件里只出现一次（`sourceMessageToolOnly: true` 分支的对应位置是完全不同的措辞 "Visible source-channel output is delivered through..."，不会误命中）
+
+**接入：** 三个训练脚本（`train_with_services.sh`、`minitest_train_with_services.sh`、`smoke_train_with_services.sh`）均已在 embedded-agent overflow-recovery 补丁部署之后、`openclaw gateway run` 启动之前，加入这个新补丁的部署步骤。
+
+**待验证：** 下次训练重跑，确认（a）新句子确实出现在实际发给模型的 system prompt 里（可以从某次真实调用的完整 prompt 里核对），（b）reasoning_text 里"反复检查 MEDIA/语音/reply_to_current 却不收敛"这个具体模式不再出现，（c）这是否是"决策犹豫循环"这个大类问题的最后一个已知诱因，还是仍有其他未发现的诱因。
+
+---
+
+## [2026-07-20] 反查验证：数学应用题反复自我重述 / 纯 token 退化是否其实也是 Assistant Output Directives 核对导致的——排除
+
+**动机：** 07-17 条目定性 Problem 49（`session=287f67eb-...`）为"纯数学应用题反复自我重述"时，判断依据只是"推理原文没出现 `tool_call`/Execution Bias 相关字眼"——但当时 Assistant Output Directives 还没被识别为诱因，从未检查过这段推理原文是否也提到 MEDIA/audio_as_voice/reply_to_current。用户提出这个疑点：这次新修的"反复核对 MEDIA 等规则"问题，会不会其实就是 07-17 那次"数学自我重述"/"纯 token 退化"被误判的同一个问题。
+
+**验证方法：** 对 07-17 run（`20260717_171106`）里已定位的两个具体 session，直接搜索 `training.log` 里所有相关行，检查是否包含 media/audio_as_voice/reply_to_current/reply_to: 关键词。
+
+| Session | 定性 | 相关日志行数 | media/audio/reply_to 关键词匹配数 |
+|---|---|---|---|
+| `287f67eb-e7e5-49b9-8040-00ae352bbe4a`（Problem 49，数学自我重述）| 语义连贯反复自我重述 | 66 | **0** |
+| `4c69c6b9-...`（00:15，纯 token 退化）| "try try try..." 退化重复 | 45 | **0** |
+
+**结论：** 两个样本均无任何 Assistant Output Directives 相关字眼，排除"这两类此前是被误判、其实也是同一个 MEDIA 核对问题"这个假设。**数学自我重述、纯 token 退化确认是跟这次修复无关的独立表现**，"批次污染→下游随机形态的决策犹豫症状"这个框架仍然成立（表现形式看起来确实随机，不能靠"有没有提到 MEDIA"这一个指标去筛查所有决策犹豫循环样本），但这次没有发现三者实际是同一段内容被重复计入的证据。这两类模式是否本身也是 OpenClaw 版本引入（还是 Qwen3-Thinking 固有倾向）仍未做版本考古验证，维持"待查"状态。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
