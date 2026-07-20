@@ -1110,6 +1110,29 @@ perf/actor_train_time: 54.0s
 
 ---
 
+## [2026-07-17] run `20260717_171106`（8 小时后自动关闭）：发现两个新问题——context overflow 死循环、决策犹豫循环的新触发方式（非 tool_call 格式歧义）
+
+**背景：** 用户回来查上次训练为什么只跑了 8 小时（17:11 启动，`training.log` 最后一条记录在次日 01:18，约 8 小时 7 分钟，跟目录 mtime 不完全一致但 log 内容才是真实结束时间），结尾卡在 `waiting for combine samples: 9/16, queue=0` 持续 19+ 分钟不再推进——是典型的"生成卡住→GPU空闲→平台自动回收"死法。往前查是哪里开始卡住的。
+
+### 问题一：Problem 47 context overflow 死循环（新问题，此前未见过）
+
+`openclaw.log` 显示：18:43:18 先有一次 108.8 秒的 `FailoverError: LLM request timed out.`；之后该 session 上下文涨到近 20000 token（`estimatedPromptTokens=19816`），超过 16384 token 的 prompt 预算（`overflowTokens=3432`）；系统尝试自动压缩瘦身但**每次都失败**，原因是 `already_compacted_recently`（压缩冷却期挡住）；压缩失败不影响 Student 脚本继续发新消息重试，**每次重试都会把新消息计入这个已经压不动的 session**（`messages=70→71→72` 持续增长），永远回不到预算内，形成死循环，8 轮内没有恢复。
+
+### 问题二：Problem 49 起决策犹豫循环复现，但触发原因跟 execution-bias-fix 修的不是同一个
+
+`training.log` 里两个 session（`student-hw-47/49-19019`）用 session-id 搜索**零匹配**——请求走的是 OpenClaw 内部重试路径（`incomplete turn detected ... stopReason=length ... reasoningRetries=0/2 emptyRetries=0/1 missingAssistantRetries=0/1 — surfacing error to user`），OpenClaw 自己内部重试耗尽后才把"⚠️ Agent couldn't generate a response"这个兜底文案以**正常 200 响应**返回给 Student——因为不是 408/503，Student 脚本自己的重试逻辑根本不会触发，只会当成"收到回复但没用"，正常推进到下一轮，8 轮全部耗光。这也解释了为什么这次 `training.log` 按 session-id 搜不到：需要按**时间窗口**去找对应的 `TRUNCATED (finish_reason=length)` 记录。
+
+按时间窗口找到对应 session（`287f67eb-e7e5-49b9-8040-00ae352bbe4a`），`thinking=31699 chars`，`TRUNCATED (finish_reason=length)`。**查完整推理原文，确认是完全不同的循环模式**——不是"要不要给纯文本回复包 tool_call 标签"那种格式判定困惑，是**纯数学应用题理解上的反复自我重述**：模型反复用略微不同的措辞重新解释同一段已经理解过的条件（"第一阶段 6 个月 $8/月"），绕了十几段都没有真正推进到计算第二、第三阶段和最终总价，从头到尾没有出现 `tool_call`/Execution Bias 相关字眼。
+
+**结论：** "决策犹豫循环"是一类问题的统称，不是单一原因——`execution-bias-fix` 补丁修复的只是其中一个已确认诱因（Execution Bias 章节造成的 tool_call 格式歧义），这次撞到的是**另一个独立诱因**（Qwen3-Thinking 在某些数学应用题上的固有倾向——反复自我重述条件而不收敛），补丁本身没有失效，只是覆盖范围不包括这一类触发方式。
+
+**待查/待定：**
+1. context overflow 死循环（问题一）是否是这次训练崩溃的真正开端——需要确认 `waiting for combine samples: 9/16` 卡住的批次里，是不是正好包含了 47/49 题这类无法在 8 轮内正常完成的 session
+2. 数学应用题反复自我重述这类循环（问题二）要不要单独修——如果是 Qwen3-Thinking 本身的固有倾向，修复思路（是否也能用类似"追加消歧规则"或其他机制）还没评估，需要用户决定优先级
+3. context overflow 的"压缩冷却期挡住重新压缩"（`already_compacted_recently`）这个机制本身是否有配置项可以调整，还没查
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
