@@ -1183,6 +1183,67 @@ perf/actor_train_time: 54.0s
 
 ---
 
+## [2026-07-20] run `20260720_112802`：context overflow 修复确认生效，但发现决策犹豫循环的第三个独立诱因——`Assistant Output Directives` 章节（跟 Execution Bias 同一次 4 月更新，此前一直没处理）
+
+**背景：** 用 `prepare_patched_embedded_agent_overflow_recovery.sh` 修复 context overflow 死循环后重新提交训练。跑到 Problem 62/63 附近时，用户观察到"⚠️ Agent couldn't generate a response"又开始出现，但这次是**断断续续**，不是像上次（run `20260717_171106`）那样从某个点起密集持续 5+ 小时——直觉上是个好迹象，但需要验证不能只凭感觉下结论。
+
+**第一步验证：确认 context overflow 修复确实生效。**
+- 这次 run 里 `incomplete turn detected`（顶格截断的下游表现）总共 **42 次**，远低于上次的 297 次
+- **"Already compacted" 补丁确认日志（`openclaw-rl-overflow-recovery-patch`）出现 0 次**——说明这次根本没有撞上 context overflow 死锁，这 42 次是完全独立的另一种诱因，不是 context overflow 没修好
+- **结论：context overflow 死循环这个根因确认修复有效**，这次的问题是"决策犹豫循环"底下另一个此前没处理过的独立诱因
+
+**第二步：确认这次是不是又发生了"批次污染→自我强化"这个已知机制（只是触发源不同）。**
+- 查第一次出现（12:44:07，`session=522028be-...`，对应 Problem 62 Turn 2/4/5 的失败）落在哪一批训练数据：这一批（12:43~12:50 收集完成）里，**这一个 session 占了 6/16（37.5%）**，其中 2 条顶格截断（`response_len=8197`），reward 有正有负——不如上次 Problem 47 那次 87.5% 极端，但确认是同一种批次污染模式
+- 后续几批训练数据的收集耗时从之前稳定的 4-7 分钟，从这一批起暴涨到 12-17 分钟，跟上次 escalation 的信号一致
+- **结论：批次污染→自我强化这个机制不是 context overflow 独有的，任何能让某个 session 连续卡住占满一批训练数据的诱因，都会触发同样的级联**——修好一个具体诱因不能保证不会再撞上另一个
+
+**第三步：确认这次的具体诱因内容——抽样查了第一次（12:44，Problem 62 相关）和最后一次（13:44，跟 Problem 62/63 内容不同的另一道题）的完整推理原文，两次内容模式完全一致：**
+
+反复检查"这条回复要不要加 MEDIA 附件、要不要加语音提示、要不要加 reply_to_current 引用标记"，反复确认"这条回复不需要这些、已经满足所有要求"，却从来不真正结束输出。原文摘录（第一次，Problem 62 相关）：
+> "The response does not have any media attachments. The response does not have any voice-note audio hint. The response does not have a reply_to_current directive. So this response meets all the requirements. The response is exactly the response text..."
+
+（第二次，13:44，另一道题）内容模式完全相同，反复重申"does not have media attachments / voice-note audio hint / reply_to_current directive... meets all requirements"。
+
+**第四步：定位到这不是一个新的、无关的诱因，是跟 Execution Bias 同一批 4 月更新里、此前一直没处理的另一部分——`## Assistant Output Directives` 章节。**
+
+查 `src/agents/system-prompt.ts` 里对应内容：
+```
+## Assistant Output Directives
+- Attach media in the final visible reply with `MEDIA:<path-or-url>` on its own line.
+- Tool-generated media paths are attachments, not prose; emit each as its own `MEDIA:<path-or-url>` line.
+  The MEDIA directive must start the line as plain text, outside code fences and without Markdown wrappers...
+- Voice-note audio hint: `[[audio_as_voice]]` when audio is attached.
+- Native quote/reply: first token `[[reply_to_current]]`; use `[[reply_to:<id>]]` only with an explicit id.
+- Supported directives are stripped before rendering; channel config still decides delivery.
+```
+
+跟模型反复检查的三项（media attachments / voice-note audio hint / reply_to_current directive）逐条对应。
+
+**版本考古（同一套已验证方法）：** 精确匹配 `"Assistant Output Directives"` 这个章节标题——论文提交时版本（2026.3.8）、2026-03-25、2026-04-01、2026-04-08 都**不存在**，2026-04-15 **首次出现**（缩小到 **2026-04-08~04-15 这一周**，比 Execution Bias 的 04-15~04-30 窗口更早，两者很可能是同一批系统提示词重构改动的一部分）。
+
+**论文提交时的对应内容是完全不同、更简单的 `## Reply Tags` 章节**（`src/agents/system-prompt.ts:109`，March 版本）：
+```
+## Reply Tags
+To request a native reply/quote on supported surfaces, include one tag in your reply:
+- Reply tags must be the very first token in the message (no leading text/newlines): [[reply_to_current]] your reply.
+- [[reply_to_current]] replies to the triggering message.
+- Prefer [[reply_to_current]]. Use [[reply_to:<id>]] only when an id was explicitly provided...
+```
+
+**关键差异（推测的具体歧义机制）：** March 版本的"Reply Tags"章节，开篇就明确框定为"**如果**你想请求原生回复/引用"（"To request a native reply/quote..."）——显式说明这是一个**按需触发的可选功能**。June 版本的"Assistant Output Directives"把 reply 标记、MEDIA 附件、语音提示三件不同的事合并成一个章节，标题也从"Reply Tags"（暗示"这是关于回复标记的"）改成"Output Directives"（听起来像"这是所有输出都要遵守的规则"），**去掉了 March 版本那句明确的"仅在需要时才触发"的条件框定**。对一个已经表现出"过度自我检查倾向"的模型（跟 Execution Bias 那次同一类问题）来说，这种表述上从"可选功能说明"变成"看起来像强制检查清单"的转变，足以诱发"每次回复前都要挨条验证是否需要 MEDIA/语音/引用标记"这种不收敛的循环。
+
+**结论（供后续汇报参考）：**
+1. **"决策犹豫循环"这个大类问题，目前已确认至少来自 3 个独立的、论文提交后新增的 OpenClaw 系统提示词内容**：Execution Bias 章节的工具调用格式歧义（已修复）、Assistant Output Directives 章节的输出指令核对歧义（这次新发现，尚未修复）、以及数学应用题反复自我重述 / 纯 token 退化这两类目前认为更可能是 Qwen3-Thinking 本身固有倾向、不是 OpenClaw 版本问题的模式
+2. **Execution Bias 和 Assistant Output Directives 大概率是同一次系统提示词重构（2026-04-08~04-30 之间）的两个部分**，只删了前者、没处理后者，导致这次撞上了后者
+3. **context overflow 死循环这个根因已确认修复有效**（0 次复现），这次的 42 次失败是纯粹的、跟 context overflow 无关的独立诱因
+4. **批次污染→自我强化这个机制被反复验证不是 context overflow 独有的**，任何能让某个 session 连续卡住的诱因都会触发同样的训练级联损害，这是这套异步训练流水线的一个结构性脆弱点，逐个修具体诱因的性价比在下降
+
+**待处理（用户已知晓，待决定优先级）：**
+1. 是否要用跟 execution-bias-fix 完全一样的方法（改内容层，去掉/改写会诱发歧义的具体表述）处理 Assistant Output Directives 章节
+2. 是否要额外加一层"训练数据批次污染拦截"（不管诱因是什么，识别到某个 session 异常占比某一批训练数据就不提交），作为对未知/未来新诱因的通用兜底，之前讨论过、用户当时倾向先治具体诱因，现在有了两次独立诱因分别导致同样级联损害的实证，可以重新评估这个方案的优先级
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
