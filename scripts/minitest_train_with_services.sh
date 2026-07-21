@@ -346,6 +346,13 @@ PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
 bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
 cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
+# Patch write/edit 工具选择指引，理由同 train_with_services.sh 同名代码块的
+# 完整说明。
+echo "生成并部署 write/edit 工具选择指引补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+PATCHED_WRITE_EDIT_DIR="${LOGS_DIR}/patched-write-edit-guidance"
+bash "${SCRIPTS_DIR}/prepare_patched_write_edit_guidance.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_WRITE_EDIT_DIR}"
+cp "${PATCHED_WRITE_EDIT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+
 # Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，理由同
 # train_with_services.sh 同名代码块的完整说明。
 echo "生成并部署 cli-compaction 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"

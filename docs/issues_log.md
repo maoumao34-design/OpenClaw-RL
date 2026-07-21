@@ -1342,6 +1342,42 @@ grep -rl "Attach media in the final visible reply" /usr/lib/node_modules/opencla
 
 **待验证：** 服务器上对真实部署文件跑一次补丁脚本确认锚点命中（未完成，下一步）；重新提交训练后，确认（a）`openclaw-rl-cli-compaction-patch` 确认日志真实出现，（b）"假完成声明"这类样本的发生率是否显著下降（这次基线对照：`20260716_182012` 2.4%、`20260717_171106` 2.1%、本次修复前 `20260720_165444` 达到 14.3%~40.5%，取决于统计口径）。
 
+**更新（部署到真实训练验证）：** run `20260721_122947` 部署此补丁后，debug 日志显示 `cli_budget` 触发的 `outcome=failed reason=already_compacted_recently` 依然会发生（冷却期机制本身没变），但**这次 HTTP 响应正常成功，不再是 internal error**——确认补丁按预期生效：不是消除了压缩冷却期，是让命中这个已知原因时不再污染整个回合。
+
+---
+
+## [2026-07-21] 假完成声明的第二个独立诱因：write 工具误用（模型用整体覆盖代替追加，丢失文件结构）
+
+**背景：** 部署 cli-compaction 补丁重新提交训练（run `20260721_122947`）后，用户发现即使补丁生效、回合不再被污染成 internal error，仍有大量题目的 homework 文件内容异常——不是空的，而是**"Problem:"和"Solution:"这两行标题完全丢失，只剩纯解答段落**。扫描 0-25 题发现 14/26（53.8%）都是这种情况，比例远超预期。
+
+**排查过程：**
+
+1. **排除"Student 把改风格和写入合并成一条消息"这个初始假设**：手工核对多个案例发现，即使 Student 严格分两条消息发（Problem 2 完全遵守官方协议），依然会出现同样的结构丢失，两者无必然关联，之前的假设不成立。
+
+2. **用真实 session 文件（不是对话文本）找到确凿证据**：`/root/.openclaw/agents/main/sessions/<id>.jsonl` 里直接记录了真实工具调用——`{"toolName":"write", "content":[{"text":"Successfully wrote 49 bytes to ..."}]}`。**模型在收到"追加到文件末尾、不要覆盖"的明确要求时，实际调用的是 `write`（整体覆盖），不是 `edit`（精确文本替换/追加）**，而且模型自己的推理原文显示它知道任务要求"不要覆盖"，只是工具选错了——不是撒谎，是真实的工具选择错误。
+
+3. **确认 PRM 打分大概率不会惩罚这类错误**：`write` 执行后返回 `"Successfully wrote N bytes..."`——这正好命中 PRM judge 评分规则里"a tool returns a successful, non-error result → 正分"这一条（`openclaw_opd_api_server.py:159` `_build_prm_eval_prompt`）。判官看到的"下一状态"只是这条通用成功文本，没有任何信息能让它分辨"选对了工具"和"选错了工具但工具本身执行成功"。
+
+4. **用户质疑（关键）：** "论文实验的时候不可能是这样的，不然怎么可能得出正确结果，是不是我们自己的脚本或 OpenClaw 版本设置有没发现的问题？" ——这个质疑推动了后续更严谨的排查，没有停留在"论文方法固有缺陷"这个结论上。
+
+5. **确认 OpenClaw 没有专门的"追加"工具**：只有 `write`（整体覆盖）和 `edit`（精确文本替换）两个文件写入工具，`edit` 要做"追加"必须精确匹配文件末尾原有内容作为 `oldText`，比 `write` 难用得多——但版本考古确认这不是这次改写丢失的东西，March 快照（`git grep '"append"' march_2026_3_8`）里同样没有专门的追加工具，这个设计限制一直都在。
+
+6. **查到真正的 OpenClaw 自身 bug：`promptGuidelines` 接线错误**。`write.ts` 本身带了一条 `promptGuidelines: ["Use write only for new files or complete rewrites."]`，意图是提醒模型别把 write 当追加用。但 `buildSystemPrompt()` 有两条分支：只有"默认/合成"分支才会把 `promptGuidelines` 渲染进提示词；生产环境的 `embedded-agent-runner` 永远走另一条分支（`buildConfiguredAgentSystemPrompt` 自己拼好整份提示词），从不读取这个字段——项目自己的测试 `sdk.test.ts:301-346` 甚至直接断言了这个"计算了但不渲染"的行为。这条本该生效的安全提示，从未真正传到过模型面前。
+
+7. **查上游第三方包排除"这是论文原始条件"的可能**：论文提交时 OpenClaw 锁定的 `@mariozechner/pi-coding-agent` 确切版本是 `0.57.1`（`package.json` 精确读到）。用 unpkg.com 直接读取这个确切版本的 `dist/core/tools/write.js`/`edit.js` 源码确认：**`write` 的描述文字跟现在完全一样，而且这个版本压根没有 `promptGuidelines` 机制**——说明这不是"OpenClaw 弄丢了上游的安全提示"，是 OpenClaw 自己后来想加这个机制、但接线接错了。`edit` 工具的模糊匹配兜底（`fuzzyFindText`）在两个版本里都存在，不是被去掉的东西。
+
+8. **结论（诚实说明证据边界）：** `promptGuidelines` 接线错误是真实存在、可验证的 OpenClaw bug，但因为上游包在论文提交时也从没提供过这条指引，不能用"恢复论文原始条件"来证明这就是这次问题的（唯一）根因——这次没能像前四个诱因那样找到一句"就是这行代码变了"的干净证据。选择先做实测验证，而不是直接下结论。
+
+**验证（debug 级别诊断，真实模型）：** 手动把这条指引文本直接插入正在运行的诊断环境的 system-prompt bundle，重启网关，重跑一次完全相同的失败场景（读文件不写→分开发送改风格请求→明确要求追加不覆盖）。**结果：这次真实 session 文件显示工具调用序列变成了 `read`→`edit`（不是 `write`），最终文件内容正确保留了"Problem:"/"Solution:"结构、答案被正确追加**。n=1，但是一次干净的正向验证。
+
+**修复：** 新脚本 `scripts/prepare_patched_write_edit_guidance.sh`，在 `buildConfiguredAgentSystemPrompt` 拼装 `lines` 数组时（`buildAssistantOutputDirectivesSection(...)` 调用点后面）插入一段"## File Editing"章节，明确说明修改已有文件应该用 `edit`、`write` 只用于新文件或真正的完全重写。**这个补丁跟前四个性质不同**：不是恢复论文原始条件（上游包当时也没有这条指引），是修复 OpenClaw 自己一个想加但没接对线的安全机制，范围刻意保持窄（只加一句明确指引，不改写其他工具描述或行为）。
+
+**技术细节（复合补丁的顺序问题）：** 这个补丁和 Assistant Output Directives 补丁改的是**同一个 bundle 文件**（`system-prompt-config-CLAPATdy.js`）。如果沿用其他补丁"共享 `.orig-unpatched` 备份"的约定，后跑的补丁会基于"两者都还没打"的原始备份重新生成，把先跑的那个补丁的改动覆盖掉。改成用独立命名的备份文件（`.orig-unpatched-write-edit-guidance`），让它在自己第一次运行时把"当时 live 文件的样子"（此时应该已经包含 Assistant Output Directives 的改动）当作自己的基准，两个补丁才能正确叠加而不是互相覆盖。本地测试专门验证过这个复合场景。
+
+**已接入：** 三个训练脚本，部署顺序紧跟在 system-prompt output-directives 补丁之后、cli-compaction 补丁之前。
+
+**待验证：** 服务器上对真实部署文件跑一次补丁脚本确认锚点命中；重新提交训练后，统计"结构丢失"这类样本的实际发生率是否显著下降（修复前 0-25 题里 53.8%）。
+
 ---
 
 <!-- 格式模板：

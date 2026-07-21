@@ -353,6 +353,27 @@ PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
 bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
 cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
+# Patch 同一个 system-prompt bundle，补上一条"修改已有文件优先用 edit、
+# 不要用 write"的明确指引——OpenClaw 自己的 write.ts 本来就带了一条
+# promptGuidelines（"Use write only for new files or complete rewrites"），
+# 但这个字段只在 buildSystemPrompt() 的"默认/合成"分支里才会被渲染进提示词，
+# 生产环境的 embedded-agent-runner 走的是另一条分支（自己拼好整份提示词），
+# 从不读取 promptGuidelines，导致这条本该生效的安全提示从未真正传到过模型
+# 面前（官方自己的测试 sdk.test.ts:301-346 甚至断言了这个"计算了但不渲染"
+# 的行为）。已用真实 debug 级别诊断确认：不打这个补丁时，模型收到"追加、
+# 不要覆盖"的要求会调用 write（整体覆盖，丢失原文件结构）；打上这句指引后，
+# 同样场景模型改为调用 read+edit（正确追加，结构完整保留）。这个补丁比较
+# 特殊——上游第三方包（论文提交时锁定的确切版本 0.57.1）也从没提供过这条
+# 提示，所以这不是"恢复论文原始条件"，是修复 OpenClaw 自己一个想加但接线
+# 接错了的安全机制，见 scripts/prepare_patched_write_edit_guidance.sh 顶部
+# 完整说明、docs/issues_log.md 2026-07-21 条目。这个补丁和上面的
+# Assistant Output Directives 补丁改的是同一个 bundle 文件，用了独立命名
+# 的备份文件（避免互相覆盖），设计上可以正确叠加，详见该脚本内注释。
+echo "生成并部署 write/edit 工具选择指引补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+PATCHED_WRITE_EDIT_DIR="${LOGS_DIR}/patched-write-edit-guidance"
+bash "${SCRIPTS_DIR}/prepare_patched_write_edit_guidance.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_WRITE_EDIT_DIR}"
+cp "${PATCHED_WRITE_EDIT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+
 # Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，让它在遇到
 # "Already compacted" 时不再无条件抛错、污染一个本已成功完成的回合。这套
 # cli_budget 压缩机制论文提交时完全不存在（2026-03-08 快照里搜不到任何

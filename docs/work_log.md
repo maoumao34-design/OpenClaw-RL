@@ -679,6 +679,22 @@
 **主要问题：**
 - 之前一度怀疑是论文 PRM 打分方法本身的固有缺陷（reward hacking），用户明确反对这个结论、坚持要求查清楚是不是我们环境跟论文不一致——最终证明用户判断正确，是 OpenClaw 版本漂移引入的新 bug，不是论文方法缺陷
 
+### 部署 cli-compaction 补丁重新提交训练，发现第五类问题：write 工具误用
+
+**完成内容：**
+- 清理上次训练残留进程（同样的 sglang scheduler 子进程问题，`ps aux | grep "openclaw gateway"` 因为真实进程名是 `openclaw-gateway`（无空格）一直搜不到，改按 PID 精确定位后清理干净）
+- 部署 cli-compaction 补丁重新提交训练（run `20260721_122947`），确认补丁生效（`already_compacted_recently` 依然触发但不再污染回合响应）
+- 用户要求继续扫描后续题目，发现新模式：0-25 题里 14/26（53.8%）的 homework 文件"Problem:"/"Solution:"标题完全丢失，只剩纯解答段落——排除"Student 合并指令"这个初始假设（Problem 2 严格分开发送依然中招），改查真实 session 文件（`.jsonl`）里的工具调用记录，**直接证实模型在"追加不要覆盖"的明确要求下调用的是 `write`（整体覆盖），不是 `edit`**
+- 确认 PRM 打分规则里"工具返回成功、非报错结果"这一条会给 `write` 的"Successfully wrote N bytes"直接判正分，没有能力分辨"选对工具"和"选错工具但执行成功"
+- 用户关键质疑："论文实验不可能有这个问题，是不是我们环境跟论文不一致"——推动进一步排查而非停留在"论文方法固有缺陷"
+- 确认 OpenClaw 没有专门的追加工具（只有整体覆盖的 write 和精确匹配替换的 edit），版本考古确认这不是丢失的东西——查了论文提交时锁定的确切上游包版本（`@mariozechner/pi-coding-agent@0.57.1`，从 unpkg.com 直接读取当时源码），从来没有专门追加工具，`edit` 的模糊匹配兜底在两版本里都存在
+- 找到真实的 OpenClaw 自身 bug：`write.ts` 带的 `promptGuidelines`（"仅用于新文件或完全重写"）因为 `buildSystemPrompt()` 的分支问题，在生产环境的 `embedded-agent-runner` 里从未被渲染进提示词——但同一次版本考古也确认上游包在论文提交时也没有这个机制，所以不能证明这就是"恢复论文条件"，诚实标注证据边界
+- 用真实 debug 诊断直接验证假设（不是先部署再看结果）：手动把这句指引插入运行中的诊断环境，重跑相同失败场景，**确认 session 文件里工具调用从 write 变成了 read+edit，文件结构正确保留** → [`issues_log.md`](issues_log.md) 2026-07-21 条目（含完整版本考古与验证记录，供答辩参考）
+- 修复：`prepare_patched_write_edit_guidance.sh`，在同一个 system-prompt bundle 里补一段"## File Editing"指引。技术上需要处理跟 Assistant Output Directives 补丁共享同一 bundle 文件的顺序问题（用独立命名的备份文件避免互相覆盖，本地测试过复合场景）。已接入三个训练脚本
+
+**主要问题：**
+- 我提出"补上这句指引能解决问题"时理由不够扎实（先说是恢复论文条件，实际上游包也没有这个机制），用户直接追问"为什么你认为这能解决"——纠正为"这是一个值得尝试的假设，需要先实测验证"，不能把推测包装成结论说给用户听
+
 ---
 
 ## 当前状态（2026-07-21）
@@ -693,7 +709,8 @@
 - [x] "503 崩溃"根因（`submission_enabled` 暂停窗口 + 重试预算过短）+ 修复（`--max-retries 8`）：**已用真实训练数据验证生效**
 - [x] "决策犹豫循环"诱因二：context overflow 死锁（`agent-session.ts` "Already compacted"，`run.ts` 入口）+ 修复（`prepare_patched_embedded_agent_overflow_recovery.sh`）：**已用真实训练数据验证 0 次复现**
 - [x] "决策犹豫循环"诱因三：Assistant Output Directives 章节 + 修复（`prepare_patched_system_prompt_output_directives.sh`）：本地测试通过，已接入三训练脚本，**真实训练效果待验证**
-- [x] 假完成声明根因：同一个"Already compacted"报错的第二入口（`cli-compaction.ts` 的 `cli_budget` 预压缩检查）+ 修复（`prepare_patched_cli_compaction.sh`）：**已用真实 debug 诊断确认根因机制，本地测试通过，服务器部署+真实训练效果待验证**
+- [x] 假完成声明根因一：同一个"Already compacted"报错的第二入口（`cli-compaction.ts` 的 `cli_budget` 预压缩检查）+ 修复（`prepare_patched_cli_compaction.sh`）：**已用真实训练数据验证生效**（run `20260721_122947`，internal error 不再出现）
+- [x] 假完成声明根因二：`write` 工具误用（模型用整体覆盖代替追加）+ 修复（`prepare_patched_write_edit_guidance.sh`）：**已用真实 debug 诊断验证生效（n=1，工具调用从 write 变为 read+edit），本地测试通过，服务器部署+真实训练效果待验证**
 
 ### 已知限制 / 未解决
 - 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后），任何未来新出现的、能让某个 session 连续卡住的诱因都可能再次触发同样的训练级联损害
@@ -701,18 +718,19 @@
 - **8GPU 正式训练从未真正保存过 checkpoint**（`--save-interval 100`，历次任务在崩溃前都没跑到过第 100 步），每次任务提交都是从 base 模型重新开始
 - workspace 的 2GB 配额区在"GPU 空闲→平台自动回收→重启"后会静默回滚到上次保存的快照
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
+- write/edit 工具选择指引补丁只用真实 debug 诊断验证过一次（n=1），真实训练下的实际改善幅度还需要观察
 
 ### 下一步
-1. 服务器上对真实部署文件跑一次 cli-compaction 补丁脚本，确认锚点命中
-2. 重新提交训练，验证 cli-compaction 补丁 + Assistant Output Directives 修复的实际效果
-3. 确认已知诱因是否已覆盖"决策犹豫循环"大类问题的全部来源，还是仍有其他未发现的诱因
+1. 服务器上对真实部署文件跑一次 write/edit 指引补丁脚本，确认锚点命中
+2. 重新提交训练，验证两个新补丁（cli-compaction + write/edit 指引）叠加后的实际效果：假完成声明发生率、结构丢失发生率是否显著下降
+3. 确认已知诱因是否已覆盖"决策犹豫循环"/"假完成声明"两大类问题的全部来源，还是仍有其他未发现的诱因
 4. 视情况重新评估"训练数据批次污染拦截"这个通用兜底方案的优先级
 5. **（用户明确要求延后）** 调小 `--save-interval`；workspace 迁移到 `/dfs/data`；去掉 `run_init_phase()` 里无条件的 `rm -rf`
 
 ### 未验证
-- [ ] cli-compaction 补丁的服务器部署与真实训练效果
+- [ ] write/edit 工具选择指引补丁的服务器部署与真实训练效果
 - [ ] Assistant Output Directives 修复的实际效果
-- [ ] 是否还有其他未发现的决策犹豫循环诱因
+- [ ] 是否还有其他未发现的决策犹豫循环/假完成声明诱因
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
 ---
