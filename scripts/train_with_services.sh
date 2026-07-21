@@ -353,6 +353,26 @@ PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
 bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
 cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
+# Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，让它在遇到
+# "Already compacted" 时不再无条件抛错、污染一个本已成功完成的回合。这套
+# cli_budget 压缩机制论文提交时完全不存在（2026-03-08 快照里搜不到任何
+# "CLI transcript compaction"/"cli_budget" 相关代码，2026-06-09 已存在），
+# 命中同一个已知的 "Already compacted" 压缩冷却期报错时会在真实工具调用
+# 已经成功执行之后直接抛错，把回合的 HTTP 响应污染成 internal error——
+# 客户端据此重试，重试收到的"已经写好了"类回复其实是真话（真实工作已经在
+# 报错的那次尝试里完成了），不是模型撒谎。这是训练数据里出现"假完成声明"
+# 现象的真正根因，PRM 打分只看对话对象满不满意、不核实真实文件状态，把这种
+# 短促的"已完成"话术当正样本训练进去、逐渐过度泛化到真正没做的场景。见
+# scripts/prepare_patched_cli_compaction.sh 顶部完整说明、
+# docs/issues_log.md 2026-07-21 条目（含真实 debug 级别诊断证据）。这个
+# bundle 文件名是内容哈希命名的，OpenClaw 升级后会变化，补丁脚本找不到
+# 锚点会明确报错退出。
+echo "生成并部署 cli-compaction 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+CLI_COMPACTION_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/cli-compaction-B6C2IDnn.js"
+PATCHED_CLI_COMPACTION_DIR="${LOGS_DIR}/patched-cli-compaction"
+bash "${SCRIPTS_DIR}/prepare_patched_cli_compaction.sh" "${CLI_COMPACTION_LIVE_FILE}" "${PATCHED_CLI_COMPACTION_DIR}"
+cp "${PATCHED_CLI_COMPACTION_DIR}/cli-compaction-B6C2IDnn.js" "${CLI_COMPACTION_LIVE_FILE}"
+
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。
 #

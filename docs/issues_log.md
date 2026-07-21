@@ -1309,6 +1309,41 @@ grep -rl "Attach media in the final visible reply" /usr/lib/node_modules/opencla
 
 ---
 
+## [2026-07-21] 假完成声明（模型声称已写入文件但实际未写入）根因定位与修复
+
+**背景：** run `20260720_165444`（Assistant Output Directives 修复后重新提交的训练）里，用户发现 Student 明确要求"把答案追加到 homework/N.txt"后，OpenClaw 回复"文件已经更新/已经包含答案"，但实际检查发现文件完全是空的（`Solution:` 后面没有任何内容）。部分案例（如 Problem 45 Turn 1）模型自己贴出的文件内容本身就是空的，却仍然宣称"already contains the solution... Homework completed!"，自相矛盾。
+
+**排查过程（逐步排除，最终定位到真正机制）：**
+
+1. **确认不是我们自己编排逻辑的 bug**：Student 模拟器判定完成的整套逻辑（`STUDENT_SYSTEM_PROMPT`、`DONE_SENTINEL` 判断）是 100% 官方原文（`openclaw-test/student_chat.py`），我们的补丁只改了 `"model": "default"` 这一个字段。官方系统提示词原文本身就是"Student 只听 policy 自己怎么说、没有任何独立核实手段"（`"After the AI says it saved the file, say exactly: HOMEWORK_DONE"`）。
+
+2. **确认训练奖励信号也是官方设计**：`openclaw_opd_api_server.py:159` 的 `_build_prm_eval_prompt`（PRM 判官系统提示词，未被我们的补丁修改）打分标准是"下一句话对方满不满意"（"the user moves on, says thanks... or a tool returns a successful, non-error result"），完全不核实真实文件状态。
+
+3. **用户提出关键质疑：** "论文实验结果显示是不会这样的，肯定是我们有地方和论文实验不一致才会导致这样的结果，问题应该在 OpenClaw 的回复本身——没有真正写入不应该回复一个看起来不错的回复才对。" 这个方向对，之前查错了地方——查的是"官方设计有没有漏洞"（有，但这不能解释为什么*这次*突然大规模爆发），应该查的是"OpenClaw 现在的行为是不是让没真正写入的情况下、回复文本本身就已经写得像真完成了"。
+
+4. **静态查代码/系统提示词排除了几个假设**：搜了 `system-prompt.ts` 有没有鼓励简短确认式回复（emoji/checkmark 风格）的指引，没找到；已知的 Execution Bias 章节其实要求"最终答案必须有证据"，方向相反，不是解释。
+
+5. **改用真实的 debug 级别诊断，拿到确凿证据（而不是继续猜测）**：单独起一个 `--log-level debug` 的 OpenClaw 网关（先后尝试指向外部 Simulator API——失败，外部服务不支持 tool_choice=auto；最终起了一个独立的 sglang server 直接加载真实 Qwen3-4B-Thinking 模型），手动模拟"读文件不写→要求追加"这个跟真实失败案例完全一致的两轮对话。
+
+   **结果：文件被真实、正确地写入了**（`Solution: 4`），**但两次 HTTP 请求都收到了 `{"error":{"message":"internal error"}}`**。debug 日志显示确切原因：
+   ```
+   [compaction-diag] ... trigger=cli_budget ... outcome=failed reason=already_compacted_recently
+   ```
+
+6. **定位真正机制**：`already_compacted_recently` 是 `compact-reasons.ts` 里对 `"already compacted"` 文本的分类结果——**这就是之前已经修过的那个"Already compacted"硬报错（`agent-session.ts` 的 manual-mode compact() 守卫，2026-05-15~06-01 加入），只是这次撞的是一个之前没覆盖到的第二入口**：`src/agents/command/cli-compaction.ts`（`"cli_budget"` 触发的预压缩检查，是 CLI 回合处理流程里的常规内务维护，在真实生成/工具调用完成**之后**才跑）。这个文件在两处（`nativeOutcome.failureReason`、`contextOutcome.failureReason`）命中任何压缩失败原因时都**无条件直接抛错**，不像我们已经修过的 `run.ts` overflow-recovery 路径那样有优雅降级分支。
+
+7. **版本考古确认这套 `cli_budget` 压缩机制本身也是论文提交后新加的**：`git show march_2026_3_8:src/agents/command/cli-compaction.ts` 报路径不存在；`git grep "CLI transcript compaction\|cli_budget" march_2026_3_8` 全仓库零匹配；`june_2026_6_9` 快照已经存在（文件头注释"CLI turn compaction lifecycle"）。落在跟另外三个诱因相同的"论文提交后系统性重构"窗口内。
+
+8. **完整因果链条**：真实工具调用成功执行（文件确实写对了）→ 回合处理流程末尾的 `cli_budget` 预压缩检查撞上"Already compacted"冷却期 → 无条件抛错，把这个回合的 HTTP 响应污染成 `internal error` → `student_chat.py` 的 `send_to_openclaw()` 收到异常后自动重试 → 重试重新发送同一条"请追加"指令 → 但此时文件已经在第一次（响应报错但真正执行成功）的尝试里写好了，所以重试收到的"已经写好了"回复是**真话**，不是模型撒谎，只是客户端从来没看到第一次真正成功的那个响应（那个响应本该带着 `Successfully wrote N bytes` 这类确凿的工具调用确认，但半路因为压缩冷却期报错丢失了）→ PRM 只看"对方满不满意"，这种简短的"already done"回复只要 student 不追问就判定正分 → 训练逐渐强化这种话术，直到过度泛化到真正什么都没做的场景（如 Problem 45 Turn 1，读到空文件就直接套用同一套"already done"话术）。
+
+9. **全面排查确认没有第三个入口**：搜了整个 `src/agents/` 目录下所有跟"压缩失败后要不要抛错"相关的生产代码（排除测试文件），确认只有 `cli-compaction.ts` 这两处会无条件抛错；`compact.ts` 里的其他 throw 是认证失败/sandbox cwd 校验，跟这次无关；`compact.ts` 本身的 `fail()` 辅助函数对压缩失败是优雅返回 `{ok:false}` 而不抛错；`agent-session.ts:1837` 是这个报错的源头本身，不是需要修的"决策点"。
+
+**修复：** 新脚本 `scripts/prepare_patched_cli_compaction.sh`，沿用之前几次的补丁模式（`.orig-unpatched` 幂等备份、python3 heredoc 按锚点定位、marker 幂等检测、锚点计数校验）。两处 `throw new Error(...)` 都改成：先判断 `failureReason` 是否包含 `"Already compacted"`，是则记一条警告日志、跳过压缩继续正常返回（不抛错，不让本已成功的回合被这个内务维护步骤污染）；其他任何压缩失败原因维持原样抛错，不是无差别抑制所有压缩失败报错。本地用真实贴出的 bundle 片段测试通过（语法校验、锚点唯一性）。已接入三个训练脚本，部署顺序紧跟在 system-prompt output-directives 补丁之后。
+
+**待验证：** 服务器上对真实部署文件跑一次补丁脚本确认锚点命中（未完成，下一步）；重新提交训练后，确认（a）`openclaw-rl-cli-compaction-patch` 确认日志真实出现，（b）"假完成声明"这类样本的发生率是否显著下降（这次基线对照：`20260716_182012` 2.4%、`20260717_171106` 2.1%、本次修复前 `20260720_165444` 达到 14.3%~40.5%，取决于统计口径）。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

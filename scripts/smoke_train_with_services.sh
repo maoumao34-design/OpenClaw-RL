@@ -268,6 +268,14 @@ launch_openclaw_gateway() {
     bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
     cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
+    # Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，理由同
+    # train_with_services.sh 同名代码块的完整说明。
+    echo "生成并部署 cli-compaction 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+    CLI_COMPACTION_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/cli-compaction-B6C2IDnn.js"
+    PATCHED_CLI_COMPACTION_DIR="${LOGS_DIR}/patched-cli-compaction"
+    bash "${SCRIPTS_DIR}/prepare_patched_cli_compaction.sh" "${CLI_COMPACTION_LIVE_FILE}" "${PATCHED_CLI_COMPACTION_DIR}"
+    cp "${PATCHED_CLI_COMPACTION_DIR}/cli-compaction-B6C2IDnn.js" "${CLI_COMPACTION_LIVE_FILE}"
+
     # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，不知道
     # 真实的 contextWindow/maxTokens，会用过大的默认值请求 max_completion_tokens
     # （实测 178210），被 sglang 400 拒绝。显式声明，maxTokens 明显小于
