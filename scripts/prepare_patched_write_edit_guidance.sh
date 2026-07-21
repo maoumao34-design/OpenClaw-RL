@@ -4,6 +4,16 @@
 # existing files" guideline, working around a dead-code bug that silently drops this exact
 # guidance today.
 #
+# Update (2026-07-21, later same day): after deploying the first version of this guideline to
+# real training (run 20260721_152519), observed a residual failure mode even with the
+# guideline active -- the model correctly chose `edit` over `write`, but anchored its
+# `oldText` on a bare newline ("\n") when trying to insert into an initially-empty "Solution:"
+# section. A bare newline is not a unique match in a short file (edit requires oldText to
+# match exactly one location), so the edit call failed outright. Added a second guideline
+# sentence addressing this specific corner case: when the target region is empty/very short,
+# anchor oldText on enough of the preceding unique text (e.g. the "Solution:" line itself)
+# rather than on trivial whitespace alone.
+#
 # Root cause (see docs/issues_log.md, 2026-07-21 entries): OpenClaw ships a `write` tool
 # (always overwrites the whole file) and an `edit` tool (exact-text-replacement) but has NO
 # dedicated "append" tool -- confirmed by checking both the current OpenClaw source and the
@@ -162,7 +172,12 @@ insertion = (
     "brand-new files or when a full, intentional rewrite is requested. To add content to an "
     "existing file (e.g. appending an answer), use edit with the trailing existing text as "
     'oldText and that same text plus your addition as newText. Never use write to append '
-    'content -- it will erase everything already in the file.",\n'
+    'content -- it will erase everything already in the file. If the region you are inserting '
+    "into is empty or very short (e.g. a blank line right after a heading like `Solution:`), do "
+    "NOT anchor oldText on a bare newline or other trivial whitespace alone -- a bare newline is "
+    "not unique and the edit will fail. Instead include enough of the preceding unique text (e.g. "
+    "the full `Solution:` line itself) in oldText, and put that same text plus your new content "
+    'in newText, so the match is unambiguous.",\n'
     '""'
 )
 
