@@ -666,6 +666,13 @@
 
 **目标：** 定位"假完成声明"（模型声称已写入文件但实际未写入）的真正根因并修复
 
+**今日新增两个补丁（均已用真实数据/真实诊断验证生效，已接入正式训练）：**
+
+| 补丁 | 解决的问题 | 根因一句话 |
+|---|---|---|
+| `prepare_patched_cli_compaction.sh` | 训练里大量样本出现"模型声称已完成但实际没做"——本质是**回合已经真实执行成功，但响应被污染成报错**，客户端重试后看到的"已完成"其实是真话 | OpenClaw 论文提交后新加的 `cli_budget` 预压缩检查，命中一个已知的压缩冷却期报错时无条件抛错，把本已成功的回合打成 internal error |
+| `prepare_patched_write_edit_guidance.sh` | 大量 homework 文件"Problem:"/"Solution:"结构完全丢失，只剩纯解答段落 | 模型在"追加不要覆盖"的要求下调用了 `write`（整体覆盖）而不是 `edit`（追加）；OpenClaw 自己写了一条"别把 write 当追加用"的安全提示，但因为提示词组装代码的分支问题，这条提示从未真正传到过模型面前 |
+
 **完成内容：**
 - 用户指出关键方向：论文实验结果不会有这个问题，说明我们的复现环境跟论文原始条件有不一致，问题应该出在 OpenClaw 的回复本身——没有真正写入不应该让回复看起来像真完成了。之前查的方向（官方设计空白）能解释"这个漏洞为什么可以被利用"，但不能解释"为什么这次突然大规模爆发"，改成直接查 OpenClaw 现在的实际行为
 - 静态查 `system-prompt.ts` 排除了"有指引鼓励简短确认式回复"这个假设，没找到证据
@@ -695,6 +702,18 @@
 **主要问题：**
 - 我提出"补上这句指引能解决问题"时理由不够扎实（先说是恢复论文条件，实际上游包也没有这个机制），用户直接追问"为什么你认为这能解决"——纠正为"这是一个值得尝试的假设，需要先实测验证"，不能把推测包装成结论说给用户听
 
+### 两个新补丁接入训练脚本 + 重新提交（run `20260721_152519`）
+
+**完成内容：**
+- `prepare_patched_write_edit_guidance.sh` 正式接入三个训练脚本；本地测试补丁和 Assistant Output Directives 补丁共享同一 bundle 文件时的叠加顺序（独立命名备份文件，避免互相覆盖）
+- 首次重新提交因残留进程占用端口 30001（诊断测试用的临时 sglang server 忘记清理导致，`ray stop --force` 清不掉独立子进程，按 PID 手动清理后确认干净）
+- 第二次提交遇到偶发 SIGSEGV（Ray actor 启动阶段崩溃，跟 07-20 那次同类问题一样，重试即可，未深究）
+- 第三次提交后训练启动但 Student INIT 全部超时失败（`ECONNREFUSED`）——**排查发现是我自己的失误**：诊断调试时把 `openclaw.json` 里 sglang provider 的 `baseUrl` 改到了临时诊断端口（30001），诊断结束后忘记改回正式训练该用的端口（30000），且训练脚本本身的配置步骤不会重置这个字段（只改 `api`/`models`），导致这个残留配置一直生效
+- 修复 `baseUrl` 后第四次提交成功：**六个补丁全部确认部署（rl-training-headers、sglang execution-bias、embedded-agent overflow-recovery、system-prompt output-directives、write/edit 工具选择指引、cli-compaction），Problem 0/1 真实对话确认追加成功、"Problem:"/"Solution:"结构完整保留**
+
+**主要问题：**
+- 诊断测试用的临时配置改动（sglang baseUrl）没有在测试结束后及时复原，直接导致下一次正式训练启动失败——以后做类似的服务器端手动诊断，测试完必须显式核对/复原所有被临时改动过的配置项，不能只清理进程
+
 ---
 
 ## 当前状态（2026-07-21）
@@ -710,7 +729,7 @@
 - [x] "决策犹豫循环"诱因二：context overflow 死锁（`agent-session.ts` "Already compacted"，`run.ts` 入口）+ 修复（`prepare_patched_embedded_agent_overflow_recovery.sh`）：**已用真实训练数据验证 0 次复现**
 - [x] "决策犹豫循环"诱因三：Assistant Output Directives 章节 + 修复（`prepare_patched_system_prompt_output_directives.sh`）：本地测试通过，已接入三训练脚本，**真实训练效果待验证**
 - [x] 假完成声明根因一：同一个"Already compacted"报错的第二入口（`cli-compaction.ts` 的 `cli_budget` 预压缩检查）+ 修复（`prepare_patched_cli_compaction.sh`）：**已用真实训练数据验证生效**（run `20260721_122947`，internal error 不再出现）
-- [x] 假完成声明根因二：`write` 工具误用（模型用整体覆盖代替追加）+ 修复（`prepare_patched_write_edit_guidance.sh`）：**已用真实 debug 诊断验证生效（n=1，工具调用从 write 变为 read+edit），本地测试通过，服务器部署+真实训练效果待验证**
+- [x] 假完成声明根因二：`write` 工具误用（模型用整体覆盖代替追加）+ 修复（`prepare_patched_write_edit_guidance.sh`）：**已接入正式训练（run `20260721_152519`），Problem 0/1 真实数据确认追加成功、文件结构完整保留**
 
 ### 已知限制 / 未解决
 - 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后），任何未来新出现的、能让某个 session 连续卡住的诱因都可能再次触发同样的训练级联损害
@@ -718,17 +737,16 @@
 - **8GPU 正式训练从未真正保存过 checkpoint**（`--save-interval 100`，历次任务在崩溃前都没跑到过第 100 步），每次任务提交都是从 base 模型重新开始
 - workspace 的 2GB 配额区在"GPU 空闲→平台自动回收→重启"后会静默回滚到上次保存的快照
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
-- write/edit 工具选择指引补丁只用真实 debug 诊断验证过一次（n=1），真实训练下的实际改善幅度还需要观察
+- 两个新补丁目前只用少量样本（Problem 0/1 等）确认"没复发已知问题"，还没做过大规模统计（类似之前 0-25 题扫描）来量化实际改善幅度
 
 ### 下一步
-1. 服务器上对真实部署文件跑一次 write/edit 指引补丁脚本，确认锚点命中
-2. 重新提交训练，验证两个新补丁（cli-compaction + write/edit 指引）叠加后的实际效果：假完成声明发生率、结构丢失发生率是否显著下降
-3. 确认已知诱因是否已覆盖"决策犹豫循环"/"假完成声明"两大类问题的全部来源，还是仍有其他未发现的诱因
-4. 视情况重新评估"训练数据批次污染拦截"这个通用兜底方案的优先级
-5. **（用户明确要求延后）** 调小 `--save-interval`；workspace 迁移到 `/dfs/data`；去掉 `run_init_phase()` 里无条件的 `rm -rf`
+1. run `20260721_152519` 跑一段时间后，统计假完成声明 / 文件结构丢失的发生率，跟修复前基线对比（14/26=53.8% 结构丢失、14.3%~40.5% 假声明，取决于统计口径）
+2. 确认已知诱因是否已覆盖"决策犹豫循环"/"假完成声明"两大类问题的全部来源，还是仍有其他未发现的诱因
+3. 视情况重新评估"训练数据批次污染拦截"这个通用兜底方案的优先级
+4. **（用户明确要求延后）** 调小 `--save-interval`；workspace 迁移到 `/dfs/data`；去掉 `run_init_phase()` 里无条件的 `rm -rf`
 
 ### 未验证
-- [ ] write/edit 工具选择指引补丁的服务器部署与真实训练效果
+- [ ] 两个新补丁叠加后，假完成声明/结构丢失发生率的实际改善幅度（大规模统计）
 - [ ] Assistant Output Directives 修复的实际效果
 - [ ] 是否还有其他未发现的决策犹豫循环/假完成声明诱因
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
