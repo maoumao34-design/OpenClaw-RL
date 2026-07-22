@@ -880,6 +880,14 @@
 - 修复两处：(1) 加强复核提示措辞，明确加一句"这次不要回复 DONE_SENTINEL"；(2) **代码层兜底（关键）**：只要"有明确诊断 且 32B 复核仍包含哨兵词"，不管 API 是否调用成功，一律强制回退固定纠正模板，从代码层面保证哨兵词绝不可能泄漏成真实聊天消息，不依赖 32B 是否听从提示
 - 本地测试：三文件语法检查通过；用真实 Problem 1 场景（overwritten 诊断 + 模拟 32B 复核仍返回 `HOMEWORK_DONE`）复现修复前必然泄漏、修复后正确替换成固定模板；另两条分支（无诊断正确放行、API 异常兜底）验证无回归 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### 按用户要求：给 32B 的线索和兜底纠正模板都改成按诊断类型区分
+
+**完成内容：**
+- 用户提出：给 32B 的内部线索不该用"隐约感觉"这类模糊措辞，应该直接说清楚是被 overwrite 还是根本没写入；兜底纠正模板也不该三角色共用一句笼统话，应该按诊断类型分开
+- `_DIAGNOSIS_HINTS` 全部改写成直接陈述事实的版本（如"The original problem text ... was overwritten -- it's gone, replaced entirely by the new content"），但仍标注为"internal note"，外层仍要求 32B 转述成自然、不提技术细节的角色内追问，只是喂给模型的输入更明确
+- `patch_file()` 的 `correction_template: str` 参数改成 `correction_templates: dict`（按 `overwritten`/`not_written`/`mismatch` 区分）+ `generic_correction_template: str`（仅用于"无诊断但 API 调用失败"这个边界情况）；运行时用 `_CORRECTION_TEMPLATES.get(_diagnosis, _GENERIC_CORRECTION_TEMPLATE)` 选择，顺带修好一个此前遗漏的边界情况——原来"有诊断但 API 异常"也只会用笼统模板，现在会用诊断专属消息
+- 本地测试：三文件语法检查通过；6 个场景（overwritten/not_written/mismatch 各自选中专属模板、无诊断+API异常落回通用模板、无诊断+正确 DONE 保持不变）全部符合预期，且确认 TA/Teacher 正确套用了各自目录名和措辞 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -889,7 +897,7 @@
 - [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
-- [x] **Student/TA/Teacher 会话级文件核验（v3 + 泄漏兜底修复）**：诊断确定性 + 32B 复核纠正消息/独立风格判断，且已修复"复核仍说 DONE_SENTINEL 时哨兵词泄漏成聊天消息"这个真实生产 bug（代码层强制兜底，不依赖提示是否被听从），本地逻辑测试通过，服务器真实部署待验证
+- [x] **Student/TA/Teacher 会话级文件核验（v3 + 泄漏兜底修复 + 诊断专属线索/模板）**：诊断确定性 + 32B 复核纠正消息/独立风格判断，已修复"复核仍说 DONE_SENTINEL 时哨兵词泄漏成聊天消息"这个真实生产 bug（代码层强制兜底，不依赖提示是否被听从），给 32B 的内部线索和兜底纠正消息均已改成按 overwritten/not_written/mismatch 分别定制（不再是笼统措辞），本地逻辑测试通过，服务器真实部署待验证
 
 ### 已知限制 / 未解决
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认

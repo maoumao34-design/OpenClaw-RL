@@ -99,6 +99,16 @@ _WHITESPACE_RE = re.compile(r"\\s+")
 
 _DIAGNOSIS_HINTS = {hints}
 
+# Diagnosis-specific fixed correction messages, used only as a safety-net
+# fallback (32B recheck call raised an exception, or -- despite the
+# instruction not to -- still echoed DONE_SENTINEL after a real diagnosis).
+# Keyed by diagnosis code so the fallback message actually names what's
+# wrong instead of a generic "something's off" -- overwritten and
+# not-written are different failure modes and deserve different asks.
+_CORRECTION_TEMPLATES = {templates}
+
+_GENERIC_CORRECTION_TEMPLATE = {generic}
+
 
 def _normalize_for_compare(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip().lower()
@@ -210,7 +220,8 @@ def patch_file(
     run_fn_call_anchor,
     done_check_anchor,
     msg_var,
-    correction_template,
+    correction_templates,
+    generic_correction_template,
 ):
     src_path = f"{src_dir}/{filename}"
     dest_path = f"{dest_dir}/{filename}"
@@ -240,7 +251,12 @@ def patch_file(
             f"in {filename}, found {text.count(sentinel_line)} (openclaw-test "
             "script may have changed upstream -- re-verify this patch)"
         )
-    helpers = HELPERS_TEMPLATE.format(marker=marker, hints=repr(hints))
+    helpers = HELPERS_TEMPLATE.format(
+        marker=marker,
+        hints=repr(hints),
+        templates=repr(correction_templates),
+        generic=repr(generic_correction_template),
+    )
     text = text.replace(sentinel_line, sentinel_line + helpers, 1)
 
     # 3. Thread an optional extra_instruction param into generate_*_message,
@@ -296,7 +312,6 @@ def patch_file(
             f"(openclaw-test script may have changed upstream -- re-verify this patch):\n"
             f"{done_check_anchor!r}"
         )
-    fallback_msg = correction_template.format(homework_dir=homework_dir)
     new_check = (
         f'if DONE_SENTINEL in {msg_var}:\n'
         f'            _diagnosis = _diagnose_homework_file(\n'
@@ -316,7 +331,7 @@ def patch_file(
         f'                print(f"  [warn] re-check call failed ({{_e}}), falling back to fixed correction message")\n'
         f'                _recheck_msg = None\n'
         f'            if _recheck_msg is None or (_diagnosis and DONE_SENTINEL in _recheck_msg):\n'
-        f'                _recheck_msg = {fallback_msg!r}.format(index=problem_index)\n'
+        f'                _recheck_msg = _CORRECTION_TEMPLATES.get(_diagnosis, _GENERIC_CORRECTION_TEMPLATE).format(index=problem_index)\n'
         f'            if _diagnosis is None and DONE_SENTINEL in _recheck_msg:\n'
         f'                print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file + re-check verified, {marker})")\n'
         f'                return True\n'
@@ -346,21 +361,15 @@ def patch_file(
     print(f"patched -> {dest_path}")
 
 
-CORRECTION_TEMPLATE = (
-    "Wait, that doesn't look right -- I don't think it actually got saved "
-    "correctly. Can you check the file {homework_dir}/{{index}}.txt again "
-    "and make sure it's really there?"
-)
-
 patch_file(
     filename="student_chat.py",
     done_sentinel="HOMEWORK_DONE",
     homework_dir="homework",
     role_label="Student",
     hints={
-        "overwritten": "You have a nagging feeling the original problem text might have gotten wiped out somehow when the file was last saved.",
-        "not_written": "You're not sure anything actually got saved to the file at all.",
-        "mismatch": "What's in the file doesn't seem to match what the AI showed you a moment ago.",
+        "overwritten": "The original problem text in your homework file was overwritten -- it's gone, replaced entirely by the new content. Point out that the problem statement itself seems to have disappeared and ask the AI to restore it along with the answer.",
+        "not_written": "Nothing was actually saved to the homework file -- it's exactly the same as before, no new content was added at all. Point out that nothing seems to have changed and ask the AI to actually save it this time.",
+        "mismatch": "The content that got saved doesn't match what the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
     },
     generate_fn_name="generate_student_message",
     generate_fn_anchor=(
@@ -387,7 +396,16 @@ patch_file(
         '            return True'
     ),
     msg_var="student_msg",
-    correction_template=CORRECTION_TEMPLATE,
+    correction_templates={
+        "overwritten": "Wait, I think the original problem text in homework/{index}.txt got overwritten -- can you check and restore it, then add the answer back in without deleting it this time?",
+        "not_written": "Wait, I don't think anything actually got saved to homework/{index}.txt -- can you check and make sure the answer is really written to the file this time?",
+        "mismatch": "Wait, what's in homework/{index}.txt doesn't look like what you just showed me -- can you double check what actually got saved?",
+    },
+    generic_correction_template=(
+        "Wait, that doesn't look right -- I don't think it actually got saved "
+        "correctly. Can you check the file homework/{index}.txt again and make "
+        "sure it's really there?"
+    ),
 )
 
 patch_file(
@@ -396,9 +414,9 @@ patch_file(
     homework_dir="homework1",
     role_label="TA",
     hints={
-        "overwritten": "You have a nagging feeling the student's original solution might have gotten wiped out somehow when the file was last saved.",
-        "not_written": "You're not sure your grading comments actually got saved to the file at all.",
-        "mismatch": "What's in the file doesn't seem to match the grading comments the AI showed you a moment ago.",
+        "overwritten": "The student's original solution in the homework file was overwritten -- it's gone, replaced entirely by the new content. Point out that the student's original submission seems to have disappeared and ask the AI to restore it along with the grading comments.",
+        "not_written": "Nothing was actually saved to the homework file -- your grading comments never got added, the file is exactly the same as before. Point out that nothing seems to have changed and ask the AI to actually save your comments this time.",
+        "mismatch": "The content that got saved doesn't match the grading comments the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
     },
     generate_fn_name="generate_ta_message",
     generate_fn_anchor=(
@@ -425,7 +443,16 @@ patch_file(
         '            return True'
     ),
     msg_var="ta_msg",
-    correction_template=CORRECTION_TEMPLATE,
+    correction_templates={
+        "overwritten": "Wait, I think the student's original solution in homework1/{index}.txt got overwritten -- can you check and restore it, then add your grading comments back in without deleting it this time?",
+        "not_written": "Wait, I don't think your grading comments actually got saved to homework1/{index}.txt -- can you check and make sure they're really written to the file this time?",
+        "mismatch": "Wait, what's in homework1/{index}.txt doesn't look like the grading comments you just showed me -- can you double check what actually got saved?",
+    },
+    generic_correction_template=(
+        "Wait, that doesn't look right -- I don't think it actually got saved "
+        "correctly. Can you check the file homework1/{index}.txt again and make "
+        "sure it's really there?"
+    ),
 )
 
 patch_file(
@@ -434,9 +461,9 @@ patch_file(
     homework_dir="homework2",
     role_label="Teacher",
     hints={
-        "overwritten": "You have a nagging feeling the student's work and the TA's grading might have gotten wiped out somehow when the file was last saved.",
-        "not_written": "You're not sure your comments actually got saved to the file at all.",
-        "mismatch": "What's in the file doesn't seem to match the comments the AI showed you a moment ago.",
+        "overwritten": "The student's work and the TA's grading in the homework file were overwritten -- they're gone, replaced entirely by the new content. Point out that the student's work and grading seem to have disappeared and ask the AI to restore them along with your comments.",
+        "not_written": "Nothing was actually saved to the homework file -- your comments never got added, the file is exactly the same as before. Point out that nothing seems to have changed and ask the AI to actually save your comments this time.",
+        "mismatch": "The content that got saved doesn't match the comments the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
     },
     generate_fn_name="generate_teacher_message",
     generate_fn_anchor=(
@@ -463,7 +490,16 @@ patch_file(
         '            return True'
     ),
     msg_var="teacher_msg",
-    correction_template=CORRECTION_TEMPLATE,
+    correction_templates={
+        "overwritten": "Wait, I think the student's work and the TA's grading in homework2/{index}.txt got overwritten -- can you check and restore them, then add your comments back in without deleting anything this time?",
+        "not_written": "Wait, I don't think your comments actually got saved to homework2/{index}.txt -- can you check and make sure they're really written to the file this time?",
+        "mismatch": "Wait, what's in homework2/{index}.txt doesn't look like the comments you just showed me -- can you double check what actually got saved?",
+    },
+    generic_correction_template=(
+        "Wait, that doesn't look right -- I don't think it actually got saved "
+        "correctly. Can you check the file homework2/{index}.txt again and make "
+        "sure it's really there?"
+    ),
 )
 PY
 

@@ -1695,6 +1695,31 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] 用户要求：给 32B 的线索和兜底纠正模板都改成按诊断类型区分，不再用笼统措辞
+
+**背景：** 上一条泄漏 bug 修复后，用户提出：给 32B 模型的内部线索（`_DIAGNOSIS_HINTS`）应该更清楚地直接说明是"被 overwrite 了"还是"实际没写入"，不要用含糊的措辞；兜底用的固定纠正模板（`_GENERIC_CORRECTION_TEMPLATE`，此前是三角色共用同一句"Wait, that doesn't look right..."）也应该按诊断类型分开，而不是统一用一句笼统的话。
+
+**改动 1：`_DIAGNOSIS_HINTS` 措辞从"模糊的直觉描述"改成"直接陈述事实"。**
+
+- 修改前（Student 举例）：`"overwritten": "You have a nagging feeling the original problem text might have gotten wiped out somehow when the file was last saved."`——用"隐约感觉"这种间接措辞包装，本身可能让 32B 也搞不清楚具体发生了什么，从而生成的追问不够有针对性。
+- 修改后：`"overwritten": "The original problem text in your homework file was overwritten -- it's gone, replaced entirely by the new content. Point out that the problem statement itself seems to have disappeared and ask the AI to restore it along with the answer."`——直接陈述发生了什么、该让模型问什么。**这个线索本身仍标注为"internal note, not shown to the AI"，`_build_recheck_instruction` 外层仍然要求 32B 把这个线索转述成自然的、不提技术细节的角色内追问**（"don't mention files, systems, or verification directly"这条约束不变）——只是喂给 32B 的内部输入更明确，输出给 OpenClaw 的措辞仍然保持自然口语化。TA/Teacher 的 `overwritten`/`not_written`/`mismatch` 三类线索同理都改成了直接陈述句，替换了原本"nagging feeling"/"not sure"这类间接措辞。
+
+**改动 2：兜底纠正模板从"三角色共用一句笼统话"改成"按诊断类型分开、按角色定制"。**
+
+- `patch_file()` 参数从单一的 `correction_template: str` 改成 `correction_templates: dict[str, str]`（键为 `overwritten`/`not_written`/`mismatch`）+ `generic_correction_template: str`（仅用于"无诊断但 API 调用失败"这个边界情况，即诊断本身没查出具体问题、只是复核调用本身出了技术故障时的兜底）。
+- 运行时选择逻辑：`_recheck_msg = _CORRECTION_TEMPLATES.get(_diagnosis, _GENERIC_CORRECTION_TEMPLATE).format(index=problem_index)`——如果 `_diagnosis` 有值且在字典里能查到，用该诊断类型专属的消息；否则（`_diagnosis` 是 `None`，对应无诊断+API失败的边界情况）落回通用兜底。**这也顺带修好了一个此前遗漏的边界情况**：原来"有诊断但 API 调用异常（`_recheck_msg is None`）"这条路径此前只会用同一句笼统模板；现在即使是 API 失败，只要诊断本身是确定的，也能用诊断专属的消息，不再退化成笼统措辞。
+- 三角色各自的诊断专属模板举例（Student）：`"overwritten"` → `"Wait, I think the original problem text in homework/{index}.txt got overwritten -- can you check and restore it, then add the answer back in without deleting it this time?"`；`"not_written"` → `"Wait, I don't think anything actually got saved to homework/{index}.txt -- can you check and make sure the answer is really written to the file this time?"`；`"mismatch"` → `"Wait, what's in homework/{index}.txt doesn't look like what you just showed me -- can you double check what actually got saved?"`。TA/Teacher 同结构，替换目标目录（`homework1`/`homework2`）和措辞（"student's original solution"/"grading comments"/"student's work and the TA's grading"/"comments"）。
+
+**实现细节：** `_CORRECTION_TEMPLATES`/`_GENERIC_CORRECTION_TEMPLATE` 通过 `HELPERS_TEMPLATE.format(marker=..., hints=repr(hints), templates=repr(correction_templates), generic=repr(generic_correction_template))` 以 `repr()` 形式嵌入生成文件的模块级常量（跟 `_DIAGNOSIS_HINTS` 同样的机制），`{index}` 占位符在这层是单层大括号（不需要像早期 `CORRECTION_TEMPLATE.format(homework_dir=...)` 那样做双层转义），因为 homework_dir 现在直接作为字面量写死在每个角色各自的模板字符串里（不再走生成时的 `.format(homework_dir=...)` 替换），`{index}` 完整保留到生成文件运行时由 `.format(index=problem_index)` 一次性替换，逻辑比原来的 `fallback_msg` 更直接。
+
+**本地测试：** 对真实官方文件重跑补丁脚本，三文件 `py_compile` 语法检查全部通过；抽取生成文件里的 `_CORRECTION_TEMPLATES`/`_GENERIC_CORRECTION_TEMPLATE`/`_DIAGNOSIS_HINTS` 单独测试 6 个场景：overwritten+复核仍泄漏哨兵词→选中 overwritten 专属模板；not_written+API异常→选中 not_written 专属模板；mismatch+复核仍泄漏→选中 mismatch 专属模板；无诊断+API异常→落回通用模板；无诊断+复核正确说 DONE→原样不变、正常放行；`_DIAGNOSIS_HINTS` 三类文本确认不再含"nagging feeling"这类模糊措辞——全部符合预期，且验证了 TA/Teacher 生成的模板正确套用了各自的目录名（`homework1`/`homework2`）和措辞（未混用 Student 的文案）。
+
+**接入：** 无需改动训练脚本——同 `prepare_openclaw_test_scripts.sh` 的既有接入方式，三个训练入口自动生效。
+
+**待验证：** 服务器真实部署跑一次，确认按诊断类型区分后的线索是否让 32B 复核阶段的追问更具体、更有针对性；确认按诊断类型区分的兜底纠正消息（万一 32B 仍不配合）是否比此前的笼统消息更能引导 4B 策略模型（尤其是 overwritten 场景下明确提示"先复原再补充"）真正诊断后正确修复。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
