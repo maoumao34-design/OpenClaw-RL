@@ -130,6 +130,11 @@ bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLA
 PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
 bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
 
+# 2026-07-22（临时诊断，见 issues_log.md 同日条目，train_with_services.sh 同日注释）：
+# 加一行调试日志确认 PRM eval turn 编号对应的具体内容，不影响训练逻辑。
+PATCHED_COMBINE_SELECT_DIR="${LOGS_DIR}/patched-openclaw-combine-select"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_combine_select.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_SELECT_DIR}"
+
 echo ""
 echo "============================================================"
 echo "  OpenClaw-RL PRE-TEST (5 GPU) — 8GPU 正式训练前置验证"
@@ -256,6 +261,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   USE_WANDB="${USE_WANDB:-1}" \
   OPENCLAW_TOPK_SELECT_SCRIPT="${MINITEST_TOPK_SELECT_SCRIPT}" \
   PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
+  PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   bash "${MINITEST_TOPK_SELECT_LAUNCHER}" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

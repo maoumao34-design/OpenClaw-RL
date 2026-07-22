@@ -1768,6 +1768,35 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] v4 部署后真实数据验证：诊断专属纠正消息有效，但顺带发现两个新问题——策略模型全程用 write 不用 edit、以及"write 动作本身有没有被正确扣分"无法从现有日志精确定位
+
+**背景：** workspace 迁移部署后，用户重新提交训练（run `20260722_163352`），观察 v4（诊断分支跳过 32B、直接给出具体缺失内容）机制真实效果。
+
+**好消息：v4 修复本身在真实数据上验证有效。** Problem 0-4 全部命中同样的模式——第 3 轮 append 时都丢了 `Solution:` 标签（诊断 `overwritten`），这次纠正消息里带了具体缺失内容后，**4B 策略模型全部在下一轮（第 4 轮）一次性正确修复**，第 5 轮确认完成——5/5 全部一次修复成功，跟此前 Problem 8/9 反复 5 轮失败（10/10）形成鲜明对比，证实"给具体缺失内容比给模糊提示有效"这个方向是对的。
+
+**新发现 1：策略模型全程只用 `write`，从未用过 `edit`（用户主动追问，已用真实工具调用数据证实）。**
+- 用真实 session trajectory 文件（`/root/.openclaw/agents/main/sessions/<uuid>.trajectory.jsonl`）核实：`grep -o '"name":"[a-zA-Z_]*"'` 统计发现，几乎所有工具名（含 `edit`）出现次数都精确等于 8（每次请求里工具目录声明本身的次数，不代表真的被调用），只有 `read`（19次）和 `write`（13次）明显超出这个基线——说明这两个才是真被调用的工具，`edit` 一次真实调用都没有
+- 进一步核实两次真实 `write` 调用参数：第一次（Turn 3，问题动作）`content` 只有答案文本，`Problem:`/`Solution:` 全部丢了；第二次（Turn 4，"修好"那次）`content` 是完整的 `Problem:\n...\n\nSolution:\n\n<答案>`——**两次都是整体覆盖，第二次能"修好"只是因为纠正消息把原文整段喂给了它，让它抄回去重新整体写入，不是它学会了用 `edit` 做局部修改**
+- 讨论结论：不能给策略模型加"该用 edit 不要用 write"这类工具选择指引（此前已经因为"给策略模型开外挂"这条原则撤销过一次同类补丁）。真正该起作用的应该是奖励信号——如果这个"丢内容"的 write 动作本身被 PRM 正确扣分，训练多轮后模型应该自己摸索出规避这个错误的办法（不管是换用 edit 还是把 write 写得更完整），不该由我们指定路径
+
+**新发现 2：无法从现有日志精确定位"哪个 PRM turn 编号对应哪次真实 write 动作"，暴露一个可观测性缺口。**
+- 尝试直接在 `training.log` 里核对 Problem 0 这次 write 动作对应的 PRM 分数：发现 4 轮真实对话（问题→改风格→append(坏写入)→纠正(好写入)）对应了 5 个 PRM turn 编号（1-5），数量本身对不上，且日志里 turn 出现顺序是乱的（异步并发打分，不按 turn 顺序落盘）
+- 尝试按"一次工具调用会拆成两次真正的模型请求（决定调用 write + 工具执行完后生成确认回复）"这个假设重新映射：turn=3（votes=[1,1,1]，score=1.0）大概率对应"决定调用 write"这个动作本身，turn=4（votes=[-1,-1,0]，score=-1.0）大概率对应"生成确认回复"这一步（其 next_state 是后续的纠正消息，触发 PRM"用户要求纠正=-1"规则）——turn=3 的满分特征（`[1,1,1]`）与本项目最早发现 Problem 11 时的信号完全吻合（write 覆盖却拿到 `[1,1,1]`），支持"reward blindness 依然存在、真正做错事的 write 动作本身没被罚，被罚的是隔壁那轮确认回复"这个推测
+- 但这个映射是靠"turn 数量差异 + 投票特征模式匹配"间接推出来的，不是直接证据；尝试用 trajectory 文件里的唯一 ID（`responseId`/toolCall `id`）去 `training.log` 里反查，确认这些 ID 完全不出现在 training.log 里——**现有日志缺一个能把"PRM turn 编号"和"具体消息内容"直接对上号的公共标识，这个映射目前没法 100% 坐实**
+
+**处理方式：新增一个纯诊断性质的补丁（不改变任何训练/奖励逻辑，只加一行日志），用于后续训练直接读出精确映射：**
+- 新建 `scripts/prepare_patched_openclaw_combine_select.sh`：给 `openclaw-combine/openclaw_combine_select_api_server.py`（真正做每轮打分决策的 `_opd_evaluate()` 所在文件，此前一直没打过补丁、直接引用官方目录）加一行调试日志，紧挨着已有的 `PRM eval session=... turn=N ... eval_score=X` 那行，把这个 turn 真正打分用的 `turn_data["response_text"]`（这一轮的动作内容）和 `next_state_text`（next_state）各截取一小段打出来
+- `run_openclaw_topk_select_modelfactory.sh` 的 PYTHONPATH 拼接加一个 `PATCHED_COMBINE_SELECT_DIR` 前缀（跟现有 `PATCHED_OPD_DIR` 完全同样的接入模式），三个训练脚本统一改：生成这个新补丁 + 把 `PATCHED_COMBINE_SELECT_DIR` 传给训练 job 环境变量
+- 明确标注为**临时诊断补丁**，一旦不再需要确认这类映射，可以直接停止生成/接入，不影响任何已有功能（这个补丁本身不修复任何问题，只加可观测性）
+
+**本地测试：** 新补丁脚本对真实官方文件跑通，生成结果 `python3 -m py_compile` 语法检查通过，人工核对生成的调试日志代码块位置和内容正确；`run_openclaw_topk_select_modelfactory.sh` 的 PYTHONPATH 补丁对真实官方 topk-select 启动脚本跑通（本地用 `PYTHONUTF8=1` 规避 Windows 默认编码问题，不影响服务器 Linux 环境），生成结果里 `PATCHED_OPD_DIR`/`PATCHED_COMBINE_SELECT_DIR` 两个前缀均正确插入，且用 bash 参数展开语法验证了"两个变量都设置"和"两个变量都不设置"两种情况下 PYTHONPATH 值都正确（不设置时完全等价于原始未打补丁的行为）；三个训练脚本 + 新补丁脚本 + launcher 补丁脚本 `bash -n` 语法检查全部通过。
+
+**接入：** 三个训练脚本均已改，下次提交训练自动生效。
+
+**待验证：** 服务器真实部署跑一次，确认新的 `[openclaw-rl-debug-turn-content]` 日志行真实出现在 training.log 里，且内容能让"PRM turn 编号 → 具体动作"这个映射直接读出来，不用再猜；用这份精确数据验证"write 覆盖的动作本身是否被正确扣分"这个此前无法坐实的推测。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

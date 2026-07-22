@@ -118,6 +118,11 @@ bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLA
 PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
 bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
 
+# 2026-07-22（临时诊断，见 issues_log.md 同日条目，train_with_services.sh 同日注释）：
+# 加一行调试日志确认 PRM eval turn 编号对应的具体内容，不影响训练逻辑。
+PATCHED_COMBINE_SELECT_DIR="${LOGS_DIR}/patched-openclaw-combine-select"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_combine_select.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_SELECT_DIR}"
+
 echo ""
 echo "============================================================"
 echo "  OpenClaw-RL SMOKE TEST (4 GPU) — NOT production training"
@@ -412,6 +417,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   USE_WANDB="${USE_WANDB:-1}" \
   PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
+  PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   bash "${SMOKE_TOPK_SELECT_LAUNCHER}" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

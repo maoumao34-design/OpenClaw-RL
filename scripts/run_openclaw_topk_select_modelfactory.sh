@@ -113,11 +113,21 @@ text = text.replace(old_ray, new_ray, 1)
 # `import openclaw_opd_api_server` resolves to the patched copy. See
 # scripts/prepare_patched_openclaw_opd.sh for why (rl-training-headers
 # X-Session-Id fallback). No-op when PATCHED_OPD_DIR is unset.
+#
+# PATCHED_COMBINE_SELECT_DIR (optional, set by caller, temporary diagnostic):
+# same mechanism, for a patched openclaw_combine_select_api_server.py ahead
+# of the official openclaw-combine/ -- adds one debug log line per PRM eval
+# turn showing the actual response_text/next_state_text used to compute that
+# turn's score, so turn->content mapping can be read directly instead of
+# guessed. See scripts/prepare_patched_openclaw_combine_select.sh. No-op
+# when PATCHED_COMBINE_SELECT_DIR is unset; safe to stop wiring this in once
+# no longer needed for debugging.
 old_pythonpath = (
     '\\"PYTHONPATH\\": \\"${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
 )
 new_pythonpath = (
     '\\"PYTHONPATH\\": \\"${PATCHED_OPD_DIR:+${PATCHED_OPD_DIR}:}'
+    '${PATCHED_COMBINE_SELECT_DIR:+${PATCHED_COMBINE_SELECT_DIR}:}'
     '${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
 )
 if old_pythonpath not in text:

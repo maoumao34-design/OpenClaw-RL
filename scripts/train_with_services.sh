@@ -133,6 +133,13 @@ bash "${SCRIPTS_DIR}/prepare_openclaw_test_scripts.sh" "${REPO_ROOT}" "${OPENCLA
 PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
 bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
 
+# 2026-07-22（临时诊断，见 issues_log.md 同日条目）：PRM eval 日志只打了
+# turn 编号和分数，没打具体是哪句话打的分，没法确认"哪个 turn 编号对应哪个
+# 真实动作"。加一行调试日志，不影响任何训练逻辑，确认不再需要时可以直接
+# 停止生成/接入这个补丁。
+PATCHED_COMBINE_SELECT_DIR="${LOGS_DIR}/patched-openclaw-combine-select"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_combine_select.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_SELECT_DIR}"
+
 # =====================================================================
 # conda
 # =====================================================================
@@ -247,6 +254,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
+  PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

@@ -906,6 +906,15 @@
 - 新建 `/dfs/data/openclaw-rl-project/runtime/` 目录（跟 `logs/` 语义对称），内部按跟 `logs/` 相同的时间戳分 run；三训练脚本统一改：`WORKSPACE` 指向 `runtime/<run_id>/workspace`，`openclaw config set agents.defaults.workspace` 每次启动前强制覆盖，`OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_WORKSPACE` 两个环境变量同步设置，`rm -rf` 清理逻辑因引用变量无需改动
 - 本地测试：三脚本语法检查通过，diff 核对改动范围精确（4 处改动 × 3 脚本）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### v4 部署后真实数据验证：修复本身有效，但发现"全程用 write 不用 edit"+"write 动作打分无法精确定位"两个新问题，加调试补丁
+
+**完成内容：**
+- workspace 迁移部署后重新提交训练，v4 修复验证有效：Problem 0-4 全部命中"append 时丢 Solution: 标签→给具体缺失内容→下一轮一次性修复"，5/5 全部成功，跟此前 Problem 8/9 的 10/10 失败形成鲜明对比
+- 用户追问"是不是没用 edit 一直用 write"：用真实 session trajectory 文件核实工具调用次数（`edit` 出现次数精确等于工具目录声明基线值，代表零次真实调用；`read`/`write` 明显超出基线，代表真实被调用），确认策略模型全程只用 `write` 整体覆盖，两次真实调用（丢内容的坏写入 + 靠纠正消息喂原文抄回去的"修复"）都不是 `edit`——讨论后确认不能给策略模型加工具选择指引（此前已否），该起作用的是奖励信号本身
+- 尝试核实"这个丢内容的 write 动作有没有被 PRM 正确扣分"：发现 4 轮真实对话对应 5 个 PRM turn 编号（数量对不上，且异步乱序落盘），按"一次工具调用拆两次模型请求"假设重新映射后，turn=3（`[1,1,1]`，score=1.0，跟 Problem 11 历史信号完全吻合）很可能就是那个 write 动作本身、依然被打了满分——但这个映射靠间接证据推出，尝试用 trajectory 里的唯一 ID 反查 training.log 未找到，无法 100% 坐实
+- 新增纯诊断补丁 `scripts/prepare_patched_openclaw_combine_select.sh`：给此前从未打过补丁的 `openclaw_combine_select_api_server.py`（真正做打分决策的文件）加一行调试日志，把每个 turn 实际打分用的 response_text/next_state_text 也打出来；`run_openclaw_topk_select_modelfactory.sh` 的 PYTHONPATH 加 `PATCHED_COMBINE_SELECT_DIR` 前缀（跟现有 `PATCHED_OPD_DIR` 同模式），三训练脚本统一接入。明确标注为临时诊断，不影响任何训练逻辑，不再需要时可直接停用
+- 本地测试：新补丁对真实官方文件跑通、`py_compile` 通过；launcher 补丁对真实官方脚本跑通，PYTHONPATH 两种取值场景（设置/不设置）均验证正确；全部脚本语法检查通过 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -915,10 +924,13 @@
 - [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
-- [x] **Student/TA/Teacher 会话级文件核验（v4：诊断分支跳过 32B、直接给出具体缺失内容）**：诊断确定性判断保留；诊断出确定性问题（overwritten/not_written）时完全跳过 32B 复核，直接用确定性诊断专属模板，`overwritten` 消息里直接附上 session 开始时的文件原文快照，不再依赖 32B 是否配合；32B 独立复核只保留在"无诊断、纯风格判断"分支（此前验证工作正常）。本地逻辑测试通过（含真实 Problem 8 场景复现），服务器真实部署待验证
+- [x] **Student/TA/Teacher 会话级文件核验（v4：诊断分支跳过 32B、直接给出具体缺失内容）**：**已用真实数据验证生效**——Problem 0-4 全部在给出具体缺失内容后下一轮一次性正确修复（5/5），对比此前 Problem 8/9 的 10/10 失败
 - [x] **workspace 从 `/root` 迁到 `/dfs/data/openclaw-rl-project/runtime/<run_id>/workspace`**：`agents.defaults.workspace`（openclaw.json，优先级高于环境变量）每次启动前强制覆盖 + `OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_WORKSPACE` 双环境变量同步，三训练脚本统一改，本地语法检查通过，服务器真实部署待验证
+- [x] **PRM turn 内容调试补丁**（`prepare_patched_openclaw_combine_select.sh`，临时诊断）：给 `openclaw_combine_select_api_server.py` 加一行日志，打出每个 turn 实际打分用的 response_text/next_state_text，本地测试通过，服务器真实部署待验证
 
 ### 已知限制 / 未解决
+- **新发现：策略模型全程只用 `write` 整体覆盖，从未用过 `edit`**（真实 session trajectory 工具调用数据证实）——不打算给策略模型加工具选择指引（开外挂），依赖奖励信号本身引导，但奖励信号是否真的在起作用还未坐实（见下一条）
+- **新发现：write 覆盖动作本身是否被 PRM 正确扣分尚未坐实**——间接证据（turn 数量、投票特征）支持"reward blindness 依然存在、真正做错事的 write 动作没被罚、罚的是隔壁那轮确认回复"这个推测，但无法从现有日志 100% 确认，已加调试补丁（见上）等下次训练数据验证
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
 - 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后）
 - 数学应用题反复自我重述 / 纯 token 退化，仍认为更可能是模型固有倾向，未做版本考古严格验证
@@ -926,16 +938,16 @@
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 提交（git commit + push）v4（诊断分支跳过 32B + 具体缺失内容）修复，服务器 `git pull`
+1. 提交（git commit + push）PRM turn 内容调试补丁，服务器 `git pull`
 2. 停掉当前 run，清理残留 GPU 进程，重新提交训练
-3. 重点观察 Problem 8/9 这类真实 overwritten 场景：这次纠正消息直接给出了缺失的具体内容（如 `Solution:` 标签），4B 策略模型能不能借此真正完成一次正确的"先复原、再补充"，而不是像之前那样反复自信宣称修好却始终漏掉同一处细节
+3. 确认新的 `[openclaw-rl-debug-turn-content]` 日志真实出现，用它精确核对"write 覆盖动作本身有没有被正确扣分"这个悬而未决的问题
 4. 观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
 5. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
 6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
-- [ ] v4 文件核验补丁（诊断分支跳过 32B、直接给出具体缺失内容）在服务器真实部署上的实际效果，尤其是 4B 策略模型这次能否借助具体内容真正诊断后改对
+- [ ] PRM turn 内容调试补丁在服务器真实部署上的实际效果——能否精确定位"write 覆盖动作本身的分数"
 - [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
 - [ ] workspace 迁到 `/dfs/data` 后 `agents.defaults.workspace` 真的按新路径生效（服务器日志核实）；此前记录的"GPU 空闲回收重启后 workspace 静默回滚到快照"这个风险在新路径下是否真的不再出现（需要一次真实的空闲/重启周期才能验证）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
