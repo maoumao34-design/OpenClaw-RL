@@ -873,6 +873,13 @@
 - 定案 v3 方案：诊断（`_diagnose_homework_file` 返回 `overwritten`/`not_written`/`mismatch`/`None`）继续 100% 确定性；检测到 DONE_SENTINEL 统一走一次复核——有诊断只给 32B 自然语气线索（不展示文件内容），结果不能推翻"未完成"这个硬结论；无诊断才展示新增内容（不含标签/已有内容）让 32B 独立复核风格，只有这条路径它说完成才算数。复用现有 `generate_*_message` 函数加 `extra_instruction` 可选参数，API 失败 fallback 回退固定模板
 - 本地测试：三文件语法检查通过；`_diagnose_homework_file` 对真实 Problem 0 场景 + 原 A/C/D 三场景全部返回正确诊断码；复核提示文本人工核对符合"不展示标签/只展示新增内容"的设计 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### v3 部署后再发现新 bug：复核仍说 DONE_SENTINEL 时哨兵词原样泄漏成聊天消息，已修复
+
+**完成内容：**
+- 用户重新提交训练（run `20260722_134555`）：Problem 0/2/3 全部顺利走完"诊断→复核→独立判断→放行"正常路径，验证了 v3 主流程本身没问题；Problem 1 正确复现"诊断出 overwritten → 拒绝放行"这条硬规则确实生效——但暴露出设计遗漏：32B 复核回复若仍只是原样 `HOMEWORK_DONE`（没听从"用自己的话自然追问"的指令），代码没做任何检查就把这句话直接当成 `student_msg` 发给 OpenClaw，导致哨兵词字面量泄漏成一条没头没尾的聊天消息，OpenClaw 顺势回复"作业已保存"，后续 4B 模型在被污染的上下文里彻底无法产出有意义内容，剩余轮次全部空转到 `max_turns`，真正的问题从未被实际提出或修复——这也直接说明用户此前悬而未决的问题（"4B 模型诊断出问题后能不能真的改对"）这次根本没被测试到
+- 修复两处：(1) 加强复核提示措辞，明确加一句"这次不要回复 DONE_SENTINEL"；(2) **代码层兜底（关键）**：只要"有明确诊断 且 32B 复核仍包含哨兵词"，不管 API 是否调用成功，一律强制回退固定纠正模板，从代码层面保证哨兵词绝不可能泄漏成真实聊天消息，不依赖 32B 是否听从提示
+- 本地测试：三文件语法检查通过；用真实 Problem 1 场景（overwritten 诊断 + 模拟 32B 复核仍返回 `HOMEWORK_DONE`）复现修复前必然泄漏、修复后正确替换成固定模板；另两条分支（无诊断正确放行、API 异常兜底）验证无回归 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -882,7 +889,7 @@
 - [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
-- [x] **Student/TA/Teacher 会话级文件核验（v3）**：诊断确定性 + 32B 复核纠正消息/独立风格判断，本地逻辑测试通过，服务器真实部署（含真实 32B Simulator 复核调用）待验证
+- [x] **Student/TA/Teacher 会话级文件核验（v3 + 泄漏兜底修复）**：诊断确定性 + 32B 复核纠正消息/独立风格判断，且已修复"复核仍说 DONE_SENTINEL 时哨兵词泄漏成聊天消息"这个真实生产 bug（代码层强制兜底，不依赖提示是否被听从），本地逻辑测试通过，服务器真实部署待验证
 
 ### 已知限制 / 未解决
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
@@ -892,16 +899,16 @@
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 提交（git commit + push）v3 核验机制，服务器 `git pull`
-2. 停掉当前 run，用 v3 版本重新提交训练
-3. 确认 Silent Reply Policy 补丁 + v3 文件核验补丁在真实部署文件上锚点命中、`extra_instruction` 真的影响了 32B 的复核回复
-4. 观察 Problem 0 这类真实 write 覆盖场景，这次借助更具体的线索能不能真正引导模型改对；观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
+1. 提交（git commit + push）泄漏兜底修复，服务器 `git pull`
+2. 停掉当前 run，清理残留 GPU 进程，重新提交训练
+3. 确认 Silent Reply Policy 补丁 + v3 文件核验补丁（含泄漏兜底）在真实部署文件上锚点命中、`extra_instruction` 真的影响了 32B 的复核回复，且哨兵词不再泄漏成聊天消息
+4. 观察 Problem 1 这类真实 write 覆盖场景，这次 4B 模型收到真正可用的纠正请求后，能不能真正学会诊断后正确修复（复原+改对），而不是在污染对话里空转；观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
 5. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
 6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`；workspace 迁移到 `/dfs/data`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
-- [ ] v3 文件核验补丁在服务器真实部署文件（含真实 32B Simulator 复核调用）上的实际效果，尤其是能否真正引导模型改对
+- [ ] v3 文件核验补丁（含泄漏兜底修复）在服务器真实部署文件（含真实 32B Simulator 复核调用）上的实际效果，尤其是 4B 策略模型诊断后能否真正改对
 - [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 

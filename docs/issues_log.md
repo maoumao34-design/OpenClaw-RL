@@ -1677,6 +1677,24 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] v3 部署后真实数据发现新 bug：复核仍说 DONE_SENTINEL 时原样泄漏成聊天消息，导致后续轮次卡死
+
+**背景：** 部署 v3（诊断+32B复核）后用户重新提交训练（run `20260722_134555`）。Problem 0/2/3 全部顺利走完"诊断→（无问题）→复核→32B 独立判断→放行"的正常路径，证明主流程本身没问题；Problem 1 正确复现了"诊断出 overwritten → 拒绝放行"这条硬规则本身也生效——但用户贴出 Problem 1 第 5-8 轮真实日志，发现了 v3 设计遗漏的一个边界情况。
+
+**根因：** `_diagnosis="overwritten"`（确定有问题）分支下，复核提示只是"建议"32B 别再说 `HOMEWORK_DONE`，没有代码层面的强制保证。当 32B 复核回复仍然只是原样的 `"HOMEWORK_DONE"`（没听从提示、忽略了让它自然提出质疑的指令）时，硬规则虽然正确阻止了 `return True`（session 没有被错误判定完成），但代码把 `_recheck_msg` 不做任何检查地直接赋值给 `student_msg`——**导致字面量哨兵词 `"HOMEWORK_DONE"` 被当作一条真实对话内容发给 OpenClaw**。OpenClaw 收到这个没头没尾的"HOMEWORK_DONE"后自然地回复"作业已经成功保存！"，之后 32B 在这个被污染的对话上下文里彻底无法产出有意义的回复，剩余轮次（6-8）全是重复的"无需进一步操作"、"Final Answer"之类空转文本，最终耗尽 `max_turns` 收场，而真正的内容问题从未被实际提出或修复——这次真实数据也直接回应了用户此前提出的悬而未决的问题（"4B 模型诊断出问题后，真的能改对吗，需不需要先复原再 edit"）：这次 bug 导致这个问题根本没有被真正测试到，因为 4B 模型压根没收到一条能看懂的纠正请求。
+
+**修复（两处，均已完成）：**
+1. **加强复核提示措辞**（`_build_recheck_instruction` 的 `diagnosis` 分支）：在原有"用自己的话自然地问一句"指令后面明确加一句 `"Do NOT respond with {done_sentinel} this time -- something still needs to be checked, so just ask about it in your own words instead."`，提高 32B 真正给出自然追问、而不是重复哨兵词的概率。
+2. **代码层兜底（关键修复，防止哨兵词泄漏是硬保证，不依赖提示是否被听从）**：`patch_file()` 生成的 DONE_SENTINEL 处理块里，原本只有 `if _recheck_msg is None:` 才回退到固定纠正模板；改成 `if _recheck_msg is None or (_diagnosis and DONE_SENTINEL in _recheck_msg):`——只要"有明确诊断问题 且 32B 复核仍包含哨兵词"这个组合条件成立，不管 API 调用是否成功，一律强制回退到固定模板，确保哨兵词绝不可能作为真实聊天消息发给 OpenClaw。
+
+**本地测试：** 对真实官方文件重跑补丁脚本，三文件 `py_compile` 语法检查全部通过；用真实 Problem 1 场景（`initial_content` 含 "Problem:.../Solution:"，文件被覆写成纯答案，模拟 32B 复核仍返回 `"HOMEWORK_DONE"`）在本地复现了修复前必然泄漏、修复后被正确替换成固定模板这一行为；同时验证另外两条分支无回归——无诊断且复核正确说 DONE 时仍正常放行 session；API 调用异常时的 `None` 兜底路径不受影响。
+
+**接入：** 无需改动训练脚本——同 `prepare_openclaw_test_scripts.sh` 的既有接入方式，三个训练入口自动生效。
+
+**待验证：** 服务器真实部署跑一次，确认 Problem 1 这类真实 overwritten 场景下，32B 复核若仍不配合，不会再把哨兵词泄漏给 OpenClaw；后续轮次能否给出真正可用的纠正请求，让 4B 策略模型有机会真正学会诊断后正确修复（复原+改对），而不是在污染对话里空转到 `max_turns`。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

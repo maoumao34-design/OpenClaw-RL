@@ -183,7 +183,9 @@ def _build_recheck_instruction(diagnosis: str | None, new_content: str, done_sen
             f"(Internal note, not shown to the AI: {{hint}} Express this as a short, "
             "natural, in-character follow-up asking the AI to double check -- don't "
             "mention files, systems, or verification directly, just say what you'd "
-            "actually say if something felt off.)"
+            "actually say if something felt off. Do NOT respond with "
+            f"{{done_sentinel}} this time -- something still needs to be checked, "
+            "so just ask about it in your own words instead.)"
         )
     return (
         "(Internal note, not shown to the AI: here is exactly what was newly "
@@ -313,7 +315,7 @@ def patch_file(
         f'            except Exception as _e:\n'
         f'                print(f"  [warn] re-check call failed ({{_e}}), falling back to fixed correction message")\n'
         f'                _recheck_msg = None\n'
-        f'            if _recheck_msg is None:\n'
+        f'            if _recheck_msg is None or (_diagnosis and DONE_SENTINEL in _recheck_msg):\n'
         f'                _recheck_msg = {fallback_msg!r}.format(index=problem_index)\n'
         f'            if _diagnosis is None and DONE_SENTINEL in _recheck_msg:\n'
         f'                print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file + re-check verified, {marker})")\n'
