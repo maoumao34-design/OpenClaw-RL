@@ -11,23 +11,25 @@
 #      problem unless the target homework file was genuinely, correctly
 #      updated. The check never trusts the simulator's own claim of "done" --
 #      it always re-derives a fresh decision:
-#        - If the file is missing prior content, has no meaningful new
-#          content, or the new content doesn't match anything shown recently
-#          (a definite, deterministic diagnosis), the simulator is given a
-#          natural-language hint about *what* seems wrong (no raw file
-#          content shown -- there is nothing safe/meaningful to show in
-#          these broken states) and asked to phrase an in-character
-#          follow-up. This is a hard rule: no matter what the simulator says
-#          back, the session cannot be marked done on this path.
+#        - If the file is missing prior content or has no meaningful new
+#          content (a definite, deterministic diagnosis), the simulator
+#          sends a fixed, diagnosis-specific correction message directly --
+#          no 32B call. For "overwritten" specifically, the message includes
+#          the actual original file content (session-start snapshot) so the
+#          policy model is told exactly what needs to still be there, not
+#          just "something's wrong, check it" (real data showed the vague
+#          version left the policy re-guessing from memory and re-losing the
+#          same detail every retry -- see docs/issues_log.md, 2026-07-22).
+#          This is a hard rule: this path can never finalize the session.
 #        - Only if the deterministic check finds no problem does the
 #          simulator get shown the actual newly-written content (just the
 #          new portion, not the whole file with its Problem:/prior-content
 #          scaffolding, so pre-existing content can't distort a length/style
 #          judgment -- e.g. inflating a TA's perceived comment length) and
-#          asked to make one more independent judgment call (matching its
-#          own step-1 requirements, e.g. non-AI-like style for Student). Only
-#          in this branch can the simulator's own response actually finalize
-#          the session.
+#          asked to make one more independent judgment call via a real 32B
+#          call (matching its own step-1 requirements, e.g. non-AI-like
+#          style for Student). Only in this branch can the simulator's own
+#          response actually finalize the session.
 #
 # Why (see docs/issues_log.md, 2026-07-22 entries): the Student/TA/Teacher
 # simulator (external Qwen3-32B, base model, unmodified prompt, no sampling
@@ -43,13 +45,20 @@
 # *reward* for a turn does not stop the *session* from ending prematurely
 # and moving to the next problem with the task never actually completed --
 # these are two different mechanisms. This patch fixes the
-# session-continuation side. It went through two real-data-driven revisions
-# before landing here: v1 fingerprinted a *past reply* instead of the file's
-# actual new content and false-positived on a genuinely correct write
-# (fixed same day); v2 added a fixed generic correction message that proved
-# too vague for the policy to self-correct from, motivating this v3 design
-# where the simulator does the final judgment call itself, grounded in
-# either a deterministic hint or the real new content.
+# session-continuation side. It went through several real-data-driven
+# revisions before landing here: v1 fingerprinted a *past reply* instead of
+# the file's actual new content and false-positived on a genuinely correct
+# write (fixed same day); v2 added a fixed generic correction message that
+# proved too vague for the policy to self-correct from; v3 tried having the
+# 32B simulator phrase the diagnosed-problem correction itself, but real
+# data showed it reliably ignored the "don't just say done" instruction
+# (10/10 observed attempts across two problems) and, even when it fell back
+# to the fixed template, that template was still too vague for the policy to
+# fix (it kept re-losing the same missing detail on every retry); this
+# version drops the 32B call for the diagnosed-problem path entirely and
+# instead sends a deterministic, diagnosis-specific message that includes
+# the concrete original content, while keeping the 32B independent style
+# recheck for the no-problem-found path (which real data showed works fine).
 #
 # Reproduction-fidelity note: this is NOT the same category of change as the
 # (reverted) write/edit prompt-guidance patch. That one gave the POLICY
@@ -58,11 +67,13 @@
 # behave more like a real person actually checking their own homework file
 # before declaring it done -- it changes nothing the policy model perceives
 # as input; the policy still receives exactly the same conversational
-# messages it always would, just possibly one more (a natural follow-up) if
-# something looked wrong. The deterministic diagnosis itself is never shown
-# to the policy model, and the simulator only ever sees content scoped to
-# what it would plausibly have access to (its own newly-requested content),
-# never raw file-format internals.
+# messages it always would, just possibly one more (a follow-up pointing out
+# a concrete discrepancy) if something looked wrong -- a real student who
+# knows their own homework problem absolutely can and would point out "hey,
+# it originally said X, that's gone now" instead of a vague "something feels
+# off". The simulator only ever sees content scoped to what it would
+# plausibly have access to (its own original problem text, or its own
+# newly-requested content), never raw file-format internals.
 #
 # This only rewrites known, literal source blocks; no training logic,
 # reward, or data path is touched. The official openclaw-test/ directory is
@@ -88,25 +99,24 @@ marker = "openclaw-rl-homework-verification-gate"
 
 # Shared helper block, inserted verbatim (module-level) into each of the
 # three scripts, right after their DONE_SENTINEL constant definition.
-# {hints} is substituted per-file with a role-appropriate hint dict literal.
 HELPERS_TEMPLATE = '''
 
 # --- {marker} ---
-# Deterministic ground-truth file check + simulator re-check, run before
-# honoring the DONE-style sentinel. See scripts/prepare_openclaw_test_scripts.sh
-# for full rationale.
+# Deterministic ground-truth file check, run before honoring the DONE-style
+# sentinel. See scripts/prepare_openclaw_test_scripts.sh for full rationale.
 _WHITESPACE_RE = re.compile(r"\\s+")
 
-_DIAGNOSIS_HINTS = {hints}
-
-# Diagnosis-specific fixed correction messages, used only as a safety-net
-# fallback (32B recheck call raised an exception, or -- despite the
-# instruction not to -- still echoed DONE_SENTINEL after a real diagnosis).
-# Keyed by diagnosis code so the fallback message actually names what's
-# wrong instead of a generic "something's off" -- overwritten and
-# not-written are different failure modes and deserve different asks.
+# Diagnosis-specific fixed correction messages, sent directly (no 32B call)
+# whenever a real content problem is deterministically found. Keyed by
+# diagnosis code so the message actually names what's wrong and, for
+# "overwritten", includes the concrete original content -- a generic
+# "something's off, check it" message left the policy re-guessing from
+# memory and re-losing the same detail on every retry (real data, see
+# docs/issues_log.md 2026-07-22).
 _CORRECTION_TEMPLATES = {templates}
 
+# Fallback for the no-diagnosis path only, used if the 32B recheck call
+# itself raises an exception (network/API failure, not a content problem).
 _GENERIC_CORRECTION_TEMPLATE = {generic}
 
 
@@ -170,33 +180,18 @@ def _diagnose_homework_file(
     return None
 
 
-def _build_recheck_instruction(diagnosis: str | None, new_content: str, done_sentinel: str) -> str:
+def _build_recheck_instruction(new_content: str, done_sentinel: str) -> str:
     """Builds the extra system-role instruction used to force a grounded,
-    final re-check before honoring a DONE-style sentinel.
+    final re-check before honoring a DONE-style sentinel, for the
+    no-deterministic-problem-found path only (a diagnosed problem is handled
+    entirely by a fixed correction message, no 32B call -- see
+    scripts/prepare_openclaw_test_scripts.sh for why).
 
-    When a deterministic problem was found, no raw file content is shown --
-    an overwrite means there is no clean "new portion" left to extract, and
-    "not written" has nothing to show anyway. Only a natural-language hint
-    about *what* seems wrong is given, framed as something the simulator
-    might plausibly notice/suspect on its own (not "the harness detected a
-    bug"). The simulator's response can never finalize the session on this
-    path, no matter what it says.
-
-    When no problem was found, the ACTUAL new content is shown (scoped to
-    just what was newly added, not the whole file with its Problem:/prior
-    scaffolding) so the simulator can independently judge it against its own
-    stated requirements one more time, grounded in real content instead of
-    conversational impression alone."""
-    if diagnosis:
-        hint = _DIAGNOSIS_HINTS[diagnosis]
-        return (
-            f"(Internal note, not shown to the AI: {{hint}} Express this as a short, "
-            "natural, in-character follow-up asking the AI to double check -- don't "
-            "mention files, systems, or verification directly, just say what you'd "
-            "actually say if something felt off. Do NOT respond with "
-            f"{{done_sentinel}} this time -- something still needs to be checked, "
-            "so just ask about it in your own words instead.)"
-        )
+    The ACTUAL new content is shown (scoped to just what was newly added,
+    not the whole file with its Problem:/prior scaffolding) so the simulator
+    can independently judge it against its own stated requirements one more
+    time, grounded in real content instead of conversational impression
+    alone."""
     return (
         "(Internal note, not shown to the AI: here is exactly what was newly "
         f"added:\\n\\n{{new_content}}\\n\\n"
@@ -213,7 +208,6 @@ def patch_file(
     done_sentinel,
     homework_dir,
     role_label,
-    hints,
     generate_fn_name,
     generate_fn_anchor,
     run_fn_anchor,
@@ -253,7 +247,6 @@ def patch_file(
         )
     helpers = HELPERS_TEMPLATE.format(
         marker=marker,
-        hints=repr(hints),
         templates=repr(correction_templates),
         generic=repr(generic_correction_template),
     )
@@ -318,28 +311,34 @@ def patch_file(
         f'                workspace_dir, "{homework_dir}", problem_index, initial_content, conversation_history,\n'
         f'            )\n'
         f'            if _diagnosis:\n'
-        f'                _new_content = ""\n'
+        f'                {msg_var} = _CORRECTION_TEMPLATES[_diagnosis].format(\n'
+        f'                    index=problem_index, original=initial_content,\n'
+        f'                )\n'
+        f'                print(\n'
+        f'                    f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but file check failed "\n'
+        f'                    f"(diagnosis={{_diagnosis}}, {marker}) -- continuing instead of ending session"\n'
+        f'                )\n'
         f'            else:\n'
         f'                _new_content = _read_homework_file(workspace_dir, "{homework_dir}", problem_index)[len(initial_content):]\n'
-        f'            _recheck_instruction = _build_recheck_instruction(_diagnosis, _new_content, DONE_SENTINEL)\n'
-        f'            try:\n'
-        f'                _recheck_msg = {generate_fn_name}(\n'
-        f'                    external_client, model, problem_index, conversation_history,\n'
-        f'                    max_retries=max_retries, extra_instruction=_recheck_instruction,\n'
+        f'                _recheck_instruction = _build_recheck_instruction(_new_content, DONE_SENTINEL)\n'
+        f'                try:\n'
+        f'                    _recheck_msg = {generate_fn_name}(\n'
+        f'                        external_client, model, problem_index, conversation_history,\n'
+        f'                        max_retries=max_retries, extra_instruction=_recheck_instruction,\n'
+        f'                    )\n'
+        f'                except Exception as _e:\n'
+        f'                    print(f"  [warn] re-check call failed ({{_e}}), falling back to fixed correction message")\n'
+        f'                    _recheck_msg = None\n'
+        f'                if _recheck_msg is None:\n'
+        f'                    _recheck_msg = _GENERIC_CORRECTION_TEMPLATE.format(index=problem_index)\n'
+        f'                if DONE_SENTINEL in _recheck_msg:\n'
+        f'                    print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file + re-check verified, {marker})")\n'
+        f'                    return True\n'
+        f'                print(\n'
+        f'                    f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but re-check did not confirm "\n'
+        f'                    f"done ({marker}) -- continuing instead of ending session"\n'
         f'                )\n'
-        f'            except Exception as _e:\n'
-        f'                print(f"  [warn] re-check call failed ({{_e}}), falling back to fixed correction message")\n'
-        f'                _recheck_msg = None\n'
-        f'            if _recheck_msg is None or (_diagnosis and DONE_SENTINEL in _recheck_msg):\n'
-        f'                _recheck_msg = _CORRECTION_TEMPLATES.get(_diagnosis, _GENERIC_CORRECTION_TEMPLATE).format(index=problem_index)\n'
-        f'            if _diagnosis is None and DONE_SENTINEL in _recheck_msg:\n'
-        f'                print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file + re-check verified, {marker})")\n'
-        f'                return True\n'
-        f'            print(\n'
-        f'                f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but re-check did not confirm "\n'
-        f'                f"done (diagnosis={{_diagnosis}}, {marker}) -- continuing instead of ending session"\n'
-        f'            )\n'
-        f'            {msg_var} = _recheck_msg'
+        f'                {msg_var} = _recheck_msg'
     )
     text = text.replace(done_check_anchor, new_check, 1)
 
@@ -366,11 +365,6 @@ patch_file(
     done_sentinel="HOMEWORK_DONE",
     homework_dir="homework",
     role_label="Student",
-    hints={
-        "overwritten": "The original problem text in your homework file was overwritten -- it's gone, replaced entirely by the new content. Point out that the problem statement itself seems to have disappeared and ask the AI to restore it along with the answer.",
-        "not_written": "Nothing was actually saved to the homework file -- it's exactly the same as before, no new content was added at all. Point out that nothing seems to have changed and ask the AI to actually save it this time.",
-        "mismatch": "The content that got saved doesn't match what the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
-    },
     generate_fn_name="generate_student_message",
     generate_fn_anchor=(
         "def generate_student_message(\n"
@@ -397,8 +391,14 @@ patch_file(
     ),
     msg_var="student_msg",
     correction_templates={
-        "overwritten": "Wait, I think the original problem text in homework/{index}.txt got overwritten -- can you check and restore it, then add the answer back in without deleting it this time?",
-        "not_written": "Wait, I don't think anything actually got saved to homework/{index}.txt -- can you check and make sure the answer is really written to the file this time?",
+        "overwritten": (
+            "Wait, I think part of what was originally in homework/{index}.txt is "
+            "now missing -- here's exactly what it's supposed to say before the "
+            "answer:\n\n{original}\n\n"
+            "Can you check the file and make sure all of that is still there, with "
+            "the answer added after it, not replacing it?"
+        ),
+        "not_written": "Wait, I don't think anything actually got saved to homework/{index}.txt -- it looks exactly the same as before. Can you check and make sure the answer is really written to the file this time?",
         "mismatch": "Wait, what's in homework/{index}.txt doesn't look like what you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
@@ -413,11 +413,6 @@ patch_file(
     done_sentinel="GRADING_DONE",
     homework_dir="homework1",
     role_label="TA",
-    hints={
-        "overwritten": "The student's original solution in the homework file was overwritten -- it's gone, replaced entirely by the new content. Point out that the student's original submission seems to have disappeared and ask the AI to restore it along with the grading comments.",
-        "not_written": "Nothing was actually saved to the homework file -- your grading comments never got added, the file is exactly the same as before. Point out that nothing seems to have changed and ask the AI to actually save your comments this time.",
-        "mismatch": "The content that got saved doesn't match the grading comments the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
-    },
     generate_fn_name="generate_ta_message",
     generate_fn_anchor=(
         "def generate_ta_message(\n"
@@ -444,8 +439,14 @@ patch_file(
     ),
     msg_var="ta_msg",
     correction_templates={
-        "overwritten": "Wait, I think the student's original solution in homework1/{index}.txt got overwritten -- can you check and restore it, then add your grading comments back in without deleting it this time?",
-        "not_written": "Wait, I don't think your grading comments actually got saved to homework1/{index}.txt -- can you check and make sure they're really written to the file this time?",
+        "overwritten": (
+            "Wait, I think part of what was originally in homework1/{index}.txt is "
+            "now missing -- here's exactly what it's supposed to contain before "
+            "your grading comments:\n\n{original}\n\n"
+            "Can you check the file and make sure all of that is still there, with "
+            "your comments added after it, not replacing it?"
+        ),
+        "not_written": "Wait, I don't think your grading comments actually got saved to homework1/{index}.txt -- it looks exactly the same as before. Can you check and make sure they're really written to the file this time?",
         "mismatch": "Wait, what's in homework1/{index}.txt doesn't look like the grading comments you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
@@ -460,11 +461,6 @@ patch_file(
     done_sentinel="COMMENT_DONE",
     homework_dir="homework2",
     role_label="Teacher",
-    hints={
-        "overwritten": "The student's work and the TA's grading in the homework file were overwritten -- they're gone, replaced entirely by the new content. Point out that the student's work and grading seem to have disappeared and ask the AI to restore them along with your comments.",
-        "not_written": "Nothing was actually saved to the homework file -- your comments never got added, the file is exactly the same as before. Point out that nothing seems to have changed and ask the AI to actually save your comments this time.",
-        "mismatch": "The content that got saved doesn't match the comments the AI just showed you -- something different ended up in the file. Point out the mismatch and ask the AI to check what actually got written.",
-    },
     generate_fn_name="generate_teacher_message",
     generate_fn_anchor=(
         "def generate_teacher_message(\n"
@@ -491,8 +487,14 @@ patch_file(
     ),
     msg_var="teacher_msg",
     correction_templates={
-        "overwritten": "Wait, I think the student's work and the TA's grading in homework2/{index}.txt got overwritten -- can you check and restore them, then add your comments back in without deleting anything this time?",
-        "not_written": "Wait, I don't think your comments actually got saved to homework2/{index}.txt -- can you check and make sure they're really written to the file this time?",
+        "overwritten": (
+            "Wait, I think part of what was originally in homework2/{index}.txt is "
+            "now missing -- here's exactly what it's supposed to contain before "
+            "your comments:\n\n{original}\n\n"
+            "Can you check the file and make sure all of that is still there, with "
+            "your comments added after it, not replacing it?"
+        ),
+        "not_written": "Wait, I don't think your comments actually got saved to homework2/{index}.txt -- it looks exactly the same as before. Can you check and make sure they're really written to the file this time?",
         "mismatch": "Wait, what's in homework2/{index}.txt doesn't look like the comments you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
