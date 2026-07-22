@@ -1797,6 +1797,36 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] Problem 13-16 卡顿排查：真正根因是 "NO_REPLY" 幻觉再次出现（Silent Reply Policy 补丁没能覆盖这个场景）+ not_written 纠正消息一个真实设计缺口
+
+**背景：** 用户观察到 run `20260722_163352` 跑到 Problem 13-16 附近时反复出现 `408 Client Error: Request Timeout`、"No response from OpenClaw"、"⚠️ Agent couldn't generate a response"，Problem 15 整个 session 完全失败。要求先查清楚根因，不急着停止训练。
+
+**排查过程（逐步排除）：**
+1. **怀疑 GPU/请求排队过载**：`nvidia-smi` 显示负责 Rollout 的 GPU4/5（`sglang.baseUrl=127.0.0.1:30000` 实际指向的引擎，OpenClaw 真实对话和训练 rollout 共用同一份算力）利用率 83-84%，一度怀疑是共享推理引擎被压垮——但核实 sglang 自己的 `#queue-req` 字段全程为 0，**排除了请求排队过载这个假设**
+2. **发现真实的吞吐骤降**：TP0（pid=12303）在 17:24:58-17:33:01 之间整整 8 分钟没有 decode batch 日志，恢复后吞吐从正常的 ~150-170 token/s 骤降到 1.36、2.60 token/s——这段窗口精确对应 openclaw.log 里那批 "incomplete turn detected...stopReason=length" 报错；同期 Megatron 侧 `train_wait_time` 从 165.9s（perf 1）→ 215.7s（perf 3）→ 373.9s（perf 6）逐步拉长，说明训练在等 rollout 样本、rollout 侧确实在变慢，但没搜到 NCCL/OOM/崩溃报错，判断是生成过程本身卡顿，不是硬件故障
+3. **翻真实 session trajectory 定位到根因**：Problem 13 对应 session（`0d6a4eab-...`）的原始请求记录显示，**从第一轮开始 OpenClaw 就不正常**——09:19:27（Turn 1）回复"Hey. I just came online. Who am I? Who are you?"（类似失忆的幻觉），09:19:50（Turn 2）assistantText **字面就是 "NO_REPLY" 这个字符串**（`student_chat.py` 把这类回复打印成"No response from OpenClaw."，不是 OpenClaw 真的没回复）；这个模式在同一 session 里反复出现（09:22:36 甚至在真实调用 write 工具的同时，可见文本回复也是 "NO_REPLY"），09:22:59 那次紧接着就真实超时（对应 openclaw.log 17:22:59 的 408）。Problem 11（`0d6a4eab` 的另一个不相关 session）也独立出现了同样的"who am I"开场——不是 Problem 10 传染过去的，更像是模型/推理栈本身一种会反复出现的退化行为
+4. **重要修正：Silent Reply Policy 补丁没有覆盖这个场景。** 这次部署的补丁针对的是"系统层面要不要允许真正的空回复"（`resolveSilentReplyPolicyFromPolicies()`），但这里模型是在正文里**真的打出了 "NO_REPLY" 这段非空文字**——从系统策略角度看这不是"沉默"，是一句完整的（无意义）文本回复，补丁自然拦不住。此前把"silent reply protocol 幻觉"和这个补丁绑在一起的判断需要修正：**这是模型自身的退化生成习惯，不是这个基础设施开关能修的问题**
+
+**用户进一步发现的真实设计缺口（Problem 10）：** Problem 10 里 Turn 2 结束后（Student 还没让 OpenClaw 写入，仍处于"先看答案"阶段），32B 自己就直接说了 HOMEWORK_DONE——这是 Student 自己违反协议、判断过早。核验机制正确识别（diagnosis=not_written），但**发的纠正消息是"确保这次真的写进去了"（implying 之前已经尝试过写入），而 OpenClaw 从来没被要求写过任何东西**，这句话对 OpenClaw 而言是逻辑对不上的非顺畅衔接（"这次"暗示"上次"，但根本没有上次）——是 not_written 纠正模板目前没有区分"写了但没成功" vs "压根没被要求写"这两种不同场景的一个真实设计缺口。
+
+**修复：**
+1. 新增 `_write_was_requested(conversation_history)` 辅助函数：扫描 Student/TA/Teacher 自己此前发出的消息（`role=="assistant"`），判断是否曾经真的提过写入/追加/保存的要求
+   - 跳过 `conversation_history` 里第一条消息：`FIRST_MESSAGE_TEMPLATE`（三个角色都一样）固定包含"don't write to the file until I tell you to"这类措辞，永远会假阳性匹配到"write"这个词，但从来不是真正的写入请求
+   - 正则要求"写入动词"（write/append/save）和"file/homework/.txt"这类词在同一句话内靠近出现，避免"Like how a person would write it"这种谈风格、不谈写入文件的句子被误判（本地测试时用真实 Problem 10 原文复现过这个假阳性，已修正）
+   - 额外排除"don't write"/"not ... write"这类否定句式——真实 Problem 11 数据里出现过"Don't write to the file yet."这种明确说"先别写"的话，同样不该算作"已经要求写入"
+2. `not_written` 诊断分支新增一个 `"not_requested"` 纠正模板变体：诊断为 `not_written` 且 `_write_was_requested()` 判定为否时，改用不暗示"之前已经写过"的措辞（例如 Student 版："Oh wait, I don't think I actually asked you to save that yet -- can you go ahead and write the answer to homework/{index}.txt now?"），TA/Teacher 同结构换角色专属措辞；`_write_was_requested()` 判定为是时，保留原有"make sure it's really written this time"措辞不变
+3. 打分决策时新增 `_template_key` 变量（区别于原始 `_diagnosis`），并把它也打进日志（`diagnosis={diagnosis}, template={template_key}`），方便后续直接从日志确认具体走了哪个分支
+
+**本地测试：** 对真实官方文件重跑补丁脚本，三文件 `py_compile` 语法检查全部通过；4 个场景验证：(a) 真实 Problem 10 原文复现——`_write_was_requested` 正确判定为 False，选中 `not_requested` 模板，措辞不再暗示"之前写过"；(b) 真实写入请求场景（Problem 8/9 风格）——正确判定为 True，保留原 `not_written` 措辞不变；(c) `overwritten` 诊断不受影响；(d) 真实 Problem 11 原文复现（含"Don't write to the file yet."这类否定句）——正确判定为 False（不误判成"已请求"），追加一句真实请求后正确翻转为 True。同时确认 TA/Teacher 生成的模板正确套用了各自措辞。
+
+**接入：** 无需改动训练脚本——同 `prepare_openclaw_test_scripts.sh` 的既有接入方式，三个训练入口自动生效。
+
+**风险记录（用户明确要求记下来）：** `_write_was_requested()` 是关键词/正则匹配，不是真正理解句子语义——这次实现过程中已经出现过两轮真实假阳性（FIRST_MESSAGE_TEMPLATE 固定措辞、"like how a person would write it"谈风格不谈写文件、Problem 11 的否定句"don't write"），每次都是靠真实数据现场发现才修的，**不能保证已经覆盖了所有说法，后续训练如果又出现纠正消息选错模板（比如明明没要求写却用了 not_written 的"这次真的写了吗"措辞，或者反过来），大概率还是这个函数的正则没盖住新的说法**。届时最低风险的处理方式是**直接去掉 `_write_was_requested()` 这个判断函数，统一退回到原来更简单的 `not_written` 固定措辞**（不再区分"要求过没要求过"），而不是继续给正则打补丁——一条"不完美但稳定"的消息，好过一个越改越复杂、越来越脆弱的分类器。已把这条风险和退路写进 `_write_was_requested()` 函数自己的 docstring 里（`prepare_openclaw_test_scripts.sh`），方便以后直接照着改。
+
+**待验证：** 服务器真实部署跑一次，确认新的 `not_requested` 分支在类似 Problem 10 这种"Student 违反协议提前说完成"的场景下能不能生效、措辞是否确实更顺畅；"NO_REPLY 幻觉"这个退化行为目前尚无有效修复手段（不在这次改动范围内），后续如果需要处理，得从策略模型自身的生成行为或训练信号入手，不是靠 harness 层面的核验能解决的。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

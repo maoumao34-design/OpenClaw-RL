@@ -915,6 +915,16 @@
 - 新增纯诊断补丁 `scripts/prepare_patched_openclaw_combine_select.sh`：给此前从未打过补丁的 `openclaw_combine_select_api_server.py`（真正做打分决策的文件）加一行调试日志，把每个 turn 实际打分用的 response_text/next_state_text 也打出来；`run_openclaw_topk_select_modelfactory.sh` 的 PYTHONPATH 加 `PATCHED_COMBINE_SELECT_DIR` 前缀（跟现有 `PATCHED_OPD_DIR` 同模式），三训练脚本统一接入。明确标注为临时诊断，不影响任何训练逻辑，不再需要时可直接停用
 - 本地测试：新补丁对真实官方文件跑通、`py_compile` 通过；launcher 补丁对真实官方脚本跑通，PYTHONPATH 两种取值场景（设置/不设置）均验证正确；全部脚本语法检查通过 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### Problem 13-16 卡顿排查：根因是 "NO_REPLY" 幻觉再次出现，Silent Reply Policy 补丁未能覆盖；顺带修复 not_written 纠正消息的一个真实设计缺口
+
+**完成内容：**
+- 排查 Problem 13-16 反复超时/无响应：先排除"GPU 请求排队过载"（`#queue-req` 全程为 0），确认真实存在的是 TP0 引擎 8 分钟吞吐骤降（150-170→1-3 token/s），跟 Megatron 侧 `train_wait_time` 逐步拉长（165.9s→215.7s→373.9s）时间吻合，但未搜到 NCCL/OOM 报错，判断是生成过程本身卡顿
+- 翻真实 session trajectory 定位根因：Problem 13 对应 session 从第一轮就出现"Hey. I just came online. Who am I?"幻觉，第二轮 assistantText **字面就是 "NO_REPLY"**（`student_chat.py` 把这类回复打印成"No response from OpenClaw."，不是真没回复），同一 session 里反复出现，紧接着触发真实超时；Problem 11 也独立出现同样的"who am I"开场
+- **重要修正：这次部署的 Silent Reply Policy 补丁没能覆盖这个场景**——补丁针对的是"系统层面允不允许真正的空回复"，但这里模型是在正文里真的打出了非空的 "NO_REPLY" 文字，从策略角度不算"沉默"，补丁拦不住。这是模型自身的退化生成习惯，不是这个基础设施开关能修的问题（此前"silent reply protocol 幻觉"跟这个补丁绑在一起的判断需要修正）
+- 用户顺带指出 Problem 10 一个真实设计缺口：Student 还没让 OpenClaw 写入就自己说了 HOMEWORK_DONE，核验机制正确识别（not_written），但纠正消息"确保这次真的写进去了"对 OpenClaw 而言逻辑对不上（暗示"上次"，但根本没写过）——修复：新增 `_write_was_requested()` 辅助函数判断此前是否真的提过写入要求，`not_written` 分支据此二选一：真提过用原有措辞，没提过用不暗示"之前写过"的新措辞（`"not_requested"` 模板）
+- 实现过程中发现并修正两次真实假阳性：FIRST_MESSAGE_TEMPLATE 固定含"don't write"导致的假阳性（跳过第一条消息解决）、"like how a person would write it"这种谈风格不谈写文件的假阳性（正则要求写入动词和 file/homework 关键词同句靠近出现）、以及真实 Problem 11 里"Don't write to the file yet."这种否定句的假阳性（正则排除否定词紧邻写入动词的情况）
+- 本地测试：三文件语法检查通过；用真实 Problem 10/11 原文复现验证 4 个场景全部符合预期（含两次假阳性修正后的回归验证）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -927,28 +937,32 @@
 - [x] **Student/TA/Teacher 会话级文件核验（v4：诊断分支跳过 32B、直接给出具体缺失内容）**：**已用真实数据验证生效**——Problem 0-4 全部在给出具体缺失内容后下一轮一次性正确修复（5/5），对比此前 Problem 8/9 的 10/10 失败
 - [x] **workspace 从 `/root` 迁到 `/dfs/data/openclaw-rl-project/runtime/<run_id>/workspace`**：`agents.defaults.workspace`（openclaw.json，优先级高于环境变量）每次启动前强制覆盖 + `OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_WORKSPACE` 双环境变量同步，三训练脚本统一改，本地语法检查通过，服务器真实部署待验证
 - [x] **PRM turn 内容调试补丁**（`prepare_patched_openclaw_combine_select.sh`，临时诊断）：给 `openclaw_combine_select_api_server.py` 加一行日志，打出每个 turn 实际打分用的 response_text/next_state_text，本地测试通过，服务器真实部署待验证
+- [x] **not_written 纠正消息新增 `not_requested` 变体**：`_write_was_requested()` 判断此前有没有真的要求过写入，没要求过就不再暗示"之前写过"，本地测试通过（含真实 Problem 10/11 数据 + 两次假阳性修正），服务器真实部署待验证
 
 ### 已知限制 / 未解决
 - **新发现：策略模型全程只用 `write` 整体覆盖，从未用过 `edit`**（真实 session trajectory 工具调用数据证实）——不打算给策略模型加工具选择指引（开外挂），依赖奖励信号本身引导，但奖励信号是否真的在起作用还未坐实（见下一条）
 - **新发现：write 覆盖动作本身是否被 PRM 正确扣分尚未坐实**——间接证据（turn 数量、投票特征）支持"reward blindness 依然存在、真正做错事的 write 动作没被罚、罚的是隔壁那轮确认回复"这个推测，但无法从现有日志 100% 确认，已加调试补丁（见上）等下次训练数据验证
-- **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
+- **新发现：模型偶发陷入"NO_REPLY 幻觉"退化生成状态**（真实字面输出 "NO_REPLY" 文本，非系统层面的真正静默），跟已部署的 Silent Reply Policy 补丁是两回事，那个补丁修不了这个——目前没有 harness 层面的修复手段，需要从策略模型自身生成行为/训练信号入手，暂未处理
+- **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认；结合本次"NO_REPLY 幻觉"发现，这两者可能是同一类退化生成现象的不同表现
 - 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后）
 - 数学应用题反复自我重述 / 纯 token 退化，仍认为更可能是模型固有倾向，未做版本考古严格验证
 - **8GPU 正式训练从未真正保存过 checkpoint**，每次任务提交都是从 base 模型重新开始
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 提交（git commit + push）PRM turn 内容调试补丁，服务器 `git pull`
+1. 提交（git commit + push）PRM turn 内容调试补丁 + not_requested 纠正消息修复，服务器 `git pull`
 2. 停掉当前 run，清理残留 GPU 进程，重新提交训练
 3. 确认新的 `[openclaw-rl-debug-turn-content]` 日志真实出现，用它精确核对"write 覆盖动作本身有没有被正确扣分"这个悬而未决的问题
-4. 观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
-5. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
-6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
+4. 观察类似 Problem 10 这种"Student 违反协议提前说完成"场景下，`not_requested` 纠正消息是否让对话更顺畅
+5. 观察 write 覆盖/未完成却判定成功/"NO_REPLY 幻觉"这几类问题的发生率变化
+6. 视需要，按真实 `weight_version` 精确核对"NO_REPLY 幻觉"/"silent reply protocol"退化与 Problem 4/11 坏样本训练 step 的先后关系
+7. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
 
 ### 未验证
-- [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
+- [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果（已确认这个补丁不能修"NO_REPLY 幻觉"，但仍可能对真正的系统级静默有效）
 - [ ] PRM turn 内容调试补丁在服务器真实部署上的实际效果——能否精确定位"write 覆盖动作本身的分数"
-- [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
+- [ ] not_written 的 `not_requested` 纠正消息变体在服务器真实部署上的实际效果
+- [ ] "NO_REPLY 幻觉"/"silent reply protocol"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
 - [ ] workspace 迁到 `/dfs/data` 后 `agents.defaults.workspace` 真的按新路径生效（服务器日志核实）；此前记录的"GPU 空闲回收重启后 workspace 静默回滚到快照"这个风险在新路径下是否真的不再出现（需要一次真实的空闲/重启周期才能验证）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 

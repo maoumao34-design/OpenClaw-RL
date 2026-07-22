@@ -124,6 +124,57 @@ def _normalize_for_compare(text: str) -> str:
     return _WHITESPACE_RE.sub(" ", text).strip().lower()
 
 
+_WRITE_REQUEST_RE = re.compile(
+    r"(?<!n't )(?<!not )\\b(write|append|saved?)\\b[^.!?\\n]{{0,80}}\\b(file|homework|\\.txt)\\b"
+    r"|\\b(file|homework|\\.txt)\\b[^.!?\\n]{{0,80}}(?<!n't )(?<!not )\\b(write|append|saved?)\\b",
+    re.IGNORECASE,
+)
+
+
+def _write_was_requested(conversation_history: list[dict]) -> bool:
+    """Whether the simulator has already asked, at some earlier point in
+    this same visible conversation, for the answer/comments to be
+    written/appended/saved.
+
+    Needed because "not_written" covers two different real situations that
+    need different correction wording: (a) a write WAS asked for and just
+    didn't happen -- "make sure it's really saved this time" makes sense
+    here; (b) the simulator hallucinated the DONE sentinel before ever
+    asking for a write at all (confirmed via real data, 2026-07-22) -- in
+    that case "this time" implies a prior attempt that, from the AI's own
+    visible conversation, never happened, which is a confusing non sequitur
+    to send. The DONE-sentinel-bearing message itself is intercepted before
+    ever being sent or added to conversation_history (official student_chat.py
+    checks DONE_SENTINEL before printing/sending), so conversation_history
+    only ever contains what was genuinely exchanged -- a reliable source for
+    whether a write was ever actually asked for here.
+
+    Skips the very first assistant message: FIRST_MESSAGE_TEMPLATE (all
+    three roles) always includes phrasing like "don't write to the file
+    until I tell you to" / "write the grading comments... don't write to
+    the file until I tell you to" -- a fixed, known template that always
+    mentions "write" but is never itself a write request, so scanning it
+    would always false-positive.
+
+    Risk note (2026-07-22): this is regex/keyword-based, not a real
+    understanding of the sentence -- it has already needed two rounds of
+    real-data-driven correction (the FIRST_MESSAGE_TEMPLATE skip above, and
+    the negative-lookbehind guard against "don't write"/"not ... write" in
+    _WRITE_REQUEST_RE) and may still miss phrasings not yet seen in
+    production. If future real data shows this picking the wrong
+    "not_written" vs "not_requested" template again, the lowest-risk fix is
+    to drop this function entirely and always use the "not_written" wording
+    (the original, simpler behavior) rather than trying to patch the regex
+    further -- a single reasonable-but-imperfect message beats an
+    increasingly fragile classifier."""
+    for entry in conversation_history[1:]:
+        if entry.get("role") != "assistant":
+            continue
+        if _WRITE_REQUEST_RE.search(entry.get("content", "")):
+            return True
+    return False
+
+
 def _read_homework_file(workspace_dir: str, homework_dir: str, problem_index: int) -> str:
     """Read the current content of the target homework file. Empty string if missing."""
     filepath = os.path.join(workspace_dir, homework_dir, f"{{problem_index}}.txt")
@@ -311,12 +362,15 @@ def patch_file(
         f'                workspace_dir, "{homework_dir}", problem_index, initial_content, conversation_history,\n'
         f'            )\n'
         f'            if _diagnosis:\n'
-        f'                {msg_var} = _CORRECTION_TEMPLATES[_diagnosis].format(\n'
+        f'                _template_key = _diagnosis\n'
+        f'                if _diagnosis == "not_written" and not _write_was_requested(conversation_history):\n'
+        f'                    _template_key = "not_requested"\n'
+        f'                {msg_var} = _CORRECTION_TEMPLATES[_template_key].format(\n'
         f'                    index=problem_index, original=initial_content,\n'
         f'                )\n'
         f'                print(\n'
         f'                    f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but file check failed "\n'
-        f'                    f"(diagnosis={{_diagnosis}}, {marker}) -- continuing instead of ending session"\n'
+        f'                    f"(diagnosis={{_diagnosis}}, template={{_template_key}}, {marker}) -- continuing instead of ending session"\n'
         f'                )\n'
         f'            else:\n'
         f'                _new_content = _read_homework_file(workspace_dir, "{homework_dir}", problem_index)[len(initial_content):]\n'
@@ -399,6 +453,7 @@ patch_file(
             "the answer added after it, not replacing it?"
         ),
         "not_written": "Wait, I don't think anything actually got saved to homework/{index}.txt -- it looks exactly the same as before. Can you check and make sure the answer is really written to the file this time?",
+        "not_requested": "Oh wait, I don't think I actually asked you to save that yet -- can you go ahead and write the answer to homework/{index}.txt now?",
         "mismatch": "Wait, what's in homework/{index}.txt doesn't look like what you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
@@ -447,6 +502,7 @@ patch_file(
             "your comments added after it, not replacing it?"
         ),
         "not_written": "Wait, I don't think your grading comments actually got saved to homework1/{index}.txt -- it looks exactly the same as before. Can you check and make sure they're really written to the file this time?",
+        "not_requested": "Oh wait, I don't think I actually asked you to save my grading comments yet -- can you go ahead and write them to homework1/{index}.txt now?",
         "mismatch": "Wait, what's in homework1/{index}.txt doesn't look like the grading comments you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
@@ -495,6 +551,7 @@ patch_file(
             "your comments added after it, not replacing it?"
         ),
         "not_written": "Wait, I don't think your comments actually got saved to homework2/{index}.txt -- it looks exactly the same as before. Can you check and make sure they're really written to the file this time?",
+        "not_requested": "Oh wait, I don't think I actually asked you to save my comments yet -- can you go ahead and write them to homework2/{index}.txt now?",
         "mismatch": "Wait, what's in homework2/{index}.txt doesn't look like the comments you just showed me -- can you double check what actually got saved?",
     },
     generic_correction_template=(
