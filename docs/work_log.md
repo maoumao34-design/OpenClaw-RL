@@ -834,6 +834,29 @@
 - 服务器定位到真实 bundle 文件（`effective-reply-route-BnYlac-J.js` 是真正定义策略函数的源头模块，`dispatch-F64i6im_.js` 只是引用方，只需改前者）
 - 新脚本 `scripts/prepare_patched_silent_reply_policy.sh`：把 `resolveSilentReplyPolicyFromPolicies` 恒定改为返回 `"disallow"`，恢复 3 月版本"这个功能不存在"的效果；本地用真实源码片段构造 mock 文件测试通过（含幂等性测试），接入三个训练脚本，`bash -n` 均通过 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### write/未完成误判奖励修正方案：从硬编码覆盖转向 Student 会话级事实核验
+
+**完成内容：**
+- 第一版方案（硬编码规则函数直接覆盖 reward）被否：用户指出检查 2 抓错了信号（是 Student 32B 直接判定 HOMEWORK_DONE，不是策略模型文本声称完成），且更根本的问题是"奖励打对了也没法阻止 session 被提前放弃"——这是最初"Problem 4 edit 失败却被判定完成"的根本原因
+- 方案收敛为：在 `student_chat.py`（同理 `TA_chat.py`/`teacher_chat.py`）加确定性 harness 层文件核验，放行 `HOMEWORK_DONE` 前核实真实内容，不通过则注入纠正消息而非放行——评估后确认这跟此前否掉的"给策略模型加 write/edit 指引"性质不同，核验的是模拟器（Student）的判断，不是给策略模型开外挂
+- 用户提出关键洞察：纠正消息会成为做错动作那一轮的 next_state，PRM 现成的"用户要求纠正=-1"规则会自动精确打分，可能完全不需要另写硬编码覆盖函数
+- 追查 Student 判断不可靠的根源：`generate_student_message()` 调用 32B API **未设任何 temperature/top_p 参数**；`STUDENT_SYSTEM_PROMPT` 第 3 步指令本身已经写得很明确（"Never say HOMEWORK_DONE until..."），不存在提示词漏洞，说明是 32B 模型自身指令遵循不可靠，不是我们提示词设计问题 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
+### 32B Simulator 配置排查 + 全部贡献者身份核实——确认无遗漏
+
+**完成内容：**
+- 对比官方 `launch_user_llm.sh` 和我们自己的 `launch_simulator.sh`：两者都没设默认采样参数，我们的部署跟官方设计一致，不是我们的差异
+- 全仓库按邮箱区分官方作者（Yinjie Wang/Ling Yang/Xuyang Chen/Xiaolong Jin）与外部贡献者：确认 Ling Yang 只改过 README/LICENSE，Xuyang Chen/Xiaolong Jin 的贡献分别全部在 `terminal-rl/`/`swe-rl/`（General Agent 赛道，不是我们复现的 Table 3 Personal Agent）——**我们实际用的 Personal Agent 路径自始至终只有 Yinjie Wang 一人编写**（另加非署名作者 Siddhant Mukherjee 早期贡献的 top-K 蒸馏基础机制，已在使用中）
+- 意外发现：官方仓库早期内嵌过完整 OpenClaw 本体，提交记录写明精确版本号 `2026.3.2-beta.1`（03-03），验证了现有 `march_2026_3_8` 基准点足够接近（只差 6 天）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
+### Student/TA/Teacher 会话级文件核验：方案定案、实现、本地测试
+
+**完成内容：**
+- 最终方案（用户确认 4+1 点）：harness 确定性核验（不靠 32B 判断）、固定模板纠正消息、严格标准（比对"session 开始前已有内容是否保留"+"是否有实质增长"+"是否包含最近认可答案的指纹"）、三角色统一处理、且核验必须在 DONE_SENTINEL 被采纳前同步生效（不能是事后补救）
+- 改造 `scripts/prepare_openclaw_test_scripts.sh`：新增通用核验函数块，插入三个官方脚本；`run_one_problem`/`run_one_grading`/`run_one_commenting` 新增 `workspace_dir` 参数并在循环开始前快照 `initial_content`；把"检测到 DONE_SENTINEL 就直接 return True"改成"先核验，通过才 return，不通过就把这一轮消息替换成纠正模板、不 return、继续循环"——替换发生在 return 之前，天然阻止"没验证通过就跳到下一题"的竞态
+- 本地测试：三文件语法检查通过；抽取核验函数单独跑 4 个场景（write 覆盖丢结构、正确追加、根本没写、内容对不上），**全部符合预期**
+- 无需额外改训练脚本——`prepare_openclaw_test_scripts.sh` 本来就已被三个训练脚本调用且执行的是补丁后的版本，改这一个脚本自动生效 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -843,6 +866,7 @@
 - [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（新增，`prepare_patched_silent_reply_policy.sh` 已实现、本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
+- [x] **Student/TA/Teacher 会话级文件核验**：`prepare_openclaw_test_scripts.sh` 已实现、本地逻辑测试 4 个场景全部通过、已自动接入三个训练脚本，服务器真实部署（含真实 32B Simulator）待验证
 
 ### 已知限制 / 未解决
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
@@ -852,16 +876,16 @@
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 重新提交训练，服务器上确认 Silent Reply Policy 补丁锚点命中、`[openclaw-rl-silent-reply-policy-patch]` 钩子真实生效
-2. 观察新 run 是否还出现"NO_REPLY"/"silent reply protocol"这类幻觉退化文本
-3. 设计并实现 write/edit 错误的奖励信号纠正方案（reward_func / `_submit_turn_sample` 一带）
+1. 提交（git commit + push）今天全部改动，服务器 `git pull`
+2. 重新提交训练，确认 Silent Reply Policy 补丁 + Student/TA/Teacher 文件核验补丁在真实部署文件上锚点命中、日志能看到对应标记
+3. 观察新 run 里 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
 4. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
 5. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`；workspace 迁移到 `/dfs/data`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
+- [ ] Student/TA/Teacher 文件核验补丁在服务器真实部署文件（含真实 32B Simulator）上的锚点命中与实际效果
 - [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
-- [ ] write/edit 奖励信号纠正方案设计与验证
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
 ---

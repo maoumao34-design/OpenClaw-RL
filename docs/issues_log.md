@@ -1554,6 +1554,90 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] write/边完成误判奖励修正方案讨论：从"硬编码奖励覆盖"转向"Student 会话级事实核验"
+
+**背景：** 继续设计 write 覆盖/未真正完成却被判定成功这两类问题的奖励修正方案，讨论过程中方案几次修正。
+
+**第一版方案（已否）：** 在 `openclaw_combine_select_api_server.py` 里加一个独立的规则式检测函数，命中 write 覆盖/声称完成却无工具调用这两种模式时，直接把 `reward`/`eval_score` 硬编码覆盖成 -1。
+
+**用户指出的问题 1：** 检查 2（"文本声称完成但没工具调用"）抓错了信号——真实观察到的情况是模型压根没说已完成，只是给出了新答案、在等待判断的时候，**是 32B 的 Student 直接判定 HOMEWORK_DONE**，问题出在 Student 的判断上，不是策略模型的文本声明上。
+
+**用户指出的问题 2（更根本）：** 就算奖励打分打对了，也没法阻止 Student 在"根本没真正完成"的情况下直接判定 HOMEWORK_DONE、结束 session、跳到下一题——这会导致这道题被提前放弃，模型再也没机会在这道题上学着真正做对。奖励信号和"session 该不该继续"是两件独立的事，只修奖励不能解决后者。这也是最初发现"Problem 4 edit 失败却被判定完成"这个问题的根本原因。
+
+**方案收敛：改为在 `student_chat.py`（以及同理的 `TA_chat.py`/`teacher_chat.py`）里加一个确定性的、harness 层面的文件核验，在放行 `HOMEWORK_DONE` 之前先核实文件真实内容，不通过就不放行、改为注入一条纠正消息。**
+
+**复现忠实度重新评估：** 这跟此前被否掉的"往策略模型系统提示词里加 write/edit 工具选择指引"性质不同——那次是给策略模型本身新增了论文原始环境里从未有过的技术帮助；这次核验的是 Student（模拟的人类学生）的判断，一个真实学生本来就会在意"作业是不是真的存对了"，现在只是让模拟器的行为更接近真实学生，不是给策略模型开外挂。
+
+**用户提出的关键洞察（可能可以完全替代硬编码奖励覆盖）：** 如果 Student 核验后发现写错了、发一句纠正消息而不是 HOMEWORK_DONE，这句纠正消息会成为**做错动作那一轮本身**的 next_state（`_fire_opd_task` 的 next_state 定义就是下一次请求的第一条消息）——PRM judge 现成的"用户要求纠正 = -1"规则（`openclaw_opd_api_server.py:159`，已确认是论文官方代码）会自动、精确地把这一轮打成 -1，完全不需要另外写一套硬编码检测函数。这样两个问题（write 覆盖误判、未完成却判定成功）可能可以用同一个改动（Student 核验）加上论文现成的奖励机制解决，不需要新增自定义打分逻辑。
+
+**待确认的具体细节（用户要求先定细节再写代码）：**
+1. 核验由 harness 的 Python 代码用确定性规则做，不是让 32B 模型自己判断
+2. 纠正消息用固定模板还是模型现场生成
+3. 核验标准的严格程度（只查"非模板/非空"，还是精确比对"是否等于 Student 刚认可的答案文本"）
+4. 是否同时覆盖 TA_chat.py / teacher_chat.py 结尾同款的"追加不覆盖→放行 DONE"模式
+
+**追加发现：Student（32B）判定完成的可靠性问题，根源核对**
+
+用户追问：为什么 32B 模型光看到一个还不错的答案就会直接判定完成，明明还没给出写入指示？重新核对 `student_chat.py` 源码：
+
+- `generate_student_message()` 调用 `client.chat.completions.create(model=model, messages=messages)` **没有传任何 `temperature`/`top_p` 等采样参数**——完全依赖外部 Simulator 服务的默认值，这是此前没有查过的变量，具体默认值是多少不清楚。
+- `STUDENT_SYSTEM_PROMPT` 第 3 步指令本身已经写得很明确："Never say HOMEWORK_DONE until the AI confirms it wrote the file"——**不存在指令含糊或有漏洞给模型钻空子**，如果模型仍然违反，是 32B 模型自身没有严格遵守一个已经写清楚的指令，不是我们提示词设计的缺陷。
+- 可能原因（未经证实，仅列出）：未设采样参数导致的随机性；提示词是叙事式描述步骤而非显式状态机，模型每次都要自己从 `conversation_history` 重新推断"现在在第几步"，当第一次给出的答案就已经自然、从未触发过"重写"时，"还没走到写入这一步"这个状态在对话历史里没有特别显眼的信号；多轮指令遵循本身是 LLM 已知的通用短板。
+- 这进一步印证了"必须做确定性 harness 核验、不能指望靠提示词让 Student 更可靠地自我监督"这个方向是对的。
+
+**下一步（用户要求）：** 继续排查还没查过的部分——32B 模型的部署/采样配置（官方 `launch_user_llm.sh` 的默认值 vs 我们自己实际部署 Simulator 时用的配置）；官方仓库里是否有其他贡献者写过跟 Student 判断可靠性/温度设置相关、此前没查到的代码。
+
+---
+
+## [2026-07-22] 排查 32B Simulator 部署配置 + 官方仓库全部贡献者身份核实——均无遗漏
+
+**32B 采样配置核实：** 对比官方 `openclaw-test/launch_user_llm.sh` 和我们自己的 `scripts/launch_simulator.sh`，两者都只是启动 SGLang server，**都没有传任何默认采样参数**——我们的脚本是官方脚本的等比例放大（4B→32B），不是我们自己引入的差异。客户端（`student_chat.py` 等）和服务端都没设温度，这是论文原始设计本身如此，不是我们部署的疏漏。
+
+**全仓库贡献者身份核实（按邮箱区分官方作者 vs 外部贡献者）：**
+
+官方作者（对应论文署名 5 人中的 4 人，Mengdi Wang 无直接提交）：
+- Yinjie Wang / yinjjiew（yinjie@uchicago.edu）——一作，198+18 次提交
+- Ling Yang（ly1988@princeton.edu）——通讯作者，13 次提交，**全部是 README/LICENSE/PDF 链接**，不涉及方法代码
+- Xuyang Chen（xuyangc@sas.upenn.edu）——7 次提交，**全部是 `terminal-rl/`**（General Agent Terminal 赛道，论文 Figure 5，不是我们复现的 Table 3 Personal Agent），另有一次改了共享 `slime` 的通用修复
+- jinxiaolong1129（应为 Xiaolong Jin）——4 次提交，**全部是 `swe-rl/`**（General Agent SWE 赛道，同样不是 Table 3）
+
+**结论：我们实际使用的 Personal Agent 路径（`openclaw-combine`/`openclaw-opd`/`openclaw-rl`/`openclaw-test`）从头到尾只有 Yinjie Wang 一人编写**，另有非署名作者 Siddhant Mukherjee 2026-03-02（早于论文提交）贡献的 top-K 蒸馏基础机制（`openclaw-opd/openclaw_opd_api_server.py` + 共享 `slime` backend），该部分已在使用中，不是遗漏。
+
+全部外部贡献者逐一核实（miaoziyang/Qwen3.5、Yi Su+"Your Name"/Fireworks、Jingyang Zhang/LoRA、Niujunbo2002/skill-bridge、zhuchichi56/OEL）——均为平行功能分支或已被删除的旧代码，均与我们实际使用的路径无关，不存在遗漏。
+
+**意外发现（有价值）：** 官方仓库 2026-03-03～03-20 期间内嵌过一份完整 OpenClaw 本体（后改为"自带 OpenClaw"），提交记录明确写着版本号 **`"version": "2026.3.2-beta.1"`**，比本项目一直用的 `march_2026_3_8`（按日期猜的 tag）精确得多，且时间只早 6 天，验证了现有基准点选得足够接近。
+
+---
+
+## [2026-07-22] Student/TA/Teacher 会话级文件核验方案定案与实现
+
+**最终确认的 4+1 点设计：**
+1. 核验由 harness（`student_chat.py`/`TA_chat.py`/`teacher_chat.py` 的 Python 代码）用确定性规则做，32B 模型不参与判断本身
+2. 纠正消息用固定模板，不调用 API 现场生成
+3. 核验标准采用更严格的版本：读取真实文件内容，比对是否仍包含"session 开始前就已存在的内容"（防覆盖丢失）+ 内容是否比初始状态有实质增长（防没写）+ 是否包含最近一次被认可的回答/评语的指纹片段（防写错内容）
+4. 三个角色（Student/TA/Teacher）统一处理，因为三者结尾都是同一种"追加不覆盖→放行 DONE"模式
+5. **（用户强调）核验必须在 DONE_SENTINEL 被采纳、session 结束、循环推进到下一题之前同步生效**，不能是事后补救
+
+**实现：** 改造 `scripts/prepare_openclaw_test_scripts.sh`（原本只做 `model` 字段兼容补丁的脚本），新增：
+- 通用核验函数块（`_read_homework_file`/`_normalize_for_compare`/`_find_last_substantial_reply`/`_verify_homework_file_ground_truth`），以完全相同的逻辑分别插入三个文件，只是目标目录（`homework`/`homework1`/`homework2`）不同
+- `run_one_problem`/`run_one_grading`/`run_one_commenting` 三个函数签名新增 `workspace_dir` 参数，并在循环开始前读取 `initial_content`（session 开始时的文件快照）
+- 把原本"检测到 DONE_SENTINEL 就直接 `return True`"的判断，改成先跑核验：**通过才 `return True`；不通过则把这一轮的消息替换成固定的纠正模板，不 return，让循环继续跑下一轮**——因为替换发生在 `return` 之前、同一个同步调用栈里，天然保证了"没验证通过就不可能让外层 `main()` 的 `for i in range(count)` 循环推进到下一题"，不存在您说的"判断没写好但已经跳到下一题"这种竞态
+- `main()` 里调用 `run_one_problem`/`run_one_grading`/`run_one_commenting` 的地方补上 `workspace_dir=workspace` 参数
+
+**本地测试（无 GPU，纯逻辑）：** 对真实官方文件跑补丁脚本，三个文件 `py_compile` 语法检查全部通过；抽取核验函数单独测试 4 个场景，全部符合预期：
+| 场景 | 预期 | 实测 |
+|---|---|---|
+| A：write 覆盖丢失 Problem:/Solution: 结构（真实 Problem 11 场景复现）| False | False ✓ |
+| B：正确追加，结构完整保留 | True | True ✓ |
+| C：根本没写，文件还是初始模板 | False | False ✓ |
+| D：写了，但内容跟被认可的答案对不上 | False | False ✓ |
+
+**接入：** 无需额外改训练脚本——`prepare_openclaw_test_scripts.sh` 本来就已经被 `train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh` 三个脚本调用，且执行的是这个脚本生成的补丁版本（`${OPENCLAW_DIR}/${script}`），不是官方原文件，改这一个脚本三处训练入口自动生效。
+
+**待验证：** 服务器真实部署（含真实 32B Simulator）跑一次，确认锚点命中、日志里能看到 `openclaw-rl-homework-verification-gate` 标记、真实训练数据里 write 覆盖/未完成却判定成功这两类问题的发生率是否显著下降。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
