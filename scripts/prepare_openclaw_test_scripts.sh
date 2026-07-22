@@ -5,12 +5,29 @@
 #      `"model": "openclaw/default"`, the agent-target format OpenClaw
 #      2026.6.9's /v1/chat/completions endpoint actually expects.
 #
-#   2. (new) Insert a deterministic, harness-level ground-truth file check
-#      before honoring the DONE-style sentinel (HOMEWORK_DONE / GRADING_DONE /
+#   2. Insert a deterministic, harness-level ground-truth file check before
+#      honoring the DONE-style sentinel (HOMEWORK_DONE / GRADING_DONE /
 #      COMMENT_DONE), so the session cannot end and advance to the next
 #      problem unless the target homework file was genuinely, correctly
-#      updated. If the check fails, the sentinel is replaced with a fixed
-#      correction message instead of being honored, and the loop continues.
+#      updated. The check never trusts the simulator's own claim of "done" --
+#      it always re-derives a fresh decision:
+#        - If the file is missing prior content, has no meaningful new
+#          content, or the new content doesn't match anything shown recently
+#          (a definite, deterministic diagnosis), the simulator is given a
+#          natural-language hint about *what* seems wrong (no raw file
+#          content shown -- there is nothing safe/meaningful to show in
+#          these broken states) and asked to phrase an in-character
+#          follow-up. This is a hard rule: no matter what the simulator says
+#          back, the session cannot be marked done on this path.
+#        - Only if the deterministic check finds no problem does the
+#          simulator get shown the actual newly-written content (just the
+#          new portion, not the whole file with its Problem:/prior-content
+#          scaffolding, so pre-existing content can't distort a length/style
+#          judgment -- e.g. inflating a TA's perceived comment length) and
+#          asked to make one more independent judgment call (matching its
+#          own step-1 requirements, e.g. non-AI-like style for Student). Only
+#          in this branch can the simulator's own response actually finalize
+#          the session.
 #
 # Why (see docs/issues_log.md, 2026-07-22 entries): the Student/TA/Teacher
 # simulator (external Qwen3-32B, base model, unmodified prompt, no sampling
@@ -19,24 +36,33 @@
 # a gap introduced by our deployment) has no file-reading capability and
 # repeatedly confirms "done" based purely on conversational impression --
 # empirically confirmed via real training data to (a) accept a genuinely
-# failed edit as complete (Problem 4) and (b) accept a `write` call that
+# failed edit as complete (Problem 4), (b) accept a `write` call that
 # silently overwrote/dropped prior content while still reporting success
-# (Problem 11, hit twice independently). Fixing the *reward* for a turn does
-# not stop the *session* from ending prematurely and moving to the next
-# problem with the task never actually completed -- these are two different
-# mechanisms. This patch fixes the session-continuation side.
+# (Problem 11, hit twice independently), and (c) accept a write whose actual
+# saved content was never independently checked for style. Fixing the
+# *reward* for a turn does not stop the *session* from ending prematurely
+# and moving to the next problem with the task never actually completed --
+# these are two different mechanisms. This patch fixes the
+# session-continuation side. It went through two real-data-driven revisions
+# before landing here: v1 fingerprinted a *past reply* instead of the file's
+# actual new content and false-positived on a genuinely correct write
+# (fixed same day); v2 added a fixed generic correction message that proved
+# too vague for the policy to self-correct from, motivating this v3 design
+# where the simulator does the final judgment call itself, grounded in
+# either a deterministic hint or the real new content.
 #
 # Reproduction-fidelity note: this is NOT the same category of change as the
-# (reverted) write/edit prompt-guidance patch. That one gave the POLICY model
-# technical help the paper's original environment never had. This one makes
-# the SIMULATOR (a stand-in for a real human student/TA/teacher) behave more
-# like a real person actually checking their own homework file before
-# declaring it done -- it changes nothing the policy model perceives as
-# input; the policy still receives exactly the same conversational messages
-# it always would, just possibly one more (a correction) if it got something
-# wrong. The 32B simulator itself does not perform this check or see its
-# internals -- it is a deterministic Python-side gate, matching the project's
-# established preference for rule-based checks over LLM judgment.
+# (reverted) write/edit prompt-guidance patch. That one gave the POLICY
+# model technical help the paper's original environment never had. This one
+# makes the SIMULATOR (a stand-in for a real human student/TA/teacher)
+# behave more like a real person actually checking their own homework file
+# before declaring it done -- it changes nothing the policy model perceives
+# as input; the policy still receives exactly the same conversational
+# messages it always would, just possibly one more (a natural follow-up) if
+# something looked wrong. The deterministic diagnosis itself is never shown
+# to the policy model, and the simulator only ever sees content scoped to
+# what it would plausibly have access to (its own newly-requested content),
+# never raw file-format internals.
 #
 # This only rewrites known, literal source blocks; no training logic,
 # reward, or data path is touched. The official openclaw-test/ directory is
@@ -62,12 +88,16 @@ marker = "openclaw-rl-homework-verification-gate"
 
 # Shared helper block, inserted verbatim (module-level) into each of the
 # three scripts, right after their DONE_SENTINEL constant definition.
-HELPERS = '''
+# {hints} is substituted per-file with a role-appropriate hint dict literal.
+HELPERS_TEMPLATE = '''
 
 # --- {marker} ---
-# Deterministic ground-truth file check, run before honoring the DONE-style
-# sentinel. See scripts/prepare_openclaw_test_scripts.sh for full rationale.
+# Deterministic ground-truth file check + simulator re-check, run before
+# honoring the DONE-style sentinel. See scripts/prepare_openclaw_test_scripts.sh
+# for full rationale.
 _WHITESPACE_RE = re.compile(r"\\s+")
+
+_DIAGNOSIS_HINTS = {hints}
 
 
 def _normalize_for_compare(text: str) -> str:
@@ -84,45 +114,39 @@ def _read_homework_file(workspace_dir: str, homework_dir: str, problem_index: in
         return ""
 
 
-def _verify_homework_file_ground_truth(
+def _diagnose_homework_file(
     workspace_dir: str,
     homework_dir: str,
     problem_index: int,
     initial_content: str,
     conversation_history: list[dict],
     recent_turns: int = 6,
-) -> bool:
-    """Returns True only if the target file was genuinely, correctly updated:
-      1. still contains whatever content was already there before this
-         session started (catches a destructive `write` overwrite that
-         silently dropped prior content), and
-      2. actually grew by a non-trivial amount (something was appended, not
-         a no-op / never-written case), and
-      3. the newly written content is recognizable somewhere in the recent
-         conversation (catches "wrote something unrelated" as well as
-         "claimed done with nothing written").
+) -> str | None:
+    """Returns None if the file appears genuinely, correctly updated (content
+    preserved, something new actually added, and that new content is
+    recognizable in the recent conversation), else a short diagnosis code:
+      "overwritten"  -- prior content is gone (destructive write)
+      "not_written"  -- no meaningful growth (nothing actually saved)
+      "mismatch"     -- new content isn't recognizable in recent conversation
 
-    Check 3 fingerprints the FILE's new content and searches for it in the
-    conversation, not the other way around: fingerprinting a specific past
-    reply (e.g. "the most recent substantial message") is fragile, because
-    the message right before a DONE-style sentinel is typically the write
-    tool's own confirmation reply, which often opens with meta-commentary
-    ("The solution has been added to homework/0.txt...") before it happens
-    to echo the actual file content -- fingerprinting just its first N
-    characters can land on that preamble and never match, even for a
-    genuinely correct write. Searching in the other direction sidesteps this
-    entirely: it does not matter which turn actually contains the matching
-    text, only that it appears somewhere recently."""
+    The mismatch check fingerprints the FILE's new content and searches for
+    it in the conversation, not the other way around: fingerprinting a
+    specific past reply (e.g. "the most recent substantial message") is
+    fragile, because the message right before a DONE-style sentinel is
+    typically the write tool's own confirmation reply, which often opens
+    with meta-commentary before it happens to echo the actual file content --
+    fingerprinting just its first N characters can land on that preamble and
+    never match, even for a genuinely correct write."""
     current_content = _read_homework_file(workspace_dir, homework_dir, problem_index)
     if not current_content:
-        return False
+        return "not_written"
 
     normalized_current = _normalize_for_compare(current_content)
     normalized_initial = _normalize_for_compare(initial_content)
     if normalized_initial and normalized_initial not in normalized_current:
-        return False
+        return "overwritten"
     if len(current_content) <= len(initial_content) + 5:
-        return False
+        return "not_written"
 
     new_content = current_content[len(initial_content):]
     fingerprint = _normalize_for_compare(new_content)[:80]
@@ -131,13 +155,61 @@ def _verify_homework_file_ground_truth(
             " ".join(entry.get("content", "") for entry in conversation_history[-recent_turns:])
         )
         if fingerprint not in recent_text:
-            return False
+            return "mismatch"
 
-    return True
-'''.format(marker=marker)
+    return None
 
 
-def patch_file(filename, done_sentinel, homework_dir, role_label, run_fn_anchor, run_fn_call_anchor, done_check_anchor, msg_var, correction_template):
+def _build_recheck_instruction(diagnosis: str | None, new_content: str, done_sentinel: str) -> str:
+    """Builds the extra system-role instruction used to force a grounded,
+    final re-check before honoring a DONE-style sentinel.
+
+    When a deterministic problem was found, no raw file content is shown --
+    an overwrite means there is no clean "new portion" left to extract, and
+    "not written" has nothing to show anyway. Only a natural-language hint
+    about *what* seems wrong is given, framed as something the simulator
+    might plausibly notice/suspect on its own (not "the harness detected a
+    bug"). The simulator's response can never finalize the session on this
+    path, no matter what it says.
+
+    When no problem was found, the ACTUAL new content is shown (scoped to
+    just what was newly added, not the whole file with its Problem:/prior
+    scaffolding) so the simulator can independently judge it against its own
+    stated requirements one more time, grounded in real content instead of
+    conversational impression alone."""
+    if diagnosis:
+        hint = _DIAGNOSIS_HINTS[diagnosis]
+        return (
+            f"(Internal note, not shown to the AI: {{hint}} Express this as a short, "
+            "natural, in-character follow-up asking the AI to double check -- don't "
+            "mention files, systems, or verification directly, just say what you'd "
+            "actually say if something felt off.)"
+        )
+    return (
+        "(Internal note, not shown to the AI: here is exactly what was newly "
+        f"added:\\n\\n{{new_content}}\\n\\n"
+        "Take a close look and judge it the same way you would in step 1 -- does "
+        "it satisfy everything you actually care about? If something is still "
+        "off, point it out naturally and ask for a fix, the same way you always "
+        f"would. If it genuinely looks good, respond with exactly {{done_sentinel}}.)"
+    )
+'''
+
+
+def patch_file(
+    filename,
+    done_sentinel,
+    homework_dir,
+    role_label,
+    hints,
+    generate_fn_name,
+    generate_fn_anchor,
+    run_fn_anchor,
+    run_fn_call_anchor,
+    done_check_anchor,
+    msg_var,
+    correction_template,
+):
     src_path = f"{src_dir}/{filename}"
     dest_path = f"{dest_dir}/{filename}"
     text = open(src_path, encoding="utf-8").read()
@@ -166,13 +238,34 @@ def patch_file(filename, done_sentinel, homework_dir, role_label, run_fn_anchor,
             f"in {filename}, found {text.count(sentinel_line)} (openclaw-test "
             "script may have changed upstream -- re-verify this patch)"
         )
-    text = text.replace(sentinel_line, sentinel_line + HELPERS, 1)
+    helpers = HELPERS_TEMPLATE.format(marker=marker, hints=repr(hints))
+    text = text.replace(sentinel_line, sentinel_line + helpers, 1)
 
-    # 3. Thread workspace_dir into the run_one_* function signature.
+    # 3. Thread an optional extra_instruction param into generate_*_message,
+    #    appended as one more system-role message right before the API call.
+    if generate_fn_anchor not in text:
+        raise SystemExit(
+            f"patch failed: {generate_fn_name} signature anchor not found in "
+            f"{filename} (openclaw-test script may have changed upstream -- "
+            f"re-verify this patch):\n{generate_fn_anchor!r}"
+        )
+    text = text.replace(generate_fn_anchor, generate_fn_anchor.replace(
+        "    max_retries: int = 3,\n) -> str:",
+        "    max_retries: int = 3,\n    extra_instruction: str | None = None,\n) -> str:",
+        1,
+    ).replace(
+        "        *conversation_history,\n    ]\n",
+        "        *conversation_history,\n    ]\n"
+        "    if extra_instruction:\n"
+        '        messages.append({"role": "system", "content": extra_instruction})\n',
+        1,
+    ), 1)
+
+    # 4. Thread workspace_dir into the run_one_* function signature.
     if run_fn_anchor not in text:
         raise SystemExit(
             f"patch failed: run-function signature anchor not found in {filename} "
-            "(openclaw-test script may have changed upstream -- re-verify this patch):\\n"
+            f"(openclaw-test script may have changed upstream -- re-verify this patch):\n"
             f"{run_fn_anchor!r}"
         )
     text = text.replace(run_fn_anchor, run_fn_anchor.replace(
@@ -181,8 +274,7 @@ def patch_file(filename, done_sentinel, homework_dir, role_label, run_fn_anchor,
         1,
     ), 1)
 
-    # 4. Capture initial_content right after conversation_history is set up,
-    #    and thread it into the DONE_SENTINEL check block below.
+    # 5. Capture initial_content right after conversation_history is set up.
     if 'conversation_history: list[dict] = []' not in text:
         raise SystemExit(
             f"patch failed: conversation_history initialization not found in {filename}"
@@ -194,35 +286,51 @@ def patch_file(filename, done_sentinel, homework_dir, role_label, run_fn_anchor,
         1,
     )
 
-    # 5. Replace the "if DONE_SENTINEL in <msg_var>: ... return True" block
-    #    with the ground-truth-gated version.
+    # 6. Replace the "if DONE_SENTINEL in <msg_var>: ... return True" block
+    #    with the diagnose-then-recheck version.
     if done_check_anchor not in text:
         raise SystemExit(
             f"patch failed: DONE_SENTINEL check anchor not found in {filename} "
-            "(openclaw-test script may have changed upstream -- re-verify this patch):\\n"
+            f"(openclaw-test script may have changed upstream -- re-verify this patch):\n"
             f"{done_check_anchor!r}"
         )
-    correction_msg = correction_template.format(homework_dir=homework_dir)
+    fallback_msg = correction_template.format(homework_dir=homework_dir)
     new_check = (
         f'if DONE_SENTINEL in {msg_var}:\n'
-        f'            if _verify_homework_file_ground_truth(\n'
+        f'            _diagnosis = _diagnose_homework_file(\n'
         f'                workspace_dir, "{homework_dir}", problem_index, initial_content, conversation_history,\n'
-        f'            ):\n'
-        f'                print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file verified, {marker})")\n'
+        f'            )\n'
+        f'            if _diagnosis:\n'
+        f'                _new_content = ""\n'
+        f'            else:\n'
+        f'                _new_content = _read_homework_file(workspace_dir, "{homework_dir}", problem_index)[len(initial_content):]\n'
+        f'            _recheck_instruction = _build_recheck_instruction(_diagnosis, _new_content, DONE_SENTINEL)\n'
+        f'            try:\n'
+        f'                _recheck_msg = {generate_fn_name}(\n'
+        f'                    external_client, model, problem_index, conversation_history,\n'
+        f'                    max_retries=max_retries, extra_instruction=_recheck_instruction,\n'
+        f'                )\n'
+        f'            except Exception as _e:\n'
+        f'                print(f"  [warn] re-check call failed ({{_e}}), falling back to fixed correction message")\n'
+        f'                _recheck_msg = None\n'
+        f'            if _recheck_msg is None:\n'
+        f'                _recheck_msg = {fallback_msg!r}.format(index=problem_index)\n'
+        f'            if _diagnosis is None and DONE_SENTINEL in _recheck_msg:\n'
+        f'                print(f"\\n  Turn {{turn + 1}}: {role_label} confirmed problem {{problem_index}} is done! (file + re-check verified, {marker})")\n'
         f'                return True\n'
         f'            print(\n'
-        f'                f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but file verification "\n'
-        f'                f"FAILED ({marker}) -- injecting correction instead of ending session"\n'
+        f'                f"\\n  Turn {{turn + 1}}: {role_label} said {done_sentinel} but re-check did not confirm "\n'
+        f'                f"done (diagnosis={{_diagnosis}}, {marker}) -- continuing instead of ending session"\n'
         f'            )\n'
-        f'            {msg_var} = {correction_msg!r}.format(index=problem_index)'
+        f'            {msg_var} = _recheck_msg'
     )
     text = text.replace(done_check_anchor, new_check, 1)
 
-    # 6. Pass workspace_dir at the run_one_* call site.
+    # 7. Pass workspace_dir at the run_one_* call site.
     if run_fn_call_anchor not in text:
         raise SystemExit(
             f"patch failed: run-function call-site anchor not found in {filename} "
-            "(openclaw-test script may have changed upstream -- re-verify this patch):\\n"
+            f"(openclaw-test script may have changed upstream -- re-verify this patch):\n"
             f"{run_fn_call_anchor!r}"
         )
     text = text.replace(run_fn_call_anchor, run_fn_call_anchor.replace(
@@ -247,6 +355,21 @@ patch_file(
     done_sentinel="HOMEWORK_DONE",
     homework_dir="homework",
     role_label="Student",
+    hints={
+        "overwritten": "You have a nagging feeling the original problem text might have gotten wiped out somehow when the file was last saved.",
+        "not_written": "You're not sure anything actually got saved to the file at all.",
+        "mismatch": "What's in the file doesn't seem to match what the AI showed you a moment ago.",
+    },
+    generate_fn_name="generate_student_message",
+    generate_fn_anchor=(
+        "def generate_student_message(\n"
+        "    client: OpenAI,\n"
+        "    model: str,\n"
+        "    problem_index: int,\n"
+        "    conversation_history: list[dict],\n"
+        "    max_retries: int = 3,\n"
+        ") -> str:"
+    ),
     run_fn_anchor=(
         "def run_one_problem(\n"
         "    problem_index: int,\n"
@@ -270,6 +393,21 @@ patch_file(
     done_sentinel="GRADING_DONE",
     homework_dir="homework1",
     role_label="TA",
+    hints={
+        "overwritten": "You have a nagging feeling the student's original solution might have gotten wiped out somehow when the file was last saved.",
+        "not_written": "You're not sure your grading comments actually got saved to the file at all.",
+        "mismatch": "What's in the file doesn't seem to match the grading comments the AI showed you a moment ago.",
+    },
+    generate_fn_name="generate_ta_message",
+    generate_fn_anchor=(
+        "def generate_ta_message(\n"
+        "    client: OpenAI,\n"
+        "    model: str,\n"
+        "    problem_index: int,\n"
+        "    conversation_history: list[dict],\n"
+        "    max_retries: int = 3,\n"
+        ") -> str:"
+    ),
     run_fn_anchor=(
         "def run_one_grading(\n"
         "    problem_index: int,\n"
@@ -293,6 +431,21 @@ patch_file(
     done_sentinel="COMMENT_DONE",
     homework_dir="homework2",
     role_label="Teacher",
+    hints={
+        "overwritten": "You have a nagging feeling the student's work and the TA's grading might have gotten wiped out somehow when the file was last saved.",
+        "not_written": "You're not sure your comments actually got saved to the file at all.",
+        "mismatch": "What's in the file doesn't seem to match the comments the AI showed you a moment ago.",
+    },
+    generate_fn_name="generate_teacher_message",
+    generate_fn_anchor=(
+        "def generate_teacher_message(\n"
+        "    client: OpenAI,\n"
+        "    model: str,\n"
+        "    problem_index: int,\n"
+        "    conversation_history: list[dict],\n"
+        "    max_retries: int = 3,\n"
+        ") -> str:"
+    ),
     run_fn_anchor=(
         "def run_one_commenting(\n"
         "    problem_index: int,\n"
@@ -312,4 +465,4 @@ patch_file(
 )
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容 + HOMEWORK_DONE/GRADING_DONE/COMMENT_DONE 前置文件核验）"
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容 + HOMEWORK_DONE/GRADING_DONE/COMMENT_DONE 前置事实核验 + 32B 复核）"

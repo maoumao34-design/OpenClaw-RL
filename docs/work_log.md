@@ -865,6 +865,14 @@
 - 修复：指纹匹配方向反过来，改成从文件新增内容取指纹，去最近几轮对话拼接文本里搜，不用再猜"哪条历史消息才是真正认可的答案"；删掉不再需要的 `_find_last_substantial_reply`
 - 用真实 Problem 0 对话数据本地复现问题、验证修复：修复前必现误判，修复后正确判定为 True；原 A-D 四个场景重跑全部保持正确，无回归 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### 核验机制升级到 v3：诊断保持确定性，纠正消息改由 32B 现场生成 + 独立复核风格
+
+**完成内容：**
+- 用修复后版本重新提交训练，真实数据暴露两个新情况：Problem 0 核验判断对了（真的 write 覆盖丢结构），但固定纠正模板太笼统，模型没能在 8 轮内改对，最终"未完成"收场（诚实但没达成"教会模型改对"）；Problem 1 核验因 Student 违反官方两步协议多绕了一轮，结果正确但不够干净
+- 用户连续追问两点关键细节：(1) 复核会不会让 32B 看到带 `Problem:`/`Solution:` 标签的原始文件格式、TA 判断字数会不会被无关内容干扰——确认会，改成只展示新增部分；(2) 这个改动会不会影响 Table 3 收敛判据——核实 `results_student_*.txt` 只在 turn 0（固定开场白，从不含 DONE_SENTINEL）写入，两条路径结构上不相交，直接影响为零
+- 定案 v3 方案：诊断（`_diagnose_homework_file` 返回 `overwritten`/`not_written`/`mismatch`/`None`）继续 100% 确定性；检测到 DONE_SENTINEL 统一走一次复核——有诊断只给 32B 自然语气线索（不展示文件内容），结果不能推翻"未完成"这个硬结论；无诊断才展示新增内容（不含标签/已有内容）让 32B 独立复核风格，只有这条路径它说完成才算数。复用现有 `generate_*_message` 函数加 `extra_instruction` 可选参数，API 失败 fallback 回退固定模板
+- 本地测试：三文件语法检查通过；`_diagnose_homework_file` 对真实 Problem 0 场景 + 原 A/C/D 三场景全部返回正确诊断码；复核提示文本人工核对符合"不展示标签/只展示新增内容"的设计 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -874,7 +882,7 @@
 - [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
-- [x] **Student/TA/Teacher 会话级文件核验**：`prepare_openclaw_test_scripts.sh` 已实现；**首次真实部署即发现一个幅面很大的误判 bug（指纹匹配方向错误），已定位根因、修复、用真实数据复测通过**，修复后的版本待重新部署验证
+- [x] **Student/TA/Teacher 会话级文件核验（v3）**：诊断确定性 + 32B 复核纠正消息/独立风格判断，本地逻辑测试通过，服务器真实部署（含真实 32B Simulator 复核调用）待验证
 
 ### 已知限制 / 未解决
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
@@ -884,16 +892,16 @@
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 提交（git commit + push）文件核验 bug 修复，服务器 `git pull`
-2. 停掉当前误判的 run（`20260722_124438`），用修复后的版本重新提交训练
-3. 确认 Silent Reply Policy 补丁 + 修复后的 Student/TA/Teacher 文件核验补丁在真实部署文件上锚点命中、日志能看到对应标记，且不再出现真实写入被误判的情况
-4. 观察新 run 里 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
+1. 提交（git commit + push）v3 核验机制，服务器 `git pull`
+2. 停掉当前 run，用 v3 版本重新提交训练
+3. 确认 Silent Reply Policy 补丁 + v3 文件核验补丁在真实部署文件上锚点命中、`extra_instruction` 真的影响了 32B 的复核回复
+4. 观察 Problem 0 这类真实 write 覆盖场景，这次借助更具体的线索能不能真正引导模型改对；观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
 5. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
 6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`；workspace 迁移到 `/dfs/data`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
-- [ ] 修复后的 Student/TA/Teacher 文件核验补丁在服务器真实部署文件（含真实 32B Simulator）上的实际效果
+- [ ] v3 文件核验补丁在服务器真实部署文件（含真实 32B Simulator 复核调用）上的实际效果，尤其是能否真正引导模型改对
 - [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
