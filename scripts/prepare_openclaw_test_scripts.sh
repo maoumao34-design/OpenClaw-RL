@@ -84,28 +84,13 @@ def _read_homework_file(workspace_dir: str, homework_dir: str, problem_index: in
         return ""
 
 
-def _find_last_substantial_reply(conversation_history: list[dict], min_len: int = 50) -> str | None:
-    """Scan backwards for the most recent OpenClaw reply that looks like a
-    real answer/comment rather than a short confirmation. In this script's
-    conversation_history convention, OpenClaw's replies are stored under
-    role="user" (from the simulator's own chat-completions perspective)."""
-    marker_text = "The AI assistant replied:\\n\\n"
-    for entry in reversed(conversation_history):
-        if entry.get("role") != "user":
-            continue
-        content = entry.get("content", "")
-        reply = content[len(marker_text):] if content.startswith(marker_text) else content
-        if len(reply.strip()) >= min_len:
-            return reply
-    return None
-
-
 def _verify_homework_file_ground_truth(
     workspace_dir: str,
     homework_dir: str,
     problem_index: int,
     initial_content: str,
     conversation_history: list[dict],
+    recent_turns: int = 6,
 ) -> bool:
     """Returns True only if the target file was genuinely, correctly updated:
       1. still contains whatever content was already there before this
@@ -113,9 +98,21 @@ def _verify_homework_file_ground_truth(
          silently dropped prior content), and
       2. actually grew by a non-trivial amount (something was appended, not
          a no-op / never-written case), and
-      3. contains a recognizable fingerprint of the most recent
-         answer/comment shown in the conversation (catches "wrote something
-         unrelated" as well as "claimed done with nothing written")."""
+      3. the newly written content is recognizable somewhere in the recent
+         conversation (catches "wrote something unrelated" as well as
+         "claimed done with nothing written").
+
+    Check 3 fingerprints the FILE's new content and searches for it in the
+    conversation, not the other way around: fingerprinting a specific past
+    reply (e.g. "the most recent substantial message") is fragile, because
+    the message right before a DONE-style sentinel is typically the write
+    tool's own confirmation reply, which often opens with meta-commentary
+    ("The solution has been added to homework/0.txt...") before it happens
+    to echo the actual file content -- fingerprinting just its first N
+    characters can land on that preamble and never match, even for a
+    genuinely correct write. Searching in the other direction sidesteps this
+    entirely: it does not matter which turn actually contains the matching
+    text, only that it appears somewhere recently."""
     current_content = _read_homework_file(workspace_dir, homework_dir, problem_index)
     if not current_content:
         return False
@@ -127,10 +124,13 @@ def _verify_homework_file_ground_truth(
     if len(current_content) <= len(initial_content) + 5:
         return False
 
-    approved = _find_last_substantial_reply(conversation_history)
-    if approved:
-        fingerprint = _normalize_for_compare(approved)[:80]
-        if fingerprint and fingerprint not in normalized_current:
+    new_content = current_content[len(initial_content):]
+    fingerprint = _normalize_for_compare(new_content)[:80]
+    if fingerprint:
+        recent_text = _normalize_for_compare(
+            " ".join(entry.get("content", "") for entry in conversation_history[-recent_turns:])
+        )
+        if fingerprint not in recent_text:
             return False
 
     return True
