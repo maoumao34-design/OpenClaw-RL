@@ -346,12 +346,9 @@ PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
 bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
 cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
-# Patch write/edit 工具选择指引，理由同 train_with_services.sh 同名代码块的
-# 完整说明。
-echo "生成并部署 write/edit 工具选择指引补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
-PATCHED_WRITE_EDIT_DIR="${LOGS_DIR}/patched-write-edit-guidance"
-bash "${SCRIPTS_DIR}/prepare_patched_write_edit_guidance.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_WRITE_EDIT_DIR}"
-cp "${PATCHED_WRITE_EDIT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+# （write/edit 工具选择指引补丁已撤销，理由同 train_with_services.sh 同名
+# 位置的完整说明：论文原始环境没有这条指引，加了会影响复现忠实度，改用
+# 训练奖励信号纠正。）
 
 # Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，理由同
 # train_with_services.sh 同名代码块的完整说明。
@@ -360,6 +357,15 @@ CLI_COMPACTION_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/cli-compaction-B6C
 PATCHED_CLI_COMPACTION_DIR="${LOGS_DIR}/patched-cli-compaction"
 bash "${SCRIPTS_DIR}/prepare_patched_cli_compaction.sh" "${CLI_COMPACTION_LIVE_FILE}" "${PATCHED_CLI_COMPACTION_DIR}"
 cp "${PATCHED_CLI_COMPACTION_DIR}/cli-compaction-B6C2IDnn.js" "${CLI_COMPACTION_LIVE_FILE}"
+
+# Patch 内置的 Silent Reply Policy，理由同 train_with_services.sh 同名位置的
+# 完整说明：这套策略论文提交时不存在，第 5 个确认"论文提交后新增"的 OpenClaw
+# 行为，强制恒定返回 "disallow"，恢复 3 月版本模式。
+echo "生成并部署 silent-reply-policy 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SILENT_REPLY_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/effective-reply-route-BnYlac-J.js"
+PATCHED_SILENT_REPLY_DIR="${LOGS_DIR}/patched-silent-reply-policy"
+bash "${SCRIPTS_DIR}/prepare_patched_silent_reply_policy.sh" "${SILENT_REPLY_LIVE_FILE}" "${PATCHED_SILENT_REPLY_DIR}"
+cp "${PATCHED_SILENT_REPLY_DIR}/effective-reply-route-BnYlac-J.js" "${SILENT_REPLY_LIVE_FILE}"
 
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke 的问题）。

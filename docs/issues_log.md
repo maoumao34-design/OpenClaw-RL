@@ -1386,6 +1386,174 @@ grep -rl "Attach media in the final visible reply" /usr/lib/node_modules/opencla
 
 ---
 
+## [2026-07-21] 撤销 write/edit 指引补丁，改用奖励信号方向
+
+**用户判断（关键转折）：** "我觉得这里我们走的路错了，不该是加指引，而是在错的时候让打分是负分，让模型自己学会怎么edit。" 指引补丁虽然经真实诊断验证能改变模型行为，但论文原始环境（含论文提交时锁定的上游包 `@mariozechner/pi-coding-agent@0.57.1`）本来就没有任何 write/edit 工具选择指引——加这句指引是给了模型论文原始条件里从未有过的额外帮助，不是"恢复论文条件"，会实质影响复现忠实度。正确方向应该是让训练奖励信号本身正确反映"这一步操作对不对"，模型输入保持跟论文一样干净。
+
+**处理：** 通过 AskUserQuestion 确认"撤掉提示词补丁，完全改用奖励信号纠正"。删除 `scripts/prepare_patched_write_edit_guidance.sh`；从 `train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh` 三个脚本里移除该补丁的部署代码块，改为说明性注释记录撤销原因；`bash -n` 确认三脚本语法仍然正确。
+
+---
+
+## [2026-07-21] 实测验证 PRM 打分对 write/edit 问题的真实反应——确认"edit 失败"被正确惩罚，"write 覆盖但语义错"存在真实盲区
+
+**背景：** 在设计奖励信号修正方案之前，先追溯真实的奖励计算管线：`--custom-rm-path openclaw_combine_api_server.reward_func` → `openclaw_combine_api_server.py` 纯转发 → 实际定义在 `openclaw_opd_api_server.py:225`，只是读取 `sample.reward["score"]`，真正赋值发生在 `openclaw_combine_select_api_server.py` 的 `_submit_turn_sample`/`_submit_rl_turn_sample`，其中 RL 分数来自 `_opd_evaluate` 里对 `_build_prm_eval_prompt`（`openclaw_opd_api_server.py:159`）的多票裁决。该 prompt 本身已经内置规则：工具返回 error/failure → `\boxed{-1}`；工具成功返回 → `\boxed{1}`。
+
+**验证 1（Problem 4，edit 真失败）：** 在服务器上定位到失败 edit 对应 session（`cbef7641-...`），在训练日志 `training.log` 里搜到该 session 逐轮 `PRM eval` 记录：turn=4 起（对应 edit 参数缺失报错）连续 9 轮（turn 4-12）全部 `eval_score=-1.0`（多为 3 票一致）。**结论：edit 真失败这个子问题，论文官方原有 PRM judge 代码本来就已经正确判负分，不需要额外规则式检测。**
+
+**验证 2（Problem 11，write 覆盖但不报错）：** 在两次**独立**训练启动（不同 pid、不同 training.log，分别为 12:47 和 15:47 两个不同 run）里都找到了 Problem 11 的同一种模式：模型对 `homework/11.txt` 调用 `write`，`content` 只有解答正文，完全丢弃了 `"Problem:\n...\n\nSolution:\n"` 模板结构。两次真实 `eval_score` 分别是 **+1.0**（票 `[1,-1,1]`，2/3 多数）和 **+1.0**（票 `[1,1,1]`，3/3 一致）。**证实了"write 覆盖但语义错误却被打正分"这个理论盲区在真实训练里确实发生，而且复现率不低。**
+
+**严重性评估（用户纠正了一次过于乐观的初步判断）：** 最初判断"这次覆盖没有造成可观测代价，因为文件里仍然有完整解答"——用户指出这个判断不成立：(1) TA 阶段读的是 `homework1/`（`TA_chat.py` 用 `shutil.copytree` 从 `homework/` 复制而来），student 阶段写坏的文件会原样带进 TA 阶段，而且 TA 阶段自己最后一步的"追加不要覆盖"指令跟 student 阶段一模一样，同样的 write 误用如果发生在那里，覆盖掉的就是学生辛苦写的解答全文，而不是无关紧要的模板标题；(2) RL 训练的本质是放大被正反馈的行为，两次独立训练都命中同一模式说明这不是偶发噪声，训练只会不断提高这个错误行为的出现频率，风险会在别的、后果更严重的场景里兑现。**结论：这是真实、会被训练主动放大、且有下游可观测破坏路径的系统性缺陷，不是可有可无的噪声。**
+
+---
+
+## [2026-07-21] 重大发现：论文版本混淆——一直以 arXiv v1（2026-03-10）为基准，应为 v2（2026-05-11 修订）
+
+**触发：** 用户追问"为什么原始论文不会碰到 write 覆盖/假完成声明这类问题"，进而查官方 GitHub issue 库（`openclaw/openclaw` 而非本项目仓库）确认这类 write/edit 冲突本身是 OpenClaw 产品早已存在、被独立报告过的已知缺陷（[#11102](https://github.com/openclaw/openclaw/issues/11102) 2026-02-07 开、[#44203](https://github.com/openclaw/openclaw/issues/44203) 2026-03-12 开、影响版本号 `2026.03.08` ——正是论文提交那个版本、[#32333](https://github.com/openclaw/openclaw/issues/32333) 2026-03-03 开），跟本项目复现无关，是论文原始条件本身自带的噪声。
+
+**用户随后追问关键点：** "joint 的分数比 separate 低，这不是更契合'收敛所需 session 数、数字越小越好'这个解读吗？" ——这句话点出了此前用 WebFetch 摘要工具读到的论文内容（Table 3 是连续 0-1 分、"combined 分数比 separate 高"）与 CLAUDE.md 一直记录的内容（Table 3 是 session 收敛数、rule-based 判断）自相矛盾。
+
+**核实（改用浏览器直接读原始网页文本，不再依赖摘要工具）：** arXiv:2603.10165 有 v1（2026-03-10 提交，873KB）和 **v2（2026-05-11 修订，2173KB，当前唯一有效版本）**两个内容差异巨大的版本。之前反复 WebFetch 读到的是 v1（2 角色 Student/Teacher、连续 0-1 打分、无 TA、无 Mem0/Cognee）。用浏览器直接读 v2 全文原文，Section 4.1 逐字确认：
+
+> "A response is identified as AI-like when it contains markers such as bold text, numbered lists, or over-formatting like boxed final answers."（Student）
+> "the TA... considers a grading response insufficient when its length is below 100 tokens."（TA）
+> "The teacher wants comments... identified by warm phrases such as 'well done!' or 'excellent!'"（Teacher）
+> "We consider the optimization effect to have been achieved once the model's response to the first message satisfies the user's preferences in three consecutive sessions."
+
+**这跟 CLAUDE.md 里 `satisfies_student`/`satisfies_ta`/`satisfies_teacher` 规则和"连续 3 个 session"收敛条件逐字对应——CLAUDE.md 记录的一直是对的，错的是本项目从始至终用来做"OpenClaw 版本考古"的时间基准点。** v2 Table 3 原表：
+
+| | Joint Hybrid RL(Ours) | GRPO | OPD | Mem0 | Cognee | Separate Hybrid RL(Ours) | GRPO | OPD | Mem0 | Cognee |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Student | 11.6 | 15.4 | 30.8 | 13.6 | 14.6 | 19.2 | 22.8 | 34.6 | 13.4 | 15.6 |
+| TA | 8.2 | 12.0 | 34.0 | 15.8 | 15.4 | 11.8 | 22.4 | 36.0 | 16.0 | 14.8 |
+| Teacher | 11.4 | 14.8 | 24.4 | 14.2 | 14.8 | 14.0 | 18.0 | 17.6 | 15.8 | 15.0 |
+| **Average** | **10.3** | 14.1 | 29.7 | 14.5 | 14.9 | **15.0** | 21.1 | 29.4 | 15.1 | 15.1 |
+
+Joint（10.3）确实低于 Separate（15.0）——指标是"收敛所需最少 session 数"，数字越小越好，跟"joint 更高效、需要更少 session"这个论文原意完全吻合，用户的质疑是对的。
+
+**同步查官方代码库 git log，确认代码时间线跟论文版本对应：** 我们训练首选脚本 `openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh` 实际是 **2026-04-28~2026-05-12** 才开发完成（PR #105/#106 4-27 落地核心基建，PR #109 `openclaw-topk-opd-main` 与 PR #110 `openclaw-test-three-phase-flow`（TA_chat.py）**同一天（5-7）合并**，PR #114 5-11 修复 import，与 v2 论文发布同一天），不是 2026-03-11 就有的（当天 `openclaw-combine/` 只有早期简单版 `combine_loss.py`）。官方仓库最后一次提交是 2026-05-22（仅 README，无代码），确认无 v3。
+
+**结论：** 本项目一直用 `march_2026_3_8`（对应 v1 提交时间点）做"OpenClaw 产品版本是否属于论文原始条件"的考古基准，这个基准点本身选错了；真正该用的基准点是 v2 代码完工的 **2026-05-12** 前后。已更新 [`CLAUDE.md`](../../CLAUDE.md) 的基准点说明。
+
+---
+
+## [2026-07-21] 核实 OpenClaw-RL-official 仓库有无遗漏代码——确认无遗漏
+
+**背景：** 版本基准点更正后，先排查是不是本项目遗漏了官方仓库里论文真正用到、但我们训练管线没接入的代码，再去动已部署的补丁。
+
+**核对项与结论：**
+- `run_openclaw_topk_select_modelfactory.sh`（自己的包装脚本）逐行核对，确认只对官方 `run_qwen3_4b_openclaw_topk_select.sh` 打了纯基础设施层面的 sed 补丁（路径、断点续训、Ray 提交方式、PYTHONPATH、NCCL 调试、wandb key 安全），核心超参数（K=4/PRM_M=3/sequence_optimal/Megatron PRM Teacher）未改动，跟官方 README 默认值一致。
+- `run_qwen3_4b_openclaw_topk_select_2nodes.sh`（官方最后一次提交 2026-05-22 新增，此前没细看）diff 后确认纯粹是单机 8 卡→双机 16 卡的拓扑扩展，与我们的单机部署无关；其 PYTHONPATH 多出的 `hint_opt_exp` 目录在仓库里根本不存在，是官方内部残留的无效路径，不是我们漏用的东西。
+- `openclaw-test/README.md` 完整重读，确认 Student→TA→Teacher 三阶段顺序依赖、`homework`→`homework1`→`homework2` 目录链、`--num-problems 36` 默认值，跟 `train_with_services.sh` 的 INIT+Joint 两阶段实现完全对应，没有遗漏步骤。
+- 全仓库搜索（commit message 关键词 + 内容 grep，覆盖 combine/opd/rl/test/gui-rl/swe-rl/terminal-rl/toolcall-rl）确认**没有任何官方或外部贡献者写过处理 write/edit 覆盖或工具结果校验的代码**；`openclaw-rl/openclaw_api_server.py`（GRPO 基线）有自己独立的 `_build_prm_judge_prompt` 实现，逐字比对后跟 combine 用的 `_build_prm_eval_prompt` 完全一致，同样的盲区被复制了两份，不是漏用了更完善的版本。
+- 确认本地克隆是官方仓库真正的最新状态（`origin/main` 最新提交即 2026-05-22 那次），此前"三月后屏蔽"只具体针对 3 个目录：`openclaw-rl/oel/`（外部贡献者 zhuchichi56 的独立方法，跟本论文无关，其自带评估脚本用的是 v1 式连续打分+纯文本无工具协议，两方面都对不上我们的复现目标）、`openclaw-fireworks/`、`openclaw-tinker/`（分别是 Fireworks/Tinker 云端训练后端的平行实现，纯基础设施选项，内容搜索确认不含任何跟 write/edit/compaction 相关代码）——均不包含被遗漏的核心方法代码。
+
+**结论：** "假完成声明"/"write 覆盖"等问题的根因不在"复现管线漏用了官方代码"，而在"OpenClaw 产品本身的行为 + 模型自身工具选择能力局限"这两个维度。
+
+---
+
+## [2026-07-21] 用修正后基准点（约 2026-05-12）重新核实 4 个已部署补丁——结论：4 个补丁在该基准点均已存在
+
+**背景：** 版本基准点从 `march_2026_3_8` 更正为约 `2026-05-12` 后，逐一重新核实此前判定"论文提交后新增、恢复论文原始条件"的 4 个补丁是否依然成立。
+
+**方法：** 本地 `D:\MAO\Claude\openclaw` OpenClaw 源码克隆里没有精确对应 2026-05-12 的 tag，取该窗口内唯一可用的真实提交 `20fcd4a3`（2026-05-11）建本地 tag `may_2026_5_11` 作为新基准，逐项 `git grep`/`git ls-tree` 核对。
+
+| 补丁 | 之前依据（对 march_2026_3_8）| 对 may_2026_5_11 重新核实 |
+|---|---|---|
+| `prepare_patched_sglang_execution_bias.sh` | 声称 2026-04-15~04-30 加入 | **已存在**（问题行原文能搜到）|
+| `prepare_patched_embedded_agent_overflow_recovery.sh` | 声称 2026-05-15~06-01 加入 | **已存在**（`agent-session.ts` 能搜到）|
+| `prepare_patched_system_prompt_output_directives.sh` | 声称 2026-04-15 加入 | **已存在**（`buildAssistantOutputDirectivesSection` 能搜到）|
+| `prepare_patched_cli_compaction.sh` | 声称提交时不存在、到 2026-06-09 才出现 | **已存在**（`cli-compaction.ts` 整个文件都在）|
+
+**初步结论（待下一条更新）：** 4 个补丁全部命中，且其中 2 个（Execution Bias、Assistant Output Directives）加入时间明显早于 5 月，落在论文作者实际开发的窗口内。如果论文真实实验用的就是这个时间段的 OpenClaw，这 4 个补丁的方向就反了——不是恢复论文条件，而是在论文条件之上又加了论文作者自己都没有的修正。
+
+---
+
+## [2026-07-21] OpenClaw 具体版本号无法从 OpenClaw-RL-official 仓库确定——真实的、尚未解决的不确定性
+
+**用户纠正：** 上一条"4 个补丁方向反了"的结论被用户叫停——"虽然五月才重新发 v2 的，但是他用的 OpenClaw 版本很可能是三月甚至更早的版本才对"。`OpenClaw-RL-official` 仓库自己的方法代码（topk-select、TA_chat.py）在 4-5 月更新，不代表作者也同步升级了外部依赖的 OpenClaw CLI 版本——这是两个独立的软件，前者是论文作者自己的仓库，后者是 npm 安装的第三方产品，没有必然的版本同步关系。
+
+**查证：**
+- 全仓库搜索版本锁定信息（`package.json`、`requirements.txt`、README 安装说明、Dockerfile、lockfile）——**没有任何一处指定或锁定 OpenClaw 具体版本号**。`extensions/rl-training-headers/package.json` 的 `openclaw` 字段只声明"这是个插件"，不含版本依赖。主 README 明确写"You can use your own openclaw"——这个项目设计上就是"用户自带 OpenClaw"，论文作者从未在代码里锁定过具体版本。
+- 全部 API server / rollout Python 文件的**完整 git 历史**（`git log -p --all`，不只是当前状态）搜索有没有出现过针对这 4 个问题的任何 workaround 代码——**零命中**，论文作者自己的代码里从未出现过处理这几个 OpenClaw 行为的任何代码。
+- 论文 v2 正文也没有提到任何具体 OpenClaw 版本号。
+
+**结论：** 这是一个凭现有证据无法确定的真实不确定性——如果作者当时用的是带这些 bug 的版本却完全没写任何应对代码，也可能只是没深挖到这次这么细的程度（这几个 bug 都很隐蔽，本项目也是靠多轮实时诊断才挖出来）；反过来，如果作者锁定的是更早、不带这些 bug 的版本，自然也不会有任何相关代码。这两种可能性无法仅凭代码仓库本身区分。**4 个补丁是否应该保留，目前处于待定状态，需要额外证据或另一种验证思路才能推进。**
+
+---
+
+## [2026-07-22] run `20260721_152519` 后段（Problem 36 起）新发现两类现象：max-turns 激增 + 模型幻觉出一套不存在的"silent reply protocol"
+
+**背景：** 用户要求核实这次训练 Problem 0-12 之外、后段（INIT 阶段 Problem 13-71）出现的"无法回复"/"循环"现象具体是什么。
+
+**现象 1：从 Problem 36 起，`Reached max turns (8)` 大量出现**——36-71 题里约 22 题没能在 DONE_SENTINEL 前正常结束，比例远超正常水平，且一直持续到 INIT 阶段结束都没恢复。
+
+**现象 2：`openclaw.log` 从 17:30 起持续出现大量 `[agent/embedded] incomplete turn detected ... stopReason=length ... surfacing error to user`，且同一 session 反复命中**（`sessionId=b05f4dbc...` 命中 7 次，`1d3e0112...` 5 次，多个 session 3 次）——生成跑满 token 预算却没能完成这一轮，不是之前查过的 compaction/execution-bias 那类"纠结要不要用 tool_call"的犹豫循环，内容完全不同。
+
+**真实推理原文（`training.log`，Problem 24，`session=ca88ea77-...`，16:03:29，本次退化最早出现的一条）：**
+```
+The answer is **10 tablespoons** of secret seasoning. 
+
+Let me know when you're ready to write the solution to a file! 😊
+
+(NO_REPLY)
+```
+模型先给出完全正常、完整的回答，然后自己平白无故加了一行 `(NO_REPLY)`——之后几十条记录里这个模式不断自我重复、自我升级（emoji 越来越多，措辞越来越夸张，最终演变成"The user has repeatedly requested the same action, but the assistant's response is a silent reply as instructed... The session is now closed as per the user's instruction."这类完全脱离实际上下文的幻觉文本）。这套"silent reply protocol"从头到尾没有任何真实指令来源——Student 没这么要求过，我们的系统提示词补丁里也没有这个东西。
+
+**用户提出假设：** 这个退化会不会是被前面 Problem 4（edit 失败，正确判 -1）/ Problem 11（write 覆盖，错误判 +1）这类样本训练带偏导致的？
+
+**时间线核对（支持但不能坐实这个假设）：**
+
+| 时间 | 事件 |
+|---|---|
+| 15:33-15:39 | Problem 4 样本陆续提交（多为正确的 `reward=-1.0`），对应至少 2 次真实 `Timer train` 权重更新 |
+| ~15:49-15:52 | Problem 11 的 write 覆盖样本被**错误**判 `reward=+1.0` 提交 |
+| **16:03:29** | "NO_REPLY" 第一次出现（Problem 24）|
+
+时间上紧跟在 Problem 11 坏样本大概率已被消费之后，但这只是相关性，不是因果证明——同一时段还有大量正确样本也在训练，且"silent reply"内容本身跟 write/edit 或 compaction 在主题上毫无关联（不过这点本身不构成反驳：真正的"坏奖励信号污染批次→带偏训练"机制退化后表现出的具体内容通常不需要跟原始坏样本沾边）。另外论文本身把 Personal Agent 场景的 KL 系数设为 0（v2 Section 4.1），完全没有机制把 policy 拉回参考模型附近，一旦被带偏就没有任何东西能拽回来，这跟此前标记过、一直没处理的"批次污染→自我强化"风险是同一件事。**结论：这是合理、有时间线支撑的假设，但不到实锤程度**，需要按真实 `weight_version`（而非墙钟时间）精确核对训练 step 才能进一步确认，本次未继续深挖。
+
+---
+
+## [2026-07-22] 第 5 个确认"论文提交时不存在、后来才加入"的 OpenClaw 行为：Silent Reply Policy——且精确命中了本项目训练场景
+
+**触发：** 沿着上一条的"silent reply"幻觉现象，用户提出：既然此前查的 4 个补丁全部命中"march_2026_3_8 缺失、may_2026_5_11 已存在"这个模式，这次的"silent reply"退化会不会也是同一类版本漂移问题？要求直接查 OpenClaw 源码历史。
+
+**查证：**
+- `git ls-tree -r <tag> --name-only | grep -i silent` 精确核对三个 tag：**`march_2026_3_8` 完全没有任何 silent-reply 相关文件；`src/config/silent-reply.ts`、`src/shared/silent-reply-policy.ts`（含独立测试文件）只在 `may_2026_5_11`/`june_2026_6_9` 出现**——这是一整套新加的功能模块，不是散落字符串，确认了论文提交时不存在这个功能。
+- 读 `may_2026_5_11` 的 `src/shared/silent-reply-policy.ts` 源码，机制是：
+
+```ts
+export const DEFAULT_SILENT_REPLY_POLICY = {
+  direct: "disallow",   // 一对一直聊：永远不允许静默
+  group: "allow",       // 群聊：允许静默不回复
+  internal: "allow",    // 内部/其他：允许静默不回复
+};
+```
+
+  对话类型分类靠 `sessionKey` 里有没有 `:group:`/`:channel:`/`:direct:`/`:dm:` 标记，或者 surface 是不是 `"webchat"`。**我们训练用的 session key 格式是 `agent:main:openai-user:student-hw-11-90772`，完全不匹配任何已知类型，会落到默认分支 `"internal"`，对应策略正是 `"allow"`。**
+- 追踪调用方 `src/auto-reply/reply/dispatch-from-config.ts:1812` 附近的 `emptyFinalAllowedAsSilent`，确认这个策略实际作用是：server 端判断"这一轮的空/沉默回复算不算合法结果"时的开关——**不是直接在系统提示词里告诉模型"你可以静默回复"，而是当这类输出出现时，是否触发 OpenClaw 原本的报错/重试纠错路径**。March 版本完全没有这层特殊判断，任何空/异常回复大概率会走当时就有的通用兜底路径，不会被这个新逻辑"放行"。
+
+**证据边界（如实说明）：** 这次没有像 cli-compaction 那次一样做到 debug 级别的直接实锤——只确认了"版本缺失"+"策略分类命中"这两条强关联证据，`emptyFinalAllowedAsSilent` 之后具体如何影响"模型是否会被允许持续生成这类退化文本而不被纠正"，没有完整追踪到底。
+
+**结论（用户拍板）：** 累计 5 个独立发现的问题（Execution Bias、Assistant Output Directives、overflow-recovery、cli-compaction、Silent Reply Policy）**全部**命中"`march_2026_3_8` 缺失、`may_2026_5_11`/`june_2026_6_9` 已存在"这个模式，样本量从 4 个增加到 5 个后，"论文作者实际使用的 OpenClaw 版本是 3 月或更早"这个推断的支持力度显著增强（依然是推断，不是像仓库锁定版本号那样的直接证据）。**据此，此前"4 个补丁是否保留"的待定状态解除，确定保留这 4 个补丁，并新增第 5 个补丁（针对 Silent Reply Policy），让 OpenClaw 在这一行为上恢复到 3 月版本的模式。**
+
+---
+
+## [2026-07-22] Silent Reply Policy 补丁实现、本地测试、接入训练脚本
+
+**定位实际 bundle 文件：** 服务器 `grep -rl "resolveSilentReplyPolicyFromPolicies\|classifySilentReplyConversationType" /usr/lib/node_modules/openclaw/dist/` 命中两个文件——`dispatch-F64i6im_.js`（只是 `import` 调用方）和 `effective-reply-route-BnYlac-J.js`（真正定义 `DEFAULT_SILENT_REPLY_POLICY`/`classifySilentReplyConversationType`/`resolveSilentReplyPolicyFromPolicies` 三者的源头模块）。确认只需要改后者一个文件，`dispatch-F64i6im_.js` 引用的是同一个函数，改了定义处即可全局生效。
+
+**修复：** 新脚本 `scripts/prepare_patched_silent_reply_policy.sh`，把 `resolveSilentReplyPolicyFromPolicies` 的函数体替换成恒定返回 `"disallow"`（保留一次性 `console.error` 确认钩子真的被调用，跟 execution-bias 补丁同样的诊断写法），不改 `classifySilentReplyConversationType` 的分类逻辑本身（分类结果不再被使用，改不改都无所谓，保留原样降低改动面）。采用跟其它补丁一致的约定：`.orig-unpatched` 纯净备份、锚点唯一性校验（`count != 1` 报错）、内容标记幂等性检查（`marker` 字符串）。
+
+**本地测试（无 GPU，纯文本）：**
+- 用服务器实测贴出的真实源码片段构造本地 mock 文件，跑补丁脚本，确认函数体被正确替换、`node --check` 语法校验通过
+- 幂等性测试：用已打过补丁的文件充当"未打补丁备份"重新跑一次，确认脚本正确检测到 marker 并报错阻止，不会静默产生双重补丁
+
+**接入：** 三个训练脚本（`train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh`）里，紧跟在 cli-compaction 补丁部署代码块之后。三脚本 `bash -n` 语法检查均通过。
+
+**待验证：** 服务器上对真实部署文件跑一次确认锚点命中；重新提交训练后，`openclaw.log`/训练日志里搜索 `[openclaw-rl-silent-reply-policy-patch]` 确认钩子真实生效；后续 run 是否还会出现"NO_REPLY"/"silent reply protocol"这类幻觉退化文本。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

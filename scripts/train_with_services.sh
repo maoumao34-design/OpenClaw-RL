@@ -353,26 +353,13 @@ PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
 bash "${SCRIPTS_DIR}/prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
 cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
 
-# Patch 同一个 system-prompt bundle，补上一条"修改已有文件优先用 edit、
-# 不要用 write"的明确指引——OpenClaw 自己的 write.ts 本来就带了一条
-# promptGuidelines（"Use write only for new files or complete rewrites"），
-# 但这个字段只在 buildSystemPrompt() 的"默认/合成"分支里才会被渲染进提示词，
-# 生产环境的 embedded-agent-runner 走的是另一条分支（自己拼好整份提示词），
-# 从不读取 promptGuidelines，导致这条本该生效的安全提示从未真正传到过模型
-# 面前（官方自己的测试 sdk.test.ts:301-346 甚至断言了这个"计算了但不渲染"
-# 的行为）。已用真实 debug 级别诊断确认：不打这个补丁时，模型收到"追加、
-# 不要覆盖"的要求会调用 write（整体覆盖，丢失原文件结构）；打上这句指引后，
-# 同样场景模型改为调用 read+edit（正确追加，结构完整保留）。这个补丁比较
-# 特殊——上游第三方包（论文提交时锁定的确切版本 0.57.1）也从没提供过这条
-# 提示，所以这不是"恢复论文原始条件"，是修复 OpenClaw 自己一个想加但接线
-# 接错了的安全机制，见 scripts/prepare_patched_write_edit_guidance.sh 顶部
-# 完整说明、docs/issues_log.md 2026-07-21 条目。这个补丁和上面的
-# Assistant Output Directives 补丁改的是同一个 bundle 文件，用了独立命名
-# 的备份文件（避免互相覆盖），设计上可以正确叠加，详见该脚本内注释。
-echo "生成并部署 write/edit 工具选择指引补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
-PATCHED_WRITE_EDIT_DIR="${LOGS_DIR}/patched-write-edit-guidance"
-bash "${SCRIPTS_DIR}/prepare_patched_write_edit_guidance.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_WRITE_EDIT_DIR}"
-cp "${PATCHED_WRITE_EDIT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+# （曾经在这里部署过 write/edit 工具选择指引补丁，2026-07-21 当天已撤销：
+# 论文提交时锁定的上游包版本（0.57.1）本来就没有任何 write/edit 工具选择
+# 指引，模型当时是在完全没有提示的情况下自己做决定的。往系统提示词里加
+# 这句指引虽然确认能改变模型行为（debug 诊断验证过），但这是论文原始环境
+# 里从未存在过的额外帮助，不是"恢复论文条件"，会实质影响复现忠实度。改为
+# 完全通过训练奖励信号纠正这类错误——模型输入保持跟论文原始环境一样干净，
+# 只改训练信号本身。见 docs/issues_log.md 2026-07-21 条目。）
 
 # Patch 内置 cli-compaction 的 "cli_budget" 预压缩检查，让它在遇到
 # "Already compacted" 时不再无条件抛错、污染一个本已成功完成的回合。这套
@@ -393,6 +380,28 @@ CLI_COMPACTION_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/cli-compaction-B6C
 PATCHED_CLI_COMPACTION_DIR="${LOGS_DIR}/patched-cli-compaction"
 bash "${SCRIPTS_DIR}/prepare_patched_cli_compaction.sh" "${CLI_COMPACTION_LIVE_FILE}" "${PATCHED_CLI_COMPACTION_DIR}"
 cp "${PATCHED_CLI_COMPACTION_DIR}/cli-compaction-B6C2IDnn.js" "${CLI_COMPACTION_LIVE_FILE}"
+
+# Patch 内置的 Silent Reply Policy，强制 resolveSilentReplyPolicyFromPolicies
+# 恒定返回 "disallow"。这套策略（src/shared/silent-reply-policy.ts）论文提交时
+# 完全不存在（2026-03-08 快照搜不到任何 silent-reply 相关文件，2026-05-11
+# 已作为一整套新功能出现），默认策略是 direct=disallow / group=allow /
+# internal=allow，而我们训练用的 session key（agent:main:openai-user:...）
+# 匹配不到任何已知会话类型，会落到默认的 internal 分类——意外命中"允许静默
+# 回复"这个论文原始环境本不存在的新分支。真实训练里观察到模型在这个分支下
+# 幻觉出一整套不存在的"silent reply protocol"、反复自我重复退化（run
+# 20260721_152519，Problem 24 起）。这是第 5 个确认"论文提交时不存在、之后
+# 才加入"的 OpenClaw 行为（前 4 个是 Execution Bias / Assistant Output
+# Directives / overflow-recovery / cli-compaction），累计证据支持"论文作者
+# 实际用的是 3 月或更早版本"这个判断。见 scripts/prepare_patched_silent_reply_policy.sh
+# 顶部完整说明、docs/issues_log.md 2026-07-22 条目（含证据边界说明：这次未做到
+# debug 级别实锤，只有"版本缺失+会话分类命中"两条强关联证据）。这个 bundle
+# 文件名是内容哈希命名的，OpenClaw 升级后会变化，补丁脚本找不到锚点会明确
+# 报错退出。
+echo "生成并部署 silent-reply-policy 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SILENT_REPLY_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/effective-reply-route-BnYlac-J.js"
+PATCHED_SILENT_REPLY_DIR="${LOGS_DIR}/patched-silent-reply-policy"
+bash "${SCRIPTS_DIR}/prepare_patched_silent_reply_policy.sh" "${SILENT_REPLY_LIVE_FILE}" "${PATCHED_SILENT_REPLY_DIR}"
+cp "${PATCHED_SILENT_REPLY_DIR}/effective-reply-route-BnYlac-J.js" "${SILENT_REPLY_LIVE_FILE}"
 
 # models.providers.sglang 未显式声明 models[] 时 OpenClaw 走自动发现，会用过大的
 # 默认值请求 max_completion_tokens，被 sglang 400 拒绝（同 smoke/minitest 的问题）。

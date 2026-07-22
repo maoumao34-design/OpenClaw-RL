@@ -714,9 +714,52 @@
 **主要问题：**
 - 诊断测试用的临时配置改动（sglang baseUrl）没有在测试结束后及时复原，直接导致下一次正式训练启动失败——以后做类似的服务器端手动诊断，测试完必须显式核对/复原所有被临时改动过的配置项，不能只清理进程
 
+### 撤销 write/edit 指引补丁，改用奖励信号方向
+
+**完成内容：**
+- 用户判断：给模型加"该用 edit 别用 write"的提示词补丁不是复现该做的事（论文原始环境本来就没有这条指引），正确方向是让打分在模型选错工具时变成负分，让模型自己从训练信号里学会 → 撤销 `prepare_patched_write_edit_guidance.sh`，从三个训练脚本移除部署代码 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-21 条目
+- 追溯真实奖励计算管线：`reward_func` → `_submit_turn_sample`/`_submit_rl_turn_sample` → `_build_prm_eval_prompt` 多票裁决
+
+### PRM 打分实测：edit 失败被正确罚分，write 覆盖存在真实盲区（用户连续两次纠正了过于乐观的中间结论）
+
+**完成内容：**
+- 实测 Problem 4（edit 真失败）：训练日志确认 turn 4-12 连续 9 轮全部 `eval_score=-1.0`，官方 PRM judge 本来就正确惩罚了这个失败，不需要额外检测
+- 实测 Problem 11（write 覆盖但不报错）：两次**独立**训练都命中同一模式（丢失"Problem:"/"Solution:"结构），真实 `eval_score` 都是 **+1.0**，坐实了理论盲区确实在真实训练中发生
+- 用户纠正"这次覆盖没有可观测代价"的初步判断：TA 阶段读的是 student 写坏的同一批文件（`homework1/` 由 `homework/` 复制而来），且 TA 阶段末尾同样的"追加不覆盖"指令一旦误用 write，覆盖掉的是学生解答全文，后果远比丢模板标题严重；两次独立训练命中同一模式说明这不是偶发噪声，会被 RL 训练持续放大 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-21 条目
+
+### 重大发现：论文版本混淆，一直用 v1（2026-03-10）当基准，应为 v2（2026-05-11 修订）
+
+**完成内容：**
+- 查官方 GitHub issue 库（`openclaw/openclaw`）确认 write/edit 冲突是 OpenClaw 产品早已存在的已知缺陷（[#11102](https://github.com/openclaw/openclaw/issues/11102)/[#44203](https://github.com/openclaw/openclaw/issues/44203)/[#32333](https://github.com/openclaw/openclaw/issues/32333)），跟本项目复现无关
+- 用户追问"joint 分数比 separate 低更符合 session 数指标"，推翻此前 WebFetch 摘要读到的论文内容；改用浏览器直接读原始网页文本，确认 arXiv:2603.10165 有 v1（2026-03-10）/v2（2026-05-11 修订，当前唯一有效版本）两个差异巨大的版本，此前一直误读 v1
+- v2 原文逐字核对：三角色（Student/TA/Teacher）、session 收敛数指标、连续 3 个 session 判据——**跟 CLAUDE.md 一直记录的内容完全一致，CLAUDE.md 本身没错，错的是本项目做"OpenClaw 版本考古"用的时间基准点**（Joint Hybrid RL 均值 10.3 < Separate 15.0，数字越小越好，跟论文原意吻合）
+- 官方仓库 git log 确认训练主脚本 `run_qwen3_4b_openclaw_topk_select.sh` 实际是 2026-04-28~2026-05-12 才开发完成（与 TA_chat.py、v2 论文同期落地），非 2026-03-11；仓库最后一次提交 2026-05-22（仅 README），确认无 v3
+- 更新 [CLAUDE.md](../../CLAUDE.md) 基准点说明和目录判断标准 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-21 条目
+
+### 核实官方仓库有无遗漏代码
+
+**完成内容：**
+- 逐项核对训练管线（topk-select 脚本、三角色 INIT+Joint、Megatron PRM Teacher）与官方 README/2-node 变体脚本，确认无遗漏，无版本滞后
+- 全仓库 commit message + 内容搜索确认没有任何作者（官方或外部贡献者）写过处理 write/edit 覆盖或工具结果校验的代码；GRPO 基线独立实现的 PRM prompt 逐字比对后跟 combine 用的完全一致，同样的盲区
+- 确认此前"三月后屏蔽"的三个目录（`oel/`、`openclaw-fireworks/`、`openclaw-tinker/`）均为其他贡献者的独立方法或平行云端后端，不含核心方法代码 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-21 条目
+
+### 用修正基准重新核实 4 个已部署补丁——结论待定
+
+**完成内容：**
+- 本地建 `may_2026_5_11` tag（该窗口内最接近的真实 OpenClaw 提交），逐一核实 Execution Bias / context-overflow overflow-recovery / Assistant Output Directives / cli-compaction 四个补丁——**全部在该基准点已存在**
+- 用户纠正：论文自己代码库 4-5 月更新不代表作者也同步升级了外部依赖的 OpenClaw 版本，两者是独立软件；查证官方仓库全程没有锁定过 OpenClaw 具体版本号（package.json/requirements.txt/README/Dockerfile 均无），且论文作者自己代码的完整 git 历史里从未出现过处理这 4 个问题的任何 workaround
+- **结论：这 4 个补丁是否该保留目前待定**——论文作者实际使用的 OpenClaw 版本号无法仅凭代码仓库证据确定 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-21 条目
+
+### 澄清：两块自建编排逻辑（区别于上面这几个"改 OpenClaw 产品行为"的补丁）
+
+用户要求明确记录——这两块不是补丁，是官方仓库压根没有参考实现、只能靠读论文文字描述自己写的编排代码：
+
+- **Joint 阶段持续驱动逻辑**（`train_with_services.sh` 的 `run_init_phase()`/`run_joint_phase()`/`run_one_persona()`）：官方 `student_chat.py`/`TA_chat.py`/`teacher_chat.py` 都是一次性脚本（跑完 `--num-problems` 道题就退出，无 `--loop`/`--continuous` 参数），`openclaw-combine`/`openclaw-opd` 也没有任何调用这三个脚本的代码——官方仓库完全没有"在一次持续几小时的真实训练里反复/持续驱动三角色"这件事的参考实现。第一版设计（每轮 6 题循环直到训练结束）是我们自己发明的，07-14 改成对照 README 字面"run them together"重新实现：三角色各传 `JOINT_NUM_PROBLEMS=1319`（GSM8K 全量）同时后台启动一次，让训练循环自然消耗真实样本 → 06-29、[07-14](openclaw-rl/docs/work_log.md) 条目，commit `4be24ab`
+- **收敛判定统计**（`scripts/check_convergence.py`）：官方三个脚本只把原始回复文本 dump 到 `results_*.txt`，Table 3 的"连续 3 个 session 满足 `satisfies_student`/`satisfies_ta`/`satisfies_teacher` 规则→算收敛"这套判定逻辑官方代码里完全没有实现，是我们自己读 Section 4.1 描述后重新写的事后分析脚本 → 2026-06-23 条目
+
 ---
 
-## 当前状态（2026-07-21）
+## 历史状态（2026-07-21 上午，已被下方结果取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
@@ -749,6 +792,76 @@
 - [ ] 两个新补丁叠加后，假完成声明/结构丢失发生率的实际改善幅度（大规模统计）
 - [ ] Assistant Output Directives 修复的实际效果
 - [ ] 是否还有其他未发现的决策犹豫循环/假完成声明诱因
+- [ ] 8 GPU 正式 Table 3 训练完整跑通
+
+---
+
+## 历史状态（2026-07-21 晚间，已被下方结果取代）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
+- [x] 假完成声明根因一：`cli-compaction.ts` 的 `cli_budget` 预压缩检查 + 修复（`prepare_patched_cli_compaction.sh`）：已用真实训练数据验证生效
+- [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
+
+### 重大未决问题（已解决，见下方 2026-07-22）
+- 4 个已部署补丁（Execution Bias / context-overflow overflow-recovery / Assistant Output Directives / cli-compaction）的合法性——已解决
+
+---
+
+## 2026-07-22
+
+**目标：** 排查 run `20260721_152519` 后段（Problem 13-71）出现的新问题；核实 4 个已部署补丁是否该保留
+
+### run `20260721_152519` 后段新发现：max-turns 激增 + 模型幻觉出"silent reply protocol"
+
+**完成内容：**
+- 确认从 Problem 36 起 `Reached max turns (8)` 大量出现（36-71 题约 22 题未达 DONE_SENTINEL），`openclaw.log` 同期持续出现同一 session 反复命中的 `stopReason=length` 未完成回合
+- 定位真实推理原文：模型在正常回答后自己平白加一行 `(NO_REPLY)`，此后几十条记录里演变成完整的、自我重复升级的"silent reply protocol"幻觉文本，跟此前查的 execution-bias/output-directives 那类犹豫循环内容完全不同
+- 用户提出假设：这个退化会不会是被 Problem 4/11 那类坏训练样本带偏导致的——时间线核对支持但不能坐实（"silent reply"首次出现紧跟在 Problem 11 坏样本大概率已被消费之后，但只是相关性）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
+### 第 5 个确认版本漂移案例：Silent Reply Policy，且精确命中本项目训练场景
+
+**完成内容：**
+- 沿着"silent reply"幻觉现象查 OpenClaw 源码历史：`src/config/silent-reply.ts`/`src/shared/silent-reply-policy.ts` 在 `march_2026_3_8` 完全不存在，`may_2026_5_11` 才作为一整套新功能出现
+- 该策略把对话按 session key 分类，`direct` 永远不允许静默，`group`/`internal` 允许；**我们训练用的 session key 格式匹配不到任何已知类型，会落到默认的 `internal` 分类，对应策略正是"允许静默"**——意外命中了这个新功能的放行分支
+- 追踪调用方确认这个策略实际控制的是"空/沉默回复算不算合法结果"的服务端判断，March 版本没有这层特殊逻辑；如实标注证据边界：这次没做到 debug 级别实锤，只是"版本缺失+分类命中"两条强关联证据 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
+### 用户拍板：4 个补丁确认保留，新增第 5 个补丁并完成实现
+
+**完成内容：**
+- 累计 5 个独立发现的问题（Execution Bias、Assistant Output Directives、overflow-recovery、cli-compaction、Silent Reply Policy）全部命中"`march_2026_3_8` 缺失、之后版本已存在"这个模式，样本量增加后大幅增强"论文作者实际用的是 3 月或更早版本"这个推断——**解除此前"4 个补丁待定"的状态，确定保留**
+- 服务器定位到真实 bundle 文件（`effective-reply-route-BnYlac-J.js` 是真正定义策略函数的源头模块，`dispatch-F64i6im_.js` 只是引用方，只需改前者）
+- 新脚本 `scripts/prepare_patched_silent_reply_policy.sh`：把 `resolveSilentReplyPolicyFromPolicies` 恒定改为返回 `"disallow"`，恢复 3 月版本"这个功能不存在"的效果；本地用真实源码片段构造 mock 文件测试通过（含幂等性测试），接入三个训练脚本，`bash -n` 均通过 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
+---
+
+## 当前状态（2026-07-22）
+
+### 已就绪
+- [x] 环境 + GPU 编译依赖（A800/H20 均已实测）
+- [x] `maxTokens=8192`、`reserveTokensFloor=16384`、`logit_bias` 屏蔽已知乱码 token、`memory-core` 插件禁用、退化样本过滤规则：均已用真实 GPU 数据验证生效
+- [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（新增，`prepare_patched_silent_reply_policy.sh` 已实现、本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
+- [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
+
+### 已知限制 / 未解决
+- **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
+- 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后）
+- 数学应用题反复自我重述 / 纯 token 退化，仍认为更可能是模型固有倾向，未做版本考古严格验证
+- **8GPU 正式训练从未真正保存过 checkpoint**，每次任务提交都是从 base 模型重新开始
+- `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
+
+### 下一步
+1. 重新提交训练，服务器上确认 Silent Reply Policy 补丁锚点命中、`[openclaw-rl-silent-reply-policy-patch]` 钩子真实生效
+2. 观察新 run 是否还出现"NO_REPLY"/"silent reply protocol"这类幻觉退化文本
+3. 设计并实现 write/edit 错误的奖励信号纠正方案（reward_func / `_submit_turn_sample` 一带）
+4. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
+5. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`；workspace 迁移到 `/dfs/data`
+
+### 未验证
+- [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
+- [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
+- [ ] write/edit 奖励信号纠正方案设计与验证
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
 ---
