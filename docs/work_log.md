@@ -925,6 +925,14 @@
 - 实现过程中发现并修正两次真实假阳性：FIRST_MESSAGE_TEMPLATE 固定含"don't write"导致的假阳性（跳过第一条消息解决）、"like how a person would write it"这种谈风格不谈写文件的假阳性（正则要求写入动词和 file/homework 关键词同句靠近出现）、以及真实 Problem 11 里"Don't write to the file yet."这种否定句的假阳性（正则排除否定词紧邻写入动词的情况）
 - 本地测试：三文件语法检查通过；用真实 Problem 10/11 原文复现验证 4 个场景全部符合预期（含两次假阳性修正后的回归验证）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### "who am I"/"NO_REPLY" 幻觉排查收尾：确认不是今天新加补丁引入的，暂缓处理，重新提交训练
+
+**完成内容：**
+- 用户追问 Problem 11 Turn 1 为什么也出现"who am I"幻觉：核实真实 session trajectory 的 `context.compiled` 事件，确认发给模型的 prompt 是干净的 Problem 11 开场白原文、`messages count: 0`（全新 session，无历史串位）——确认这是模型自身对干净输入的异常回复，不是 session 管理/prompt 拼接层面的 bug
+- 用户追问这两类幻觉是不是今天新加的补丁引入的：结构上确认排除——Turn 1 用的固定开场白模板不受今天任何改动影响（核验补丁只在 DONE_SENTINEL 之后触发），workspace 迁移不碰对话内容，PRM 调试补丁不经过发给策略模型的请求路径；且 "NO_REPLY" 幻觉本身早在 07-21 训练（run `20260721_152519`）就已观察到，早于 Silent Reply Policy 补丁被设计出来——**两类幻觉都是训练本身早就存在的模型固有退化行为，不是今天任何一次改动引入的新问题**。更早部署的 5 个 OpenClaw 版本漂移补丁跟这个现象有没有关联，未完全排除，需要更早期训练数据对比才能确认
+- 用户认可这类幻觉会造成"批次污染→自我强化"，但仍属于此前已多次要求延后处理的范畴（模型自身生成行为层面，不是 harness 能修的）——本次决定先记录、继续观察，不在这次改动范围内处理 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+- 清理服务器残留 sglang 进程（`kill -9`，确认显存已释放），重新提交训练（`bash train_with_services.sh`），明天查看这次训练结果
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -942,7 +950,7 @@
 ### 已知限制 / 未解决
 - **新发现：策略模型全程只用 `write` 整体覆盖，从未用过 `edit`**（真实 session trajectory 工具调用数据证实）——不打算给策略模型加工具选择指引（开外挂），依赖奖励信号本身引导，但奖励信号是否真的在起作用还未坐实（见下一条）
 - **新发现：write 覆盖动作本身是否被 PRM 正确扣分尚未坐实**——间接证据（turn 数量、投票特征）支持"reward blindness 依然存在、真正做错事的 write 动作没被罚、罚的是隔壁那轮确认回复"这个推测，但无法从现有日志 100% 确认，已加调试补丁（见上）等下次训练数据验证
-- **新发现：模型偶发陷入"NO_REPLY 幻觉"退化生成状态**（真实字面输出 "NO_REPLY" 文本，非系统层面的真正静默），跟已部署的 Silent Reply Policy 补丁是两回事，那个补丁修不了这个——目前没有 harness 层面的修复手段，需要从策略模型自身生成行为/训练信号入手，暂未处理
+- **新发现：模型偶发陷入"NO_REPLY 幻觉"/"who am I 幻觉"退化生成状态**（真实字面输出 "NO_REPLY" 文本或"Hey. I just came online. Who am I?"这类脱离上下文的回复，非系统层面的真正静默、也不是 session/prompt 污染导致）——跟已部署的 Silent Reply Policy 补丁是两回事，那个补丁修不了这个；**已确认不是本项目任何一次补丁（含今天新加的、含更早的 5 个 OpenClaw 版本漂移补丁）引入的新问题，"NO_REPLY" 早在 07-21 就已存在**；用户认可会污染训练数据，但仍属于已多次要求延后处理的范畴，本次决定先记录、继续观察
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认；结合本次"NO_REPLY 幻觉"发现，这两者可能是同一类退化生成现象的不同表现
 - 批次污染→自我强化这个机制本身未被拦截（用户明确要求延后）
 - 数学应用题反复自我重述 / 纯 token 退化，仍认为更可能是模型固有倾向，未做版本考古严格验证
@@ -950,13 +958,12 @@
 - `run_init_phase()`/`run_one_persona()` 缺乏阻塞机制的设计缺陷仍未修
 
 ### 下一步
-1. 提交（git commit + push）PRM turn 内容调试补丁 + not_requested 纠正消息修复，服务器 `git pull`
-2. 停掉当前 run，清理残留 GPU 进程，重新提交训练
-3. 确认新的 `[openclaw-rl-debug-turn-content]` 日志真实出现，用它精确核对"write 覆盖动作本身有没有被正确扣分"这个悬而未决的问题
-4. 观察类似 Problem 10 这种"Student 违反协议提前说完成"场景下，`not_requested` 纠正消息是否让对话更顺畅
-5. 观察 write 覆盖/未完成却判定成功/"NO_REPLY 幻觉"这几类问题的发生率变化
-6. 视需要，按真实 `weight_version` 精确核对"NO_REPLY 幻觉"/"silent reply protocol"退化与 Problem 4/11 坏样本训练 step 的先后关系
-7. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
+1. **（已完成）** 提交（git commit + push）PRM turn 内容调试补丁 + not_requested 纠正消息修复；服务器已 `git pull`、清理残留 GPU 进程、重新提交训练（`bash train_with_services.sh`）——**明天查看这次训练结果**
+2. 确认新的 `[openclaw-rl-debug-turn-content]` 日志真实出现，用它精确核对"write 覆盖动作本身有没有被正确扣分"这个悬而未决的问题
+3. 观察类似 Problem 10 这种"Student 违反协议提前说完成"场景下，`not_requested` 纠正消息是否让对话更顺畅
+4. 观察 write 覆盖/未完成却判定成功/"NO_REPLY 幻觉"/"who am I 幻觉"这几类问题的发生率变化
+5. 视需要，按真实 `weight_version` 精确核对这几类幻觉退化与 Problem 4/11 坏样本训练 step 的先后关系；如需进一步确认是否与更早的 5 个 OpenClaw 版本漂移补丁有关，需要对比这些补丁部署前的更早期训练数据
+6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果（已确认这个补丁不能修"NO_REPLY 幻觉"，但仍可能对真正的系统级静默有效）
