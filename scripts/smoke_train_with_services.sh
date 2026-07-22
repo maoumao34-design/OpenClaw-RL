@@ -63,7 +63,11 @@ CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/smoke_$(date +%Y%m%d_%H%M%S)}
-WORKSPACE=${HOME}/.openclaw/workspace
+# 2026-07-22：workspace 从 ${HOME}/.openclaw/workspace（/root 下，配额小，且
+# GPU 空闲被平台回收重启后会静默回滚到上次快照）迁到 /dfs/data 下的 runtime/
+# 目录，跟 logs/ 用同一个时间戳配对。
+RUNTIME_DIR=${RUNTIME_DIR:-/dfs/data/openclaw-rl-project/runtime/$(basename "${LOGS_DIR}")}
+WORKSPACE="${RUNTIME_DIR}/workspace"
 OPENCLAW_DIR="${LOGS_DIR}/openclaw-test-patched"
 SMOKE_TOPK_SELECT_LAUNCHER="${SCRIPTS_DIR}/smoke_run_qwen3_4b_openclaw_topk_select.sh"
 
@@ -97,7 +101,7 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
     exit 1
 fi
 
-mkdir -p "${LOGS_DIR}"
+mkdir -p "${LOGS_DIR}" "${WORKSPACE}"
 
 # openclaw-test/*.py 硬编码 "model": "default"，当前 OpenClaw CLI（2026.6.9）的
 # /v1/chat/completions 只认 openclaw/openclaw-<agentId> 这套 agent-target 格式，
@@ -227,6 +231,16 @@ launch_openclaw_gateway() {
     echo "[verify] agents.defaults.compaction.reserveTokensFloor = $(openclaw config get agents.defaults.compaction.reserveTokensFloor 2>&1 | tail -1)" \
         | tee -a "${LOGS_DIR}/openclaw.log"
 
+    # 2026-07-22：agents.defaults.workspace 优先级高于 OPENCLAW_WORKSPACE_DIR
+    # 环境变量，每次启动前强制设为本次 run 的 runtime 目录。见
+    # train_with_services.sh 同日注释。
+    echo "确保 agents.defaults.workspace 指向本次 run 的 runtime 目录..." \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+    openclaw config set agents.defaults.workspace "${WORKSPACE}" \
+        >> "${LOGS_DIR}/openclaw.log" 2>&1
+    echo "[verify] agents.defaults.workspace = $(openclaw config get agents.defaults.workspace 2>&1 | tail -1)" \
+        | tee -a "${LOGS_DIR}/openclaw.log"
+
     # 部署 rl-training-headers 插件（appendSystemContext 版本，见上方 PATCHED_OPD_DIR
     # 注释）。写入 OpenClaw 自己的系统安装目录（openclaw plugins list --verbose 确认的
     # source 路径），不是插件扩展开发目录——这个 OpenClaw 版本的插件加载器只扫描这里，
@@ -329,6 +343,7 @@ print('patched models.providers.sglang.models')
 
     echo "启动 OpenClaw gateway（port 18789）..."
     OPENCLAW_GATEWAY_TOKEN="${OPENCLAW_GATEWAY_TOKEN}" \
+    OPENCLAW_WORKSPACE_DIR="${WORKSPACE}" \
     openclaw gateway run --allow-unconfigured --force \
         >> "${LOGS_DIR}/openclaw.log" 2>&1 &
     OPENCLAW_PID=$!
@@ -441,6 +456,7 @@ run_smoke_chat() {
     OPENAI_BASE_URL="${SIMULATOR_BASE_URL}" \
     EXTERNAL_MODEL="${EXTERNAL_MODEL}" \
     OPENCLAW_GATEWAY_URL=http://localhost:18789 \
+    OPENCLAW_WORKSPACE="${WORKSPACE}" \
     python "${OPENCLAW_DIR}/${script_name}" \
         --dataset "${DATASET}" \
         --num-problems "${NUM_PROBLEMS_PER_ROUND}" \

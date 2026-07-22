@@ -898,6 +898,14 @@
 - 复现忠实度重新确认：把模拟器自己最初拥有的题目原文展示回给它，不算给策略模型开外挂——一个真实学生完全可能说"这里原来写的是 XXX，现在不见了"这种具体反馈
 - 本地测试：三文件语法检查通过；真实 Problem 8 场景复现验证诊断仍正确判定 `overwritten`，生成消息里完整包含缺失的 `Solution:` 标签和题目原文；确认这条分支不再需要任何 API 调用；无诊断路径回归测试通过 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
 
+### workspace 从 /root 迁到 /dfs/data
+
+**完成内容：**
+- 用户提出 `/root` 分区不适合放太多太大文件，问 workspace（homework/homework1/homework2 落地位置）能不能迁到 `/dfs/data`——顺带回应此前"GPU 空闲回收重启后 workspace 静默回滚到快照"这条已知限制，怀疑是 `/root` 分区本身的平台行为
+- 排查官方源码确认两套独立机制：OpenClaw 自身（`agent-scope-config.ts` 的 `resolveAgentWorkspaceDir()`）优先读 `openclaw.json` 的 `agents.defaults.workspace`，其次才是 `OPENCLAW_WORKSPACE_DIR` 环境变量；`student_chat.py` 等三个脚本读另一个变量 `OPENCLAW_WORKSPACE`。用户贴出真实 `openclaw.json` 确认 `agents.defaults.workspace` 已显式设为 `/root/.openclaw/workspace`——证实只设环境变量不够，必须直接改配置
+- 新建 `/dfs/data/openclaw-rl-project/runtime/` 目录（跟 `logs/` 语义对称），内部按跟 `logs/` 相同的时间戳分 run；三训练脚本统一改：`WORKSPACE` 指向 `runtime/<run_id>/workspace`，`openclaw config set agents.defaults.workspace` 每次启动前强制覆盖，`OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_WORKSPACE` 两个环境变量同步设置，`rm -rf` 清理逻辑因引用变量无需改动
+- 本地测试：三脚本语法检查通过，diff 核对改动范围精确（4 处改动 × 3 脚本）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-22 条目
+
 ---
 
 ## 当前状态（2026-07-22）
@@ -908,6 +916,7 @@
 - [x] **5 个 OpenClaw 版本漂移补丁确认保留**：Execution Bias、context-overflow overflow-recovery、Assistant Output Directives、cli-compaction（均已用真实训练数据验证生效）+ Silent Reply Policy（本地测试通过、已接入三个训练脚本，服务器真实部署待验证）
 - [x] write 覆盖导致 PRM 误判正分：已用真实数据实锤证实（Problem 11 两次独立训练命中同一模式）
 - [x] **Student/TA/Teacher 会话级文件核验（v4：诊断分支跳过 32B、直接给出具体缺失内容）**：诊断确定性判断保留；诊断出确定性问题（overwritten/not_written）时完全跳过 32B 复核，直接用确定性诊断专属模板，`overwritten` 消息里直接附上 session 开始时的文件原文快照，不再依赖 32B 是否配合；32B 独立复核只保留在"无诊断、纯风格判断"分支（此前验证工作正常）。本地逻辑测试通过（含真实 Problem 8 场景复现），服务器真实部署待验证
+- [x] **workspace 从 `/root` 迁到 `/dfs/data/openclaw-rl-project/runtime/<run_id>/workspace`**：`agents.defaults.workspace`（openclaw.json，优先级高于环境变量）每次启动前强制覆盖 + `OPENCLAW_WORKSPACE_DIR`/`OPENCLAW_WORKSPACE` 双环境变量同步，三训练脚本统一改，本地语法检查通过，服务器真实部署待验证
 
 ### 已知限制 / 未解决
 - **新发现：Problem 36 起 max-turns 激增 + "silent reply protocol"幻觉退化**，疑似与早期坏样本（Problem 4/11）训练带偏有关，但未做到 step 级别实锤，需要更精确的 `weight_version` 对照才能确认
@@ -922,12 +931,13 @@
 3. 重点观察 Problem 8/9 这类真实 overwritten 场景：这次纠正消息直接给出了缺失的具体内容（如 `Solution:` 标签），4B 策略模型能不能借此真正完成一次正确的"先复原、再补充"，而不是像之前那样反复自信宣称修好却始终漏掉同一处细节
 4. 观察 write 覆盖/未完成却判定成功/"silent reply protocol"这几类问题的发生率是否显著下降
 5. 视需要，按真实 `weight_version` 精确核对"silent reply"退化与 Problem 4/11 坏样本训练 step 的先后关系
-6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`；workspace 迁移到 `/dfs/data`
+6. **（用户明确要求延后）** 训练数据批次污染拦截；调小 `--save-interval`
 
 ### 未验证
 - [ ] Silent Reply Policy 补丁在服务器真实部署文件上的锚点命中与实际效果
 - [ ] v4 文件核验补丁（诊断分支跳过 32B、直接给出具体缺失内容）在服务器真实部署上的实际效果，尤其是 4B 策略模型这次能否借助具体内容真正诊断后改对
 - [ ] "silent reply"退化与早期坏样本训练的因果关系（目前只有时间线支持，未到 step 级别实锤）
+- [ ] workspace 迁到 `/dfs/data` 后 `agents.defaults.workspace` 真的按新路径生效（服务器日志核实）；此前记录的"GPU 空闲回收重启后 workspace 静默回滚到快照"这个风险在新路径下是否真的不再出现（需要一次真实的空闲/重启周期才能验证）
 - [ ] 8 GPU 正式 Table 3 训练完整跑通
 
 ---

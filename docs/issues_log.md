@@ -1745,6 +1745,29 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-22] workspace 从 /root 迁到 /dfs/data，规避配额+快照回滚风险
+
+**背景：** 用户提出 `/root/.openclaw/workspace`（homework/homework1/homework2 等运行时文件的实际落地位置）所在的 `/root` 分区不适合放太多太大文件，问能不能迁到 `/dfs/data` 持久化目录。这也顺带回应了此前一直标记为"待办、已知限制"的一条记录：workspace 所在的 2GB 配额区在"GPU 空闲→平台自动回收→重启"后会静默回滚到上次保存的快照，怀疑跟 `/root` 这个分区本身的平台级行为有关，迁到 `/dfs/data` 有机会一并规避。
+
+**排查 OpenClaw 官方源码，确认路径解析机制：** workspace 目录由两套完全独立的机制分别决定，缺一不可：
+1. **OpenClaw 自身（gateway/agent 进程，实际执行 read/write/edit 工具调用的地方）**：`agent-scope-config.ts:179-195` 的 `resolveAgentWorkspaceDir()`——**优先读 `openclaw.json` 里的 `agents.defaults.workspace`（如果显式设置过），其次才退回到 `OPENCLAW_WORKSPACE_DIR` 环境变量**（`workspace-default.ts:16`）。用户贴出的真实 `openclaw.json` 内容确认 `agents.defaults.workspace` 当前显式设置为 `"/root/.openclaw/workspace"`——**证实只设环境变量是不够的，配置文件里的值优先级更高，必须直接改配置**。
+2. **`student_chat.py`/`TA_chat.py`/`teacher_chat.py`（Python 编排脚本，写初始作业文件+核验用）**：读官方自带的 `OPENCLAW_WORKSPACE` 环境变量（注意跟上面那个 `OPENCLAW_WORKSPACE_DIR` 不是同一个变量名，容易搞混），不设则退回 `~/.openclaw/workspace`。
+
+**实施方案（三个训练脚本 `train_with_services.sh`/`minitest_train_with_services.sh`/`smoke_train_with_services.sh` 统一改，跟现有"每次启动前强制覆盖某个配置字段"的模式一致，比如 chatCompletions/compaction 那几处）：**
+1. 新建 `/dfs/data/openclaw-rl-project/runtime/` 目录（跟已有的 `logs/` 语义对称：`logs/` 放日志产出，`runtime/` 放运行时状态文件），内部按跟 `logs/` 相同的时间戳分 run（`runtime/<run_id>/workspace`），方便按 run 配对查找
+2. `WORKSPACE` 变量从 `${HOME}/.openclaw/workspace` 改成 `${RUNTIME_DIR}/workspace`（`RUNTIME_DIR` 由 `LOGS_DIR` 的 basename 派生，保证跟对应的 `logs/<run_id>/` 用同一个 run 标识）
+3. 用 `openclaw config set agents.defaults.workspace "${WORKSPACE}"` 每次启动前强制覆盖（不依赖之前是什么值），并保留 `OPENCLAW_WORKSPACE_DIR` 环境变量作为双保险
+4. 调用三个 Python 编排脚本时补上 `OPENCLAW_WORKSPACE="${WORKSPACE}"` 环境变量，保证两套机制指向同一个新路径，不会出现"脚本写作业文件到一处，OpenClaw 工具读写到另一处"的路径不一致
+5. `run_init_phase()`/`launch_openclaw_gateway()` 里原有的 `rm -rf "${WORKSPACE}/homework" ...` 清理逻辑因为已经引用 `${WORKSPACE}` 变量，无需改动即可自动作用于新路径
+
+**本地测试：** 三个脚本 `bash -n` 语法检查全部通过；核对 diff 确认改动范围精确匹配预期（`WORKSPACE`/`RUNTIME_DIR` 定义、`mkdir -p` 补 workspace、config 强制覆盖块、gateway 启动环境变量、Python 脚本调用环境变量，共 4 处改动 × 3 脚本，无遗漏无多改）。
+
+**接入：** 三个训练脚本均已改，下次提交训练自动生效。
+
+**待验证：** 服务器真实部署跑一次，确认 `agents.defaults.workspace` 真的按新路径生效（日志里搜 `[verify] agents.defaults.workspace`）、`homework`/`homework1`/`homework2` 真实落在 `/dfs/data/openclaw-rl-project/runtime/<run_id>/workspace/` 下而不是 `/root`；确认此前记录的"GPU 空闲回收重启后 workspace 静默回滚到快照"这个风险在新路径下是否真的不再出现（需要等一次真实的空闲/重启周期才能验证，无法一次训练内确认）。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
