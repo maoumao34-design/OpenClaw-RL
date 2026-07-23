@@ -935,7 +935,69 @@
 
 ---
 
-## 当前状态（2026-07-22）
+## 2026-07-23
+
+**目标：** 查看 07-22 晚提交的训练结果；追问 Table 3 收敛指标细节，牵出 Joint 训练真实编排方式的重新核实
+
+### Joint 训练真实编排方式重新核实：确认现有 INIT→Joint 架构不对，真实流程是先跑完 Separate 再复用其产物启动 Joint
+
+**背景：** 用户报告训练又是几小时就失败，追问 Table 3 的"session"单位（一道题，不是训练侧"16 条样本一步"的那个 16）、`SESSION_LIMIT=72` 是不是预设值、收敛后训练是否还会继续——这几个问题逐步牵出一个更大的疑点：现有的 INIT→Joint 两阶段架构（Student 顺序跑 72 题→TA 顺序跑 72 题→Teacher 顺序跑 72 题，再切到并行）有没有真的对应论文的训练方式。
+
+**完成内容：**
+- 确认 Table 3 的"session"= 一道题的 Turn 0 回复（`check_convergence.py` 源码核实），跟训练侧的 batch size 是完全不同的概念
+- 用户发现关键反证：Table 3 里 Joint vs Separate 的 Student 收敛数字差值（7.6）明显大于 TA（3.6）和 Teacher（2.6）——如果 INIT 阶段 Student 真的完全独立跑，应该是差值最小的那个，跟实际相反；且 Table 3 图注确认"5 次独立试验取平均"，排除"只是训练噪声"这个解释
+- 直接重读论文原文（`pdftoppm` 渲染 PDF 页面读图，不用 WebFetch 摘要）：p.5 明确"three simulated users using OpenClaw simultaneously"；p.21 附录 A.1 确认 72 是"at most"的评估上限（不是预先准备好的题量），且"先建立 homework1/homework2，然后开始 joint optimization...simultaneously"；全篇没有"收敛后训练终止"的表述
+- 重新核查三个被禁目录（`openclaw-rl/oel/`、`openclaw-fireworks/`、`openclaw-tinker/`）：确认禁用标准从来不是按时间线（CLAUDE.md 原文早已写明），且 `openclaw-rl/oel/eval/gsm8k_personal_agent.py` 进一步确认是 v1 风格的 2 角色设计（无 TA）+ 直接拿 ground truth 顶替学生答案（不走真实文件工具），再次独立证实不能作为 v2 参考
+- git 历史考古：`TA_chat.py` 2026-05-07 才加入（v2），`student_chat.py`/`teacher_chat.py` 2026-03-11 就有（v1，2 角色）；加 TA 那次 commit 的 README 改动把"two sequential phases"改成"three sequential phases"，**"run order matters"顺序执行的措辞被原样保留扩展，没有改成并行**；v1 时代 README 完全没有"joint"/"separate"/"homework1"/"homework2"这几个词——**这个对比维度本身是 v2 才新增的**
+- 核实 `ensure_homework_dir()` 源码：一次性快照复制（`if os.path.isdir(target): return`），只在目标目录不存在时执行一次，之后永不更新——结构上不支持"跟上游实时进度同步的并发"，只支持"上游已完整、下游一次性复制"
+- **最终结论（用户提出）：真实流程应该是先完整跑一遍 Separate（Student/TA/Teacher 各自独立训练 job，Table 3 本来就要报这一列数字），Separate 跑完后 `homework/`/`homework1/` 作为真实副产品自然留下；Joint 直接复用这些已经完整、不再变化的快照，三角色从一开始就同时启动**——不需要专门为 Joint 设计 bootstrap，也不存在死锁/追赶进度的问题（因为快照已经是完整的，TA/Teacher 不需要等 Student 实时进度）。现有 INIT 阶段（用刚开始训练、接近基础模型状态的模型拼凑 homework1/homework2）不是论文真实做法 → [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-23 条目，`docs/paper_reproduction_scope.md` 已同步更新 Joint/Separate 描述和执行路线优先级（Separate 从低优先级变成 Joint 的前置依赖）
+
+**下一步（用户明确指定）：** 先完成 Separate-Student 部分（`train_separate_student.sh`，Table 3 复现路线 Phase 3a）。
+
+### Joint 阶段 homework1/homework2 建立方式细化：确认需要"错位复制"，正文 4.4 节进一步确认，四阶段方案定案
+
+**完成内容：**
+- 用户追问"如果 homework1 里已经有 TA 的真实答案，Joint-TA 再训练这一题会不会被已有答案干扰"：核实 `TA_chat.py`/`teacher_chat.py` 是**读写同一个文件**（`HOMEWORK_DIR`/`SOURCE_HOMEWORK_DIR` 都是写死的模块级常量，只服务单次运行内部复制），一度提出"每个角色写独立文件"的方案后被否——跟官方硬编码协议（TA 系统提示词明确是"追加进它刚读的那份文件"）不符，write/edit 覆盖问题不会因为换文件命名方案消失，是两个独立问题
+- 确认"错位复制"能正确避免污染：Joint 的 `homework1`（给 TA 用）要从 **Separate-Student 自己的 `homework/`** 复制（干净，TA 从没写过东西进去）；Joint 的 `homework2`（给 Teacher 用）要从 **Separate-TA 自己的 `homework1/`** 复制（干净，没有 Teacher 点评）——规则："下一角色要用的目录，必须从上一角色自己读写的目录复制，不能从上上个角色的目录复制"
+- 重新解读附录 A.1"we first save the directory completed by the student as homework1, and save the directory completed by the TA as homework2"，确认这就是错位命名的字面意思（之前下意识按脚本内部命名习惯理解错了）
+- 确认这套错位复制规则完全没有官方代码参考，是从附录原文 + 自己推理"怎么避免污染"两方面推出来的
+- 用户追问系统提示词（三步协议）到底有没有生效：核实 `generate_student_message()` 每次调用都完整发送 `STUDENT_SYSTEM_PROMPT`；确认我们新加的 `extra_instruction` 只在复核（recheck）这一次特殊调用里追加，不影响正常对话轮次——排除是我们补丁干扰的可能，判断是 32B 模型自身指令遵循不可靠（此前已确认的已知短板）
+- **要求完整重读论文（不只是附录，正文实验章节也要读）确认四阶段方案没有偏差**：正文 4.4 节（p.12）"In addition to optimizing the model for a single user, OpenClaw-RL supports multiple individuals sharing the same model, with the model jointly optimized..."——正文原话明确 single user（Separate）是基础情况、各角色独立模型，joint 是额外能力、共用同一模型，比 Table 3 表格列名本身更直接地确认了 Separate/Joint 是两个不同模型
+- **四阶段方案定案**：Phase A（Separate-Student）→ Phase B（Separate-TA，依赖 A）→ Phase C（Separate-Teacher，依赖 B）→ Phase D（Joint，全新模型，错位复用 A/B 产出，三角色从一开始同时启动）；产物统一存到 `/dfs/data/openclaw-rl-project/table3-artifacts/`（持久化，不用 `runtime/<run_id>/` 这种每次训练都换的临时目录）→ [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-07-23 条目，`docs/paper_reproduction_scope.md` 已更新完整方案
+
+**下一步：** 开始写 `train_separate_student.sh`。
+
+---
+
+## 当前状态（2026-07-23）
+
+### 已就绪
+（同 2026-07-22，未变——见下方"历史状态（2026-07-22）"完整列表）
+
+### 已知限制 / 未解决
+- **架构层面确认：`train_with_services.sh` 现有的 Joint INIT 阶段不是论文真实做法**——完整四阶段方案（Separate-Student→Separate-TA→Separate-Teacher→Joint，错位复用产物）已定案，见 `docs/paper_reproduction_scope.md`，当前从 Phase A（`train_separate_student.sh`）开始实现
+- `train_separate_student.sh` 已写完、本地语法检查通过，尚未推送/未在服务器实测
+- **诊断实验：homework-verification-gate 补丁已移除，Simulator 临时换成 DeepSeek V4**（`prepare_openclaw_test_scripts.sh` 简化为只保留 model 字段兼容修复），用来判断此前反复出现的 write/overwrite 核验失败问题是 Qwen3-32B 这个具体模型能力不够，还是更深层不挑模型的设计问题——**这次实验的产出不算 Table 3 有效数据点**（论文 Section 4.1 明确用的是 Qwen3-32B），见 `docs/issues_log.md` 2026-07-23 条目
+- 07-22 晚提交的训练又在几小时内失败——具体原因还没来得及排查，优先级低于当前诊断实验
+- 其余已知限制（write 覆盖 PRM 打分定位、"NO_REPLY"/"who am I"幻觉、silent reply 退化等）状态不变，见 07-22 历史状态
+
+### 下一步
+1. **跑诊断实验**：用户在服务器上把 `simulator.env` 换成 DeepSeek V4，pull 最新代码，跑一次 `train_separate_student.sh`，贴回真实结果
+2. 根据诊断结果判断：write-compliance 问题若随换模型消失，说明是 Qwen3-32B 本身局限（论文原始条件下真实存在的限制），回到 Qwen3-32B 正式跑 Table 3 时再讨论是否需要重新引入某种核验机制；若依然存在，需要继续排查更深层原因
+3. Separate-Student（Qwen3-32B、无诊断补丁 or 补丁重新引入，视诊断结果而定）真实数据跑出后，验证"Joint 应该复用 Separate 产物"这个结论、以及"16 条样本触发一步训练"频率是否对得上收敛速度
+4. 排查 07-22 晚训练为什么又是几小时内失败
+5. 待 Separate-Student/TA/Teacher 全部完成后，重新设计 `train_with_services.sh` 的 Joint 阶段（去掉 INIT，直接消费 Separate 产物，三角色从一开始就同时启动）
+6. 其余待办（PRM turn 内容调试补丁验证、not_requested 效果验证等）延后到架构问题理清之后
+
+### 未验证
+- [ ] **write/overwrite 核验失败问题是否是 Qwen3-32B 特有**——本次 DeepSeek V4 诊断实验要回答的核心问题
+- [ ] "先跑完 Separate 再复用产物启动 Joint"这个结论——目前是逻辑推导出的最自洽版本，没有直接的官方参考实现证实
+- [ ] Table 3 收敛 session 数很短（TA 最快不到 10 题）跟"16 条样本触发一步训练"这个频率对不对得上——等 Separate-Student（Qwen3-32B 正式版）真实数据核对每题实际产生多少条可训练样本
+- [ ] 其余同 07-22（见下方历史状态）
+
+---
+
+## 历史状态（2026-07-22，已被 7/23 架构重新理解取代）
 
 ### 已就绪
 - [x] 环境 + GPU 编译依赖（A800/H20 均已实测）

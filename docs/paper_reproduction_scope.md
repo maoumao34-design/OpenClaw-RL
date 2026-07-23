@@ -92,24 +92,59 @@ Separate opt:
 
 ### Joint vs Separate 区别
 
+> ⚠️ **架构重新核实（2026-07-23）：Joint 不是"自己顺序建立 homework1/homework2 再切并行"，而是复用 Separate 跑完之后留下的真实产物。** 完整推导过程见 [`issues_log.md`](issues_log.md) 2026-07-23 条目（"Joint 训练真实编排方式重新核实"+"homework1/homework2 该怎么建立"两条）。之前 `scripts/train_with_services.sh` 里的 INIT 阶段（用刚开始训练、接近基础模型状态的模型顺序跑 72 题拼凑 homework1/homework2）**不是论文的真实做法**，已确认需要改。
+
+**证据来源（均为直接读原文确认，非推断）：**
+- 正文 4.4 节（p.12）："In addition to optimizing the model for **a single user**, OpenClaw-RL supports **multiple individuals sharing the same model**, with the model **jointly optimized**..."——明确"single user"（Separate，每个角色独立模型）是基础情况，"joint"（多角色共用同一模型）是额外能力，两者训练出来的是**不同的模型**
+- 附录 A.1（p.21，Evaluation Configurations）："The TA setting can only be evaluated after the student setting has been completed. Similarly, the teacher setting can only be evaluated after the TA setting has been completed."——这句在"joint optimization setting"之前，是对 student/TA/teacher 三个独立设置本身的通用顺序约束（对应 Separate 内部依赖）
+- 附录 A.1："In the joint optimization setting, we first save the directory completed by the student **as homework1**, and save the directory completed by the TA **as homework2**. We then start joint optimization... simultaneously."——**错位命名**：Student 自己完成的目录（正常语境下是 `homework/`）被存成"homework1"喂给 Joint；TA 自己完成的目录（正常语境下是 `homework1/`）被存成"homework2"喂给 Joint
+
 | 设定 | 训练方式 | 模拟结构 |
 |------|---------|---------|
-| **Joint opt** | 一个 job，Student/TA/Teacher 三个 persona 混合训练同一个模型 | **INIT 阶段**（一次性顺序）：Student → TA → Teacher 各跑 72 题，建立 `homework1/` `homework2/`；**Joint 阶段**（循环并行）：三 Simulator 同时运行，各操作独立目录 |
-| **Separate opt** | 三个独立 job，每个只训练一种 persona | 模拟循环只跑对应的一个 Simulator 脚本 |
+| **Separate opt** | 三个独立 job，每个只训练一种 persona，模拟循环只跑对应的一个 Simulator 脚本，**必须按 Student→TA→Teacher 顺序跑**（TA 需要 Student 产出的真实 `homework/` 才能开始，Teacher 需要 TA 产出的真实 `homework1/`） | Student 独立训练 job 跑完（最多 72 题）后，`homework/` 里留下真实、由**已训练模型**产出的解答；TA 独立训练 job 用这份 `homework/` 起步（`ensure_homework_dir()` 复制成 `homework1/`），跑完后 `homework1/` 里留下真实批改；Teacher 同理产出 `homework2/` |
+| **Joint opt** | 一个 job，Student/TA/Teacher 三个 persona 混合训练**同一个全新的、从基础模型开始的模型**（不接续任何 Separate 的 checkpoint，只复用 Separate 的**文件产出**）| 启动前**错位预铺**三个目录：`homework/`=空模板（Joint-Student 自己重新解，从零开始）；`homework1/`=复制 **Separate-Student** 的 `homework/`（干净、没有批改过的内容，给 Joint-TA 当起点）；`homework2/`=复制 **Separate-TA** 的 `homework1/`（干净、没有点评过的内容，给 Joint-Teacher 当起点）。三角色从一开始就同时启动，各自独立处理这批（最多 72 道）题目，互不阻塞、不需要等待信号 |
+
+**为什么 Joint 不能直接复用 Separate 各自的"最终产出"，必须错位一层：** TA_chat.py/teacher_chat.py 是"读某个目录、把自己的产出追加进同一个目录"（`ensure_homework_dir()` 只是把源目录整体复制过来当起点，之后角色自己在这份复制品上追加）。如果 Joint-TA 直接拿 Separate-TA 已经批改完的 `homework1/` 当自己的起点，文件里会已经有一份批改内容，Joint-TA 读文件时会被"已经有答案"干扰，测不出当前（联合训练中）模型自己的真实判断。错位一层（用上一个角色**自己产出**、还没被下一个角色动过的版本）就能保证 Joint-TA/Teacher 拿到的都是干净、没被后续角色写过的内容。
+
+**为什么必须先跑 Separate：** ①Table 3 本来就要报 Separate 这一列的数字，无论如何都要做；②`TA_chat.py`/`teacher_chat.py` 的 `ensure_homework_dir()` 要求源目录（`homework`/`homework1`）必须已存在真实内容，否则直接报错退出——Joint 没有独立的建立机制，必须依赖某次真实训练（Separate）产出的内容作为起点。
+
+**残留的不确定性（如实记录，未被证实或证伪）：** 附录 A.1"student/TA/teacher setting"这三个独立设置是不是就是 Table 3 报告的、完整训练过的 Separate 模型，还是仅仅是 Joint 实验自己需要的一次性铺垫（可能用的是训练程度较浅的模型），论文原文没有直接点名。但不管哪种解读，Phase A（Separate-Student）都是必须先做的第一步，不影响现在的实现顺序。
+
+**产物永久存放路径（2026-07-23 确定）：** Separate 各阶段产出的 `homework/`/`homework1/`/`homework2/` 需要跨训练任务、长期复用，不能放在 `runtime/<run_id>/workspace/` 这种每次训练都重新生成时间戳的临时目录里（后面阶段找不到）。统一放在 `/dfs/data/openclaw-rl-project/table3-artifacts/`（持久化存储，不受 GPU 空闲回收影响）：
+```
+/dfs/data/openclaw-rl-project/table3-artifacts/
+├── separate-student/homework/     # Phase A 产出（Separate-Student 真实解答）
+├── separate-ta/homework1/         # Phase B 产出（Separate-TA 真实批改）
+└── separate-teacher/homework2/    # Phase C 产出（Separate-Teacher 真实点评，Joint 不需要，但 Table 3 Separate 列需要）
+```
 
 ### Table 3 完整复现执行路线
 
-**Phase 1：Joint Block — Hybrid RL 列（当前阶段）**
+> ⚠️ **优先级顺序已重排（2026-07-23）：Separate（Phase 3a-3c）从"低优先级、Joint 之后再做"改为 Joint 的前置依赖，必须先做。** 原因见上方"Joint vs Separate 区别"——Joint 需要直接复用 Separate 跑完后留下的 `homework/`/`homework1/`（错位一层），`train_with_services.sh` 现有的 INIT 阶段（自己拼凑 homework1/homework2）不是论文真实做法，需要改成直接消费 Separate 的产物。
+
+**Phase 3：Separate Block — Hybrid RL 列（当前阶段，Joint 的前置依赖）**
+
+三个独立 job，每个模拟循环只保留一个 persona，**必须按顺序跑**（TA 依赖 Student 产出的 `homework/`，Teacher 依赖 TA 产出的 `homework1/`），每个阶段跑完后把产出复制进 `/dfs/data/openclaw-rl-project/table3-artifacts/` 永久保存：
+
+| 步骤 | 训练内容 | 需要的脚本 | 状态 |
+|------|---------|----------|------|
+| **3a** | **Separate 训练，只训 Student，最多 72 题，跑完停止训练** | `train_separate_student.sh` | 🔨 **当前正在做** |
+| 3b | Separate 训练，只训 TA（依赖 3a 产出的 `homework/`，复制进这次训练的起始 workspace） | `train_separate_ta.sh` | ⬜ 需写，待 3a 完成 |
+| 3c | Separate 训练，只训 Teacher（依赖 3b 产出的 `homework1/`，复制进这次训练的起始 workspace） | `train_separate_teacher.sh` | ⬜ 需写，待 3b 完成 |
+| 3d | 评估三个 checkpoint 各自的收敛 session，得到 Separate / Hybrid RL 列数字 | `check_convergence.py` | ⬜ |
+
+**Phase 1：Joint Block — Hybrid RL 列（待 Phase 3 完成后才能正确跑）**
 
 | 步骤 | 操作 | 脚本 | 状态 |
 |------|------|------|------|
-| 1a | Joint 训练，Hybrid RL | `scripts/train_with_services.sh` | ✅ 已写，待跑 |
-| 1b | 评估：3 个 persona 各数收敛 session | `scripts/check_convergence.py` | ✅ 已写，待跑 |
-| 1c | 得到 Joint / Hybrid RL 列：Student=?, TA=?, Teacher=? | — | ⬜ |
+| 1a | 改 `train_with_services.sh`：去掉自己拼凑 homework1/homework2 的 INIT 阶段，改成启动前从 `table3-artifacts/` 错位复制（`separate-student/homework/`→本次 `homework1/`，`separate-ta/homework1/`→本次 `homework2/`），三角色从一开始就同时启动 | `scripts/train_with_services.sh` | ⬜ 需改（待 Phase 3 产出真实数据后设计细节） |
+| 1b | Joint 训练，Hybrid RL，全新基础模型开始 | 同上 | ⬜ |
+| 1c | 评估：3 个 persona 各数收敛 session | `scripts/check_convergence.py` | ✅ 脚本本身已写 |
+| 1d | 得到 Joint / Hybrid RL 列：Student=?, TA=?, Teacher=? | — | ⬜ |
 
 **Phase 2：Joint Block — 基线列（GRPO、OPD）**
 
-每列结构与 Phase 1 相同，只换训练脚本（模拟循环不变，三个 persona 仍全部保留）：
+每列结构与 Phase 1 相同，只换训练脚本（模拟循环不变，三个 persona 仍全部保留，同样依赖 Phase 3 的产物）：
 
 | 步骤 | 操作 | 训练后端 | 状态 |
 |------|------|---------|------|
@@ -117,17 +152,6 @@ Separate opt:
 | 2b | 评估 GRPO 列 | `check_convergence.py` | ⬜ |
 | 2c | Joint 训练，OPD only | `openclaw-opd/run_qwen3_4b_openclaw_opd.sh` | ⬜ 需写 `train_opd_joint.sh` |
 | 2d | 评估 OPD 列 | `check_convergence.py` | ⬜ |
-
-**Phase 3：Separate Block — Hybrid RL 列**
-
-三个独立 job，每个模拟循环只保留一个 persona：
-
-| 步骤 | 训练内容 | 需要的脚本 | 状态 |
-|------|---------|----------|------|
-| 3a | Separate 训练，只训 Student | `train_separate_student.sh` | ⬜ 需写 |
-| 3b | Separate 训练，只训 TA | `train_separate_ta.sh` | ⬜ 需写 |
-| 3c | Separate 训练，只训 Teacher | `train_separate_teacher.sh` | ⬜ 需写 |
-| 3d | 评估三个 checkpoint 各自的收敛 session | `check_convergence.py` | ⬜ |
 
 **Phase 4：Separate Block — 基线列（低优先级）**
 
@@ -159,9 +183,9 @@ Separate opt:
 
 ---
 
-**优先级建议：**  
-Phase 1 → Phase 2 → Phase 3（Hybrid RL 列）→ Phase 3（基线）→ Phase 4 → Phase 5  
-Phase 1 完成后即可验证主结论（Joint Hybrid RL < Joint GRPO < Joint OPD）。
+**优先级建议（2026-07-23 更新，Separate 提前）：**  
+Phase 3（Separate / Hybrid RL 列，Joint 前置依赖）→ Phase 1（Joint / Hybrid RL 列）→ Phase 2（Joint 基线）→ Phase 4（Separate 基线）→ Phase 5  
+Phase 3 + Phase 1 完成后即可验证主结论（Joint Hybrid RL < Joint GRPO < Joint OPD，且 Joint < Separate 体现协同效应）。
 
 ---
 

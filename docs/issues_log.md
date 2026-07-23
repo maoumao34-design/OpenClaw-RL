@@ -1848,6 +1848,133 @@ export const DEFAULT_SILENT_REPLY_POLICY = {
 
 ---
 
+## [2026-07-23] Joint 训练真实编排方式重新核实：确认现有 INIT→Joint 架构不对，真实流程应该是先跑完 Separate 再复用其产物启动 Joint
+
+**背景：** 用户追问 Table 3 的"session"单位到底是什么（一道题，不是训练 batch 的 16 条），进而追问 INIT 阶段的 `SESSION_LIMIT=72` 是不是预设值、收敛后训练是否还会继续——这些问题逐步牵出一个更大的疑点：**我们现在的 INIT→Joint 两阶段架构（Student 顺序跑 72 题→TA 顺序跑 72 题→Teacher 顺序跑 72 题，然后才切到三角色并行的 Joint）有没有真的对应论文的训练方式**。
+
+**第一层证据：Table 3 "session"单位确认。** 核实 `scripts/check_convergence.py` 源码：`session` = 一道题的 Turn 0 回复（`[session: student-hw-N-pid]` 分块），不是训练侧"16 条样本一步"的那个 16——两者是完全不同的概念，不能混用。
+
+**第二层证据：Joint vs Separate 的 Student 数字差异，推翻"Student 应该完全不受干扰"的假设。**
+- 用户观察：如果 INIT 阶段 Student 真的是完全独立跑（TA/Teacher 还没开始），Joint 的 Student 收敛数字应该跟 Separate 很接近，但 Table 3 显示 Joint Student=11.6 明显小于 Separate Student=19.2，而且**差值在 Student/TA/Teacher 三者中是最大的**（Student 7.6 > TA 3.6 > Teacher 2.6）——如果是"Student 先独立跑完 72 题保护期"这种架构，Student 应该是差值最小的那个，跟实际相反
+- 核实 Table 3 图注："We run 5 independent trials... and report the mean"——5 次独立试验平均，排除"只是单次训练噪声"这个解释，差值模式应该是真实、系统性的
+
+**第三层证据：直接重读论文原文（用 `pdftoppm` 渲染 PDF 页面为图片再读，不用 WebFetch 摘要）。**
+- p.5（Introduction 贡献点）："**We first simulate users from different professions using OpenClaw simultaneously** and show that OpenClaw-RL can make the model align to per-user preferences within around 10.3 sessions..."——明确说三角色"同时"用 OpenClaw，支持并行
+- p.21（Appendix A.1，Evaluation Configurations）："By default, we set the conversation-session limit to 72, meaning that **at most** 72 tasks are used for evaluation."——确认 72 是**上限**，不是"提前准备好的题目数量"；"In the joint optimization setting, we first save the directory completed by the student as homework1, and save the directory completed by the TA as homework2. We then start joint optimization, where the three simulated users use OpenClaw to conduct their work **simultaneously**."——先建立 homework1/homework2，然后才三角色同时开始
+- 没有找到任何"收敛后训练终止"的表述——收敛数字是事后统计出来、用于跨方法对比的报告指标，不是训练停止条件
+
+**第四层证据：被禁代码（`openclaw-rl/oel/`、`openclaw-fireworks/`、`openclaw-tinker/`）重新核查，确认排除。**
+- 用户提出：之前禁用这些目录是不是因为搞错了 v1/v2 时间基准，现在应该重新评估——核实 CLAUDE.md 原文，禁用标准从来不是按时间，是"是否实现了 v2 论文描述的方法"（`openclaw-rl/oel/` 是外部贡献者 zhuchichi56 的独立方法 PR#96，不是本论文内容）
+- 用 Explore agent 逐个搜索三个被禁目录：只有 `openclaw-rl/oel/eval/gsm8k_personal_agent.py`（+`select_hard_problems.py`/`personalization_evaluator.py`）有 Personal Agent 相关内容，但**进一步确认它是 v1 风格的 2 角色设计（只有 student/teacher 轮流交替，完全没有 TA），且用 `student_answer = f"The answer is {ground_truth}."` 直接拿 ground truth 顶替学生答案，完全不走真实 OpenClaw 文件工具**——再次独立证实它对应错误的论文版本，不能作为 v2 训练方式的参考
+- `openclaw_combine_select_api_server.py`/`openclaw_opd_api_server.py`（真正的训练奖励管线）确认完全任务无关，没有任何 GSM8K/homework 特定代码——支持"训练管线本身不区分训练用途还是评估用途的对话，两者是同一回事"
+
+**第五层证据：git 历史考古，`openclaw-test/` 的设计定性。**
+- `git log --diff-filter=A`：`student_chat.py`/`teacher_chat.py` 2026-03-11 加入（v1，2 角色，teacher 就是"批改"角色），`TA_chat.py` 2026-05-07 才加入（"Add TA phase to OpenClaw test flow"，对应 v2）
+- 加 TA 那次 commit 的 README 改动：v1 原文"The test consists of **two sequential phases**"+"**Run order matters**: Run student_chat.py first... then teacher_chat.py"，改成 v2 后是"**three sequential phases**"+"Run order matters: student→TA→teacher"——**顺序执行、run order matters 这个措辞被原样保留并扩展，v2 加 TA 时完全没有改成"并行"的表述**
+- 核实 v1 时代（加 TA 之前）的 README 全文：完全没有"joint"/"separate"/"homework1"/"homework2"这几个词——**"Joint vs Separate"这个对比维度本身是 v2 才新增的实验设计，v1 根本没有这个概念**，git 历史里从未记录过"simultaneously"具体怎么实现，是仓库历史上从未公开过的实现细节
+- 核实 `ensure_homework_dir()` 源码（`TA_chat.py`/`teacher_chat.py` 中相同实现）：`if os.path.isdir(target): return`——**一次性快照复制，只在 target 目录不存在时执行一次，之后永不更新**。这是代码层面的硬约束：`homework1`（TA 用）和 `homework2`（Teacher 用）一旦建立就是冻结快照，源头（`homework`/`homework1`）后续再怎么变都不会同步过去——**结构上就不支持"跟 Student/TA 实时进度保持同步的并发"**，只支持"上游已经完整、不再变化，下游一次性复制"这种模式
+
+**最终结论（用户提出，逻辑自洽、目前证据支持）：** 
+真实流程应该是——
+1. **先完整跑一遍 Separate**（Student/TA/Teacher 各自独立训练 job）。Table 3 本来就要报 Separate 这一列的数字，这是无论如何都要做的事。
+2. Separate 跑完之后，`homework/`（Separate-Student 产出的真实解答）、`homework1/`（Separate-TA 产出的真实批改）作为**自然副产品**留了下来——不需要专门为 Joint 再设计一次 bootstrap
+3. **Joint 直接复用这些已有的、真实的 homework/homework1 内容**，三角色（用新的、待联合训练的模型）同时启动——因为 `homework1`/`homework2` 已经是完整、不再变化的快照，TA/Teacher 不需要等 Student 的实时进度，天然可以真并发，不存在死锁或"追上 Student 进度"的问题
+4. 现在这套 `train_with_services.sh` 的 INIT 阶段（用一个刚开始训练、接近基础模型状态的模型顺序跑 72 题拼凑 homework1/homework2）**不是论文的真实做法**——INIT 产出的内容质量（未经过 Separate 训练的模型）跟真实流程（用完整训练过的 Separate 模型产出）有本质差别
+
+**影响：** `docs/paper_reproduction_scope.md` 里"Joint vs Separate 区别"这张表和执行路线优先级需要更新——Separate（尤其 Phase 3a：Separate-Student）从"低优先级、Phase 1/2 之后再做"变成 Joint 能正确复现的**前置依赖**。
+
+**接入：** 无代码改动，这次是架构层面的重新理解，具体实现方案下次动手时再定。
+
+**待验证：** 这个结论目前是逻辑推导出的最自洽版本，不是找到了直接的官方参考实现证实（论文原文对这层实现细节确实没写清楚，官方仓库 git 历史里也从未记录过）。跑通 Separate-Student 之后，用真实产出的 homework 内容质量（跟现在 INIT 产出的对比）作为间接验证。
+
+---
+
+## [2026-07-23] Joint 阶段 homework1/homework2 该怎么建立：确认需要"错位复制"，且这部分完全没有官方代码可参考
+
+**背景：** 继续设计 Joint 阶段该怎么复用 Separate 的产物，追问"如果 homework1 里已经有 TA 的真实答案，Joint-TA 再训练这一题会不会被已有答案干扰"。
+
+**核实 TA/Teacher 读写行为：** 确认 `TA_chat.py`/`teacher_chat.py` 是**读写同一个文件**，不是分别写进各自独立的新文件——`TA_chat.py`：`SOURCE_HOMEWORK_DIR="homework"`、`HOMEWORK_DIR="homework1"`（复制源是 `homework`，自己读写的是 `homework1`，把批改追加进复制过来的同一份文件里）；`teacher_chat.py` 同理，复制源 `homework1`、自己读写 `homework2`。这两个常量是**写死在脚本顶部的模块级常量**，不是命令行参数或环境变量可配置——**确认官方脚本完全不知道"Separate"/"Joint"/"跨训练任务复用产物"这些概念，只处理"自己这一次运行内部"的目录复制**。
+
+**用户一度提出"每个角色写独立文件"的方案（已否）：** 提议 homework 永远只放题目、Student 写 homework1（只放答案）、TA 写 homework2（只放批改），这样就没有 write 覆盖问题了。核实后确认这跟官方硬编码协议不符——TA 的系统提示词原文就是"compare it with the correct answer, and write the grading comments directly"，明确是追加进它刚读的那份文件（`homework1`），不是另开新文件。**write/edit 覆盖问题不会因为换个文件命名方案就消失**，这是"内容从哪来"（今天在讨论的）和"写文件时会不会写错"（此前那套核验补丁在处理的）两个独立问题，不能混为一谈。
+
+**确认"错位复制"能正确避免污染：** 重新走一遍复制路径——
+- Joint 的 `homework1`（给 Joint-TA 用）应该从 **Separate-Student 自己的 `homework/`** 复制（只有题目+学生答案，TA 从来没写过东西进去，因为 TA 只写自己的 `homework1/`）——这样 Joint-TA 拿到的是干净的，不会被"已有批改"干扰
+- Joint 的 `homework2`（给 Joint-Teacher 用）应该从 **Separate-TA 自己的 `homework1/`** 复制（题目+答案+TA 真实批改，没有 Teacher 点评）——Joint-Teacher 同样拿到干净的
+- 规则："下一个角色要用的目录，必须从上一个角色自己读写的那个目录复制，不能从上上个角色的目录复制"——只要复制源头选对，就不会把"已经有人回答过"的内容带进去
+
+**重新解读附录 A.1 原文，发现这个"错位"很可能就是论文本来的意思：** "we first save the directory completed by the student **as homework1**, and save the directory completed by the TA **as homework2**"——逐字读，"the directory completed by the student"（Student 自己完成的目录，正常语境下就是 `homework/`）被存成"homework1"；"the directory completed by the TA"（TA 自己完成的目录，正常语境下就是 `homework1/`）被存成"homework2"——这正好是错位命名，跟我们推出来的方案吻合。之前一直下意识按"homework1=TA 自己的目录、homework2=Teacher 自己的目录"这个脚本内部命名习惯去理解这句话，没意识到论文这句话说的是错位对应关系。
+
+**确认这部分完全没有官方代码可参考：** `HOMEWORK_DIR`/`SOURCE_HOMEWORK_DIR` 写死在脚本里，只服务于单次运行内部的复制，没有任何代码处理"跨训练任务复用产物"这件事。整套"Joint 该从 Separate 的哪个目录复制到哪个目录"的规则，是纯粹从附录 A.1 这句话逐字重读 + 自己推理"怎么避免污染"这两方面推出来的，不是找到官方参考实现确认的。
+
+**接入：** 无代码改动，这次是设计层面的记录，具体实现留到写 Joint 阶段代码时再做。
+
+**待验证：** 同上一条——这套错位复制规则目前只是逻辑推导，没有官方代码或数据能直接验证；等 Separate-Student/TA/Teacher 都跑完、真正实现 Joint 阶段时，可以观察 Joint-TA/Teacher 拿到"错位"后的干净内容时，是不是真的能正常读题批改，不出现"文件已经写过答案"这类混乱回应，作为间接验证。
+
+---
+
+## [2026-07-23] 四阶段复现方案定案：正文 4.4 节确认 Separate/Joint 是不同模型，产物统一存 /dfs/data 永久保存
+
+**背景：** 完整梳理"Separate-Student→Separate-TA→Separate-Teacher→Joint"这条链路后，要求正式定案前必须完整重读论文（不只是附录，正文实验章节也要读），确认这次不能再出现偏差。
+
+**正文 4.4 节（p.12）核实，找到比附录更直接的确认：**
+> "In addition to optimizing the model for **a single user**, OpenClaw-RL supports **multiple individuals sharing the same model**, with the model **jointly optimized** across their interactions."
+
+明确写出："single user"（单用户，对应 Separate）是基础情况，每个角色用**独立模型**；"multiple individuals sharing the same model"（多角色共用同一模型，对应 Joint）是在此基础上的额外能力。这是正文原话，不是从 Table 3 表格列名反推的，进一步确认 Separate 和 Joint 训练出来的是两个不同的模型，Joint 不接续任何 Separate 的 checkpoint，只复用 Separate 的**文件产出**（`homework/`/`homework1/`）。
+
+**四阶段方案最终确认：**
+```
+Phase A: Separate-Student（独立训练 job，最多 72 题，跑完停止训练）
+  → 产出真实 homework/（Table 3 "Separate Student" 数字 + Phase D 的 homework1 种子）
+Phase B: Separate-TA（依赖 A 的 homework/ 作为起点，独立训练 job）
+  → 产出真实 homework1/（Table 3 "Separate TA" 数字 + Phase D 的 homework2 种子）
+Phase C: Separate-Teacher（依赖 B 的 homework1/ 作为起点，独立训练 job）
+  → 产出真实 homework2/（Table 3 "Separate Teacher" 数字，Joint 不需要这份）
+Phase D: Joint（全新基础模型，三角色错位复用 A/B 的产出，从一开始就同时启动）
+  → Table 3 Joint 三个数字（最终目标）
+```
+
+**产物永久存放路径确定：** 之前（07-22）workspace 迁移到的 `runtime/<run_id>/workspace/` 是每次训练启动都重新生成时间戳的临时目录，Phase B/C/D 找不到之前阶段留下的东西。改为统一存放到持久化的：
+```
+/dfs/data/openclaw-rl-project/table3-artifacts/
+├── separate-student/homework/     # Phase A 产出
+├── separate-ta/homework1/         # Phase B 产出
+└── separate-teacher/homework2/    # Phase C 产出
+```
+不受 GPU 空闲回收/训练重启影响，各阶段之间可以稳定引用固定路径，不用去猜之前是哪次 run_id。
+
+**接入：** `docs/paper_reproduction_scope.md` 已同步更新完整的四阶段方案、证据引用、错位复制规则、残留不确定性、永久存放路径。
+
+**下一步：** 开始写 `train_separate_student.sh`（Phase A）。
+
+---
+
+## [2026-07-23] 待验证记录：收敛 session 数很短，"16 条样本触发一步训练"这个频率应该对应得上
+
+**背景：** 设计 `train_separate_student.sh` 的"跑完 72 题就主动停止训练"这个逻辑时，用户顺带提出一个值得记录、留待后续验证的观察。
+
+**观察：** Table 3 里 TA 的收敛数字最小（Joint 8.2、Separate 11.8），意味着往往不到 10 道题就能连续 3 次通过。附录 A.1 训练配置："we trigger asynchronous training after collecting 16 training samples"——每凑够 16 条真实样本才触发一次训练（权重更新）。**如果收敛真的发生在 10 道题以内，那"凑够 16 条样本"这件事必须发生得足够频繁才行**——按官方"每个 session-turn 各自算一条 Sample"的语义（`openclaw-combine` 文档注释里确认过），10 道题如果每道题产生 4-6 个 turn，大概能攒到 40-60 条样本，够触发 2-4 次真实的权重更新——这个量级勉强够解释"10 题以内就能看出模型行为改变"，但如果实际每道题产生的真实可训练样本数比这个少很多，收敛这么快就说不通。
+
+**待验证：** 等 Separate-Student 真实跑出数据后，从 `training.log` 里核对：①每道题实际产生了多少条真实训练样本（main-line turn，不算 side turn）；②凑够 16 条、触发一次真实训练步骤的频率，是不是能撑得起"不到 10 道题就收敛"这个观察到的现象。如果实际样本产生速率明显跟不上，可能说明我们的真实训练速率/样本利用率跟论文原始环境有系统性差距，需要进一步排查（比如是不是有大量 side turn 没被算作可训练样本、或者哪个环节样本没有被真正提交进训练队列）。
+
+---
+
+## [2026-07-23] 诊断实验：去掉 homework-verification-gate 补丁，Simulator 换 DeepSeek V4
+
+**背景：** `prepare_openclaw_test_scripts.sh` 里的 homework-verification-gate（07-22 引入，v1→v4 经过多轮真实数据驱动修订，见本文件 07-22 各条目）一直在解决同一类问题：外部 Simulator（Qwen3-32B，base model，无 sampling 参数，论文原始设计本来就是这样）经常在没有真正核实文件内容的情况下就确认 `HOMEWORK_DONE`/`GRADING_DONE`/`COMMENT_DONE`——包括接受实际写入失败的回合、接受覆盖掉原内容的 `write` 调用、以及从不核实写入内容的风格。用户提出一个值得先验证的问题：这些问题到底是 Qwen3-32B 这个具体模型本身能力不够（没有读文件能力、纯靠对话印象判断"完成"），还是更深层的、换任何 Simulator 模型都会复现的设计问题？如果是前者，继续在 harness 层加补丁掩盖，不如先确认根因。
+
+**改动：**
+1. `scripts/prepare_openclaw_test_scripts.sh` 简化：只保留 `"model": "default"` → `"model": "openclaw/default"` 这一条纯 API 兼容性改写（这条不算"我们加的补丁"，是这版 OpenClaw CLI 路由格式要求的，去掉的话请求直接 400，什么都跑不起来），homework-verification-gate 的诊断/纠错模板整段移除，`openclaw-test/{student,TA,teacher}_chat.py` 的 `DONE_SENTINEL` 判定逻辑恢复成官方原始的样子（模型说完成就直接结束这道题）。
+2. Simulator 从 Qwen3-32B 换成 DeepSeek V4——接入机制不变，仍然是 `simulator.env` 里的 `SIMULATOR_BASE_URL`/`SIMULATOR_API_KEY`/`EXTERNAL_MODEL` 三个变量对接任意 OpenAI 兼容端点，脚本本身不用改。这部分改动由用户直接在服务器上编辑 `simulator.env` 完成。
+3. 跑的脚本：`train_separate_student.sh`（Phase A，Student-only，72 题，成本最低，一次就能看出问题是否还在）。
+
+**复现忠实度提醒（重要）：** 论文 Section 4.1 明确写的 Simulator 是 Qwen3-32B，不是任何其他模型。**这次实验换成 DeepSeek V4 后，产出的数字不能算作 Table 3 的有效数据点**，只能用来做"write-compliance 问题是不是 32B 特有"这个诊断判断。等诊断完成后：
+- 如果 DeepSeek V4 下 write/overwrite 问题基本消失 → 说明问题确实是 Qwen3-32B 这个模型能力不够（论文本来就用 32B，这是论文原始条件下会真实存在的限制，不是我们环境的 bug）——需要回到用 Qwen3-32B 正式跑 Table 3，届时是否需要重新引入某种形式的核验机制，再具体讨论。
+- 如果换了模型问题依然存在 → 说明是更深层、不挑 Simulator 模型的设计问题，需要继续排查，且不能证明"回到 32B 后曾经加的补丁是必需的"。
+
+**下一步：** 用户在服务器上把 `simulator.env` 改成 DeepSeek V4 的地址/key/模型名，pull 这次改动，跑一次 `train_separate_student.sh`，把真实结果贴回来判断。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
