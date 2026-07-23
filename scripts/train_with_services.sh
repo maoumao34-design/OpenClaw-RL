@@ -205,20 +205,30 @@ wait_for_port() {
 wait_for_external_simulator() {
     local max_wait=${1:-300}
     local waited=0
-    # SIMULATOR_BASE_URL=http://host:30001/v1 → health 在 http://host:30001/health
-    local health_url="${SIMULATOR_BASE_URL%/v1}/health"
-    echo "检查外部 Simulator: ${health_url}"
-    while ! curl -sf "${health_url}" > /dev/null 2>&1; do
+    # 2026-07-23 修复：原来拼 <base>/health 是沿用自建 sglang 服务器（launch_simulator.sh）
+    # 自带的标准探活路径。换成走内部平台网关（如 Lenovo modelfactory service-large）时，
+    # 这类网关往往只实现标准 OpenAI 兼容路径（/v1/models、/v1/chat/completions 等），
+    # 没有 /health，探活请求会一直连不上/超时，跟 Simulator 服务本身是否就绪无关。改用
+    # GET /v1/models（两种后端都支持的标准路径）+ 可选 Authorization 头（自建 sglang 未
+    # 设 key 时这个头会被忽略，无副作用）；curl 显式加 --max-time，避免网络不可达时一直
+    # 挂起、把每轮循环拖到远超预期的 10s。见 docs/issues_log.md 2026-07-23 条目。
+    local models_url="${SIMULATOR_BASE_URL%/}/models"
+    local auth_args=()
+    if [ -n "${SIMULATOR_API_KEY:-}" ] && [ "${SIMULATOR_API_KEY}" != "EMPTY" ]; then
+        auth_args=(-H "Authorization: Bearer ${SIMULATOR_API_KEY}")
+    fi
+    echo "检查外部 Simulator: ${models_url}"
+    while ! curl -sf --max-time 10 "${models_url}" "${auth_args[@]}" > /dev/null 2>&1; do
         sleep 10
         waited=$((waited + 10))
         if [ ${waited} -ge ${max_wait} ]; then
             echo "超时：外部 Simulator 在 ${max_wait}s 内不可达" >&2
-            echo "请确认已在另一台机器启动 scripts/launch_simulator.sh，且训练机网络可达" >&2
+            echo "请确认 Simulator 服务已启动、网络策略已开通、SIMULATOR_BASE_URL 配置正确" >&2
             return 1
         fi
         echo "  已等待 ${waited}s..."
     done
-    echo "外部 Simulator 已就绪 (${health_url})"
+    echo "外部 Simulator 已就绪 (${models_url})"
 }
 
 # =====================================================================
