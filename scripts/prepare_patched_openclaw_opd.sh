@@ -275,8 +275,42 @@ if tool_calls_log_old not in text:
 tool_calls_log_new = (
     '        if tool_calls:\n'
     '            logger.info("[OpenClaw-OPD] session=%s tool_calls: %s", session_id, str(tool_calls)[:500])\n'
+    '            # --- openclaw-rl-debug-repeat-thinking (temporary, safe to remove) ---\n'
+    '            # 2026-07-24: 诊断"模型在单个 turn 内反复用相同参数调用同一工具、\n'
+    '            # 迟迟不给出文字回复"这个现象（见 docs/issues_log.md 2026-07-24\n'
+    '            # 条目，Problem 36 从无界循环开始那次）。此前只记录 thinking 的\n'
+    '            # 字符数，拿不到真实推理文字，没法判断模型每次"决定再读一次"\n'
+    '            # 背后到底在想什么。这里检测"这次工具调用是否跟上一次完全相同"，\n'
+    '            # 命中时把完整 reasoning 原文打出来，只在真的发生重复时才打，\n'
+    '            # 避免正常情况下日志量暴涨。\n'
+    '            _cur_call = (\n'
+    '                tool_calls[0].get("function", {}).get("name"),\n'
+    '                tool_calls[0].get("function", {}).get("arguments"),\n'
+    '            )\n'
+    '            _prev_call = self._last_tool_call.get(session_id)\n'
+    '            if _prev_call is not None and _prev_call == _cur_call:\n'
+    '                logger.info(\n'
+    '                    "[openclaw-rl-debug-repeat-thinking] session=%s repeated tool_call=%s reasoning:\\n%s",\n'
+    '                    session_id, _cur_call, reasoning,\n'
+    '                )\n'
+    '            self._last_tool_call[session_id] = _cur_call\n'
 )
 text = text.replace(tool_calls_log_old, tool_calls_log_new, 1)
+
+init_dict_old = (
+    '        self._pending_records: dict[str, dict[str, Any]] = {}\n'
+)
+if init_dict_old not in text:
+    raise SystemExit(
+        "patch failed: expected _pending_records init line not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+init_dict_new = init_dict_old + (
+    '        # openclaw-rl-debug-repeat-thinking: per-session (tool_name, arguments)\n'
+    '        # of the most recent tool call, used to detect exact-repeat tool calls.\n'
+    '        self._last_tool_call: dict[str, tuple] = {}\n'
+)
+text = text.replace(init_dict_old, init_dict_new, 1)
 
 empty_response_old = (
     '            if not response_ids and not response_text.strip():\n'

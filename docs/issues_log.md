@@ -2122,6 +2122,49 @@ if missing:
 
 ---
 
+## [2026-07-24] Execution Bias 补丁上线后，Problem 35/36 起再次出现 context overflow——根因是"重复调用同一工具"这个模型习惯性行为发生了突变，不是补丁失效
+
+**背景：** Execution Bias 整章清空的补丁（见上一条 07-24 记录）推送后，当天（07-24）重新起了一次训练。用户观察到 Problem 36/37 又出现了跟昨天 Problem 31 一样的"迟迟拿不到回复、最后 context overflow"现象，怀疑是不是老问题没修好，或者受前面题目影响累积出来的。
+
+**排查过程，三个假设逐一被证伪：**
+
+1. **假设：Problem 37 的内容被 Problem 36 污染了。** 直接读 Problem 37 的 session 文件（全新 UUID `0713b671-...`），内容确认是 Anna/books 这道题本身真实、正确的内容，不是 Problem 36 的 Solo/pages 题——**证伪**。Problem 37 消息数偏高是它自己 Turn 1 内部连续 4 次重复调用同一个 `write`（参数完全相同）导致的，不是跨 session 污染。
+
+2. **假设：今天的 job 从昨天（07-23）跑崩的 checkpoint 恢复了、继承了退化权重。** 检查 checkpoint 目录 `/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-separate-student/`，**目录根本不存在**——今天的 job 确认是从 base 模型 `Qwen3-4B-Thinking-2507` 全新开始训练的（`--load` 指向的目录不存在，Megatron 走了 `--ref-load` 兜底）。`wandb: Resuming run` 那行日志只是指标看板的连续性，跟模型权重无关——**证伪**。
+
+3. **假设：Execution Bias 补丁没生效，第 2 条有害指令仍在起作用。** `grep "execution-bias-fix"` 确认补丁的一次性确认日志已经打印，整章确认被清空。但重复调用同一工具的现象依然存在，而且往前追溯发现最早在 **Problem 5**（训练刚开始不久）就已经出现过——**证伪补丁是唯一/完整原因**（补丁本身仍然是对的，只是没解决这个另外存在的问题）。
+
+**确认的真实机制：** 模型（Qwen3-4B-Thinking）存在一种习惯性行为——在一个 Turn 内部，会连续多次用完全相同的参数重复调用同一个工具（`read` 或 `write`），然后才产出真正的文字回复或往下推进。直接看 session 文件 JSONL 里的时间戳（重复调用之间相隔 5-20 秒），确认是模型每次独立决策的结果，不是技术性的重放 bug。这个过程发生在 Turn 1/2 内部，harness 层面的 transcript 看不到（只显示最终真实回复），但会悄悄把 session 的消息数/token 数撑大；撑到一定程度后 `estimatedPromptTokens` 超过 `promptBudgetBeforeReserve=16384`，触发 `already_compacted_recently` 压缩失败循环，导致该题后续 turn 永久 `Context overflow`——跟昨天 Problem 31 的表现完全一致。
+
+**用重复次数统计脚本（扫 `training.log` 里每个 session 的 `tool_calls`，找同一 `(tool_name, path)` 连续出现的最长长度）量化后发现的关键规律：**
+
+```
+Problem 0-34: max_repeat 基本 1-2 次，仅 Problem 17 出现过一次异常值（5 次，共 8 次调用）
+Problem 31:   max_repeat = 3（共 6 次）
+Problem 35:   一开始统计脚本漏掉了（见下方"技术细节"），补查后确认 max_repeat = 7（共 13 次），有界、能自行恢复
+Problem 36:   max_repeat = 32（共 35 次）  ← 严重，且无界（见下方修正）
+Problem 37:   max_repeat = 22（共 36 次）  ← 严重
+Problem 38:   max_repeat = 18（共 35 次）  ← 严重
+Problem 39:   max_repeat = 24（共 41 次）  ← 严重
+Problem 40:   max_repeat = 14（共 45 次）  ← 严重
+```
+
+**用户明确澄清的关键判断标准（本条记录的核心结论，答辩时要讲清楚）：** 重复调用次数在 **10 次以内**属于模型的正常/基线行为，本身不影响最终能不能产出真实回复，**不是异常**。真正的异常是重复次数**突然跳到 30 次左右这个量级**——这个量级会导致 context 真正撑爆、题目彻底失败，是"能不能成功回复"这种**质变**，不是"重复次数多一点少一点"的量变。
+
+**技术细节：** Problem 35 的 `tool_calls` 用的是**绝对路径** `/dfs/data/openclaw-rl-project/table3-artifacts/separate-student/homework/35.txt`，而 Problem 0-34/36/37 等其余所有题目用的都是**相对路径** `homework/N.txt`。第一版统计脚本的正则只匹配相对路径格式，导致 Problem 35 被漏统计。
+
+**⚠️ 更正（用户核对 simulation.log 原始对话后发现的错误）：** 上一版记录写的"补查后确认 Problem 35 从 10:41:01 起已经是严重模式，真正突变起点是 Problem 35 不是 36"**是错误的结论**——当时只看了"38 秒内有 5 次调用"就下判断，没有真正重跑统计脚本、也没有对照 harness 层面的真实对话内容。用户直接贴出 Problem 35/36 的 `simulation.log` 原始对话后发现：**Problem 35 全程 4 轮，每轮都拿到干净、合理的真实回复，完全没有 context overflow**；**Problem 36 前两轮（介绍解法、按要求改写成"不那么 AI 腔"的版本）都正常完成，是第 3 轮（"去掉 emoji 再显示一遍，先别写文件"）开始才突然卡死、之后 6 轮全部 `Context overflow`**——问题明确是在 Problem 36 自己 session 内部、且是中途（第 3 轮）才出现的，不是从题目一开始就有、也不是被前面题目"带坏"的。
+
+用 session UUID（而不是 harness 层面的 `student-hw-N-xxxxx` 标签，两者是完全不同的 ID 体系）反查 `training.log` 原始 tool_calls，逐条核对后确认：
+- **Problem 35（session `98694e28-...`）**：10:41:01~10:43:29 共 13 次调用，序列为 `read,read,write,read×7(10:41:30~10:42:33),write,read,read`——**最长连续重复 = 7 次，且每次都被 write 打断，最终收敛出干净结果**，落在"10 次以内算正常"的范围内。
+- **Problem 36（session `d921c3be-...`）**：10:43:37 `read`、10:43:41 `read`、10:43:51 `write`（对应 Turn 1 的正常回复）——之后从 **10:44:01 起变成清一色的 `read`，一次都没被打断过，连续跑满至少 32 次、持续 4 分钟以上（日志被截断，实际次数可能更多）**。这是一次**无界**循环，跟 Problem 35 那种"重复几次后自己恢复"的**有界**循环性质完全不同——真正决定题目是否失败的，是循环会不会自己终止，不是重复次数的绝对大小。
+
+**训练 step 时间窗口也一并更正：** 上一版写的"转折点在 step 8（10:39:03）附近"不准确。Problem 34/35 都发生在 **step 8（10:39:03 完成）之后、step 9（10:43:42 完成）之前**，且都是有界、能恢复的模式；**Problem 36 真正进入无界循环的时间点是 10:44:01，在 step 9（10:43:42）完成之后**。也就是说，"有界可恢复"→"无界不可恢复"这个质变，精确卡在 **step 9 这次权重更新之后**，不是 step 8。这仍然只是时间上的相关性，还没有查证 step 9 对应的训练 batch 里是否存在具体的异常打分/异常样本作为触发原因——留作下一步排查方向。
+
+**当前结论：** 这是一个真实存在、机制已确认、但根本原因（为什么 step 9 这次更新后会让模型在某些 session 里进入不会自己终止的重复调用循环）尚未查清的模型训练动态问题，不是 Execution Bias 补丁失效，也不是 harness/脚本层面的 bug。暂不判定是否可修复，待进一步查证 step 9 附近的训练样本/打分数据后再决定。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
