@@ -92,50 +92,6 @@ new_block = old_block + (
 )
 text = text.replace(old_block, new_block, 1)
 
-# ---------------------------------------------------------------------
-# 2026-07-24 补丁：openclaw-rl-repeat-tool-call-penalty
-#
-# 背景（docs/issues_log.md 2026-07-24 条目）：_build_prm_eval_prompt()
-# （openclaw-opd/openclaw_opd_api_server.py）的判分规则写死"工具调用
-# 只要没报错就该打正分"，完全不检测这次调用是不是在原样重复上一次、
-# 没有任何新信息或进展。真实训练日志证实 Problem 36 那种连续 32 次
-# read 的无界循环——每一次 read 都成功返回文件内容（没报错），按这条
-# 规则每一次都会被判正分，训练信号上完全没有"这是浪费轮次的坏行为"
-# 这个概念。openclaw_opd_api_server.py 那边的补丁
-# （prepare_patched_openclaw_opd.sh）已经在 turn_data 里加了
-# "is_repeat_tool_call" 标记（检测这次工具调用参数是否跟上一次完全
-# 相同）。这里读取这个标记，命中时直接把 eval_score 强制覆盖成 -1.0，
-# 不再指望 LLM 判官自己发现这个盲区——因为判官本来就看不到"上一次
-# 调用了什么"，没有信息去判断"是不是在重复"。
-#
-# 覆盖点选在 eval_score 刚算出来之后：_submit_turn_sample（hint 被
-# 采纳时）和 _submit_rl_turn_sample（没有 hint 时）用的 reward 都直接
-# 来自这同一个 eval_score 变量（见 openclaw_combine_api_server.py 里
-# _maybe_submit_ready_samples 的调度逻辑），所以只需要改这一处，两条
-# 路径都会生效。
-# ---------------------------------------------------------------------
-eval_score_old = (
-    '            eval_score = _prm_eval_majority_vote(eval_raw)\n'
-)
-if text.count(eval_score_old) != 1:
-    raise SystemExit(
-        f"patch failed: expected exactly 1 occurrence of the eval_score assignment "
-        f"in {src_path}, found {text.count(eval_score_old)} (official file may have "
-        "changed upstream -- re-verify this patch)"
-    )
-eval_score_new = eval_score_old + (
-    '            # --- openclaw-rl-repeat-tool-call-penalty (temporary, safe to remove) ---\n'
-    '            if turn_data.get("is_repeat_tool_call"):\n'
-    '                logger.info(\n'
-    '                    "%s[openclaw-rl-repeat-tool-call-penalty] session=%s turn=%d "\n'
-    '                    "tool_call exactly repeats previous turn -- overriding "\n'
-    '                    "eval_score %.1f -> -1.0%s",\n'
-    '                    _CYAN, session_id, turn_num, eval_score, _RESET,\n'
-    '                )\n'
-    '                eval_score = -1.0\n'
-)
-text = text.replace(eval_score_old, eval_score_new, 1)
-
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched -> {dest_path}")

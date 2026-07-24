@@ -273,13 +273,6 @@ if tool_calls_log_old not in text:
         "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
     )
 tool_calls_log_new = (
-    '        # openclaw-rl-repeat-tool-call-penalty: default: this turn is not a\n'
-    '        # repeat unless proven otherwise below. Computed unconditionally (not\n'
-    '        # just inside "if tool_calls:") so it is always defined by the time\n'
-    '        # turn_data gets built further down, including on turns with no tool\n'
-    '        # call at all (plain text turns), where it must be False, not stale\n'
-    '        # from a previous turn.\n'
-    '        _is_repeat_tool_call = False\n'
     '        if tool_calls:\n'
     '            logger.info("[OpenClaw-OPD] session=%s tool_calls: %s", session_id, str(tool_calls)[:500])\n'
     '            # --- openclaw-rl-debug-repeat-thinking (temporary, safe to remove) ---\n'
@@ -296,7 +289,6 @@ tool_calls_log_new = (
     '            )\n'
     '            _prev_call = self._last_tool_call.get(session_id)\n'
     '            if _prev_call is not None and _prev_call == _cur_call:\n'
-    '                _is_repeat_tool_call = True\n'
     '                logger.info(\n'
     '                    "[openclaw-rl-debug-repeat-thinking] session=%s repeated tool_call=%s reasoning:\\n%s",\n'
     '                    session_id, _cur_call, reasoning,\n'
@@ -304,56 +296,6 @@ tool_calls_log_new = (
     '            self._last_tool_call[session_id] = _cur_call\n'
 )
 text = text.replace(tool_calls_log_old, tool_calls_log_new, 1)
-
-# ---------------------------------------------------------------------
-# 2026-07-24 补丁：把"是否重复上一次工具调用"这个标记带进 turn_data，
-# 供 openclaw-combine/openclaw_combine_select_api_server.py 的 PRM 打分
-# 逻辑读取，强制把这类重复 turn 的 eval_score 改成 -1（见该文件补丁脚本
-# prepare_patched_openclaw_combine_select.sh 里的对应改动）。
-#
-# 根因（docs/issues_log.md 2026-07-24 条目）：_build_prm_eval_prompt() 的
-# 判分规则写死"工具调用只要没报错就该打正分"（"A successful, non-error
-# tool output means the assistant's action worked correctly and should be
-# scored positively"），完全不检测这次调用是不是在重复上一次、没有任何
-# 新信息——Problem 36 那 32 次连续 read 每一次都会因为"读取成功、没报错"
-# 被判正分，训练信号上完全没有"这是浪费轮次的坏行为"这个概念，可能是
-# 这种循环一旦开始就很难自己停下来、甚至被强化的原因。这里不指望 LLM
-# 判官自己纠正这个盲区（它根本看不到"这是不是重复"），改成代码层面直接
-# 检测、直接覆盖分数。
-# ---------------------------------------------------------------------
-turn_data_old = (
-    '            turn_data = {\n'
-    '                "prompt_ids": prompt_ids,\n'
-    '                "response_ids": response_ids,\n'
-    '                "response_logprobs": response_logprobs,\n'
-    '                "prompt_text": prompt_text,\n'
-    '                "response_text": response_text,\n'
-    '                "messages": messages,\n'
-    '                "tools": tools,\n'
-    '                "has_next_state": False,\n'
-    '            }\n'
-)
-if turn_data_old not in text:
-    raise SystemExit(
-        "patch failed: expected turn_data construction block not found "
-        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
-    )
-turn_data_new = (
-    '            turn_data = {\n'
-    '                "prompt_ids": prompt_ids,\n'
-    '                "response_ids": response_ids,\n'
-    '                "response_logprobs": response_logprobs,\n'
-    '                "prompt_text": prompt_text,\n'
-    '                "response_text": response_text,\n'
-    '                "messages": messages,\n'
-    '                "tools": tools,\n'
-    '                "has_next_state": False,\n'
-    '                # openclaw-rl-repeat-tool-call-penalty (2026-07-24): see comment\n'
-    '                # near _is_repeat_tool_call above.\n'
-    '                "is_repeat_tool_call": _is_repeat_tool_call,\n'
-    '            }\n'
-)
-text = text.replace(turn_data_old, turn_data_new, 1)
 
 init_dict_old = (
     '        self._pending_records: dict[str, dict[str, Any]] = {}\n'

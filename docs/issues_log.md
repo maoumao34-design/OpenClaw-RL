@@ -2165,35 +2165,6 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 
 ---
 
-## [2026-07-24] 定位到"训崩"（无界重复调用工具）很可能的真正根因：PRM 打分规则本身会把重复调用系统性地打成正分——已打补丁，用代码层面强制覆盖分数
-
-**背景：** 用户提出一个关键怀疑——"训崩"问题最主要还是要看 PRM 打分打得对不对，为正确操作打正分、为错误操作打负分。顺着这个方向去读实际计算训练奖励的代码，而不是继续停留在"观察现象"层面。
-
-**找到的具体证据：** `openclaw-opd/openclaw_opd_api_server.py` 的 `_build_prm_eval_prompt()`——这是实际用来算 `eval_score`（进而直接成为 RL/GRPO 训练奖励 `sample.reward["score"]`）的判分提示词——里写死了一条规则：
-
-```
-- role='tool': The return value of a tool the assistant invoked. ...
-  A successful, non-error tool output means the assistant's action worked
-  correctly and should be scored positively.
-```
-
-**这条规则只检查"这次工具调用有没有报错"，完全不检查"这次调用是不是在原样重复上一次、没有任何新信息"。** 对照 Problem 36 那 32 次连续 `read`——每一次都成功返回了文件内容（没报错），按这条规则**每一次都会被判定为该打正分**，训练信号上完全没有"这是在浪费轮次、该停下来了"这个概念。
-
-**确认了这个 `eval_score` 确实是真实训练奖励，不是只用于离线诊断：** 追踪 `openclaw-combine/openclaw_combine_api_server.py` 的 `_maybe_submit_ready_samples()` 调度逻辑，确认 `_submit_turn_sample`（hint 被采纳时，`reward=float(eval_score)`）和 `_submit_rl_turn_sample`（没有 hint 时，`reward={"score": float(eval_score)}`）两条路径的奖励都直接来自这同一个 `eval_score` 变量——即 `_build_prm_eval_prompt` 这条"工具成功=正分"的规则，直接决定了实际喂进 GRPO `advantages` 的奖励值，不是一个独立于训练之外的诊断指标。
-
-**修复（代码层面强制覆盖，不指望 LLM 判官自己纠正这个盲区，因为判官本来就看不到"上一次调用了什么"，没有信息去判断"是不是在重复"）：**
-
-1. `scripts/prepare_patched_openclaw_opd.sh`：在 `turn_data` 构造前，检测"这次工具调用的 (工具名, 参数) 是否跟该 session 上一次完全相同"，结果作为 `_is_repeat_tool_call` 标记（默认 False，包括纯文字回复的 turn，避免用上一轮的陈旧值）写进 `turn_data["is_repeat_tool_call"]`。
-2. `scripts/prepare_patched_openclaw_combine_select.sh`：在 `_opd_evaluate()` 里 `eval_score = _prm_eval_majority_vote(eval_raw)` 算出来之后，读取 `turn_data.get("is_repeat_tool_call")`，命中就直接把 `eval_score` 强制覆盖成 `-1.0`（覆盖发生在原有日志行打印之前，日志会如实反映覆盖后的最终值，同时新增一条专门的覆盖日志说明原始分数是多少）。只需要改这一处，因为"hint 被采纳"和"RL-only"两条奖励路径读的是同一个 `eval_score` 变量。
-
-**设计取舍：** 只要检测到跟上一次完全相同就覆盖成 -1，不设"重复几次以上才罚"的阈值——即便是第一次重复（第 2 次出现）也直接判负分。理由：这类原样重复本身就没有意义（没有获得任何新信息），从训练信号角度没必要等它累积到某个次数才开始纠正；而且设阈值本身是任意的，不如让模型一开始就学会"不要原样重复调用"。
-
-**验证：** 两个补丁脚本本地用真实官方源码跑过一遍（`bash -n` 语法检查 + 用真实 `OpenClaw-RL-official` 源码文件模拟运行 + `py_compile` 编译检查），确认锚点唯一命中、生成的 JS/Python 语法正确、`is_repeat_tool_call` 标记正确从 `openclaw_opd_api_server.py` 传递到 `openclaw_combine_select_api_server.py`（通过 PYTHONPATH 顺序确认两个补丁会被同一次训练同时加载）。**尚未用真实训练验证这个覆盖规则是否真的能抑制 Problem 36 这类无界循环**——这是下一次训练需要重点观察的效果。
-
-**待办：** 推送后重新提交训练，对比这次跟之前几次跑的 Problem 35+ 附近的重复调用统计（用之前写的 `max_repeat` 统计脚本），看是否还会出现 14+ 次的严重值；同时用 `openclaw-rl-repeat-tool-call-penalty` 这个日志 tag 确认覆盖逻辑真的在训练中触发过。
-
----
-
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
