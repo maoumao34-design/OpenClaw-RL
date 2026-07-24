@@ -978,19 +978,31 @@
 - **架构层面确认：`train_with_services.sh` 现有的 Joint INIT 阶段不是论文真实做法**——完整四阶段方案（Separate-Student→Separate-TA→Separate-Teacher→Joint，错位复用产物）已定案，见 `docs/paper_reproduction_scope.md`，当前从 Phase A（`train_separate_student.sh`）开始实现
 - `train_separate_student.sh` 已写完、本地语法检查通过，尚未推送/未在服务器实测
 - **诊断实验：homework-verification-gate 补丁已移除，Simulator 临时换成 DeepSeek V4**（`prepare_openclaw_test_scripts.sh` 简化为只保留 model 字段兼容修复），用来判断此前反复出现的 write/overwrite 核验失败问题是 Qwen3-32B 这个具体模型能力不够，还是更深层不挑模型的设计问题——**这次实验的产出不算 Table 3 有效数据点**（论文 Section 4.1 明确用的是 Qwen3-32B），见 `docs/issues_log.md` 2026-07-23 条目
+- **诊断实验初步结果非常正面**：72 题跑到第 25 题才第一次出现"异常"，且排查后确认第 25 题实际写入数据是干净的（`homework/25.txt` 内容完整正确），异常只是 OpenClaw 生成确认话术时撞上了训练步骤造成的长时间 503、Student 没识别出确认话术本身有问题，不影响真实文件内容——对比之前 Qwen3-32B 频繁出现的 write 覆盖/未写入问题，效果差异显著
+- **CLAUDE.md 记录修正**：07-21 那条"OpenClaw 产品版本考古基准改成 05-12"的更正只反映了第一次尝试（错误地把该基准套到 OpenClaw CLI 工具本身），没有同步用户当场的纠正和后续查证结论——已直接修正 CLAUDE.md：05-12 基准只适用于 `OpenClaw-RL-official`（论文训练代码）的 v1/v2 判断，OpenClaw CLI 工具本身版本归属另算。**当前工作假设：基本可以确定论文作者用的是三月版本的 OpenClaw CLI**（从未锁定版本号、多个新增行为零 workaround、bring-your-own-openclaw 设计，综合判断）。
+- **"session 持久化架构五月才有"这个结论已收回**：路径 `src/agents/sessions/agent-session.ts` 在三月确实搜不到，但三月版本在完全不同路径（`src/agents/pi-embedded-runner/`，包一层外部依赖 `pi-coding-agent` 自带的 SessionManager）下有等价机制，五月只是"内部化重写+改名"，不是凭空新增能力——之前判断是搜错路径导致的假阴性，这个方向的可修复性重新变回未知。
+- **重大突破：坐实 Execution Bias 章节第 2 条有害指令是"No response"和"context overflow"两个问题的共同根因，已打补丁，待验证**（见 `docs/issues_log.md` 2026-07-23 最新条目）：
+  - 用 Problem 31（session `86d5e924-...`）完整未截断的原始记录 + `training.log` 交叉核对，确认"180 秒等待过久"根本不是排队/单次超长生成，而是**模型每隔 ~20 秒做一次决策，反复调用 `read`/`memory_search`（工具本身完全正常、结果正确）而不给出答案，一个 session 内部连续跑了 41 轮、持续 12 分钟自己停不下来**——Problem 1（No response）和 Problem 2（context overflow）确认是这同一个模型行为的两个表现，不是两个独立机制
+  - 根因定位到 `## Execution Bias` 系统提示词章节的"Weak/empty tool result: vary query, path, command, or source before concluding."这一句——`memory_search` 两次返回空结果，这句指令明确要求换源再试、不要下结论，跟观察到的行为精确吻合（结构性强关联证据，非模型原始 `thinking` 文字逐字实锤——`training.log` 调试日志拿不到 `thinking` 原文，只有字符数）
+  - **用户决策：不再逐条排查其余 5 行是否也有害，直接把整个 Execution Bias 章节（7 行全部）清空，只留标题**——4B 模型能力不足以正确判断"什么时候算够"，这类优化指令对弱模型是负面影响，且整章节本来就是三月版本没有的东西，没必要保留任何一条
+  - **已实现**：`scripts/prepare_patched_sglang_execution_bias.sh` 从"删 1 行留 6 行"改为"全清空只留标题"，处理了一个技术细节（不能用空字符串覆盖，会被 OpenClaw 自己的 trim+falsy 判断打回默认值，改用纯标题字符串），本地模拟跑过完整补丁逻辑验证通过
+  - 已排除的方向：sglang 请求优先级调度（暂停发生在到达 sglang 之前，无关）；`--sglang-max-running-requests`（实测 4096，远超实际并发量，不是瓶颈）
+- **同时坐实 Problem 27 的 reward blindness 猜测**：那次有缺陷的 write（用 write 整体覆盖、丢了展示过的完整步骤）被 PRM 打了满分 `eval_score=1.0`，真实提交进了训练队列——首次用真实数据证实此前 07-22 记录的"write 覆盖动作本身是否被 PRM 正确扣分尚未坐实"这个猜测，答案是没有被扣分。
 - 07-22 晚提交的训练又在几小时内失败——具体原因还没来得及排查，优先级低于当前诊断实验
-- 其余已知限制（write 覆盖 PRM 打分定位、"NO_REPLY"/"who am I"幻觉、silent reply 退化等）状态不变，见 07-22 历史状态
+- 其余已知限制（"NO_REPLY"/"who am I"幻觉、silent reply 退化等）状态不变，见 07-22 历史状态
 
 ### 下一步
-1. **跑诊断实验**：用户在服务器上把 `simulator.env` 换成 DeepSeek V4，pull 最新代码，跑一次 `train_separate_student.sh`，贴回真实结果
-2. 根据诊断结果判断：write-compliance 问题若随换模型消失，说明是 Qwen3-32B 本身局限（论文原始条件下真实存在的限制），回到 Qwen3-32B 正式跑 Table 3 时再讨论是否需要重新引入某种核验机制；若依然存在，需要继续排查更深层原因
-3. Separate-Student（Qwen3-32B、无诊断补丁 or 补丁重新引入，视诊断结果而定）真实数据跑出后，验证"Joint 应该复用 Separate 产物"这个结论、以及"16 条样本触发一步训练"频率是否对得上收敛速度
-4. 排查 07-22 晚训练为什么又是几小时内失败
-5. 待 Separate-Student/TA/Teacher 全部完成后，重新设计 `train_with_services.sh` 的 Joint 阶段（去掉 INIT，直接消费 Separate 产物，三角色从一开始就同时启动）
-6. 其余待办（PRM turn 内容调试补丁验证、not_requested 效果验证等）延后到架构问题理清之后
+1. **推送这次的 Execution Bias 全清空补丁，重新跑一次训练验证 Problem 31 这类"反复工具调用不收尾"行为是否消失**（当前任务，下次会话优先做）
+2. 如果这次补丁有效，诊断实验的原始目的（write-compliance 问题是否 Qwen3-32B 特有）才能真正得出可信结论——之前的数据被这两个更根本的问题干扰了
+3. "OpenClaw 把重试请求当新一轮完整处理"这个方向的可修复性重新变回未知，暂不深挖（外部依赖包无源码可查），优先级低于验证 Execution Bias 补丁效果
+4. Separate-Student（Qwen3-32B 正式版）真实数据跑出后，验证"Joint 应该复用 Separate 产物"这个结论、以及"16 条样本触发一步训练"频率是否对得上收敛速度（这次诊断实验里已经首次实测到"凑够 16 条样本触发训练"这个机制真实生效，可以作为频率参考）
+5. 排查 07-22 晚训练为什么又是几小时内失败
+6. 待 Separate-Student/TA/Teacher 全部完成后，重新设计 `train_with_services.sh` 的 Joint 阶段（去掉 INIT，直接消费 Separate 产物，三角色从一开始就同时启动）——**注意：Joint 阶段三角色并发会让 No response/context overflow 这类问题明显加重（并发请求量翻倍以上），设计时要考虑这一点**
+7. 其余待办（PRM turn 内容调试补丁验证、not_requested 效果验证等）延后到架构问题理清之后
 
 ### 未验证
-- [ ] **write/overwrite 核验失败问题是否是 Qwen3-32B 特有**——本次 DeepSeek V4 诊断实验要回答的核心问题
+- [ ] **Execution Bias 全清空补丁是否真的解决了"反复工具调用不收尾"的问题**——刚打完补丁，还没有真实训练数据验证效果
+- [ ] **write/overwrite 核验失败问题是否是 Qwen3-32B 特有**——本次 DeepSeek V4 诊断实验被更根本的上游问题干扰，原始诊断目的还没有可信结论
 - [ ] "先跑完 Separate 再复用产物启动 Joint"这个结论——目前是逻辑推导出的最自洽版本，没有直接的官方参考实现证实
 - [ ] Table 3 收敛 session 数很短（TA 最快不到 10 题）跟"16 条样本触发一步训练"这个频率对不对得上——等 Separate-Student（Qwen3-32B 正式版）真实数据核对每题实际产生多少条可训练样本
 - [ ] 其余同 07-22（见下方历史状态）
