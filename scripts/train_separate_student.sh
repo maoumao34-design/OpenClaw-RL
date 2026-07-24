@@ -452,14 +452,21 @@ simulation_loop() {
 
     echo "" | tee -a "${LOGS_DIR}/simulation.log"
     echo "=== 收敛检测（Table 3 指标，仅 Student）===" | tee -a "${LOGS_DIR}/simulation.log"
-    # check_convergence.py 的 --ta/--teacher 是必填参数，这次没有 TA/Teacher
-    # 数据，传两个不存在的占位路径——脚本本身对"文件不存在"有容错（当 0 个
-    # session 处理），会打印"NOT converged (checked 0 sessions)"，不影响
-    # Student 那一行的真实结果。
+    # 2026-07-24 修复：check_convergence.py 在真正解析文件之前，先对
+    # --student/--ta/--teacher 三个参数做一次硬性 os.path.exists() 检查
+    # （main() 里，早于 parse_output_file() 那层宽松的 FileNotFoundError
+    # 容错），只要有一个路径不存在就直接打印 Error + exit 1，根本不会执行到
+    # 后面处理 Student 数据那一步——之前传"不存在的占位路径"这个设计完全
+    # 无效，实测每次都会在这一步直接报错退出，从未真正生成过收敛结果
+    # （真实数据见 docs/issues_log.md 2026-07-24 条目）。改成先创建真实存在
+    # 的空占位文件，让 os.path.exists() 检查通过，parse_output_file() 读到
+    # 空文件内容会自然返回空列表，TA/Teacher 那两行仍然会正确显示
+    # "NOT converged (checked 0 sessions)"，不影响 Student 的真实结果。
+    touch "${LOGS_DIR}/results_TA_all.txt.empty-placeholder" "${LOGS_DIR}/results_teacher_all.txt.empty-placeholder"
     python "${SCRIPTS_DIR}/check_convergence.py" \
         --student "${STUDENT_ALL}" \
-        --ta      "${LOGS_DIR}/results_TA_all.txt.does-not-exist" \
-        --teacher "${LOGS_DIR}/results_teacher_all.txt.does-not-exist" \
+        --ta      "${LOGS_DIR}/results_TA_all.txt.empty-placeholder" \
+        --teacher "${LOGS_DIR}/results_teacher_all.txt.empty-placeholder" \
         2>&1 | tee "${LOGS_DIR}/convergence_result.txt"
 }
 
