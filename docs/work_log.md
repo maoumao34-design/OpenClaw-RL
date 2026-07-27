@@ -1081,6 +1081,20 @@
 - `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 标记计算逻辑
 - `scripts/prepare_patched_openclaw_combine_select.sh`：新增读取该标记、覆盖 `eval_score` 为 -1.0 的逻辑
 
+### 补丁已拉取重新提交训练；发现"训练目标≠Table 3 评估目标"这个更深层问题
+
+**完成内容：**
+- 服务器 `git pull` 确认拉取成功，新训练已提交，**结果留到明天再看**
+- 澄清了打分范围的确切边界：只有 Policy（4B）自己在 OpenClaw 对话里的动作（含工具调用）会被打分、计入训练样本；Simulator 的回复、PRM 判官/Teacher 自己的生成都不会
+- **新发现（用户提出）：Simulator 主观判定"AI 感太足"要求重写后，重写版本有时会带上 `1. 2. 3.` 编号列表——这种格式反而命中论文正则的 `^\d+\.` 规则、判定不通过，而重写前的版本（比如破折号列表）本来是能通过正则的。** 说明训练时实际驱动奖励的信号（PRM 判官看"下一句话是否表现出满意"）跟 Table 3 汇报用的窄正则规则，衡量的根本不是同一件事——这能部分解释"收敛后又倒退回编号列表"这种反复
+- 追查到 `STUDENT_SYSTEM_PROMPT` 原文：明确举例"bold text/numbered lists/**Final answer**:"这三种具体特征（跟论文正则高度对应），但后面跟了一句开放式兜底"or anything too AI-like"——这句没有精确边界，完全依赖具体 Simulator 模型的主观解读，是这次错位现象的直接来源
+- **关键澄清：这周（含本次新提交的训练）Simulator 用的其实是 DeepSeek V4，不是论文原文规定的 Qwen3-32B**——上面这个"AI 感判断错位"的具体严重程度，可能是 DeepSeek V4 自己的主观偏好导致的，换成 Qwen3-32B 会不会有同样表现、错位程度有多大，需要真实测试才能确认，目前不能直接下结论
+→ 详见 [`issues_log.md`](issues_log.md) 2026-07-27 条目（待补充：这次讨论目前只在对话中，尚未整理进 issues_log.md）
+
+**关键决策：** 用户提出的"改用 Turn 2 是否要求重写来判断收敛"这个替代指标，讨论后确认**不能替换 Table 3 官方正则指标**（论文原文逐字给出的判定规则，换掉就没法跟论文数字比较），但可以作为独立的补充分析保留。
+
+**新提出的问题（用户）：随着训练次数增加，难以追溯"哪次训练对应哪个问题、做了什么改动"。** 讨论出的方案：让训练脚本启动时自动把当前 `openclaw-rl` 仓库的 git commit hash 写进该次训练自己的日志目录（`RUN_MANIFEST.txt`），把"这次训练用的是哪个版本代码"这件事交给 git 自动记录，不再依赖人工记忆——**方案已讨论，尚未实现，等用户确认后再动手**。
+
 ## 当前状态（2026-07-24，已被 7/27 结果取代）
 
 ### 已就绪
@@ -1119,10 +1133,12 @@
 - 其余已知限制同 07-24（见上方历史状态）
 
 ### 下一步
-1. **推送这次的 PRM 打分修正补丁，重新提交训练验证效果**：确认 `[openclaw-rl-invalid-tool-use-penalty]` 日志真实触发、Problem 42 型循环是否不再演变成永久性沦陷、"read→write→read"合理验证模式有没有被误伤
+1. **PRM 打分修正补丁已推送、已提交新训练，结果明天再看**：确认 `[openclaw-rl-invalid-tool-use-penalty]` 日志真实触发、Problem 42 型循环是否不再演变成永久性沦陷、"read→write→read"合理验证模式有没有被误伤
 2. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制，决定要不要合并处理
-3. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
-4. 其余下一步同 07-24（见上方历史状态）
+3. 如果 GPU 有空余，考虑用 `scripts/launch_simulator.sh` 起一次 Qwen3-32B 服务，测试它对已收集到的真实"正则通过但被要求重写"文本的判断，跟 DeepSeek V4 的结果对比，确认"AI 感判断错位"这个现象是不是 DeepSeek V4 特有的
+4. 考虑给训练脚本加 `RUN_MANIFEST.txt`（自动记录 git commit hash），解决"训练次数一多难以追溯对应关系"的问题——已讨论，待确认后实现
+5. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+6. 其余下一步同 07-24（见上方历史状态）
 
 ### 产出
 - `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 判定逻辑（三条规则）
@@ -1130,8 +1146,9 @@
 - 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27"PRM 打分修正"条目
 
 ### 未验证
-- [ ] **PRM 打分修正的真实训练效果**（本地测试通过，未跑过真实训练）
+- [ ] **PRM 打分修正的真实训练效果**（本地测试通过，未跑过真实训练，结果明天看）
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
+- [ ] "AI 感判断错位"现象是否是 DeepSeek V4 特有、换 Qwen3-32B 会不会有同样表现
 - [ ] 其余同 07-24（见上方历史状态）
 
 ---
