@@ -1093,7 +1093,7 @@
 
 **关键决策：** 用户提出的"改用 Turn 2 是否要求重写来判断收敛"这个替代指标，讨论后确认**不能替换 Table 3 官方正则指标**（论文原文逐字给出的判定规则，换掉就没法跟论文数字比较），但可以作为独立的补充分析保留。
 
-**新提出的问题（用户）：随着训练次数增加，难以追溯"哪次训练对应哪个问题、做了什么改动"。** 讨论出的方案：让训练脚本启动时自动把当前 `openclaw-rl` 仓库的 git commit hash 写进该次训练自己的日志目录（`RUN_MANIFEST.txt`），把"这次训练用的是哪个版本代码"这件事交给 git 自动记录，不再依赖人工记忆——**方案已讨论，尚未实现，等用户确认后再动手**。
+**新提出的问题（用户）：随着训练次数增加，难以追溯"哪次训练对应哪个问题、做了什么改动"。已实现：** `train_separate_student.sh` 启动时自动把当前 `openclaw-rl` 仓库的 git commit hash 写进该次训练自己的日志目录（`RUN_MANIFEST.txt`），**同时按用户要求同步拼进 wandb 的 run 名字里**（`run_openclaw_topk_select_modelfactory.sh` 的 `--wandb-group` 后缀），两边都能查到"这次训练对应哪个版本的补丁代码"，不再依赖人工记忆。本地验证通过（语法检查 + 真实官方源码模拟补丁生成）。**目前只覆盖 `train_separate_student.sh` 这一条训练路径，其他训练脚本还没有加**，见 [`issues_log.md`](issues_log.md) 2026-07-27 条目。
 
 ## 当前状态（2026-07-24，已被 7/27 结果取代）
 
@@ -1143,7 +1143,8 @@
 ### 产出
 - `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 判定逻辑（三条规则）
 - `scripts/prepare_patched_openclaw_combine_select.sh`：新增读取该标记、覆盖 `eval_score` 的逻辑
-- 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27"PRM 打分修正"条目
+- `scripts/train_separate_student.sh` + `scripts/run_openclaw_topk_select_modelfactory.sh`：新增训练可追溯性（`RUN_MANIFEST.txt` + wandb run 名字拼 git commit）
+- 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27 两条相关条目
 
 ### 未验证
 - [ ] **PRM 打分修正的真实训练效果**（本地测试通过，未跑过真实训练，结果明天看）

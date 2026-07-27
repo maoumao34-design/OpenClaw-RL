@@ -169,15 +169,21 @@ old_wandb_args = (
     "    --wandb-key ${WANDB_KEY_VALUE}\n"
     "  )"
 )
+if old_wandb_args not in text:
+    raise SystemExit("patch failed: WANDB_ARGS block not found in topk-select launcher")
+
+# 2026-07-27: 把这次训练用的 openclaw-rl commit（我们自己的补丁/脚本仓库，
+# 不是 OpenClaw-RL-official）拼进 wandb group 名字里——训练次数一多，光
+# 靠打开 wandb 看 run 名字就能知道这次用的是哪个版本的补丁，不用再跑去
+# 日志目录翻 RUN_MANIFEST.txt（train_separate_student.sh 里同步写了一份，
+# 两边都能查）。取不到时用 "unknown" 兜底，不阻断训练。
 new_wandb_args = (
     "  WANDB_ARGS=(\n"
     "    --use-wandb\n"
     "    --wandb-project ${WANDB_PROJECT}\n"
-    "    --wandb-group qwen3-4b-openclaw-topk-select\n"
+    '    --wandb-group qwen3-4b-openclaw-topk-select-${OPENCLAW_RL_GIT_SHA:-unknown}\n'
     "  )"
 )
-if old_wandb_args not in text:
-    raise SystemExit("patch failed: WANDB_ARGS block not found in topk-select launcher")
 text = text.replace(old_wandb_args, new_wandb_args, 1)
 
 path.write_text(text)

@@ -2210,6 +2210,21 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 
 ---
 
+## [2026-07-27] 新增训练可追溯性：把 openclaw-rl 的 git commit 同时写进日志目录和 wandb run 名字
+
+**背景：** 用户反映训练次数一多，很难追溯"哪次训练对应哪个问题、当时用的是哪个版本的补丁代码"——issues_log.md 按日期记录，但没有跟具体某个 `logs/<run_id>/` 目录或 wandb run 建立直接对应关系，事后核对只能靠时间戳猜。
+
+**方案：** 不新建一份需要人工维护、容易过期的索引表，直接复用 git 本身作为唯一真相来源——在训练启动时自动把当前 `openclaw-rl` 仓库（我们自己的补丁/脚本集合，不是 `OpenClaw-RL-official`）的 short commit hash 记录下来，同时写进两个地方：
+
+1. **日志目录**（`train_separate_student.sh`）：`mkdir -p "${LOGS_DIR}"` 之后立刻写一份 `${LOGS_DIR}/RUN_MANIFEST.txt`，内容是 commit hash、启动时间（UTC）、完整命令行。
+2. **wandb run 名字**（`run_openclaw_topk_select_modelfactory.sh`）：把 `--wandb-group` 从固定的 `qwen3-4b-openclaw-topk-select` 改成拼接 `qwen3-4b-openclaw-topk-select-${OPENCLAW_RL_GIT_SHA:-unknown}`，这样直接在 wandb 界面看 run 名字就知道对应哪个 commit，不用跳去服务器翻日志目录。
+
+`OPENCLAW_RL_GIT_SHA` 在 `train_separate_student.sh` 最开头（`SCRIPTS_DIR` 定义之后）用 `git rev-parse --short HEAD` 计算并 `export`，取不到时兜底成 `"unknown"`、不阻断训练；通过环境变量透传给 `run_openclaw_topk_select_modelfactory.sh`，再由它写进生成的补丁训练脚本里（`${OPENCLAW_RL_GIT_SHA:-unknown}` 作为字面文本嵌进去，由那个脚本自己运行时通过继承的环境变量展开，不是在补丁生成阶段就展开）。
+
+**验证：** 语法检查（`bash -n`）通过；`run_openclaw_topk_select_modelfactory.sh` 本地用真实官方源码跑过补丁生成部分（跳过最后 `exec bash` 真正提交训练那一步），确认生成的脚本里 `--wandb-group qwen3-4b-openclaw-topk-select-${OPENCLAW_RL_GIT_SHA:-unknown}` 这一行正确出现；`RUN_MANIFEST.txt` 的写入逻辑单独模拟验证过，内容格式正确。**只在这次改动里覆盖了 `train_separate_student.sh` + `run_openclaw_topk_select_modelfactory.sh` 这一条 Hybrid RL 训练路径，其他训练脚本（`train_with_services.sh` 等）还没有加同样的记录逻辑**，如果之后也想要同样的可追溯性，需要照着这个模式再加一遍。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

@@ -39,6 +39,13 @@
 set -euo pipefail
 
 SCRIPTS_DIR=$(dirname "$(realpath "$0")")
+# 2026-07-27: 记录这次训练实际用的是 openclaw-rl 仓库（我们自己的补丁/脚本
+# 集合）的哪个 commit——训练次数一多，光靠人工记忆很难对上"哪次训练对应
+# 哪些补丁"。同时写进本地日志目录（见下方 RUN_MANIFEST.txt）和 wandb 的
+# run 名字里（见 run_openclaw_topk_select_modelfactory.sh 的 wandb-group
+# 拼接），两边都能查到。取不到时不阻断训练，用 "unknown" 兜底。
+OPENCLAW_RL_GIT_SHA=$(cd "${SCRIPTS_DIR}/.." && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+export OPENCLAW_RL_GIT_SHA
 SIMULATOR_ENV="${SCRIPTS_DIR}/simulator.env"
 if [ ! -f "${SIMULATOR_ENV}" ]; then
     if [ -f "${SCRIPTS_DIR}/simulator.env.example" ]; then
@@ -116,6 +123,16 @@ WORKSPACE="/dfs/data/openclaw-rl-project/table3-artifacts/separate-student"
 OPENCLAW_DIR="${LOGS_DIR}/openclaw-test-patched"
 
 mkdir -p "${LOGS_DIR}" "${WORKSPACE}"
+
+# 2026-07-27: 见上方 OPENCLAW_RL_GIT_SHA 注释——把这次训练用的 openclaw-rl
+# commit、启动时间、完整命令行记到这次训练自己的日志目录里，事后不用再
+# 靠猜测去对应"这个 run 目录当时用的是哪个版本的补丁代码"。
+cat > "${LOGS_DIR}/RUN_MANIFEST.txt" <<EOF
+openclaw-rl commit: ${OPENCLAW_RL_GIT_SHA}
+started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+command: $0 $*
+EOF
+
 echo "日志目录: ${LOGS_DIR}"
 echo "workspace（永久）: ${WORKSPACE}"
 echo "外部 Simulator: ${SIMULATOR_BASE_URL} (model=${EXTERNAL_MODEL})"
@@ -265,6 +282,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
+  OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
