@@ -273,26 +273,61 @@ if tool_calls_log_old not in text:
         "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
     )
 tool_calls_log_new = (
+    '        # openclaw-rl-invalid-tool-use-penalty: default: this turn is not a\n'
+    '        # known-invalid action unless proven otherwise below. Computed\n'
+    '        # unconditionally (not just inside "if tool_calls:") so it is always\n'
+    '        # defined by the time turn_data gets built further down, including on\n'
+    '        # turns with no tool call at all (plain text turns), where it must be\n'
+    '        # False, not stale from a previous turn.\n'
+    '        _is_invalid_tool_use = False\n'
     '        if tool_calls:\n'
     '            logger.info("[OpenClaw-OPD] session=%s tool_calls: %s", session_id, str(tool_calls)[:500])\n'
+    '            _tool_name = tool_calls[0].get("function", {}).get("name")\n'
+    '            _tool_args_raw = tool_calls[0].get("function", {}).get("arguments")\n'
+    '            _cur_call = (_tool_name, _tool_args_raw)\n'
+    '\n'
     '            # --- openclaw-rl-debug-repeat-thinking (temporary, safe to remove) ---\n'
-    '            # 2026-07-24: 诊断"模型在单个 turn 内反复用相同参数调用同一工具、\n'
-    '            # 迟迟不给出文字回复"这个现象（见 docs/issues_log.md 2026-07-24\n'
-    '            # 条目，Problem 36 从无界循环开始那次）。此前只记录 thinking 的\n'
-    '            # 字符数，拿不到真实推理文字，没法判断模型每次"决定再读一次"\n'
-    '            # 背后到底在想什么。这里检测"这次工具调用是否跟上一次完全相同"，\n'
-    '            # 命中时把完整 reasoning 原文打出来，只在真的发生重复时才打，\n'
-    '            # 避免正常情况下日志量暴涨。\n'
-    '            _cur_call = (\n'
-    '                tool_calls[0].get("function", {}).get("name"),\n'
-    '                tool_calls[0].get("function", {}).get("arguments"),\n'
-    '            )\n'
+    '            # 2026-07-24: log full reasoning text whenever a tool_call exactly\n'
+    '            # repeats the previous one -- observational only, does not feed\n'
+    '            # into the scoring logic below.\n'
     '            _prev_call = self._last_tool_call.get(session_id)\n'
     '            if _prev_call is not None and _prev_call == _cur_call:\n'
     '                logger.info(\n'
     '                    "[openclaw-rl-debug-repeat-thinking] session=%s repeated tool_call=%s reasoning:\\n%s",\n'
     '                    session_id, _cur_call, reasoning,\n'
     '                )\n'
+    '\n'
+    '            # --- openclaw-rl-invalid-tool-use-penalty (2026-07-27, temporary, safe to remove) ---\n'
+    '            # docs/issues_log.md 2026-07-27 条目。三条规则都是"不管换到什么\n'
+    '            # 任务/工具集都必然成立"的逻辑判断，尽量降低误伤合理工具用法的风险：\n'
+    '            #\n'
+    '            # 规则 1：read 类查询工具，紧邻上一次调用参数完全相同 -> 没有\n'
+    '            # 中间的 write/edit，文件内容不可能变化，重复读取确定没有新\n'
+    '            # 信息。只限定 read，不适用于结果可能随外部状态变化的工具\n'
+    '            # （如 exec/轮询类），避免误伤合理的重复调用。\n'
+    '            if _tool_name == "read" and _prev_call is not None and _prev_call == _cur_call:\n'
+    '                _is_invalid_tool_use = True\n'
+    '\n'
+    '            # 规则 2a：sessions_send 的目标是自己当前这个 session（自问\n'
+    '            # 自答）-- 这种消息不可能真正送达任何外部对象，这是逻辑上的\n'
+    '            # 必然结论，不依赖具体任务。发给真正不同的、合法派生的子\n'
+    '            # session 不受影响。\n'
+    '            if _tool_name == "sessions_send":\n'
+    '                try:\n'
+    '                    _send_args = json.loads(_tool_args_raw) if _tool_args_raw else {}\n'
+    '                except (TypeError, ValueError):\n'
+    '                    _send_args = {}\n'
+    '                if _send_args.get("sessionKey") == "current":\n'
+    '                    _is_invalid_tool_use = True\n'
+    '\n'
+    '            # 规则 2b：sessions_yield（结束当前轮次、等子 agent 结果回来）\n'
+    '            # 在这个对话里从未真正调用过 sessions_spawn 派生过子 agent 的\n'
+    '            # 情况下毫无意义 -- 没有派发过任务，逻辑上不可能有结果可等。\n'
+    '            if _tool_name == "sessions_spawn":\n'
+    '                self._has_spawned_subagent[session_id] = True\n'
+    '            if _tool_name == "sessions_yield" and not self._has_spawned_subagent.get(session_id, False):\n'
+    '                _is_invalid_tool_use = True\n'
+    '\n'
     '            self._last_tool_call[session_id] = _cur_call\n'
 )
 text = text.replace(tool_calls_log_old, tool_calls_log_new, 1)
@@ -309,8 +344,58 @@ init_dict_new = init_dict_old + (
     '        # openclaw-rl-debug-repeat-thinking: per-session (tool_name, arguments)\n'
     '        # of the most recent tool call, used to detect exact-repeat tool calls.\n'
     '        self._last_tool_call: dict[str, tuple] = {}\n'
+    '        # openclaw-rl-invalid-tool-use-penalty: per-session flag, True once\n'
+    '        # sessions_spawn has actually been called (used by the sessions_yield\n'
+    '        # check -- see docs/issues_log.md 2026-07-27).\n'
+    '        self._has_spawned_subagent: dict[str, bool] = {}\n'
 )
 text = text.replace(init_dict_old, init_dict_new, 1)
+
+# ---------------------------------------------------------------------
+# 2026-07-27 补丁：把"这次工具调用是否属于三条已确认无效模式之一"这个
+# 标记带进 turn_data，供 openclaw-combine/openclaw_combine_select_api_server.py
+# 的 PRM 打分逻辑读取，强制把这类 turn 的 eval_score 改成 -1（见该文件
+# 补丁脚本 prepare_patched_openclaw_combine_select.sh 里的对应改动）。
+#
+# 根因（docs/issues_log.md 2026-07-27 条目）：_build_prm_eval_prompt() 的
+# 判分规则写死"工具调用只要没报错就该打正分"，完全不检测这次调用是不是
+# 在原地打转（重复读取、自己给自己发消息、无意义地等一个从未存在过的
+# 子任务结果）。这里不指望 LLM 判官自己纠正这个盲区，改成代码层面直接
+# 检测三条逻辑上必然成立的无效模式、直接覆盖分数。
+# ---------------------------------------------------------------------
+turn_data_old = (
+    '            turn_data = {\n'
+    '                "prompt_ids": prompt_ids,\n'
+    '                "response_ids": response_ids,\n'
+    '                "response_logprobs": response_logprobs,\n'
+    '                "prompt_text": prompt_text,\n'
+    '                "response_text": response_text,\n'
+    '                "messages": messages,\n'
+    '                "tools": tools,\n'
+    '                "has_next_state": False,\n'
+    '            }\n'
+)
+if turn_data_old not in text:
+    raise SystemExit(
+        "patch failed: expected turn_data construction block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+turn_data_new = (
+    '            turn_data = {\n'
+    '                "prompt_ids": prompt_ids,\n'
+    '                "response_ids": response_ids,\n'
+    '                "response_logprobs": response_logprobs,\n'
+    '                "prompt_text": prompt_text,\n'
+    '                "response_text": response_text,\n'
+    '                "messages": messages,\n'
+    '                "tools": tools,\n'
+    '                "has_next_state": False,\n'
+    '                # openclaw-rl-invalid-tool-use-penalty (2026-07-27): see comment\n'
+    '                # near _is_invalid_tool_use above.\n'
+    '                "is_invalid_tool_use": _is_invalid_tool_use,\n'
+    '            }\n'
+)
+text = text.replace(turn_data_old, turn_data_new, 1)
 
 empty_response_old = (
     '            if not response_ids and not response_text.strip():\n'

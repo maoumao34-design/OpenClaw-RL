@@ -1068,6 +1068,19 @@
 
 **关键决策：** 用户明确指出 Problem 42 这种"一旦出现、之后全部沦陷"的模式才是真正需要优先解决的问题，重要性高于 26/29 这类局部、可恢复的偶发情况——下一步排查应聚焦这里，而不是平均用力查所有重复调用现象。
 
+### Problem 42 根因排查到底 + PRM 打分修正定案并实现
+
+**完成内容：**
+- 精确核对 `prompt_msgs` 增量，切出 Problem 42 harness 层第 1 轮对应的全部 6 个内部 turn：`read → read(重复) → sessions_send → sessions_send(重复) → read → sessions_yield`，全程没有产出过一次真正的文字回复——确认"No response"的直接原因是模型选择了 `sessions_send`/`sessions_yield` 这类多 agent 协调工具，而不是训练权重瞬间损坏
+- 查清这两个工具的真实用途（`sessions_send` 本意是发消息给别的 session/子 agent，`sessions_yield` 本意是派完子任务后等结果）——都是**给多 agent 协作场景设计的工具**，这次单轮 Student-Policy 对话根本用不上；`sessions_send`/`message` 两个工具三月版本就存在（不是版本漂移新增的），只有 `sessions_yield` 是六月才新增，说明不能简单归因为"OpenClaw 版本问题"
+- 核对三个工具各自的 PRM 打分：`sessions_send`/`sessions_yield` 因为"技术上没报错"全部被打正分（分别 12 次和 6 次，全部 +1.0），`message` 因为报错（没配置聊天频道）被正确打了负分（3 次，全部 -1.0，之后被模型放弃）——证实问题出在"没报错=正分"这条规则本身，不是所有工具都被误判
+- **PRM 打分修正方案定案并实现**（过程中否决了两版方案）：工具黑名单（否决，没有可迁移性）→ 改 LLM 判官提示词（否决，风险不可控：判官本身是弱模型、软标准会增加打分噪声、影响面覆盖 GRPO-only 和 Hybrid RL 两条线）→ 全局 turn 计数阈值（否决，模型学不到具体因果）→ **最终采用三条"逻辑上必然成立、不针对具体任务设计"的确定性代码规则**（read 类查询工具紧邻重复、sessions_send 自问自答、sessions_yield 没有对应的 sessions_spawn），已实现并本地验证（语法检查 + 真实官方源码模拟 + 编译检查），**尚未用真实训练验证效果**
+→ 详见 [`issues_log.md`](issues_log.md) 2026-07-27 两条相关条目（排查过程 + 打分修正方案）
+
+**产出：**
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 标记计算逻辑
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增读取该标记、覆盖 `eval_score` 为 -1.0 的逻辑
+
 ## 当前状态（2026-07-24，已被 7/27 结果取代）
 
 ### 已就绪
@@ -1099,23 +1112,26 @@
 （同 2026-07-24，未变——见上方"历史状态（2026-07-24）"完整列表）
 
 ### 已知限制 / 未解决
-- **最高优先级：Problem 42 型"永久退化"**——一旦出现，之后所有全新 session（互不共享上下文）都会持续失败，明显不同于 Problem 26（孤立不传染）、Problem 29（自己能收敛）。触发原因未查清，怀疑是 Policy 权重在某次训练更新后进入了持续性退化状态；Problem 42 起始表现（Turn 1 即"No response from OpenClaw"）疑似跟此前一直被搁置的"NO_REPLY/silent reply 幻觉"是同一机制，需要重新评估这两个此前当作独立问题搁置的现象是否该合并排查 → [`issues_log.md`](issues_log.md) 2026-07-27 条目
+- **Problem 42 型"永久退化"根因已查清（模型误用 sessions_send/sessions_yield 这类多 agent 工具，非训练权重瞬间损坏）；PRM 打分修正已实现，待真实训练验证**——见下方"产出"和 [`issues_log.md`](issues_log.md) 2026-07-27 两条条目
 - **虚构文件名循环**：模型会把答案反复写去一个从未被提及的虚构文件（如 `N_answer.txt`/`N_answer.md`），不是单纯重复读同一个真实文件——这是比"重复调用同一工具"更具体的一种表现形式
-- **调试补丁的检测标准需要修正**：`openclaw-rl-debug-repeat-thinking` 现在按"参数逐字相同"判定重复，漏掉了"目标路径相同但内容每次略有改写"的情况，统计出的重复次数可能系统性偏低——尚未修正
-- `/reset`/`/new` 在 context overflow 状态下并不能真正恢复session（Problem 26 实测 5 次尝试全部失败）——官方错误提示的建议在这个状态下失效
+- **write/edit 内容语义正确性仍是已知局限、这次没有解决**：PRM 打分修正这次只覆盖了三条"逻辑上必然成立"的无效工具用法（read 重复、sessions_send 自问自答、sessions_yield 无对应 spawn），"写入内容语义对不对"仍然只能依赖 LLM 判官自己读内容判断，没有确定性代码规则能覆盖
+- `/reset`/`/new` 在 context overflow 状态下并不能真正恢复 session（Problem 26 实测 5 次尝试全部失败）——官方错误提示的建议在这个状态下失效
 - 其余已知限制同 07-24（见上方历史状态）
 
 ### 下一步
-1. **优先排查 Problem 42 型永久退化的触发原因**：核对该次训练在 Problem 42 附近的 step 时间戳和对应训练 batch，看是否有具体异常样本/打分事件
+1. **推送这次的 PRM 打分修正补丁，重新提交训练验证效果**：确认 `[openclaw-rl-invalid-tool-use-penalty]` 日志真实触发、Problem 42 型循环是否不再演变成永久性沦陷、"read→write→read"合理验证模式有没有被误伤
 2. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制，决定要不要合并处理
-3. 修正 `openclaw-rl-debug-repeat-thinking` 的重复判定标准（改成路径/目标相同，不要求参数逐字相同），重新统计这次 run 的真实规模
-4. PRM 打分"重复调用惩罚"方案（含虚构文件名场景）继续讨论定案后再实施
-5. 其余下一步同 07-24（见上方历史状态）
+3. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+4. 其余下一步同 07-24（见上方历史状态）
+
+### 产出
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 判定逻辑（三条规则）
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增读取该标记、覆盖 `eval_score` 的逻辑
+- 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27"PRM 打分修正"条目
 
 ### 未验证
-- [ ] Problem 42 型永久退化的根本触发原因
+- [ ] **PRM 打分修正的真实训练效果**（本地测试通过，未跑过真实训练）
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
-- [ ] 修正后的重复检测标准统计出的真实规模
 - [ ] 其余同 07-24（见上方历史状态）
 
 ---
