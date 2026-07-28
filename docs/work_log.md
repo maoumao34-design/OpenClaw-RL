@@ -1126,28 +1126,28 @@
 （同 2026-07-24，未变——见上方"历史状态（2026-07-24）"完整列表）
 
 ### 已知限制 / 未解决
-- **Problem 42 型"永久退化"根因已查清（模型误用 sessions_send/sessions_yield 这类多 agent 工具，非训练权重瞬间损坏）；PRM 打分修正已实现，待真实训练验证**——见下方"产出"和 [`issues_log.md`](issues_log.md) 2026-07-27 两条条目
+- **Problem 42 型"永久退化"根因已查清（模型误用 sessions_send/sessions_yield 这类多 agent 工具，非训练权重瞬间损坏）；PRM 打分修正已实现并推送，已用真实训练验证补丁真实触发**（同一晚新训练里补丁触发 31 次，均正确覆盖为负分）——见下方"产出"和 [`issues_log.md`](issues_log.md) 相关条目
+- **新发现（同一晚，补丁上线后）：`edit` 工具反复因"找不到精确匹配文本"而失败、PRM 判官大多仍打正分，导致某个 session 卡进 50+ 内部 turn 的死循环，进而拖垮 `submission` 流水线、最终整个训练任务被外部杀死**——这是今天补丁没有覆盖到的另一类退化模式（write/edit 内容语义盲区的具体实例），比"自问自答"问题后果更严重（不只是单题失败，是整个任务被杀）→ [`issues_log.md`](issues_log.md) 2026-07-27 最新条目
 - **虚构文件名循环**：模型会把答案反复写去一个从未被提及的虚构文件（如 `N_answer.txt`/`N_answer.md`），不是单纯重复读同一个真实文件——这是比"重复调用同一工具"更具体的一种表现形式
-- **write/edit 内容语义正确性仍是已知局限、这次没有解决**：PRM 打分修正这次只覆盖了三条"逻辑上必然成立"的无效工具用法（read 重复、sessions_send 自问自答、sessions_yield 无对应 spawn），"写入内容语义对不对"仍然只能依赖 LLM 判官自己读内容判断，没有确定性代码规则能覆盖
+- **write/edit 内容语义正确性仍是已知局限、这次没有解决，且已经实锤造成过一次任务被杀**：PRM 打分修正这次只覆盖了三条"逻辑上必然成立"的无效工具用法，"写入/编辑内容语义对不对"仍然只能依赖 LLM 判官自己读内容判断，没有确定性代码规则能覆盖——需要评估要不要针对"edit 明确返回找不到匹配文本"这种有明确错误标记、可以确定性判断的子情况单独加一条规则
 - `/reset`/`/new` 在 context overflow 状态下并不能真正恢复 session（Problem 26 实测 5 次尝试全部失败）——官方错误提示的建议在这个状态下失效
 - 其余已知限制同 07-24（见上方历史状态）
 
 ### 下一步
-1. **PRM 打分修正补丁已推送、已提交新训练，结果明天再看**：确认 `[openclaw-rl-invalid-tool-use-penalty]` 日志真实触发、Problem 42 型循环是否不再演变成永久性沦陷、"read→write→read"合理验证模式有没有被误伤
+1. 评估要不要针对"`edit` 工具明确返回找不到匹配文本"这种情况单独加一条确定性判负分规则（思路类似"消息类工具需要真正送达"那条，靠 next_state 里的明确错误标记判断，不需要理解语义）
 2. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制，决定要不要合并处理
 3. 如果 GPU 有空余，考虑用 `scripts/launch_simulator.sh` 起一次 Qwen3-32B 服务，测试它对已收集到的真实"正则通过但被要求重写"文本的判断，跟 DeepSeek V4 的结果对比，确认"AI 感判断错位"这个现象是不是 DeepSeek V4 特有的
-4. 考虑给训练脚本加 `RUN_MANIFEST.txt`（自动记录 git commit hash），解决"训练次数一多难以追溯对应关系"的问题——已讨论，待确认后实现
-5. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
-6. 其余下一步同 07-24（见上方历史状态）
+4. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+5. 其余下一步同 07-24（见上方历史状态）
 
 ### 产出
 - `scripts/prepare_patched_openclaw_opd.sh`：新增 `is_invalid_tool_use` 判定逻辑（三条规则）
 - `scripts/prepare_patched_openclaw_combine_select.sh`：新增读取该标记、覆盖 `eval_score` 的逻辑
-- `scripts/train_separate_student.sh` + `scripts/run_openclaw_topk_select_modelfactory.sh`：新增训练可追溯性（`RUN_MANIFEST.txt` + wandb run 名字拼 git commit）
-- 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27 两条相关条目
+- `scripts/train_separate_student.sh` + `scripts/run_openclaw_topk_select_modelfactory.sh`：新增训练可追溯性（`RUN_MANIFEST.txt` + wandb run 名字拼 git commit），已完成
+- 详细设计过程和取舍见 [`issues_log.md`](issues_log.md) 2026-07-27 相关条目
 
 ### 未验证
-- [ ] **PRM 打分修正的真实训练效果**（本地测试通过，未跑过真实训练，结果明天看）
+- [ ] `edit` 反复失败判负分规则（如果决定做）的实际效果
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
 - [ ] "AI 感判断错位"现象是否是 DeepSeek V4 特有、换 Qwen3-32B 会不会有同样表现
 - [ ] 其余同 07-24（见上方历史状态）
