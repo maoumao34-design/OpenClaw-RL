@@ -133,8 +133,33 @@ eval_score_new = eval_score_old + (
     '                    _CYAN, session_id, turn_num, eval_score, _RESET,\n'
     '                )\n'
     '                eval_score = -1.0\n'
+    '\n'
+    '            # --- openclaw-rl-tool-error-penalty (2026-07-28, temporary, safe to remove) ---\n'
+    '            # docs/issues_log.md 2026-07-28 条目。_build_prm_eval_prompt() 自己写的\n'
+    '            # 规则里本来就包含"环境返回 error/failure -> 该打 -1"，但真实数据证实\n'
+    '            # LLM 判官不总是照着自己这条规则执行（比如一次连续 3 次 edit 失败、\n'
+    '            # 每次工具原样返回 {"status": "error", ...} 的场景里，判官投票并未\n'
+    '            # 稳定打出 -1）。这里不再依赖判官，直接从 next_state 本身检测：\n'
+    '            # 只要这一步的环境反馈是一个 status=="error" 的工具结果，不管是\n'
+    '            # 哪个工具（edit/write/message/...)产生的，直接强制 -1，通用、不挑\n'
+    '            # 工具，是对判官自己规则的代码层兜底，不是新增规则。\n'
+    '            if next_state_role == "tool":\n'
+    '                try:\n'
+    '                    _next_state_parsed = json.loads(next_state_text)\n'
+    '                except (TypeError, ValueError):\n'
+    '                    _next_state_parsed = None\n'
+    '                if isinstance(_next_state_parsed, dict) and _next_state_parsed.get("status") == "error":\n'
+    '                    logger.info(\n'
+    '                        "%s[openclaw-rl-tool-error-penalty] session=%s turn=%d "\n'
+    '                        "tool result status=error -- overriding eval_score %.1f -> -1.0%s",\n'
+    '                        _CYAN, session_id, turn_num, eval_score, _RESET,\n'
+    '                    )\n'
+    '                    eval_score = -1.0\n'
 )
 text = text.replace(eval_score_old, eval_score_new, 1)
+
+if "\nimport json\n" not in text:
+    text = text.replace("import logging\n", "import json\nimport logging\n", 1)
 
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
