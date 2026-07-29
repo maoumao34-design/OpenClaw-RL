@@ -2287,6 +2287,46 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 
 ---
 
+## [2026-07-29] 回复长度随训练持续膨胀：定位到"AI 味"开放式判断标准是具体驱动机制，去掉 Simulator 提示词里的开放式兜底
+
+**背景：** 07-29 提交的新训练（commit `52e9c75` + `4406e4c`，即两条新 PRM 规则上线后的下一次训练）跑到 Problem 36 时反复 context overflow，且 `/new` 重开 session 也救不回来。排查 context overflow 本身的根因后（见下方"技术支线"），用户注意到一个更根本的现象：**回复长度在这次训练过程中持续变长，这明显不合理**。
+
+**技术支线（context overflow 的直接原因，已查清，不是本条目重点）：** 精确读取 `openclaw.log` 里 `context-overflow-diag` 系列日志，确认这次超预算幅度很小（`estimatedPromptTokens=16784` vs 预算 `16384`，只超约 400 token），但每次尝试自动压缩都以 `outcome=failed reason=already_compacted_recently` 收场——OpenClaw 自身有个"刚压缩过、短时间内不再压缩"的节流机制（`src/agents/embedded-agent-runner/compact.ts`/`compact-reasons.ts`），一旦压缩后仍有少量残留超预算，就会陷入"超预算→压缩被拒→仍超预算"的死循环，`/new` 开新 session 很快又撞上同样的节流也救不回来。同时确认 `toolResultReducibleChars=0`——说明这次超预算的内容主体不是工具调用历史（压缩引擎能砍的东西），而是系统提示词 + 模型自己越写越长的回复本身，这与下面的长度膨胀发现直接吻合。这是 OpenClaw CLI 自身的行为，不是本次两条新 PRM 规则导致的。
+
+**长度膨胀的量化确认：** 写脚本统计 `simulation.log` 里全部 39 道题的 Turn 1 回复长度和是否满足论文收敛正则（`satisfies_student`）：
+- 前 19 题平均 Turn1 长度 400 字符，后 20 题平均 855 字符，翻倍以上，且持续加速（Problem 26 冲到 1715 字符，Problem 37 冲到 2152 字符）。
+- 全程只有 2 题（36、38）Turn1 满足正则，但**这两题都是假阳性**——两条回复都只有 56 字符，对照真实内容确认是"⚠️ Agent couldn't generate a response. Please try again."这种生成失败的错误提示，不是真正答对的干净回复，只是碰巧不含 `**`/`^\d+\.`/`\boxed{}` 才被正则误判为"满足条件"。真实的、有意义的 Turn1-干净次数是 0/39，远达不到论文汇报的"平均 20 个 session 收敛"。
+
+**排除的假设：**
+- **Simulator 系统提示词没有每个 session 重新给** → 排除。读 `student_chat.py` 源码确认 `conversation_history` 是 `run_one_problem()` 内部局部变量、每道题从空列表开始，且 `generate_student_message()` 每次调用都重新拼 `[system, *conversation_history]`，系统提示词每一轮都完整重发，不存在跨题目残留或中途丢失。
+- **多候选 hint 选择机制偏好长 hint** → 排除。读 `openclaw_combine_select_api_server.py` 的 `_opd_evaluate()` 确认多候选选择逻辑是 `accepted.sort(key=lambda v: len(v["hint"])); accepted = accepted[:_max_cand()]`——按最短优先排序、超出上限砍掉长的，明确偏好更短的 hint，不是长度膨胀的来源。
+- **整条奖励链路（Simulator 提示词 `STUDENT_SYSTEM_PROMPT` / Table 3 收敛正则 `satisfies_student` / PRM Hint Judge 和 Eval Judge 的打分提示词 `_build_hint_judge_messages`/`_build_prm_eval_prompt`）逐一确认，没有任何一处对"长度/啰嗦程度"设限**——三层判断标准都只盯着具体格式特征（bold/numbered-list/boxed）或任务是否推进，是一个结构性缺口，但只是"没有惩罚"，还不是能直接解释"为什么会主动越写越长"的具体机制。
+
+**真正定位到的具体机制（实测比对 Problem 20、21 两个真实 session 的完整 turn 记录）：**
+- Problem 20（4 turn）：读文件(+1) → 完整解答被判"AI 味"要求重写(-1) → 重写一次后学生满意(+1) → 写入文件成功但被判官误判(-1，判官自己没遵守"工具成功该打正分"的规则)。
+- Problem 21（6 turn）：读文件(+1) → 完整解答被判"像机器人写的"(-1) → **第一次重写后仍被打回："still looks a bit AI-like with the emoji and the 'over coffee' thing"**(-1) → 第二次重写后学生满意(+1) → 保存(+1) → 写入成功(+1，这次判官判对了，同类动作跟 Problem 20 打分不一致，是噪声)。
+- **关键发现**：Problem 21 之所以比 Problem 20 多花一轮，是因为模型第一次重写时为了"听起来更自然"，主动加了 emoji 和"像喝咖啡一样聊"这类场景化措辞，这些新加的内容本身又被 Simulator 判定为"AI 味"，导致还要再重写一次。**模型应对"不要像 AI"这个要求的方式是往回复里加东西（凑自然感），不是做减法**——这是一个具体的、可复现的增长机制，比"整体缺少长度惩罚"更进一步：纠正循环本身在主动喂长度，重写次数越多、累积内容越多，且没有任何环节会在事后把这些新加的内容清理掉。
+- 同一轮里观察到单次生成 `thinking=16906 chars`、`response_tokens=4139`——量化确认了 token 层面的膨胀幅度，不只是字符数估算的粗略印象。
+
+**用户提出的假设（未证实，本次改动是为了验证/缓解它，不是已确认的结论）：** 当前顶替论文原定 Qwen3-32B 的 Simulator 用的是 DeepSeek V4，可能本身能力更强、对"AI 感"的判断标准比论文原定模型更敏感/更严格，导致 4B policy 很难达标，形成越纠正越写越多的恶性循环。
+
+**改动（用户明确确认后实施）：** 在 `scripts/prepare_openclaw_test_scripts.sh` 里新增一段 python3 补丁，只针对 `student_chat.py` 的 `STUDENT_SYSTEM_PROMPT`，去掉两处开放式"AI 味"兜底判断：
+1. 判断标准段落里的"or anything too AI-like"（只保留 bold / numbered lists / `**Final answer**:` 三个具体特征）；
+2. Steps 第 1 条里的"If it looks too 'AI-like'"（同样收窄成上述三个具体特征）。
+
+去掉这两处开放式兜底后，Simulator 要求重写的触发条件跟 Table 3 用来算收敛的正则（`**`/`^\d+\.`/`\boxed{}`）基本对齐，理论上能切断"主观感觉 AI 味 → 要求重写 → 模型加东西凑自然感 → 仍被判 AI 味 → 再重写"这条已实测确认的具体增长路径。
+
+**复现忠实性说明（如实记录，不当默认修复）：** 这是主动偏离论文自己写定的 Simulator 提示词（`openclaw-test/student_chat.py` 是 CLAUDE.md 标注的论文相关目录，应该原样使用），不是修一个"跟论文原意不符"的 bug。去掉开放式兜底后，Simulator 不会再纠正三个具体格式特征之外的"AI 感"内容（比如 emoji、场景化措辞）——这些内容如果模型本身倾向于生成，可能会正大光明地留在最终答案里而不再被要求修改。收敛数字可能因此变好看很多（因为跟正则完全对齐了），但不代表模型真的学会了论文期望的"完全自然地表达"，只能说明学会了"绕开三个具体格式标记"。在结果汇报里必须明确说明这一处偏离及其含义。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh` 新增 python3 heredoc 补丁段（锚定在官方 `student_chat.py` 的 `STUDENT_SYSTEM_PROMPT` 两处具体文本上，找不到就报错退出）。已有的调用链（`train_separate_student.sh` 已经在用 `OPENCLAW_DIR="${LOGS_DIR}/openclaw-test-patched"` 作为 `run_one_persona` 实际执行 `student_chat.py` 的目录）无需改动，下次训练自动生效。
+
+**验证：** `bash -n` 语法检查、用真实 `OpenClaw-RL-official` 源码模拟生成、`py_compile` 编译检查均通过；确认生成的 `STUDENT_SYSTEM_PROMPT` 两处开放式兜底均已移除、语句通顺、其余内容不变。**尚未用真实训练验证效果**——下次训练需要观察：
+1. Turn1 回复长度是否不再随训练持续膨胀；
+2. 真实的（排除生成失败误判后的）Turn1-干净率是否明显提升、能不能凑出论文要求的连续 3 个 session；
+3. 去掉兜底后，是否有 emoji/场景化措辞这类"格式外 AI 感"内容开始稳定出现在最终答案里而不再被纠正（如果出现，需要在结果里如实说明这是本次偏离带来的副作用）。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
