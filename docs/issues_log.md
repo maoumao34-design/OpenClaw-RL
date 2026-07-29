@@ -2327,32 +2327,6 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 2. 真实的（排除生成失败误判后的）Turn1-干净率是否明显提升、能不能凑出论文要求的连续 3 个 session；
 3. 去掉兜底后，是否有 emoji/场景化措辞这类"格式外 AI 感"内容开始稳定出现在最终答案里而不再被纠正（如果出现，需要在结果里如实说明这是本次偏离带来的副作用）。
 
-### 后续追加（同一天）：Simulator 提示词上线后的新训练里，人工通读 Problem 20-30 发现"只给答案"仍会导致烂尾，加 Steps 第 0 条兜底
-
-**背景：** 上面的改动推送后，用户提交了新训练（`separate_student_20260729_131944`），观察到 Problem 19 附近出现"Policy 只给答案、没人要求补步骤"的情况。**先用正则粗筛（检测 Student 消息里是否包含算式）统计了改动前后的比例（1.7% → 4.2%），但用户明确指出这个筛法不完整、样本太小，要求在下结论/做修改前先人工通读真实数据**——这是正确的方法论要求，之前的正则统计确实遗漏了大量非算式形式的"Student 自己代答"案例。
-
-**人工通读 Problem 20-30（11 道题）后的真实情况，比正则统计复杂得多：**
-- **Problem 20**：Turn 1 只给光秒答案，全程没人要求补步骤，Student 自己复述了一遍算式后 Policy 直接跟着回了个"14"，最终写入文件的内容是 `"Solution:\nFinal answer: 14."`——**没有任何解题过程**，是这批里唯一真正"烂尾"到底的案例。
-- **Problem 21/22/23/29**：Turn 1 同样只给光秒答案，但后续 Policy 大多能自己或在 Student 混乱的追问下把真实解题步骤补回来（Problem 22/23 里 Student 甚至编造了错误/无关的解法，Policy 反而纠正了它、拿出真实步骤）——最终写入文件的内容大多数还是有完整步骤的，只是过程比预期混乱。
-- **Problem 24/26/27/28/30**：Turn 1 本身就有真实步骤，没有这个问题。
-
-**同时发现两个跟"只给答案"不同类、可能更严重的独立问题（本次不处理，先记录）：**
-1. **Problem 27**：OpenClaw 明确返回"No response from OpenClaw."（请求失败），Student 却仍然说"confirmed done"，直接违反了提示词里"Never say HOMEWORK_DONE until the AI confirms it wrote the file"这条规则——大概率意味着 `homework/27.txt` 根本没有被真正写入却被当成"已完成"记入结果，而这批 `homework/` 产物要被 Phase B/D 复用，需要单独排查这类"假完成"的影响范围。
-2. **Problem 25**：Turn 1 Policy 给出答案"32"，但 Turn 2 Student 自己"假装读了文件"编出的问题描述（车 3 小时开 150 公里，答案 50）跟"32"对不上，Policy 没有像 Problem 22 那样纠正这个矛盾，而是顺着 Student 编的说法把"50"写进了文件——**最终写入的解答内容可能是错的，不只是格式/长度问题**，需要单独核实 `homework/25.txt` 的真实题目和正确答案。
-
-**根因讨论与最终方案：** 用户提出假设——这些"Student 自己编题/编答案"的混乱行为，很可能是下游症状，根源是 Turn 1 拿到光秒答案后 Student 不知道怎么接话、只能自己脑补；如果从源头上保证 Student 稳定要求"show me the steps"，大部分下游混乱会一并消失（Problem 27 的"假完成"是例外，跟这个无关，暂不处理）。核对发现：**提示词里其实已经写了"必须有完整步骤"这条要求**（判断标准段落："The answers must still include the full solution process with all steps shown..."），但这句话只是开头段落里的一般性陈述，不是 Steps 列表里第一个要检查的显式动作，导致 Simulator 大部分时候能自己想到要执行、但不是每次都稳定（Problem 20 就是反例）。
-
-**实现：** 在 `scripts/prepare_openclaw_test_scripts.sh` 里追加一条 Steps 第 0 条，风格上跟 Step 1（对"AI 味"的处理）保持一致的并列句式（各 Step 之间没有互相指向"进入下一步"的衔接语，靠编号和各自触发条件自然排开）：
-
-> 0. If the AI only gives a short answer with no steps shown, tell it to show all the steps. If it already shows the steps, no need to ask.
-
-这条不是新规则，是把已经存在于开头段落的"必须有完整步骤"要求，变成跟 Step 1 同等地位的显式检查动作，提高执行的稳定性，而不是从"大部分时候管用"变成"每次都要求"这种质变。
-
-**验证：** `bash -n` 语法检查、真实官方源码模拟生成、`py_compile` 编译检查均通过，确认生成的 `STUDENT_SYSTEM_PROMPT` 里 Steps 列表正确插入了第 0 条、编号顺序正确、其余内容不变。**尚未用真实训练验证效果**——下次训练需要观察：
-1. Problem 20 这类"全程没人要求补步骤"的情况是否消失；
-2. Problem 22/23/29 这类"Student 自己编解法/编重写"的混乱行为是否随之减少（验证"下游症状说"）；
-3. Problem 27 型"假完成"、Problem 25 型"答案对不上"这两个独立问题预期不会被这次改动解决，需要另外排查。
-
 ---
 
 <!-- 格式模板：

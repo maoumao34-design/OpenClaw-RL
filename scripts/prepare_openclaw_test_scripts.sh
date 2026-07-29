@@ -122,31 +122,6 @@ new_step1 = (
 )
 text = text.replace(old_step1, new_step1, 1)
 
-# ---------------------------------------------------------------------
-# 2026-07-29 补丁（同一天，第二次）：加一条 Steps 第 0 条，把判断标准段落
-# 里已有的"必须有完整步骤"要求（"The answers must still include the full
-# solution process with all steps shown"）变成 Steps 列表里第一个要检查的
-# 显式动作，跟 Step 1 对"AI 味"的处理是同一个模式——原来这条要求只写在
-# 前面段落里，Simulator 大部分时候能自己想到要检查，但不是每次都稳定
-# （Problem 20 是明确的反例：Turn 1 只给了光秒答案，全程没人要求补步骤，
-# 最后写进文件的内容里完全没有解题过程）。见 docs/issues_log.md 2026-07-29。
-# ---------------------------------------------------------------------
-old_steps_header = 'Steps:\n1. Look at what the AI gives you.'
-if text.count(old_steps_header) != 1:
-    raise SystemExit(
-        f"patch failed: expected exactly 1 occurrence of 'Steps:\\n1. Look at "
-        f"what the AI gives you.' in student_chat.py, found "
-        f"{text.count(old_steps_header)} (official file may have changed "
-        "upstream -- update this patch)"
-    )
-new_steps_header = (
-    'Steps:\n'
-    '0. If the AI only gives a short answer with no steps shown, tell it to '
-    'show all the steps. If it already shows the steps, no need to ask.\n'
-    '1. Look at what the AI gives you.'
-)
-text = text.replace(old_steps_header, new_steps_header, 1)
-
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched (AI-like catch-all removed) -> {dest_path}")

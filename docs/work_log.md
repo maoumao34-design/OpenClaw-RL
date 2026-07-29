@@ -1239,53 +1239,33 @@
 
 **下一步：** 推送后请求用户 `git pull`，重新提交训练观察长度膨胀是否缓解、真实 Turn1-干净率是否提升
 
-### 新训练里人工通读 Problem 20-30，"只给答案"仍会烂尾，加 Steps 第 0 条
-
-**完成内容：**
-- Simulator 提示词收窄改动上线后提交的新训练（`separate_student_20260729_131944`）里，用正则粗筛统计"Student 自己代答"比例（改动前 1.7% vs 改动后 4.2%），**用户指出正则筛法不完整、样本太小，要求先人工通读真实数据再下结论/做改动**——按此要求人工通读 Problem 20-30 全部 11 道题
-- 真实情况：Problem 20 是唯一真正"烂尾"的（全程无人要求补步骤，最终文件只有光秒答案无解题过程）；Problem 21/22/23/29 虽然 Turn1 也是光秒答案，但后续大多能自己或在混乱追问下把真实步骤补回来；其余题目 Turn1 本身就有步骤
-- **额外发现两个独立问题，本次不处理，先记录**：Problem 27 里 OpenClaw 明确返回"No response from OpenClaw."，Student 却仍宣布 HOMEWORK_DONE，违反自身规则，`homework/27.txt` 大概率未被真正写入却计入"已完成"；Problem 25 里 Student 自己编造的问题描述跟 Policy 原始答案对不上，Policy 未纠正，最终写入答案可能有误（正确性问题，不只是格式/长度问题）
-- 用户提出假设：这些下游混乱大多是"Turn1 拿到光秒答案后 Student 只能自己脑补"导致的，从源头稳定要求"show me the steps"能一并解决大部分（Problem 27 型"假完成"除外）。核实提示词后确认：**"必须有完整步骤"这条要求本来就写在开头段落，只是没有变成 Steps 列表里第一个要检查的显式动作**，导致"大部分时候管用但不稳定"
-- **实施改动（用户确认后）**：`scripts/prepare_openclaw_test_scripts.sh` 追加 Steps 第 0 条（跟 Step 1 同样的并列句式，无衔接语）："If the AI only gives a short answer with no steps shown, tell it to show all the steps. If it already shows the steps, no need to ask."
-→ 详见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（后续追加部分，含 Problem 20-30 逐题通读记录、Problem 27/25 两个独立问题的完整描述）
-
-**产出：**
-- `scripts/prepare_openclaw_test_scripts.sh`：追加 Steps 第 0 条（补全步骤要求前置检查）
-
-**下一步：** 推送后请求用户 `git pull`，重新提交训练观察"只给答案"烂尾情况是否消失、下游混乱行为是否减少
-
 ## 当前状态（2026-07-29）
 
 ### 已就绪
-（同 07-28，未变——见上方"历史状态（2026-07-28）"完整列表。另加：Context overflow 死循环根因定位到 OpenClaw 自身压缩节流机制；长度膨胀问题定位到"重写循环主动加内容"这一具体机制；Simulator 提示词收窄改动 + Steps 第 0 条补全步骤检查均已实现并本地验证）
+（同 07-28，未变——见上方"历史状态（2026-07-28）"完整列表。另加：Context overflow 死循环根因定位到 OpenClaw 自身压缩节流机制；长度膨胀问题定位到"重写循环主动加内容"这一具体机制；Simulator 提示词收窄改动已实现并本地验证）
 
 ### 已知限制 / 未解决
-- **长度膨胀 + "只给答案烂尾"两处成因均已定位并实施 Simulator 提示词改动，但两次改动均尚未用真实训练完整验证效果**——需要观察长度是否不再持续膨胀、Problem 20 型烂尾是否消失、下游混乱行为（Student 自己编题/编解法）是否随之减少
-- **两处改动都是主动偏离论文原始 Simulator 提示词，不是复现 bug 修复**——去掉开放式"AI 味"判断后，emoji/场景化措辞等格式外内容可能不再被纠正；Steps 第 0 条本身是把已有要求变成显式检查，风险相对小，但同样需要在结果汇报里说明这些偏离
-- **新发现两个独立问题，本次改动预期不会解决，需要另外排查**：(1) Problem 27 型"OpenClaw 无响应却被 Student 宣布已完成"，可能导致 `homework/` 产物里混入假完成的坏数据，影响 Phase B/D 复用；(2) Problem 25 型"Student 编造的问题描述跟 Policy 原始答案对不上，最终写入内容可能是错的"，是正确性问题而不只是格式问题
+- **长度膨胀的具体成因已定位（重写循环导致模型主动加内容），已实施 Simulator 提示词收窄改动，但尚未用真实训练验证效果**——需要观察长度是否不再持续膨胀、真实 Turn1-干净率是否提升
+- **这一改动是主动偏离论文原始 Simulator 提示词，不是复现 bug 修复**——去掉开放式"AI 味"判断后，emoji/场景化措辞等格式外内容可能不再被纠正、正大光明留在最终答案里，收敛数字可能变好看但不代表真正学会了论文期望的自然表达，结果汇报需明确说明
 - **收敛判定的正则本身分不清"干净的好回复"和"生成失败的错误提示"**——两者都可能因为不含 bold/numbered-list/boxed 而被误判为满足条件（07-29 实测发现 2 个假阳性案例），`check_convergence.py` 是否有同样漏洞尚未核查（用户明确表示这个不是当前优先级）
 - OpenClaw 自身的压缩节流机制（`already_compacted_recently`）在超预算幅度很小时会造成永久性死循环，`/reset`/`/new` 均救不回来——这是 OpenClaw CLI 自身行为，非本项目补丁导致，暂无绕过方案
 - 其余已知限制同 07-28（见上方历史状态）
 
 ### 下一步
-1. 推送本次改动，请用户 `git pull`，提交新训练观察长度膨胀是否缓解、"只给答案"烂尾是否消失
-2. 排查 Problem 27 型"假完成"的影响范围（`homework/` 产物是否需要清理重跑）、Problem 25 型答案正确性问题
-3. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
-4. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（也可对比换回 Qwen3-32B 后长度膨胀是否依然存在）
-5. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
-6. 其余下一步同 07-28（见上方历史状态）
+1. 推送本次改动，请用户 `git pull`，提交新训练观察长度膨胀是否缓解
+2. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
+3. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（现在多了一个新角度：也可以对比换回 Qwen3-32B 后长度膨胀是否依然存在，帮助判断是不是 DeepSeek V4 特有）
+4. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+5. 其余下一步同 07-28（见上方历史状态）
 
 ### 产出
-- `scripts/prepare_openclaw_test_scripts.sh`：新增 Simulator 提示词 AI-like 开放式兜底移除补丁 + Steps 第 0 条补全步骤检查
-- 详细排查过程、Problem 20-30 逐题通读记录、Problem 27/25 独立问题描述见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（含后续追加部分）
+- `scripts/prepare_openclaw_test_scripts.sh`：新增 Simulator 提示词 AI-like 开放式兜底移除补丁
+- 详细排查过程、Problem 20/21 对比、改动风险说明见 [`issues_log.md`](issues_log.md) 2026-07-29 条目
 
 ### 未验证
 - [ ] Simulator 提示词收窄后，回复长度是否不再持续膨胀
-- [ ] Steps 第 0 条上线后，Problem 20 型"只给答案烂尾"是否消失
-- [ ] Problem 22/23/29 型"Student 自己编解法/编重写"的下游混乱是否随第 0 条一并减少
 - [ ] 真实 Turn1-干净率是否明显提升、能否凑出连续 3 个 session
 - [ ] 去掉开放式兜底后，是否有格式外"AI 感"内容开始稳定留在最终答案里
-- [ ] Problem 27 型"假完成"的影响范围、Problem 25 型答案正确性问题（均待单独排查）
 - [ ] 两条 07-28 新规则在真实训练里的触发频率和效果（上次训练被 context overflow 打断，未跑完）
 - [ ] Problem 33 型 edit 死循环是否能被新规则及时打断
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
