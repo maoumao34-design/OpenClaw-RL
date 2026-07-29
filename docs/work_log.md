@@ -1252,6 +1252,17 @@
 
 **下一步：** "Student 自己代答"的真正成因仍未查清，仍是开放问题；下次需要先弄清楚为什么 Steps 第 0 条没能生效，而不是直接再假设新方案
 
+### 新训练（撤销 Steps 第 0 条后）Problem 19 崩溃排查：两个并发 session 各自膨胀上下文拖垮网关，定位 edit 死循环第三种根因
+
+**完成内容：**
+- 撤销 Steps 第 0 条、清理残留 GPU 进程后重新提交训练，Problem 19 因连续 408 超时崩溃退出，同时 Problem 17 出现写入失败——分别排查，定位到两个独立根因
+- **Problem 19**：session 反复用逐字节相同的参数调用 `write`（每次都成功），PRM 判官照"成功=正分"规则连续打 +1，`prompt_len` 持续膨胀（23770→24725），最终拖垮 SGLang（503）、网关被 SIGTERM 杀掉。**确认现有"精确重复调用判负分"规则只覆盖 `read`，没覆盖 `write`**，是一个待补的具体缺口
+- **Problem 17**：读 OpenClaw 本地源码（`src/agents/agent-tools.params.ts`）确认 `edit` 工具要求 `oldText.trim().length > 0`，而这次模型的 `oldText` 是纯换行符 `"\n"`，trim 后为空，校验必然失败，报错"Missing required parameter: edits"措辞具有误导性（模型看不出真正问题在哪），导致 43 个 turn、24 分钟反复重试同一个注定失败的调用。**这是第三种独立的 edit 失败机制**（不同于 07-27 的 JSON 双重转义、07-28 的通用 status:error 兜底）
+- 同时确认已上线规则大部分时候在正确工作（status:error 规则、read 精确重复规则均在这次追踪里正确生效），唯一没覆盖的缺口是"重复失败/成功但无意义的动作本身不会被阻止，只是打分层面兜底"
+→ 详见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（含完整技术细节、源码引用、两个 session 的逐 turn 追踪）
+
+**下一步：** 均未实现修复，只是查清楚记录；后续可考虑把"精确重复调用判负分"规则从只覆盖 `read` 扩展到 `write`
+
 ## 当前状态（2026-07-29）
 
 ### 已就绪
@@ -1262,21 +1273,24 @@
 - **这一改动是主动偏离论文原始 Simulator 提示词，不是复现 bug 修复**——去掉开放式"AI 味"判断后，emoji/场景化措辞等格式外内容可能不再被纠正、正大光明留在最终答案里，收敛数字可能变好看但不代表真正学会了论文期望的自然表达，结果汇报需明确说明
 - **"Student 自己代答"（编题目/编解法/自己写完整步骤）的真正成因仍未查清**——已尝试的"Steps 第 0 条前置检查"方案经真实训练验证无效（Problem 21 仍然自己代答），已撤销，是当前最大的开放问题
 - **两个独立问题待排查**：Problem 27 型"OpenClaw 无响应却被 Student 宣布已完成"（可能导致 `homework/` 产物混入假完成数据，影响 Phase B/D 复用）；Problem 25 型"Student 编造的问题描述跟 Policy 原始答案对不上，最终写入内容可能有误"（正确性问题）
+- **"精确重复调用判负分"规则只覆盖 `read`，没覆盖 `write`**——Problem 19 崩溃根因是 `write` 精确重复调用因为每次都成功而持续被判官打正分，上下文无限膨胀直至拖垮网关，是待补的具体缺口
+- **edit 死循环新增第三种独立根因**：`oldText` 是纯空白/换行符时，OpenClaw 自身校验（`oldText.trim().length > 0`）必然拒绝，报错"Missing required parameter: edits"措辞误导，模型无法从报错反推真正问题，导致反复重试同一注定失败的调用（Problem 17，43 turn/24 分钟）——OpenClaw 自身设计行为，不是我们能直接修改的地方
 - **收敛判定的正则本身分不清"干净的好回复"和"生成失败的错误提示"**——两者都可能因为不含 bold/numbered-list/boxed 而被误判为满足条件（07-29 实测发现 2 个假阳性案例），`check_convergence.py` 是否有同样漏洞尚未核查（用户明确表示这个不是当前优先级）
 - OpenClaw 自身的压缩节流机制（`already_compacted_recently`）在超预算幅度很小时会造成永久性死循环，`/reset`/`/new` 均救不回来——这是 OpenClaw CLI 自身行为，非本项目补丁导致，暂无绕过方案
 - 其余已知限制同 07-28（见上方历史状态）
 
 ### 下一步
 1. 排查"Student 自己代答"为什么 Steps 第 0 条没能生效（是没被读到、还是被别的因素覆盖），再决定下一步方案
-2. 排查 Problem 27 型"假完成"的影响范围（`homework/` 产物是否需要清理重跑）、Problem 25 型答案正确性问题
-3. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
-4. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（也可对比换回 Qwen3-32B 后长度膨胀是否依然存在）
-5. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
-6. 其余下一步同 07-28（见上方历史状态）
+2. 考虑把"精确重复调用判负分"规则从只覆盖 `read` 扩展到 `write`（Problem 19 型崩溃的直接对策）
+3. 排查 Problem 27 型"假完成"的影响范围（`homework/` 产物是否需要清理重跑）、Problem 25 型答案正确性问题
+4. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
+5. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（也可对比换回 Qwen3-32B 后长度膨胀是否依然存在）
+6. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+7. 其余下一步同 07-28（见上方历史状态）
 
 ### 产出
 - `scripts/prepare_openclaw_test_scripts.sh`：新增 Simulator 提示词 AI-like 开放式兜底移除补丁（Steps 第 0 条已实现但验证无效并撤销，不在当前代码里）
-- 详细排查过程、Problem 20-30 逐题通读记录、Steps 第 0 条完整实现与撤销过程见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（含后续追加部分）
+- 详细排查过程、Problem 20-30 逐题通读记录、Steps 第 0 条完整实现与撤销过程、Problem 19/17 崩溃根因见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（含后续追加部分）
 
 ### 未验证
 - [ ] Simulator 提示词收窄后，回复长度是否不再持续膨胀
@@ -1284,7 +1298,8 @@
 - [ ] 去掉开放式兜底后，是否有格式外"AI 感"内容开始稳定留在最终答案里
 - [ ] "Student 自己代答"的真正成因（开放问题，Steps 第 0 条已证实无效）
 - [ ] Problem 27 型"假完成"的影响范围、Problem 25 型答案正确性问题
-- [ ] 两条 07-28 新规则在真实训练里的触发频率和效果（上次训练被 context overflow 打断，未跑完）
+- [ ] "精确重复调用判负分"规则扩展到 `write` 后能否阻止 Problem 19 型崩溃（尚未实现）
+- [ ] 两条 07-28 新规则在真实训练里的触发频率和效果（本次训练又被 Problem 19 崩溃打断，未跑完）
 - [ ] Problem 33 型 edit 死循环是否能被新规则及时打断
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
 - [ ] "AI 感判断错位"现象是否是 DeepSeek V4 特有

@@ -2353,6 +2353,53 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 
 ---
 
+## [2026-07-29] 新训练（撤销 Steps 第 0 条之后那次）Problem 19 崩溃：两个并发 session 分别以不同机制膨胀上下文，共同拖垮网关；定位到 edit 死循环的第三种独立根因
+
+**背景：** 撤销 Steps 第 0 条、清理残留 GPU 进程后重新提交的训练（`separate_student_20260729_161349`），跑到 Problem 19 时 `student_chat.py` 因连续 9 次 408 超时、`raise_for_status()` 抛出未捕获异常而崩溃退出，被 `train_separate_student.sh` 既有的 shell 层兜底捕获（"警告：Student 模拟未完全完成，继续"）。同时 Problem 17 出现"写入失败"的现象。两者分别排查，定位到两个独立但性质相似的根因，且两者的时间窗口高度重合，判断是共同拖垮了这次训练的网关。
+
+### Problem 19：`write` 精确重复调用被判官持续打正分，上下文无限膨胀
+
+**排查过程：** 用题目文件名（`homework/19.txt`）定位到 session `24aa035d-ea00-4799-995e-07eec5039518`。training.log 显示该 session 的 turn=41/42/43 连续三次调用 `write`，**参数逐字节完全相同**（往 `homework/19.txt` 写同一段已经写过的内容），每次都命中 `[openclaw-rl-debug-repeat-thinking] repeated tool_call=...` 的观测性日志。但因为 `write` 本身每次都成功返回（"Successfully wrote 340 bytes to homework/19.txt"），PRM 判官照着"工具成功=正分"的规则连续给出 `eval_votes=[1,1,1] -> eval_score=1.0`，每次都被当作新的正样本提交训练（`index=172` 到 `176`，`prompt_len` 从 23770 一路涨到 24725）。这个不断膨胀的 session 最终在 17:25:35 前后导致 SGLang 开始返回 `503 Service Unavailable`，17:25:37 网关被 SIGTERM 杀掉——这正是 `student_chat.py`（此时仍在处理其他题目）从这时起连续 408 超时、最终崩溃退出的直接原因。
+
+**关键漏洞：** 07-27 上线的"精确重复调用判负分"规则（`is_invalid_tool_use` 规则 1a）**目前只覆盖 `_tool_name == "read"`**：
+```python
+if _tool_name == "read" and _prev_call is not None and _prev_call == _cur_call:
+    _is_invalid_tool_use = True
+```
+`write` 的精确重复完全没被这条规则覆盖到——逻辑上跟 `read` 是同一个道理：紧邻上一次调用参数完全相同的 `write`，文件内容不可能因此产生新信息，重复写入没有任何意义，理应判负分。**这是一个待补的具体缺口，本次先记录、未实现修复。**
+
+### Problem 17：edit 死循环的第三种独立根因——`oldText` 是纯换行符，被 OpenClaw 自身校验规则拒绝，报错信息具有误导性
+
+**现象：** session `c17b61b0-f54b-44c6-88b3-f69fb684ee9a` 从 16:50:56 到 17:15:18（约 24 分钟、43 个内部 turn）反复调用 `edit`，几乎每次都撞上同一个报错：
+```json
+{"status": "error", "tool": "edit", "error": "Missing required parameter: edits (received: path, edits=<array>)."}
+```
+期间多次生成长度直接顶到 8197 token 生成上限被截断（`TRUNCATED finish_reason=length`），`prompt_tokens` 从 18349 涨到 22988+。
+
+**根因（读 OpenClaw 本地源码 `src/agents/agent-tools.params.ts` 确认，非推测）：**
+```javascript
+function isValidEditReplacement(value) {
+  ...
+  return (
+    typeof record.oldText === "string" &&
+    record.oldText.trim().length > 0 &&   // 关键：trim 后长度必须 > 0
+    typeof record.newText === "string"
+  );
+}
+```
+`edit` 工具的参数校验明确要求 `oldText.trim().length > 0`，即**不允许纯空白/换行符作为匹配锚点**。Problem 17 这次的真实调用参数是 `{"oldText": "\n", "newText": "..."}`——`oldText` 是一个裸换行符，`"\n".trim()` 结果是空字符串，长度为 0，校验必然失败。`assertRequiredParams`（同文件）据此抛出"Missing required parameter: edits (received: path, edits=<array>)"——这句话措辞具有误导性：`edits` 数组本身确实"收到了"，但因为里面这个条目的 `oldText` 是纯空白、被判定为无效条目，导致整个 `edits` 参数被认定为"事实上缺失"。**报错信息完全没有提示"是 oldText 内容本身的问题"，模型拿到这个词不达意的报错无从判断真正该怎么改**，只要它还坚持用换行符当 `oldText`，就会确定性地一直失败下去——这解释了为什么会卡 40+ 轮跳不出来。
+
+**这是第三种独立的 edit 失败机制**，跟之前查过的两种都不一样：
+1. 07-27 Problem 33：JSON 双重转义，`oldText` 变成字面反斜杠+n，文件里没有对应真实字节；
+2. 这次 Problem 17：`oldText` 是纯换行符，被 OpenClaw 自己"trim 后长度必须 >0"的规则直接拒绝；
+3. （07-28 上线的"status: error"通用判负分规则只是打分层面兜底，不解决模型为什么会反复生成这种注定失败的调用。）
+
+**已确认有效的部分**：这次追踪同时确认了已上线的规则大部分时候在正确工作——"status:error"规则几乎每次都正确把这些 edit 报错 turn 压成 -1.0；"read 精确重复"规则（07-27 规则 1a）也正确逮到了该 session 中途反复重读题目文件的动作（turn=30/33/34，判官三票全给 +1 但仍被强制覆盖成 -1.0）；turn=41 模型误把 `homework` 文件夹当文件 read、报 `EISDIR` 错误，也被"status:error"规则正确覆盖。**唯一没被覆盖的是"重复失败的动作本身没有阻止模型继续浪费轮次/token"这件事**——打分规则只能决定"这个动作打不打分"，没法阻止模型在一个根本走不通的工具调用上无限重试。
+
+**结论：** 这次崩溃是 Problem 17（edit 死循环，失败但被正确打负分）和 Problem 19（write 重复，成功但被错误打正分）两个并发 session **各自独立膨胀上下文**、共同拖垮 SGLang/网关导致的，两者互不影响、只是时间窗口重合。**均未实现修复，本次只是查清楚记录**，后续如果要处理，规则 1a 扩展到 `write` 是最直接、跟现有设计一致的方向；`oldText` 纯空白被拒绝这件事本身是 OpenClaw 自身的设计行为，不是我们能改的地方，只能考虑是否要在打分/提示词层面给模型更明确的信号。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
