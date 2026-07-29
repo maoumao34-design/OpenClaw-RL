@@ -2327,6 +2327,30 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 2. 真实的（排除生成失败误判后的）Turn1-干净率是否明显提升、能不能凑出论文要求的连续 3 个 session；
 3. 去掉兜底后，是否有 emoji/场景化措辞这类"格式外 AI 感"内容开始稳定出现在最终答案里而不再被纠正（如果出现，需要在结果里如实说明这是本次偏离带来的副作用）。
 
+### 后续追加（同一天）：人工通读 Problem 20-30 发现"只给答案"仍会导致烂尾，Steps 第 0 条方案已实现但被验证否决、已撤销
+
+**背景：** 上面的改动推送后，用户提交了新训练（`separate_student_20260729_131944`），观察到 Problem 19 附近出现"Policy 只给答案、没人要求补步骤"的情况。**先用正则粗筛（检测 Student 消息里是否包含算式）统计了改动前后的比例（1.7% → 4.2%），但用户明确指出这个筛法不完整、样本太小，要求在下结论/做修改前先人工通读真实数据**——这是正确的方法论要求，之前的正则统计确实遗漏了大量非算式形式的"Student 自己代答"案例。
+
+**人工通读 Problem 20-30（11 道题）后的真实情况，比正则统计复杂得多：**
+- **Problem 20**：Turn 1 只给光秒答案，全程没人要求补步骤，Student 自己复述了一遍算式后 Policy 直接跟着回了个"14"，最终写入文件的内容是 `"Solution:\nFinal answer: 14."`——**没有任何解题过程**，是这批里唯一真正"烂尾"到底的案例。
+- **Problem 21/22/23/29**：Turn 1 同样只给光秒答案，但后续 Policy 大多能自己或在 Student 混乱的追问下把真实解题步骤补回来（Problem 22/23 里 Student 甚至编造了错误/无关的解法，Policy 反而纠正了它、拿出真实步骤）——最终写入文件的内容大多数还是有完整步骤的，只是过程比预期混乱。
+- **Problem 24/26/27/28/30**：Turn 1 本身就有真实步骤，没有这个问题。
+
+**同时发现两个跟"只给答案"不同类、可能更严重的独立问题（本次不处理，先记录）：**
+1. **Problem 27**：OpenClaw 明确返回"No response from OpenClaw."（请求失败），Student 却仍然说"confirmed done"，直接违反了提示词里"Never say HOMEWORK_DONE until the AI confirms it wrote the file"这条规则——大概率意味着 `homework/27.txt` 根本没有被真正写入却被当成"已完成"记入结果，而这批 `homework/` 产物要被 Phase B/D 复用，需要单独排查这类"假完成"的影响范围。
+2. **Problem 25**：Turn 1 Policy 给出答案"32"，但 Turn 2 Student 自己"假装读了文件"编出的问题描述（车 3 小时开 150 公里，答案 50）跟"32"对不上，Policy 没有像 Problem 22 那样纠正这个矛盾，而是顺着 Student 编的说法把"50"写进了文件——**最终写入的解答内容可能是错的，不只是格式/长度问题**，需要单独核实 `homework/25.txt` 的真实题目和正确答案。
+
+**根因讨论与实现（已否决、已撤销）：** 用户提出假设——这些"Student 自己编题/编答案"的混乱行为，很可能是下游症状，根源是 Turn 1 拿到光秒答案后 Student 不知道怎么接话、只能自己脑补；如果从源头上保证 Student 稳定要求"show me the steps"，大部分下游混乱会一并消失（Problem 27 的"假完成"是例外，跟这个无关，暂不处理）。核对发现提示词里其实已经写了"必须有完整步骤"这条要求（判断标准段落），但这句话只是开头段落里的一般性陈述，不是 Steps 列表里第一个要检查的显式动作，导致"大部分时候管用但不稳定"。
+
+按此实现了 Steps 第 0 条（跟 Step 1 同样的并列句式）：
+> 0. If the AI only gives a short answer with no steps shown, tell it to show all the steps. If it already shows the steps, no need to ask.
+
+`bash -n`/真实源码模拟生成/`py_compile` 本地验证均通过，推送后用户拉取并提交了新训练（`student-hw-21-92757` 等）。
+
+**真实训练结果：方案未解决问题、且出现新故障，用户要求撤销，本次不再深查。** Problem 21 的 Turn 2 里，Student **仍然自己给出了完整的分步解答**（矩阵特征值/特征向量问题，带 `**Step 1**`/`**Step 2**` 等加粗步骤标题），说明 Steps 第 0 条并未能阻止"Student 自己代答"这个行为；同时 Turn 3/Turn 4 连续出现"⚠️ Agent couldn't generate a response. Please try again."这种新的生成失败故障。**用户明确要求不深查这次新故障、直接撤销 Steps 第 0 条这次改动**——已通过 `git revert` 撤销（revert commit，`scripts/prepare_openclaw_test_scripts.sh` 恢复到只有 Step 1/2/3、没有 Step 0 的状态，AI-like 兜底收窄的改动保留不受影响）。
+
+**结论：** Steps 第 0 条这个"把已有要求显式化"的思路没有在真实训练里生效，"Student 自己代答"这个问题的真正成因仍未查清，仍是开放问题。下次如果要继续处理，需要先弄清楚为什么加了这条显式检查后 Simulator 还是会自己代答（是没有生效、还是被别的因素覆盖了），而不是直接再假设一个新方案。
+
 ---
 
 <!-- 格式模板：

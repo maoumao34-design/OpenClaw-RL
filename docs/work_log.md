@@ -1239,6 +1239,19 @@
 
 **下一步：** 推送后请求用户 `git pull`，重新提交训练观察长度膨胀是否缓解、真实 Turn1-干净率是否提升
 
+### 新训练里人工通读 Problem 20-30，"只给答案"仍会烂尾；Steps 第 0 条方案实现后经真实训练验证无效，已撤销
+
+**完成内容：**
+- Simulator 提示词收窄改动上线后提交的新训练（`separate_student_20260729_131944`）里，用正则粗筛统计"Student 自己代答"比例（改动前 1.7% vs 改动后 4.2%），**用户指出正则筛法不完整、样本太小，要求先人工通读真实数据再下结论/做改动**——按此要求人工通读 Problem 20-30 全部 11 道题
+- 真实情况：Problem 20 是唯一真正"烂尾"的（全程无人要求补步骤，最终文件只有光秒答案无解题过程）；Problem 21/22/23/29 虽然 Turn1 也是光秒答案，但后续大多能自己或在混乱追问下把真实步骤补回来；其余题目 Turn1 本身就有步骤
+- **额外发现两个独立问题，本次不处理，先记录**：Problem 27 里 OpenClaw 明确返回"No response from OpenClaw."，Student 却仍宣布 HOMEWORK_DONE，违反自身规则，`homework/27.txt` 大概率未被真正写入却计入"已完成"；Problem 25 里 Student 自己编造的问题描述跟 Policy 原始答案对不上，Policy 未纠正，最终写入答案可能有误（正确性问题，不只是格式/长度问题）
+- 用户提出假设：这些下游混乱大多是"Turn1 拿到光秒答案后 Student 只能自己脑补"导致的，从源头稳定要求"show me the steps"能一并解决大部分。核实提示词后确认"必须有完整步骤"这条要求本来就写在开头段落，只是没有变成 Steps 列表里第一个要检查的显式动作
+- **实施改动（用户确认后）**：`scripts/prepare_openclaw_test_scripts.sh` 追加 Steps 第 0 条（跟 Step 1 同样的并列句式，无衔接语）："If the AI only gives a short answer with no steps shown, tell it to show all the steps. If it already shows the steps, no need to ask."，本地验证通过后推送
+- **真实训练结果：方案未生效，且出现新故障**——用户拉取并提交新训练后，Problem 21 的 Student 仍然自己给出了完整的分步解答（带 `**Step 1**`/`**Step 2**` 加粗标题），Steps 第 0 条并未阻止"Student 自己代答"；同时出现"⚠️ Agent couldn't generate a response."的新生成失败故障。**用户明确要求不深查这次新故障，直接撤销 Steps 第 0 条这次改动**——已通过 `git revert` 撤销，AI-like 兜底收窄的改动保留不受影响
+→ 详见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（后续追加部分，含 Problem 20-30 逐题通读记录、Problem 27/25 两个独立问题的完整描述、Steps 第 0 条的完整实现与撤销过程）
+
+**下一步：** "Student 自己代答"的真正成因仍未查清，仍是开放问题；下次需要先弄清楚为什么 Steps 第 0 条没能生效，而不是直接再假设新方案
+
 ## 当前状态（2026-07-29）
 
 ### 已就绪
@@ -1247,25 +1260,30 @@
 ### 已知限制 / 未解决
 - **长度膨胀的具体成因已定位（重写循环导致模型主动加内容），已实施 Simulator 提示词收窄改动，但尚未用真实训练验证效果**——需要观察长度是否不再持续膨胀、真实 Turn1-干净率是否提升
 - **这一改动是主动偏离论文原始 Simulator 提示词，不是复现 bug 修复**——去掉开放式"AI 味"判断后，emoji/场景化措辞等格式外内容可能不再被纠正、正大光明留在最终答案里，收敛数字可能变好看但不代表真正学会了论文期望的自然表达，结果汇报需明确说明
+- **"Student 自己代答"（编题目/编解法/自己写完整步骤）的真正成因仍未查清**——已尝试的"Steps 第 0 条前置检查"方案经真实训练验证无效（Problem 21 仍然自己代答），已撤销，是当前最大的开放问题
+- **两个独立问题待排查**：Problem 27 型"OpenClaw 无响应却被 Student 宣布已完成"（可能导致 `homework/` 产物混入假完成数据，影响 Phase B/D 复用）；Problem 25 型"Student 编造的问题描述跟 Policy 原始答案对不上，最终写入内容可能有误"（正确性问题）
 - **收敛判定的正则本身分不清"干净的好回复"和"生成失败的错误提示"**——两者都可能因为不含 bold/numbered-list/boxed 而被误判为满足条件（07-29 实测发现 2 个假阳性案例），`check_convergence.py` 是否有同样漏洞尚未核查（用户明确表示这个不是当前优先级）
 - OpenClaw 自身的压缩节流机制（`already_compacted_recently`）在超预算幅度很小时会造成永久性死循环，`/reset`/`/new` 均救不回来——这是 OpenClaw CLI 自身行为，非本项目补丁导致，暂无绕过方案
 - 其余已知限制同 07-28（见上方历史状态）
 
 ### 下一步
-1. 推送本次改动，请用户 `git pull`，提交新训练观察长度膨胀是否缓解
-2. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
-3. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（现在多了一个新角度：也可以对比换回 Qwen3-32B 后长度膨胀是否依然存在，帮助判断是不是 DeepSeek V4 特有）
-4. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
-5. 其余下一步同 07-28（见上方历史状态）
+1. 排查"Student 自己代答"为什么 Steps 第 0 条没能生效（是没被读到、还是被别的因素覆盖），再决定下一步方案
+2. 排查 Problem 27 型"假完成"的影响范围（`homework/` 产物是否需要清理重跑）、Problem 25 型答案正确性问题
+3. 评估 Problem 42 型退化与"NO_REPLY/silent reply 幻觉"是否同一机制
+4. 如果 GPU 有空余，测试 Qwen3-32B vs DeepSeek V4 的"AI 感判断"差异（也可对比换回 Qwen3-32B 后长度膨胀是否依然存在）
+5. 下周导师会议后确定：TA/Teacher/Joint 是否彻底搁置、下一阶段方向选 General Agent（`toolcall-rl`）还是 SEA-Eval
+6. 其余下一步同 07-28（见上方历史状态）
 
 ### 产出
-- `scripts/prepare_openclaw_test_scripts.sh`：新增 Simulator 提示词 AI-like 开放式兜底移除补丁
-- 详细排查过程、Problem 20/21 对比、改动风险说明见 [`issues_log.md`](issues_log.md) 2026-07-29 条目
+- `scripts/prepare_openclaw_test_scripts.sh`：新增 Simulator 提示词 AI-like 开放式兜底移除补丁（Steps 第 0 条已实现但验证无效并撤销，不在当前代码里）
+- 详细排查过程、Problem 20-30 逐题通读记录、Steps 第 0 条完整实现与撤销过程见 [`issues_log.md`](issues_log.md) 2026-07-29 条目（含后续追加部分）
 
 ### 未验证
 - [ ] Simulator 提示词收窄后，回复长度是否不再持续膨胀
 - [ ] 真实 Turn1-干净率是否明显提升、能否凑出连续 3 个 session
 - [ ] 去掉开放式兜底后，是否有格式外"AI 感"内容开始稳定留在最终答案里
+- [ ] "Student 自己代答"的真正成因（开放问题，Steps 第 0 条已证实无效）
+- [ ] Problem 27 型"假完成"的影响范围、Problem 25 型答案正确性问题
 - [ ] 两条 07-28 新规则在真实训练里的触发频率和效果（上次训练被 context overflow 打断，未跑完）
 - [ ] Problem 33 型 edit 死循环是否能被新规则及时打断
 - [ ] Problem 42 与 NO_REPLY/silent reply 幻觉是否同一机制
