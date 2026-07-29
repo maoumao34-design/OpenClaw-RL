@@ -86,6 +86,7 @@ src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(dest_path, encoding="utf-8").read()
 
 old_criteria = (
+    'is the WRITING STYLE. If the AI\'s answer has stuff like bold text, numbered \\\n'
     'lists, "**Final answer**:", or anything too AI-like, tell it to \\\n'
     'rewrite in a more natural way but keep all the steps.'
 )
@@ -95,8 +96,12 @@ if text.count(old_criteria) != 1:
         f"sentence in student_chat.py, found {text.count(old_criteria)} "
         "(official file may have changed upstream -- update this patch)"
     )
+# Narrow WHAT counts as AI-like to the three concrete markers the Table 3
+# regex actually checks, but keep "AI-like" itself as the framing concept --
+# not a bare checklist disconnected from it (see docs/issues_log.md 2026-07-29).
 new_criteria = (
-    'lists, or "**Final answer**:", tell it to \\\n'
+    'is the WRITING STYLE. If the AI\'s answer looks AI-like -- stuff like bold \\\n'
+    'text, numbered lists, or "**Final answer**:" -- tell it to \\\n'
     'rewrite in a more natural way but keep all the steps.'
 )
 text = text.replace(old_criteria, new_criteria, 1)
@@ -112,8 +117,8 @@ if text.count(old_step1) != 1:
         "have changed upstream -- update this patch)"
     )
 new_step1 = (
-    '1. Look at what the AI gives you. If it has bold text, numbered lists, or '
-    '"**Final answer**:", tell it to redo it. If not, no need to redo. \\\n'
+    '1. Look at what the AI gives you. If it looks AI-like -- bold text, numbered '
+    'lists, or "**Final answer**:" -- tell it to redo it. If not, no need to redo. \\\n'
 )
 text = text.replace(old_step1, new_step1, 1)
 

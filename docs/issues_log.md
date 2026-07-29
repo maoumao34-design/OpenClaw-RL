@@ -2310,11 +2310,13 @@ Problem 40:   max_repeat = 14（共 45 次）  ← 严重
 
 **用户提出的假设（未证实，本次改动是为了验证/缓解它，不是已确认的结论）：** 当前顶替论文原定 Qwen3-32B 的 Simulator 用的是 DeepSeek V4，可能本身能力更强、对"AI 感"的判断标准比论文原定模型更敏感/更严格，导致 4B policy 很难达标，形成越纠正越写越多的恶性循环。
 
-**改动（用户明确确认后实施）：** 在 `scripts/prepare_openclaw_test_scripts.sh` 里新增一段 python3 补丁，只针对 `student_chat.py` 的 `STUDENT_SYSTEM_PROMPT`，去掉两处开放式"AI 味"兜底判断：
-1. 判断标准段落里的"or anything too AI-like"（只保留 bold / numbered lists / `**Final answer**:` 三个具体特征）；
-2. Steps 第 1 条里的"If it looks too 'AI-like'"（同样收窄成上述三个具体特征）。
+**改动（用户明确确认后实施）：** 在 `scripts/prepare_openclaw_test_scripts.sh` 里新增一段 python3 补丁，只针对 `student_chat.py` 的 `STUDENT_SYSTEM_PROMPT`，收窄两处"AI 味"判断的范围：
+1. 判断标准段落（"is the WRITING STYLE. If the AI's answer ..."）；
+2. Steps 第 1 条（"Look at what the AI gives you. If it looks ..."）。
 
-去掉这两处开放式兜底后，Simulator 要求重写的触发条件跟 Table 3 用来算收敛的正则（`**`/`^\d+\.`/`\boxed{}`）基本对齐，理论上能切断"主观感觉 AI 味 → 要求重写 → 模型加东西凑自然感 → 仍被判 AI 味 → 再重写"这条已实测确认的具体增长路径。
+**用户明确指出第一版实现有问题**：不应该把"AI-like"这个判断框架本身去掉、换成一个孤立的格式清单——Simulator 的判断依据应该仍然是"这是不是 AI 味"，只是把"AI 味"具体指什么这件事从开放式主观判断收窄成三个具体特征（bold / numbered lists / `**Final answer**:`），保留"AI-like"这个词/概念作为判断框架。已按此修正两处措辞（均改成"If it looks AI-like -- bold text, numbered lists, or '**Final answer**:'"这种"保留概念、收窄范围"的句式，而不是直接删掉"AI-like"换成一句纯格式清单）。
+
+去掉开放式兜底、只保留这三个具体特征作为"AI 味"的判定范围后，Simulator 要求重写的触发条件跟 Table 3 用来算收敛的正则（`**`/`^\d+\.`/`\boxed{}`）基本对齐，理论上能切断"主观感觉 AI 味 → 要求重写 → 模型加东西凑自然感 → 仍被判 AI 味 → 再重写"这条已实测确认的具体增长路径。
 
 **复现忠实性说明（如实记录，不当默认修复）：** 这是主动偏离论文自己写定的 Simulator 提示词（`openclaw-test/student_chat.py` 是 CLAUDE.md 标注的论文相关目录，应该原样使用），不是修一个"跟论文原意不符"的 bug。去掉开放式兜底后，Simulator 不会再纠正三个具体格式特征之外的"AI 感"内容（比如 emoji、场景化措辞）——这些内容如果模型本身倾向于生成，可能会正大光明地留在最终答案里而不再被要求修改。收敛数字可能因此变好看很多（因为跟正则完全对齐了），但不代表模型真的学会了论文期望的"完全自然地表达"，只能说明学会了"绕开三个具体格式标记"。在结果汇报里必须明确说明这一处偏离及其含义。
 
