@@ -70,14 +70,14 @@
 
 <g>
 <rect x="490" y="502" width="170" height="64" rx="8" fill="#EAF1FB" stroke="#2B5F9E" stroke-width="1"/>
-<text x="575" y="520" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#1E4573">Hint 判官（M 票）</text>
+<text x="575" y="520" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#1E4573">Hint 判官</text>
 <text x="575" y="538" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="11" fill="#2B5F9E">判断有没有可吸取的</text>
 <text x="575" y="554" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="11" fill="#2B5F9E">教训，给出改进 hint</text>
 </g>
 
 <g>
 <rect x="660" y="502" width="170" height="64" rx="8" fill="#EAF1FB" stroke="#2B5F9E" stroke-width="1"/>
-<text x="745" y="520" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#1E4573">Eval 判官（另 M 票）</text>
+<text x="745" y="520" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#1E4573">Eval 判官</text>
 <text x="745" y="538" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="11" fill="#2B5F9E">判断这次回复有没有</text>
 <text x="745" y="554" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="11" fill="#2B5F9E">达成用户意图</text>
 </g>
