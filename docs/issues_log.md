@@ -2414,6 +2414,35 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-03] 外部审阅（Cursor 读全部 workspace 文件后的建议）核实：OpenClaw 自带 `tools.loopDetection`（默认关闭），能在源头拦截死循环，跟已有 PRM 打分规则是互补关系；save-interval 暂不调整
+
+**背景：** 用户让 Cursor 通读了 workspace 全部文件后给了一份分析和改进建议（核心论点：先保证"能正确跑完 72 个有效 session"这道硬门槛，再谈"训练效果是否越来越好"；后者在前者不稳定之前测不准）。建议本身没有直接采纳，先逐条核实其中的事实性断言是否属实。
+
+**逐条核实结果（全部通过直接读源码/脚本验证，不是听信外部工具的一面之词）：**
+
+1. **`max_turns=8` 只管 `student_chat.py` 的外层 Student 对话轮次，不管一次 HTTP 请求内部的工具调用轮次**——这一点跟本项目这学期反复实测确认的一致（Problem 17 harness 层显示"Turn 4/8"，但内部 OPD turn 编号跑到了 43；Problem 33 类似），不是新发现，只是被再次印证。
+
+2. **OpenClaw 自带 `tools.loopDetection` 配置，默认 `enabled: false`**——读 `openclaw/src/agents/tool-loop-detection.ts` 和 `openclaw/src/config/types.tools.ts` 确认：
+   - `criticalThreshold` 默认 **20**，`globalCircuitBreakerThreshold` 默认 **30**（跟 Cursor 给出的数字一致）；
+   - 触发后（`detectToolCallLoop()` 返回 `stuck: true, level: "critical"`）会在工具执行前直接拦截，不让这次调用真正执行，回一条"CRITICAL: ... Session execution blocked to prevent runaway loops."的消息给模型，逼它换策略——是在**生成数据的过程中**就掐断死循环，跟我们之前评估"方向 2（训练端熔断）技术可行性存疑"时设想的机制不同：不需要我们自己的 OPD/Combine-Select 服务主动终止 session，是 OpenClaw 自己（Agent 运行的那一层）就有这个能力，只是没打开。
+   - **开启方式风险很低**：项目里 `train_separate_student.sh` 等脚本本来就有一套用 `openclaw config set <路径> <值>` 调整 OpenClaw 自身配置的现成机制（比如已经在用它设置 `agents.defaults.compaction.reserveTokens`），加一行 `openclaw config set tools.loopDetection.enabled true` 是同一类、已有先例的配置调整，不是修改 OpenClaw 源码本身。
+
+3. **`--save-interval 100`、`--num-rollout 100000000`**——在 `OpenClaw-RL-official/openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh` 里逐字核实无误。
+
+4. **`student_chat.py` 的 `main()` 对每道题的调用外层确实没有 try/except**——读源码确认 `for i in range(count): completed = run_one_problem(...)` 没有任何异常捕获，`run_one_problem()` 一旦抛出未捕获异常，整个 for 循环直接终止，后续所有题目都不会再尝试——这正是这学期反复见到的"一题崩溃、整场训练戛然而止"的直接机制。
+
+**关键澄清（用户提问引出）：开启 `loopDetection` 之后，已有的 PRM 打分规则（Rule 1a/1b 精确重复判负分、status:error 通用判负分）不能因此去掉，两者是互补关系，不是替代关系：**
+- `loopDetection` 工作在**对话/rollout 发生的那一层**，决定"这个动作实际会不会被执行"，而且它的 `criticalThreshold` 默认要**重复到第 20 次才拦截**；
+- 我们自己的 Rule 1a 工作在**训练打分那一层**，决定"这条样本该打多少分"，而且是**第 2 次重复就判负**——如果只留 `loopDetection`、去掉 Rule 1a，第 2 到第 19 次这些重复调用（比如 Problem 19 那种每次都"成功"的 `write`）依然会在训练信号里被判官打成正分，只是不会拖到 40+ 轮那么夸张；
+- status:error 规则管的是**任意一次工具报错**，跟"是不是在重复"无关，`loopDetection` 完全不会对这种一次性报错生效。
+
+**决策：**
+- **checkpoint/`--save-interval` 暂不调整**——用户明确表示 Separate-Student 跑得很快，当前阶段不需要存 checkpoint，Cursor 建议里这一条不采纳。
+- **`tools.loopDetection` 开启 + `student_chat.py` 单题异常捕获**：均已核实是真实存在的缺口、且修复方案本身风险较低（前者是已有先例的配置调整，后者是纯编排加固，都不碰训练算法/PRM 打分逻辑），但**均尚未实施**，需要另外确认要不要动手。
+- 开启 `tools.loopDetection` 会是对 OpenClaw 默认行为的又一处主动偏离，如果后续决定启用，需要照此前 `reserveTokens` 等偏离项的记录方式一并记账。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

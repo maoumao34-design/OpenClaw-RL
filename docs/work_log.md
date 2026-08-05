@@ -1341,23 +1341,34 @@
 **产出：**
 - `docs/personal_agent_dialogue_vs_training_loop.svg`/`.png`：去掉 Hint/Eval 判官框里的"（M 票）"/"（另 M 票）"
 
+### 核实外部审阅（Cursor）建议：发现 OpenClaw 自带死循环检测（默认关闭），与已有 PRM 规则互补；checkpoint 间隔暂不调整
+
+**完成内容：**
+- 用户提供了 Cursor 通读全部 workspace 文件后的分析建议，逐条核实其中的事实性断言（不直接采纳外部工具结论）：`max_turns=8` 只管外层对话轮次（已知）、`--save-interval 100`/`--num-rollout 100000000`（读脚本确认属实）、`student_chat.py` 单题异常无捕获会导致整场终止（读源码确认属实）
+- **关键新发现**：OpenClaw 自带 `tools.loopDetection` 配置（`openclaw/src/agents/tool-loop-detection.ts`），默认 `enabled: false`，`criticalThreshold`/`globalCircuitBreakerThreshold` 默认 20/30，触发后在工具执行前直接拦截并提示模型换策略——这是在 rollout 过程中就能掐断死循环的机制，比训练端事后打分更直接；开启方式（`openclaw config set tools.loopDetection.enabled true`）跟项目里已有的 `reserveTokens` 等配置调整是同一类手法，风险较低
+- 用户提问引出关键澄清：开启 `loopDetection` 后不能去掉已有的 Rule 1a/1b、status:error 判负分规则，两者工作在不同层面（loopDetection 管"动作会不会被执行"且阈值高达 20 次；PRM 规则管"训练信号该打多少分"且第 2 次重复就生效），是互补不是替代
+→ 详见 [`issues_log.md`](issues_log.md) 2026-08-03 条目
+
+**关键决策：** checkpoint/`--save-interval` 暂不调整，Separate-Student 跑得快，当前阶段不需要存档；`loopDetection` 开启 + `student_chat.py` 单题异常捕获均已核实可行，但尚未实施，需另行确认
+
 ## 当前状态（2026-08-03）
 
 ### 已就绪
 （同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正——工程细节"凑够 16 条样本"已去掉，Hint/Eval 判官的"M 票"歧义说明已去掉）
 
 ### 已知限制 / 未解决
-（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表——07-30 提交的验证训练结果尚未汇报回来，本次训练是否解决了 Problem 19 型崩溃、两条 07-28 规则的真实触发效果均待确认）
+（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表——07-30 提交的验证训练结果尚未汇报回来，本次训练是否解决了 Problem 19 型崩溃、两条 07-28 规则的真实触发效果均待确认。另加：Problem 17/19 型死循环有了一个更直接的可选对策——OpenClaw 自带 `tools.loopDetection`，默认关闭，已核实可用但尚未启用）
 
 ### 下一步
-（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
+1. 决定是否开启 `tools.loopDetection`（`openclaw config set tools.loopDetection.enabled true`，跟已有 `reserveTokens` 配置调整同类手法，风险较低）+ `student_chat.py` 加单题级别 try/except（防止一题崩溃拖死整场）——均已核实可行，待实施
+2. 其余同 07-29（见上方"历史状态（2026-07-29）"完整列表）
 
 ### 产出
 - `docs/personal_agent_dialogue_vs_training_loop.svg`/`.png`：两处表述简化（07-31 工程细节、08-03 判官 M 票歧义），详见上方对应日期条目
 
 ### 未验证
-（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
-- [ ] 其余同 07-28（见上方历史状态）
+- [ ] `tools.loopDetection` 开启后能否有效阻止 Problem 17/19 型死循环（尚未实施）
+（其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 
 ---
 
