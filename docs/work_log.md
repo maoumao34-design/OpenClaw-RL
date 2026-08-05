@@ -1351,23 +1351,38 @@
 
 **关键决策：** checkpoint/`--save-interval` 暂不调整，Separate-Student 跑得快，当前阶段不需要存档；`loopDetection` 开启 + `student_chat.py` 单题异常捕获均已核实可行，但尚未实施，需另行确认
 
+### `postCompactionGuard` 核实不适用于 07-29 压缩死循环；`loopDetection` 开启 + `student_chat.py` 单题容错已实现
+
+**完成内容：**
+- 核实 `tools.loopDetection.postCompactionGuard` 子机制：默认启用，但读 `run.ts` 确认它只在"压缩真正成功"之后才会被"上膛"；07-29 记录的 Problem 36 死循环是压缩从未真正成功过（一直被 `already_compacted_recently` 拒绝），这个 guard 从未被上膛，不会介入——确认它解决不了 07-29 那个问题，是另一类失败模式的对策
+- **实现（已完成）**：`scripts/train_separate_student.sh` 新增 `openclaw config set tools.loopDetection.enabled true`（官方默认阈值，不额外调参）；`scripts/prepare_openclaw_test_scripts.sh` 新增补丁，给 `student_chat.py` 的 `main()` 问题循环外层加 try/except，单题崩溃标记 incomplete 后继续跑下一题
+- 本地验证通过：`bash -n`、真实官方源码模拟生成、`py_compile`、确认生成代码缩进和 `results` 列表长度正确
+→ 详见 [`issues_log.md`](issues_log.md) 2026-08-03 条目（后续追加部分）
+
+**下一步：** 提交新训练，观察 `loopDetection` 是否真实触发、Problem 17/19 型死循环是否被提前拦截、单题崩溃后训练是否能继续跑完剩余题目
+
 ## 当前状态（2026-08-03）
 
 ### 已就绪
-（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正——工程细节"凑够 16 条样本"已去掉，Hint/Eval 判官的"M 票"歧义说明已去掉）
+（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错均已实现并本地验证）
 
 ### 已知限制 / 未解决
-（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表——07-30 提交的验证训练结果尚未汇报回来，本次训练是否解决了 Problem 19 型崩溃、两条 07-28 规则的真实触发效果均待确认。另加：Problem 17/19 型死循环有了一个更直接的可选对策——OpenClaw 自带 `tools.loopDetection`，默认关闭，已核实可用但尚未启用）
+（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表——07-30 提交的验证训练结果尚未汇报回来，本次训练是否解决了 Problem 19 型崩溃、两条 07-28 规则的真实触发效果均待确认。另加：`tools.loopDetection` 开启 + `student_chat.py` 单题容错均已实现，但尚未用真实训练验证效果；`postCompactionGuard` 确认不适用于 07-29 的压缩死循环，那个问题仍无对策）
 
 ### 下一步
-1. 决定是否开启 `tools.loopDetection`（`openclaw config set tools.loopDetection.enabled true`，跟已有 `reserveTokens` 配置调整同类手法，风险较低）+ `student_chat.py` 加单题级别 try/except（防止一题崩溃拖死整场）——均已核实可行，待实施
+1. 提交新训练，验证 `tools.loopDetection` 是否真实触发、能否提前拦截 Problem 17/19 型死循环、单题崩溃后是否能继续跑完剩余题目
 2. 其余同 07-29（见上方"历史状态（2026-07-29）"完整列表）
 
 ### 产出
-- `docs/personal_agent_dialogue_vs_training_loop.svg`/`.png`：两处表述简化（07-31 工程细节、08-03 判官 M 票歧义），详见上方对应日期条目
+- `docs/personal_agent_dialogue_vs_training_loop.svg`/`.png`：两处表述简化（07-31 工程细节、08-03 判官 M 票歧义）
+- `scripts/train_separate_student.sh`：新增 `tools.loopDetection.enabled true` 配置
+- `scripts/prepare_openclaw_test_scripts.sh`：新增 `student_chat.py` 单题异常容错补丁
+- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-03 条目（含后续追加部分）
 
 ### 未验证
-- [ ] `tools.loopDetection` 开启后能否有效阻止 Problem 17/19 型死循环（尚未实施）
+- [ ] `tools.loopDetection` 开启后能否有效阻止 Problem 17/19 型死循环（已实现，待真实训练验证）
+- [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
+- [ ] `loopDetection` 有没有误伤合理的重复调用（如轮询类工具）
 （其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 
 ---

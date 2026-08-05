@@ -127,4 +127,71 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (AI-like catch-all removed) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29）"
+# ---------------------------------------------------------------------
+# 2026-08-03 补丁：student_chat.py 的 main() 对每道题的调用外层加 try/except，
+# 单题崩溃不再拖死整场训练。
+#
+# 背景（docs/issues_log.md 2026-08-03 条目）：官方源码 main() 里 `for i in
+# range(count): completed = run_one_problem(...)` 外层没有任何异常捕获——
+# 这学期反复观察到的"某道题连续 408/超时、run_one_problem() 内部
+# resp.raise_for_status() 抛出未捕获的 HTTPError、整个 for 循环直接终止、
+# 后续所有题目一个都不再尝试"，根因就在这里，不是训练侧的问题。
+#
+# 这是纯编排加固，不改训练算法/奖励逻辑：某道题崩溃时只把它记成
+# incomplete（跟原本 max_turns 用完时的"incomplete"语义一致），继续跑
+# 下一题，最大化这次训练实际能收集到的有效 session 数。
+# ---------------------------------------------------------------------
+python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+text = open(dest_path, encoding="utf-8").read()
+
+old_loop = (
+    '    results = []\n'
+    '    for i in range(count):\n'
+    '        completed = run_one_problem(\n'
+    '            problem_index=i,\n'
+    '            gateway_url=gateway_url,\n'
+    '            gateway_token=gateway_token,\n'
+    '            external_client=external_client,\n'
+    '            model=model,\n'
+    '            max_turns=args.max_turns,\n'
+    '            max_retries=args.max_retries,\n'
+    '            output_file=args.output,\n'
+    '        )\n'
+    '        results.append(completed)\n'
+)
+if text.count(old_loop) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the main() problem "
+        f"loop in student_chat.py, found {text.count(old_loop)} (official "
+        "file may have changed upstream -- update this patch)"
+    )
+new_loop = (
+    '    results = []\n'
+    '    for i in range(count):\n'
+    '        try:\n'
+    '            completed = run_one_problem(\n'
+    '                problem_index=i,\n'
+    '                gateway_url=gateway_url,\n'
+    '                gateway_token=gateway_token,\n'
+    '                external_client=external_client,\n'
+    '                model=model,\n'
+    '                max_turns=args.max_turns,\n'
+    '                max_retries=args.max_retries,\n'
+    '                output_file=args.output,\n'
+    '            )\n'
+    '        except Exception as e:\n'
+    '            print(f"\\n  [ERROR] Problem {i} crashed: {e}. Marking incomplete, continuing to next problem.")\n'
+    '            completed = False\n'
+    '        results.append(completed)\n'
+)
+text = text.replace(old_loop, new_loop, 1)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (per-problem exception handling added) -> {dest_path}")
+PY
+
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03）"

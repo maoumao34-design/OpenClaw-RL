@@ -2441,6 +2441,20 @@ function isValidEditReplacement(value) {
 - **`tools.loopDetection` 开启 + `student_chat.py` 单题异常捕获**：均已核实是真实存在的缺口、且修复方案本身风险较低（前者是已有先例的配置调整，后者是纯编排加固，都不碰训练算法/PRM 打分逻辑），但**均尚未实施**，需要另外确认要不要动手。
 - 开启 `tools.loopDetection` 会是对 OpenClaw 默认行为的又一处主动偏离，如果后续决定启用，需要照此前 `reserveTokens` 等偏离项的记录方式一并记账。
 
+### 后续追加（同一天）：`postCompactionGuard` 核实不适用于 07-29 的压缩死循环；`loopDetection` 开启 + `student_chat.py` 单题容错已实现
+
+**`postCompactionGuard` 核实（用户提问引出）：** `tools.loopDetection.postCompactionGuard` 是 `loopDetection` 底下另一个独立子机制，读 `openclaw/src/agents/embedded-agent-runner/post-compaction-loop-guard.ts` 确认它**默认启用**（跟 `loopDetection` 其他检测器默认关闭不同），逻辑是"压缩成功后的 3 次尝试窗口内，如果同一个（工具、参数、结果）原样重复，直接 abort 整个 run"。但读 `run.ts` 里三处 `armPostCompaction()` 的实际调用点（都在"compaction succeeded... retrying prompt"分支内）确认：**这个 guard 只在压缩真正成功之后才会被"上膛"**。07-29 记录的 Problem 36 那次死循环恰恰是**压缩从头到尾没有一次真正成功过**（每次都被 `already_compacted_recently` 拒绝），guard 从未被上膛，不会介入——两者是不同的失败模式，`postCompactionGuard` 解决不了 07-29 那个问题。它能覆盖的是另一种场景：压缩确实成功了一次，但压缩完之后模型立刻在同一个循环里原样重复 3 次（比如 Problem 17 型 edit 死循环里如果中途真的触发过一次成功压缩）。
+
+**实现（已完成）：**
+1. `scripts/train_separate_student.sh`：在 `agents.defaults.compaction.reserveTokensFloor` 配置之后新增 `openclaw config set tools.loopDetection.enabled true`，只用官方默认阈值（`criticalThreshold=20`、`globalCircuitBreakerThreshold=30`），不额外调参，配套 `[verify]` 回读确认生效。
+2. `scripts/prepare_openclaw_test_scripts.sh`：新增 python3 补丁段，给 `student_chat.py` 的 `main()` 里 `for i in range(count): completed = run_one_problem(...)` 外层加 `try/except Exception`，崩溃时打印错误、把该题标记为 `completed = False`（跟原本 `max_turns` 用完时的"incomplete"语义一致），继续跑下一题，不再让单题崩溃拖死整场训练。
+
+**验证：** 两处改动均本地验证通过——`bash -n` 语法检查（两个脚本）、`prepare_openclaw_test_scripts.sh` 用真实官方源码模拟生成 + `py_compile` 编译检查、确认生成的 `student_chat.py` 里 try/except 缩进正确、`results` 列表长度不变（保证后续 summary 统计逻辑不受影响）。**尚未用真实训练验证效果**——下次训练需要观察：
+1. `tools.loopDetection` 触发时 training.log/openclaw.log 里是否出现"CRITICAL: ... blocked/aborted"类日志，确认真的生效（不是死代码）；
+2. Problem 17/19 型死循环是否被显著提前拦截，不再拖到 40+ 轮；
+3. 单题崩溃（如 408 超时耗尽重试）后训练是否能继续跑完剩余题目，而不是整场终止；
+4. 有没有误伤合理的重复调用（比如合理的轮询类工具，`loopDetection` 对已知轮询工具有单独更宽松的判断逻辑，理论上不应误伤，需要真实数据确认）。
+
 ---
 
 <!-- 格式模板：

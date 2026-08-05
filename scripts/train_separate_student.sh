@@ -330,6 +330,24 @@ openclaw config set agents.defaults.compaction.reserveTokensFloor 16384 \
 echo "[verify] agents.defaults.compaction.reserveTokensFloor = $(openclaw config get agents.defaults.compaction.reserveTokensFloor 2>&1 | tail -1)" \
     | tee -a "${LOGS_DIR}/openclaw.log"
 
+# 2026-08-03：开启 OpenClaw 自带的工具调用死循环检测（默认关闭）。跟已有的
+# PRM 打分规则（read/write 精确重复判负分、status:error 通用判负分）是
+# 互补关系，不是替代——PRM 规则只影响训练样本的分数，不会阻止模型继续
+# 在一个不断失败/无意义成功的调用上反复浪费轮次和上下文，直至拖垮
+# SGLang/网关（Problem 17 edit 死循环 43 turn、Problem 19 write 重复膨胀
+# 崩溃均属此类）。loopDetection 在 OpenClaw 自己执行 Agent 的那一层工作，
+# 达到阈值后直接拦截工具调用本身、不让它真正执行，从源头限制死循环能
+# 拖多久，而不是等它先拖垮网关再事后打分。只用官方默认阈值
+# （criticalThreshold=20, globalCircuitBreakerThreshold=30），不额外
+# 调参。这是对 OpenClaw 默认行为的一处主动偏离（默认关闭），见
+# docs/issues_log.md 2026-08-03 条目。
+echo "开启 tools.loopDetection（默认关闭，见 issues_log.md 2026-08-03）..." \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+openclaw config set tools.loopDetection.enabled true \
+    >> "${LOGS_DIR}/openclaw.log" 2>&1
+echo "[verify] tools.loopDetection.enabled = $(openclaw config get tools.loopDetection.enabled 2>&1 | tail -1)" \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+
 # agents.defaults.workspace 优先级高于 OPENCLAW_WORKSPACE_DIR 环境变量
 # （agent-scope-config.ts 先查 config 再退回环境变量），每次启动前强制设为
 # 本次的永久 workspace 路径。
