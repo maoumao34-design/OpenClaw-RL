@@ -2414,7 +2414,7 @@ function isValidEditReplacement(value) {
 
 ---
 
-## [2026-08-03] 外部审阅（Cursor 读全部 workspace 文件后的建议）核实：OpenClaw 自带 `tools.loopDetection`（默认关闭），能在源头拦截死循环，跟已有 PRM 打分规则是互补关系；save-interval 暂不调整
+## [2026-08-05] 外部审阅（Cursor 读全部 workspace 文件后的建议）核实：OpenClaw 自带 `tools.loopDetection`（默认关闭），能在源头拦截死循环，跟已有 PRM 打分规则是互补关系；save-interval 暂不调整
 
 **背景：** 用户让 Cursor 通读了 workspace 全部文件后给了一份分析和改进建议（核心论点：先保证"能正确跑完 72 个有效 session"这道硬门槛，再谈"训练效果是否越来越好"；后者在前者不稳定之前测不准）。建议本身没有直接采纳，先逐条核实其中的事实性断言是否属实。
 
