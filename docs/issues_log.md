@@ -2475,6 +2475,27 @@ function isValidEditReplacement(value) {
 
 **验证：** 用真实官方源码模拟生成（`bash prepare_patched_openclaw_opd.sh "OpenClaw-RL-official" <scratch_dir>`）+ `py_compile` 编译通过；正则单独测试确认只命中纯 token 回复（`"NO_REPLY"`、`"  NO_REPLY  "`、`"no_reply"`、`"NO_REPLY NO_REPLY"`），不误伤 `"NO_REPLYhello"`（粘连内容）或正文结尾恰好出现该词的实质性回答（如 `"Here is the answer... NO_REPLY"`）。**尚未用真实训练验证**——下次训练需要观察 training.log 里 `[openclaw-rl-invalid-tool-use-penalty]` 日志是否对这类 turn 生效，以及 NO_REPLY 现象出现频率是否随训练下降。
 
+### 后续追加（同一天）：`tools.loopDetection` 零触发根因确认——不是配置/时序问题，是本轮失效形态本身不在其检测范围内
+
+**用户让 workspace 里的 CLI 对 `separate_student_20260805_204436` 做了针对性核实，结论：配置大概率生效了，但本轮问题基本不在它的检测范围内；就算开着，也解决不了这次训坏的主因。**
+
+1. **配置确实生效，不是时序/未重启问题**：`train_separate_student.sh` 里 `openclaw config set tools.loopDetection.enabled true`（~346 行）在 `openclaw gateway run`（~431 行）之前执行；`openclaw.log` 里能看到"Updated tools.loopDetection.enabled. Restart the gateway to apply."提示出现时网关尚未起，之后才起的新进程，配套 `[verify] tools.loopDetection.enabled = true` 确认回读正确。全程 `openclaw.log` 里 `CRITICAL` 出现次数为 0，唯一出现的 `livenessState=blocked` 全部来自 context-overflow-recovery，跟 loopDetection 无关。
+
+2. **零触发的真实原因：本轮实测的工具重复次数远低于默认阈值**。官方默认 `criticalThreshold=20`（同工具名+参数哈希完全一致才计数）。对本轮 `training.log` 全部 `tool_calls` 按 session 统计：同 session 内 exact (name, args) 最大重复次数 **9**（最凶的后期卡死题 P57，连续 9 次 `read {"path":"homework/57.txt"}`），P59 exact read 5 次，P58 是 `read`×3+`sessions_yield`×3 混合、根本不是单一哈希撞墙——**全场没有一个 session 达到 10 次，更别说 20 次**。
+
+3. **本轮真正的坏行为跟 loopDetection 的设计前提对不上**：
+   | 本轮主问题 | loopDetection 管不管得住 |
+   |---|---|
+   | 超长 thinking 原地复读（无固定 tool_call） | 不管——它只对有 `toolName`+`params` 的调用做 hash 比对，纯文本/thinking-only 的复读它看不见（跟本项目更早读源码时得出的架构结论一致） |
+   | 短答 / 只给 answer | 不管 |
+   | 字面 NO_REPLY | 不管（这个已经用规则 3 单独覆盖，见上） |
+   | 真空 / 顶格截断 | 不管 |
+   | 偶发 exact 重复 read（本轮最多 9 次） | 达不到 20，拦不住；且这类 exact 重复本来就已被 Rule 1a 在**第 2 次**就打成负分，训练侧信号早就在起作用，不需要等到 loopDetection 的第 20 次 |
+
+**结论：** `tools.loopDetection` 确认已按预期开启生效，不是死代码；但它的设计目标（同参数工具调用高频复读的极端保险丝）跟本轮实际观察到的失效模式（语义空转的长 thinking、短答、NO_REPLY、顶格/空生成）不匹配，属于"检测范围之外"，不是"配置没生效"。这跟 08-05 条目里记录的"loopDetection 与 PRM 打分规则互补、不是替代"的判断完全一致——loopDetection 管的是执行层的极端保险丝，训练侧的 Rule 1a/1b/2a/2b/3 管的是打分层，两者本来就分工不同，不能指望 loopDetection 覆盖训练侧规则以外的所有问题。
+
+**遗留问题（唯一目前完全没有任何机制覆盖的一类失效）：** 超长 thinking 原地复读——没有固定的工具调用、纯文本内容逐字或语义上不断变化的空转——既不触发 loopDetection（没有可 hash 的工具调用），也没有对应的 PRM 规则（内容一直在变，无法用精确匹配识别"重复"）。这是下一步需要讨论的方向。
+
 ---
 
 <!-- 格式模板：
