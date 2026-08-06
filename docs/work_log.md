@@ -1451,10 +1451,15 @@
 2. 数据回来后：用干净的 +1/-1 分布定"句子重复 ≥N 次"规则的安全阈值 N，再评估是否要加生成阶段的轻力度 `repetition_penalty`
 3. CLI 提出的编排类杠杆（同 session 进批占比上限、Rule 1a 命中后提前结束/降权、Student 侧无进展熔断）——方向合理，本轮不做，待前两项效果明确后再评估
 
+**Rule 1a 通用化：** 用户认为"只对 read/write 特判"不够普适，讨论后确认"工具重复"和"句子重复"本质是同一件事（内容/动作已出现过、无新信息），Rule 1a 的正确性前提对所有工具都成立，不是 read/write 特有性质。让 CLI 核实了作业环境实际用到的工具（`read`/`write`/`edit`/`exec`/`message`/`web_search`/`sessions_*`），唯一有真正轮询语义的是 `process`，予以豁免（连同 `args.action=="poll"` 的防御性覆盖）。**明确了这一步的边界**：只解决"紧邻同参重复、exact-match 可测"这个子类，覆盖到之前遗漏的 `edit`/`sessions_*`/`message`，但解决不了本轮长负样本主体的"换皮空转"（跨 turn 文本相似度 0.02-0.15，逐字比对根本抓不住）——那部分仍需要真正的"无状态进展"过程信号（Rule 1b 精神推广到全工具，本轮不做）或生成阶段轻量重复惩罚（已推迟），是互补关系不是替代。全历史（非紧邻）版本的通用化会有假阳性（中间发生过状态变化的重复调用会被误判），本轮只做"紧邻上一次"这个安全范围内的通用化。
+→ 详见 [`issues_log.md`](issues_log.md) 又一条 2026-08-06 条目
+
+**实现：** `scripts/prepare_patched_openclaw_opd.sh` 新增 `_is_poll_style_call()` helper；Rule 1a 判断条件去掉 `_tool_name in ("read", "write")` 限定，改为对所有工具生效、豁免轮询类调用。已用真实官方源码模拟生成 + `py_compile` 验证通过，独立测试确认豁免逻辑行为正确。
+
 ## 当前状态（2026-08-06）
 
 ### 已就绪
-（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）+ `FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义 + 顶格截断强制判负分 + shadow 句重复统计日志均已实现并本地验证）
+（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）+ `FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义 + 顶格截断强制判负分 + shadow 句重复统计日志 + Rule 1a 通用化（去 read/write 白名单，豁免轮询）均已实现并本地验证）
 
 ### 已知限制 / 未解决
 （同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表。另加：`tools.loopDetection` 确认零触发根因是"本轮失效形态不在其设计检测范围内"（实测同 session 最大 exact 重复仅 9 次，远低于阈值 20），不是配置/时序问题，但也意味着它对本轮实际问题基本无效；唯一目前完全没有机制覆盖的一类失效是超长 thinking 原地复读（无固定工具调用，loopDetection 和精确匹配的 PRM 规则都覆盖不到）；`postCompactionGuard` 确认不适用于 07-29 的压缩死循环，那个问题仍无对策；"verbose CoT 自我强化"假说已被 n=342 全量数据推翻，真实模式是"失败轨迹在训练后期变长"这一更窄的现象，尚无对应修复；PRM 规则 3 已实现但尚未用真实训练验证效果）
@@ -1465,15 +1470,16 @@
 3. 其余同 07-29（见上方"历史状态（2026-07-29）"完整列表）
 
 ### 产出
-- `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）+ 顶格截断标记（`is_truncated`）+ shadow 句重复统计日志
+- `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）+ 顶格截断标记（`is_truncated`）+ shadow 句重复统计日志 + Rule 1a 通用化（去白名单、豁免轮询）
 - `scripts/prepare_openclaw_test_scripts.sh`：`FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义
 - `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-truncation-penalty` 覆盖块
-- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 三条条目
+- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 四条条目
 
 ### 未验证
 - [ ] PRM 规则 3 能否在真实训练里正确识别并惩罚 NO_REPLY 误用（已实现，待真实训练验证）
 - [ ] `FIRST_MESSAGE_TEMPLATE` 改动能否降低"短答/只给 answer"类失效的出现频率（已实现，待真实训练验证）
 - [ ] 顶格截断强制判负分是否生效、shadow 句重复统计日志能否覆盖全量无偏分布（已实现，待真实训练验证）
+- [ ] Rule 1a 通用化后能否正确拦截 `edit`/`sessions_*`/`message` 的紧邻精确重复、有没有误伤合理调用（已实现，待真实训练验证）
 - [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
 （其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 

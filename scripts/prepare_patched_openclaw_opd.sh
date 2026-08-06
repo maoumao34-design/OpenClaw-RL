@@ -107,6 +107,27 @@ def _max_sentence_copies(text, min_len=40):
     return max(counts.values()) if counts else 0
 
 
+# openclaw-rl-invalid-tool-use-penalty 规则 1a 通用化（2026-08-06）：见该规则
+# 定义处的注释。已核实这次作业环境实际会用到的工具集合（read/write/edit/
+# exec/message/web_search/sessions_*）里唯一真正有"轮询"语义的是 OpenClaw
+# 自带的 process 工具（查询后台 exec 状态），跟 loopDetection 自己对轮询类
+# 工具单独放宽阈值是同一个顾虑。这里豁免 process 工具本身，以及任何工具
+# 调用里 args.action == "poll" 的情况（防御性地覆盖其他可能设计成轮询语义
+# 的工具），其余工具一律不再区分名字。
+_POLL_EXEMPT_TOOL_NAMES = {"process"}
+
+
+def _is_poll_style_call(tool_name, args_raw):
+    if tool_name in _POLL_EXEMPT_TOOL_NAMES:
+        return True
+    try:
+        args = json.loads(args_raw) if args_raw else {}
+    except (TypeError, ValueError):
+        return False
+    action = args.get("action") if isinstance(args, dict) else None
+    return isinstance(action, str) and action.strip().lower() == "poll"
+
+
 def _extract_session_id_from_system_prompt(messages):
     """Fallback session id when X-Session-Id/body.session_id/RL-TRAINING-META
     marker are all absent.
@@ -386,18 +407,27 @@ tool_calls_log_new = (
     '            # docs/issues_log.md 2026-07-27 条目。三条规则都是"不管换到什么\n'
     '            # 任务/工具集都必然成立"的逻辑判断，尽量降低误伤合理工具用法的风险：\n'
     '            #\n'
-    '            # 规则 1a：read/write 类工具，紧邻上一次调用参数完全相同 -> 没有\n'
-    '            # 新信息或没有新效果。read 的道理：中间没有 write/edit，文件内容\n'
-    '            # 不可能变化，重复读取确定没有新信息。write 的道理是对称的\n'
-    '            # （2026-07-29 补丁，docs/issues_log.md 2026-07-29 条目）：紧邻\n'
-    '            # 上一次把同样的内容写到同一个 path，文件已经是这个内容了，\n'
-    '            # 再写一次没有任何新效果——但因为 write 通常会返回"成功"，\n'
-    '            # 在没有这条规则之前，判官会照着"工具成功=正分"的规则把这种\n'
-    '            # 纯重复动作持续打成正分，真实训练数据里见过反复重复同一个\n'
-    '            # write、每次都被打 +1、session 上下文持续膨胀直至拖垮 SGLang/\n'
-    '            # 网关的案例。只限定 read/write，不适用于结果可能随外部状态\n'
-    '            # 变化的工具（如 exec/轮询类），避免误伤合理的重复调用。\n'
-    '            if _tool_name in ("read", "write") and _prev_call is not None and _prev_call == _cur_call:\n'
+    '            # 规则 1a（2026-08-06 通用化，见同日 issues_log.md 条目）：紧邻上一次\n'
+    '            # 调用（工具名 + 参数）完全相同 -> 没有新信息或没有新效果，不再限定\n'
+    '            # read/write 这两个工具名。原始动机（read 的道理：中间没有\n'
+    '            # write/edit，文件内容不可能变化，重复读取确定没有新信息；write 的\n'
+    '            # 道理对称：紧邻上一次把同样内容写到同一个 path，文件已经是这个内容\n'
+    '            # 了，再写一次没有新效果）对任何工具都成立，不是 read/write 特有的\n'
+    '            # 性质——真正需要排除的只有结果会随外部状态自行变化、重复调用本身\n'
+    '            # 就有意义的轮询类工具。已核实这次作业环境实际会用到的工具集合\n'
+    '            # （read/write/edit/exec/message/web_search/sessions_*）里唯一有\n'
+    '            # 这种语义的是 OpenClaw 自带的 process（查询后台 exec 状态），用\n'
+    '            # _is_poll_style_call() 豁免它（以及任何 args.action=="poll" 的\n'
+    '            # 调用，防御性覆盖其他可能设计成轮询语义的工具），其余工具一律\n'
+    '            # 不再区分名字。之前只限定 read/write 时，edit/sessions_*/message\n'
+    '            # 这类工具的紧邻精确重复完全没有规则覆盖；真实训练数据里见过反复\n'
+    '            # 重复同一个 write、每次都被判官打 +1、session 上下文持续膨胀直至\n'
+    '            # 拖垮 SGLang/网关的案例，同样的机制对其他工具一样成立。\n'
+    '            if (\n'
+    '                _prev_call is not None\n'
+    '                and _prev_call == _cur_call\n'
+    '                and not _is_poll_style_call(_tool_name, _tool_args_raw)\n'
+    '            ):\n'
     '                _is_invalid_tool_use = True\n'
     '\n'
     '            # 规则 1b（2026-07-28）：同一个 path 换 limit 参数重复读取，会\n'

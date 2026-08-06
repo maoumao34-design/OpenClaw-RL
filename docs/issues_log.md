@@ -2559,6 +2559,26 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-06] Rule 1a 去掉 read/write 白名单、通用化到所有工具（豁免轮询语义）；明确"这解决不了换皮空转"的边界
+
+**背景：** 承接同日"超长 thinking 原地复读怎么解决"的讨论。用户指出现有 Rule 1a 硬编码 `_tool_name in ("read", "write")` 太具体，不应该按特定工具名判断，应该做一条对所有工具和 thinking 都有普适性的规则。讨论后确认：
+
+1. **"工具调用重复"和"句子重复"本质是同一件事**：都是"这段内容/这个动作在这个 session 里已经出现过、没有带来任何新信息"。Rule 1a 的正确性前提（紧邻上一次、中间没有可能改变相关状态的动作，所以确定没有新效果）对任何工具都成立，不是 read/write 特有的性质。
+2. **完全通用（比对整个 session 历史而不只是紧邻上一次）会有假阳性**：比如先 read 一个文件、中间 write 改过内容、之后又用完全相同参数 read 同一文件——这次结果其实变了，是有效调用，但纯参数比对会误判为无效。要做到真正安全的"全历史"版本需要"自上次这个调用以来是否发生过状态变化"的判断（Rule 1b 对 read 已经在做的 EOF/覆盖范围追踪，需要推广到所有工具）——这轮明确先不做，只做"紧邻上一次"这个安全范围内的通用化。
+3. **轮询类工具需要豁免**：让 CLI 核实了这次作业环境实际会用到的工具集合（`read`/`write`/`edit`/`exec`/`message`/`web_search`/`sessions_*`），唯一有真正轮询语义的是 OpenClaw 自带的 `process`（查询后台 exec 状态），跟 loopDetection 自己对轮询类工具单独放宽阈值是同一个顾虑。作业轨迹里几乎没见到真实轮询用法，但保守起见仍然豁免 `process` 工具本身，以及任何工具调用里 `args.action == "poll"` 的情况（防御性覆盖其他可能设计成轮询语义的工具）。
+
+**诚实边界（不要夸大这一步能解决的范围）：** 这条泛化规则解决的是"紧邻同参重复、且确实无新信息"这个可以被 exact-match 检测到的子类——对齐的症状是"死循环式的原地重复调用"（现在覆盖到 `edit`/`sessions_*`/`message` 等之前没被 Rule 1a 覆盖到的工具）。**它解决不了本轮长负样本的主体——"换皮空转"**（同一个卡点反复用不同措辞绕，SequenceMatcher 显示跨 turn 文本相似度只有 0.02-0.15，往往是 `finish_reason=stop` 而不是顶格）：这种情况下无论工具调用参数还是句子内容，逐字比对根本抓不住，因为它每次都在变。也就是说，这一步能让"exact 重复且无新信息"这一类行为的训练信号从"依赖判官/局限于 read+write"变成"确定性、覆盖全部工具"，对这一子类更好学；但对"抽象意义上的别绕圈"这个更大的问题，仍然缺一块——要么是真正的"无状态进展"过程特征（Rule 1b 精神的推广，本轮不做）、要么是验证/强化 topk-select 组内对比是否已经在惩罚空转候选、要么是生成阶段的轻量重复惩罚（本轮已推迟，见另一条 2026-08-06 条目）。这几个方向是互补关系，不是这条规则能替代的。
+
+**决策（本轮工程范围）：** 只做规则 1a 的通用化（去掉 read/write 白名单 + process/poll 豁免）；句子片段重复规则继续等 shadow 数据定阈值（已在跑）；2a/2b（sessions_send 自问自答、sessions_yield 无对应 spawn）保持不变——这两条是"逻辑上不可能有意义"的判断，跟"重复了所以无效"是不同的判断类型，不需要跟着泛化。全历史（非紧邻）版本的通用化、真正的"无进展"过程信号，都明确记账为后续待办，不在本轮实现。
+
+**实现：** `scripts/prepare_patched_openclaw_opd.sh`：
+- 新增 `_POLL_EXEMPT_TOOL_NAMES = {"process"}` 和 `_is_poll_style_call(tool_name, args_raw)` 模块级 helper。
+- Rule 1a 判断条件从 `_tool_name in ("read", "write") and _prev_call is not None and _prev_call == _cur_call` 改为 `_prev_call is not None and _prev_call == _cur_call and not _is_poll_style_call(_tool_name, _tool_args_raw)`——去掉工具名限定，加上轮询豁免。
+
+**验证：** 用真实官方源码模拟生成，无报错；`py_compile` 编译通过；独立测试 `_is_poll_style_call()`：`process` 工具 → 豁免，`action="Poll"`（大小写不敏感）→ 豁免，`read`/`write` 等正常调用 → 不豁免，参数不是合法 JSON 或为 `None` → 安全地不豁免（不会因为解析失败而误豁免）；`grep` 确认生成文件里新 helper 和新判断条件都正确出现在预期位置。**尚未用真实训练验证**——下次训练需要观察 `edit`/`sessions_*`/`message` 这类工具的紧邻精确重复是否被正确拦截，以及有没有误伤合理的重复调用。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
