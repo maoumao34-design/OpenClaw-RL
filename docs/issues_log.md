@@ -2457,6 +2457,26 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-06] NO_REPLY 误用根因确认 + PRM 规则 3 实现：direct chat 从未教过模型这个 token，模型自发套用导致教学任务被静默跳过
+
+**背景：** 对 `separate_student_20260805_204436` 的进一步分析（用户让 workspace 里的 CLI 核实）发现，`training.log` 里至少 6 处 `thinking=N chars, response:\nNO_REPLY`——模型在成功 `write` 之后，回复正文字面就是 "NO_REPLY" 四个字（不是真空回复）。Student 端看到的是网关自己的占位渲染 "No response from OpenClaw."（200 OK，不是请求失败）。CLI 同时确认了已有的 `prepare_patched_silent_reply_policy.sh` 补丁（强制 `resolveSilentReplyPolicyFromPolicies()` 永远返回 `"disallow"`）在这次训练里确实部署生效，但这个补丁管的是 OpenClaw 判定"真·空回复"时要不要放行当静默完成，跟模型自己写出非空的字面文本 "NO_REPLY" 完全是两条独立路径，补丁逻辑根本不会被触发。
+
+**根因核实（读源码，非猜测）：**
+1. `NO_REPLY` 是 OpenClaw 自带的真实 token（`SILENT_REPLY_TOKEN`，定义于 `openclaw/src/auto-reply/tokens.ts:7`），不是模型瞎编的字符串。
+2. 但这个约定**只在 group chat 场景**才会被写进 system prompt 教给模型：`buildGroupChatContext()`（`openclaw/src/auto-reply/reply/groups.ts:279-291`）只有 `isGroupChat` 且 `silentReplyPolicy !== "disallow"` 时才会加上"如果不需要回复，就回复 `NO_REPLY`"这句指示；而 `buildDirectChatContext()`（同文件 298-317 行）通篇没有任何 NO_REPLY / silent-reply 相关字样。
+3. `student_chat.py` 用 `/v1/chat/completions` + `user=session_user` 的单会话方式，经 `classifySilentReplyConversationType()`（`openclaw/src/shared/silent-reply-policy.ts:17-37`）判断会落到 `direct`（webchat surface），不会被当成 group chat。
+4. 结论：**这次训练的会话里，policy 模型从没被 OpenClaw 教过"NO_REPLY"这个约定**——模型自发套用了一个大概率从预训练/RLHF 阶段就见过的通用 agent 框架惯例，不是遵循这次训练实际给它的 system prompt。`normalizeReplyPayload()`（`openclaw/src/auto-reply/reply/normalize-reply.ts:60-66`）里 `isSilentReplyPayloadText` 命中后会把这次回复当 token-only 静默回复处理掉，教学任务实际上被跳过了。
+
+**附带发现：** `resolveSilentReplyPolicyFromPolicies()` 对 `conversationType === "direct"` 本来就硬编码永远返回 `"disallow"`（`silent-reply-policy.ts:45-48`，不受配置覆盖影响）——现有的"强制全部 disallow"补丁对 direct 类型会话从一开始就是重复保险，没有起到之前以为的作用，但不影响本次结论（问题根本不在 policy 那层，在模型输出层面）。
+
+**决策：** 这是模型输出层面的问题，不在现有任何补丁（silent-reply-policy、loopDetection、Rule 1a/1b/2a/2b）的覆盖范围内。照搬这次训练已经在用的"打分层兜底"模式，在 `openclaw_opd_api_server.py` 里新增 **规则 3**：最终回复内容经 trim 后精确等于（大小写不敏感、允许以空白分隔的重复 token，语义对齐 OpenClaw 自己 `isSilentReplyText()` 的判定）`"NO_REPLY"`，直接判定为已知无效动作，强制 `eval_score = -1.0`。这是纯文本 turn（没有 tool_calls），检测点放在 `tool_calls` 判断之外；复用规则 1a/1b/2a/2b 共用的 `_is_invalid_tool_use` 标记/`turn_data["is_invalid_tool_use"]` 字段，下游 `openclaw_combine_select_api_server.py` 的消费逻辑不用改。这是打分层面的兜底，不能"防止"模型生成这个 token，只是不让它继续被判官/规则误当正常完成而获得正分。
+
+**实现：** `scripts/prepare_patched_openclaw_opd.sh` 新增 `_NO_REPLY_ONLY_RE = re.compile(r"^\s*NO_REPLY(?:\s+NO_REPLY)*\s*$", re.IGNORECASE)`（模块级编译一次），在 `_is_invalid_tool_use = False` 之后、`if tool_calls:` 之前调用 `_NO_REPLY_ONLY_RE.match(content)`。
+
+**验证：** 用真实官方源码模拟生成（`bash prepare_patched_openclaw_opd.sh "OpenClaw-RL-official" <scratch_dir>`）+ `py_compile` 编译通过；正则单独测试确认只命中纯 token 回复（`"NO_REPLY"`、`"  NO_REPLY  "`、`"no_reply"`、`"NO_REPLY NO_REPLY"`），不误伤 `"NO_REPLYhello"`（粘连内容）或正文结尾恰好出现该词的实质性回答（如 `"Here is the answer... NO_REPLY"`）。**尚未用真实训练验证**——下次训练需要观察 training.log 里 `[openclaw-rl-invalid-tool-use-penalty]` 日志是否对这类 turn 生效，以及 NO_REPLY 现象出现频率是否随训练下降。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

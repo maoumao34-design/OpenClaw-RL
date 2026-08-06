@@ -1380,7 +1380,7 @@
 
 **下一步：** 提交新训练，观察 `loopDetection` 是否真实触发、Problem 17/19 型死循环是否被提前拦截、单题崩溃后训练是否能继续跑完剩余题目
 
-## 当前状态（2026-08-05）
+## 历史状态（2026-08-05，已被 8/6 结果取代）
 
 ### 已就绪
 （同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错均已实现并本地验证）
@@ -1401,6 +1401,54 @@
 - [ ] `tools.loopDetection` 开启后能否有效阻止 Problem 17/19 型死循环（已实现，待真实训练验证）
 - [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
 - [ ] `loopDetection` 有没有误伤合理的重复调用（如轮询类工具）
+（其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
+
+---
+
+## 2026-08-06
+
+**目标：** 核实 `separate_student_20260805_204436`（commit `8c7ff43`，已含 loopDetection/write 精确重复判负分/单题容错三项补丁）里持续出现的坏行为的根因，重点排查 NO_REPLY 现象
+
+**完成内容：**
+- 用户提供了新一轮 Cursor 分析（6 类"种子行为" + 3 类"主要奖励强化成因"），逐条核对哪些行为其实从未真正修过（如 Steps 第 0 条已被撤销、false-completion 链条从未处理过）、哪些只有打分层兜底但不阻止动作本身发生（Rule 2a/2b）、哪些理论上该被 loopDetection 覆盖但需要验证
+- 用户提供全量统计数据（n=342 组 thinking_chars/eval_score 配对样本）核查"verbose CoT 被奖励并自我强化"这个假说——数据不支持这个简单结论：`+1` 样本的 thinking 长度分布早晚期几乎不变（6321→6386 字符），只有 `-1` 样本明显变长（5665→9996 字符），且长度与得分是倒 U 型关系（3000-5000 字符区间 +1 率最高，达 73.5%），不是单调"越长越容易被打正分"；顶格截断（`finish_reason=length`）仅占全部 turn 的约 1%，样本量太小，不支持"顶格垃圾内容系统性拿正分"这个说法
+- 用户提供 grep 结果确认 `tools.loopDetection` 全程零次触发日志（只有配置生效确认行），核实配置生效时序（`openclaw config set` 在 gateway 进程启动前执行）排除配置未生效的可能，判断更可能是本次训练的实际失败模式（内容不断变化的死循环、或纯文本无工具调用的膨胀）本身不匹配 loopDetection 的"精确 hash 匹配的工具调用重复"设计，而不是配置没生效——**这一点仍待用具体 session 的工具调用序列做最终确认**
+- 用户提供 NO_REPLY 专项分析：确认 silent-reply-policy 补丁在本次训练里确实部署生效，但它管的是 OpenClaw 判定"真·空回复"要不要放行，跟模型自己写出非空字面文本 "NO_REPLY" 完全是两条路径，补丁逻辑不会被触发
+- 读源码确认 NO_REPLY 根因：`NO_REPLY` 是 OpenClaw 自带真实 token（`tokens.ts` 的 `SILENT_REPLY_TOKEN`），但只有 `buildGroupChatContext()` 会把它写进 system prompt 教给模型，`buildDirectChatContext()` 完全没有；`student_chat.py` 的单会话对话被分类成 `direct`，模型从没被这次训练的 system prompt 教过这个约定，是自发套用了训练外的通用 agent 惯例。这跟 07-21/07-22 就记录过的"NO_REPLY 幻觉"是同一个现象（当时确认过不是新引入的补丁副作用，但没查出根因，一直延后处理）——本次补上了根因
+→ 详见 [`issues_log.md`](issues_log.md) 2026-08-06 条目
+
+**关键决策：** NO_REPLY 是模型输出层面的问题，不在任何现有补丁覆盖范围内，照搬本项目"打分层兜底"的既有模式处理，不是从 system prompt 层面禁止（那样等于给策略模型加外挂指引）
+
+**实现：**
+- `scripts/prepare_patched_openclaw_opd.sh` 新增规则 3：最终回复内容 trim 后精确匹配 `NO_REPLY`（大小写不敏感，语义对齐 OpenClaw 自己 `isSilentReplyText()`），复用 Rule 1a/1b/2a/2b 共用的 `_is_invalid_tool_use` 标记，强制 `eval_score = -1.0`；下游 `openclaw_combine_select_api_server.py` 消费逻辑不用改
+- 本地验证通过：真实官方源码模拟生成 + `py_compile`，正则单独测试确认只命中纯 token 回复，不误伤粘连内容或结尾恰好出现该词的实质性回答
+
+**下一步：**
+1. 提交新训练，验证 NO_REPLY 规则 3 是否生效（training.log 里 `[openclaw-rl-invalid-tool-use-penalty]` 日志）、NO_REPLY 现象出现频率是否下降
+2. 仍待确认：`loopDetection` 零触发究竟是因为本次训练的失败模式不匹配其设计，还是有未发现的配置/时序问题——需要具体 session 的工具调用序列核实
+3. "force -1 on 顶格截断样本"这条用户提出的方案：已评估为合理可加但不解决主要矛盾（顶格样本太少，不是主因），是否实施待用户决定
+
+## 当前状态（2026-08-06）
+
+### 已就绪
+（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）均已实现并本地验证）
+
+### 已知限制 / 未解决
+（同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表。另加：`tools.loopDetection` 全程零触发，根因未 100% 确认——待具体 session 工具调用序列核实是设计不匹配还是配置/时序问题；`postCompactionGuard` 确认不适用于 07-29 的压缩死循环，那个问题仍无对策；"verbose CoT 自我强化"假说已被 n=342 全量数据推翻，真实模式是"失败轨迹在训练后期变长"这一更窄的现象，尚无对应修复；PRM 规则 3 已实现但尚未用真实训练验证效果）
+
+### 下一步
+1. 提交新训练，验证 PRM 规则 3（NO_REPLY 判负分）+ `tools.loopDetection` 的真实生效情况
+2. 确认 `tools.loopDetection` 零触发的根因（设计不匹配 vs 配置/时序问题）
+3. 其余同 07-29（见上方"历史状态（2026-07-29）"完整列表）
+
+### 产出
+- `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）
+- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 条目
+
+### 未验证
+- [ ] PRM 规则 3 能否在真实训练里正确识别并惩罚 NO_REPLY 误用（已实现，待真实训练验证）
+- [ ] `tools.loopDetection` 零触发的根因（已实现但效果未知，待具体 session 数据核实）
+- [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
 （其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 
 ---

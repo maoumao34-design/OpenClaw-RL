@@ -79,6 +79,10 @@ if class_marker not in text:
 helper = '''
 _RUNTIME_SESSION_RE = re.compile(r"session=agent:[^:]+:openai-user:(\\S+)")
 _RL_META_RE = re.compile(r"\\[RL-TRAINING-META\\] session_id=(\\S*) turn_type=(\\S*)")
+# openclaw-rl-invalid-tool-use-penalty 规则 3（2026-08-06）：见该规则定义处的
+# 注释。匹配官方 OpenClaw 自己 isSilentReplyText() 的语义（token-only，大小写
+# 不敏感，允许以空白分隔的重复 token）。
+_NO_REPLY_ONLY_RE = re.compile(r"^\\s*NO_REPLY(?:\\s+NO_REPLY)*\\s*$", re.IGNORECASE)
 
 
 def _extract_session_id_from_system_prompt(messages):
@@ -315,6 +319,30 @@ tool_calls_log_new = (
     '        # turns with no tool call at all (plain text turns), where it must be\n'
     '        # False, not stale from a previous turn.\n'
     '        _is_invalid_tool_use = False\n'
+    '\n'
+    '        # --- openclaw-rl-invalid-tool-use-penalty 规则 3（NO_REPLY 误用检测，\n'
+    '        # 2026-08-06，temporary, safe to remove）---\n'
+    '        # 背景（docs/issues_log.md 2026-08-05 条目，NO_REPLY 分析）：NO_REPLY\n'
+    '        # 是 OpenClaw 自带的真实 token（SILENT_REPLY_TOKEN，见\n'
+    '        # openclaw/src/auto-reply/tokens.ts），但只在 group chat 场景才会被\n'
+    '        # 写进 system prompt 教给模型（buildGroupChatContext()，且要求\n'
+    '        # silentReplyPolicy != "disallow"）；这次训练用的是 direct/webchat\n'
+    '        # 单会话对话，system prompt 里从没出现过这个约定（buildDirectChatContext()\n'
+    '        # 通篇没有任何 NO_REPLY 相关字样）。真实训练日志里反复观察到模型在\n'
+    '        # 成功 write 之后自己吐出字面文本 "NO_REPLY" 作为回复正文——这是模型\n'
+    '        # 自发套用了一个这次训练里没人教过的惯例，不是遵循 OpenClaw 给的\n'
+    '        # 指示。下游表现是 Student 收到 "No response from OpenClaw."（网关把\n'
+    '        # 这当 token-only 静默回复处理，见 normalizeReplyPayload() 里\n'
+    '        # isSilentReplyPayloadText 命中的分支），教学任务实际上被跳过了，跟\n'
+    '        # 现有的 silent-reply-policy 补丁（只管"真·空回复"）是两码事，那个\n'
+    '        # 补丁管不到这里。这不是"工具调用"，是纯文本 turn，检测放在\n'
+    '        # tool_calls 判断之外；跟规则 1a/1b/2a/2b 共用同一个\n'
+    '        # _is_invalid_tool_use 标记——下游 openclaw_combine_select_api_server.py\n'
+    '        # 只认这一个字段名，语义上已经是"已知无效动作"而不严格限定于工具\n'
+    '        # 调用（见规则 1a 定义处的注释）。\n'
+    '        if _NO_REPLY_ONLY_RE.match(content):\n'
+    '            _is_invalid_tool_use = True\n'
+    '\n'
     '        if tool_calls:\n'
     '            logger.info("[OpenClaw-OPD] session=%s tool_calls: %s", session_id, str(tool_calls)[:500])\n'
     '            _tool_name = tool_calls[0].get("function", {}).get("name")\n'
