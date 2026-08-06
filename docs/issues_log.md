@@ -2498,6 +2498,30 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-06] FIRST_MESSAGE_TEMPLATE 措辞去 bare-answer 歧义：怀疑"Show me the answer first"诱导 4B 只给光答案
+
+**背景：** 讨论"超长 thinking 原地复读"问题时，用户提出一个相关但独立的假设：`student_chat.py` 的 `FIRST_MESSAGE_TEMPLATE`（每道题第一轮直接发给 policy 的消息，不经过 Student LLM 系统提示词过滤）里"Show me the answer first"这句话，可能诱导训练中的 4B 模型把"answer"理解成"只给最终答案"，而不是"完整解出来、给我看解法"。
+
+**机制分析（基于逻辑推理，未经真实训练数据验证）：** 这个偏差一旦发生，后续没有任何机制会纠正——`STUDENT_SYSTEM_PROMPT` 判断要不要打回重写只检查三个具体格式特征（bold / 编号列表 / `"**Final answer**:"`），一个不带任何格式标记的简短答案不会触发重写，这条"短答"坏样本会被当满足要求直接推进到写文件那一步，跟此前定位到的"短答 / 只给 answer"失效类别（见 08-06 `loopDetection` 核实条目里的分类表）对得上。
+
+**决策：** 给出三个改法（A 最小改动只加修饰词、B 把"the answer"整句换成"your full solution with all the steps"、C 全部换成"walk me through step by step"框架），用户选择 **方案 B**：改动集中在最可能引起歧义的那半句话，"先展示、后写入"这个两阶段结构完全保留。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh` 新增补丁段，把
+```
+"Show me the answer first — don't write to the file until I tell you to."
+```
+改成
+```
+"Show me your full solution with all the steps first — don't write to the file until I tell you to."
+```
+其余两行（问候语、"Can you read it and help me solve it?"）不变。
+
+**复现忠实性说明：** 这是主动偏离论文原始 `student_chat.py` 的 prompt 设计，跟 07-29 那次去掉 Simulator 提示词里"AI-like"开放式兜底判断是同一类性质——都是为了让训练信号更准确而主动修改论文给定的提示词，不是修复一个"跟论文原意不符"的 bug。
+
+**验证：** 用真实官方源码模拟生成（`bash prepare_openclaw_test_scripts.sh "OpenClaw-RL-official" <scratch_dir>`），四个补丁段全部按顺序应用成功；`py_compile` 编译通过；`grep` 确认生成的 `student_chat.py` 里 `FIRST_MESSAGE_TEMPLATE` 文本、em dash、撇号全部正确保留。**尚未用真实训练验证**——下次训练需要观察"短答/只给 answer"这类失效样本的出现频率是否下降。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

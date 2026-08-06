@@ -1426,15 +1426,23 @@
 **后续追加（同一天）：** 用户让 workspace CLI 对本轮工具调用做了针对性统计，确认 `tools.loopDetection` 零触发的根因——配置确实生效（网关启动前已 set + verify 回读正确，全程 CRITICAL=0），但本轮实测同 session 内 exact 重复工具调用最大只有 9 次（最凶的 P57 连续 9 次 `read` 同一文件），远低于官方默认阈值 20，且本轮真正的坏行为（超长 thinking 原地复读、短答、NO_REPLY、顶格/空生成）大多根本不涉及"同参数工具调用重复"这个 loopDetection 唯一能检测的模式。结论：**不是配置/时序问题，是本轮失效形态本身在 loopDetection 设计范围之外**，跟"loopDetection 与 PRM 打分规则互补、不是替代"的既有判断一致——偶发的 exact 重复本来就已经被 Rule 1a 在第 2 次就打负分覆盖了，不需要等 loopDetection 的第 20 次。唯一目前完全没有机制覆盖的一类失效是**超长 thinking 原地复读**（无固定工具调用、内容不断变化，loopDetection 看不见、精确匹配的 PRM 规则也抓不住）。
 → 详见 [`issues_log.md`](issues_log.md) 2026-08-06 条目"后续追加"部分
 
+**讨论"超长 thinking 原地复读"时，用户提出一个相关假设并当场拍板修复：** `student_chat.py` 的 `FIRST_MESSAGE_TEMPLATE`（第一轮直接发给 policy、不经 Student 系统提示词过滤的消息）里"Show me the answer first"可能诱导 4B 模型把"answer"理解成"只给最终答案"，而 `STUDENT_SYSTEM_PROMPT` 的重写触发条件只看格式特征（bold/编号列表/`**Final answer**:`），不带格式标记的简短答案不会被打回重写——这条因果链能解释"短答/只给 answer"这类失效为何会被当满足要求放过。给了三个改法（A 加修饰词、B 整句换成强调完整解法、C 全部换成 step-by-step 框架），用户选 **B**。
+→ 详见 [`issues_log.md`](issues_log.md) 另一条 2026-08-06 条目
+
+**实现：**
+- `scripts/prepare_patched_openclaw_opd.sh`：NO_REPLY 规则 3（见上）
+- `scripts/prepare_openclaw_test_scripts.sh`：`FIRST_MESSAGE_TEMPLATE` 把"Show me the answer first"改成"Show me your full solution with all the steps first"，其余文案不变
+- 均已用真实官方源码模拟生成 + `py_compile` 验证通过
+
 **下一步：**
-1. 提交新训练，验证 NO_REPLY 规则 3 是否生效（training.log 里 `[openclaw-rl-invalid-tool-use-penalty]` 日志）、NO_REPLY 现象出现频率是否下降
-2. **新的待讨论方向**：超长 thinking 原地复读目前完全没有对策（loopDetection 和现有 PRM 规则都覆盖不到），需要另外想办法（比如基于相似度而非精确匹配的检测，或别的思路）
+1. 提交新训练，验证 NO_REPLY 规则 3、`FIRST_MESSAGE_TEMPLATE` 改动是否生效（training.log 里对应日志/短答现象出现频率是否下降）
+2. **仍待讨论方向**：超长 thinking 原地复读目前完全没有对策（loopDetection 和现有 PRM 规则都覆盖不到），需要另外想办法（比如基于相似度而非精确匹配的检测，或别的思路）——本次讨论中途先插入了 FIRST_MESSAGE_TEMPLATE 这个独立修复，原问题本身还没有方案
 3. "force -1 on 顶格截断样本"这条用户提出的方案：已评估为合理可加但不解决主要矛盾（顶格样本太少，不是主因），是否实施待用户决定
 
 ## 当前状态（2026-08-06）
 
 ### 已就绪
-（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）均已实现并本地验证）
+（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）+ `FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义均已实现并本地验证）
 
 ### 已知限制 / 未解决
 （同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表。另加：`tools.loopDetection` 确认零触发根因是"本轮失效形态不在其设计检测范围内"（实测同 session 最大 exact 重复仅 9 次，远低于阈值 20），不是配置/时序问题，但也意味着它对本轮实际问题基本无效；唯一目前完全没有机制覆盖的一类失效是超长 thinking 原地复读（无固定工具调用，loopDetection 和精确匹配的 PRM 规则都覆盖不到）；`postCompactionGuard` 确认不适用于 07-29 的压缩死循环，那个问题仍无对策；"verbose CoT 自我强化"假说已被 n=342 全量数据推翻，真实模式是"失败轨迹在训练后期变长"这一更窄的现象，尚无对应修复；PRM 规则 3 已实现但尚未用真实训练验证效果）
@@ -1446,10 +1454,12 @@
 
 ### 产出
 - `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）
-- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 条目
+- `scripts/prepare_openclaw_test_scripts.sh`：`FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义
+- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 两条条目
 
 ### 未验证
 - [ ] PRM 规则 3 能否在真实训练里正确识别并惩罚 NO_REPLY 误用（已实现，待真实训练验证）
+- [ ] `FIRST_MESSAGE_TEMPLATE` 改动能否降低"短答/只给 answer"类失效的出现频率（已实现，待真实训练验证）
 - [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
 （其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 
