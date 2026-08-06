@@ -155,6 +155,21 @@ eval_score_new = eval_score_old + (
     '                        _CYAN, session_id, turn_num, eval_score, _RESET,\n'
     '                    )\n'
     '                    eval_score = -1.0\n'
+    '\n'
+    '            # --- openclaw-rl-truncation-penalty (2026-08-06, temporary, safe to remove) ---\n'
+    '            # docs/issues_log.md 2026-08-06 条目。顶格截断（finish_reason==length）时\n'
+    '            # 模型还没说完就被生成上限切断，不能代表这是一次完整、正确的回答——即使\n'
+    '            # 判官因为看到的内容凑巧"看起来还行"给了正分也不该采信。已用真实数据实锤\n'
+    '            # 过至少 2 条顶格样本被误判 +1（rtok=8197，同一句话原样重复 12/45 次，\n'
+    '            # 明显是空转被切断，不是正常完成）。这条独立于"同句原样重复 >= N 次"这条\n'
+    '            # 候选规则（后者的安全阈值还没标定，尚未启用，见同一条 issues_log 记录）。\n'
+    '            if turn_data.get("is_truncated"):\n'
+    '                logger.info(\n'
+    '                    "%s[openclaw-rl-truncation-penalty] session=%s turn=%d "\n'
+    '                    "truncated (finish_reason=length) -- overriding eval_score %.1f -> -1.0%s",\n'
+    '                    _CYAN, session_id, turn_num, eval_score, _RESET,\n'
+    '                )\n'
+    '                eval_score = -1.0\n'
 )
 text = text.replace(eval_score_old, eval_score_new, 1)
 

@@ -84,6 +84,28 @@ _RL_META_RE = re.compile(r"\\[RL-TRAINING-META\\] session_id=(\\S*) turn_type=(\
 # 不敏感，允许以空白分隔的重复 token）。
 _NO_REPLY_ONLY_RE = re.compile(r"^\\s*NO_REPLY(?:\\s+NO_REPLY)*\\s*$", re.IGNORECASE)
 
+# openclaw-rl-shadow-sentence-repeat（2026-08-06，temporary，observability only）：
+# 句子切分正则，跟 docs/issues_log.md 2026-08-06 条目里人工统计"同句原样重复
+# 几次"用的口径一致（按句末标点/换行切分，只统计长度 >= min_len 的句子）。
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\\s+|\\n+")
+
+
+def _max_sentence_copies(text, min_len=40):
+    """Max number of times any single normalized sentence (len >= min_len)
+    repeats verbatim within `text`. Mirrors the manual analysis methodology in
+    docs/issues_log.md 2026-08-06 so results are directly comparable. Pure
+    text statistic -- does not read or affect eval_score/reward.
+    """
+    if not text:
+        return 0
+    counts = {}
+    for raw in _SENTENCE_SPLIT_RE.split(text):
+        sentence = raw.strip()
+        if len(sentence) < min_len:
+            continue
+        counts[sentence] = counts.get(sentence, 0) + 1
+    return max(counts.values()) if counts else 0
+
 
 def _extract_session_id_from_system_prompt(messages):
     """Fallback session id when X-Session-Id/body.session_id/RL-TRAINING-META
@@ -431,6 +453,22 @@ tool_calls_log_new = (
     '                _is_invalid_tool_use = True\n'
     '\n'
     '            self._last_tool_call[session_id] = _cur_call\n'
+    '\n'
+    '        # --- openclaw-rl-shadow-sentence-repeat (2026-08-06, temporary, safe to\n'
+    '        # remove) --- docs/issues_log.md 2026-08-06 条目：为"同句原样重复 >= N 次\n'
+    '        # 强制判负分"这条候选规则收集校准数据。之前只有 repeat-thinking/TRUNCATED\n'
+    '        # 两条路径能拿到 reasoning 全文，是有偏子集（唯二拿到的"+1"全文样本本身都是\n'
+    '        # 顶格误判 +1，不能代表真正做对的长 thinking）。这里对每一个 turn 都算一次\n'
+    '        # 统计量（不需要 dump 全文，只是切句计数，代价接近零），覆盖全量、无偏，\n'
+    '        # 不改 reward/训练逻辑，纯 observability。位置放在 tool_calls 判断之外，\n'
+    '        # 确保没有工具调用的纯文本 turn（比如规则 3 的 NO_REPLY 情形）也会被记录。\n'
+    '        logger.info(\n'
+    '            "[openclaw-rl-shadow-sentence-repeat] session=%s turn_type=%s "\n'
+    '            "thinking_chars=%d max_sentence_copies=%d finish_reason=%s "\n'
+    '            "is_invalid_tool_use=%s",\n'
+    '            session_id, turn_type, len(reasoning), _max_sentence_copies(reasoning),\n'
+    '            _finish_reason, _is_invalid_tool_use,\n'
+    '        )\n'
 )
 text = text.replace(tool_calls_log_old, tool_calls_log_new, 1)
 
@@ -505,6 +543,10 @@ turn_data_new = (
     '                # openclaw-rl-invalid-tool-use-penalty (2026-07-27): see comment\n'
     '                # near _is_invalid_tool_use above.\n'
     '                "is_invalid_tool_use": _is_invalid_tool_use,\n'
+    '                # openclaw-rl-truncation-penalty (2026-08-06, temporary, safe to\n'
+    '                # remove): finish_reason == "length" 说明模型还没说完就被切断，\n'
+    '                # 见 docs/issues_log.md 2026-08-06 条目。\n'
+    '                "is_truncated": _finish_reason == "length",\n'
     '            }\n'
 )
 text = text.replace(turn_data_old, turn_data_new, 1)

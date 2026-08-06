@@ -2522,6 +2522,43 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-06] "超长 thinking 原地复读"讨论结论：本轮只做顶格截断强制判负分 + shadow 统计日志，生成阶段重复惩罚和句重复正式规则都推迟到下一轮
+
+**背景：** 承接同日早些时候"loopDetection 零触发根因确认"条目里标出的遗留问题——超长 thinking 原地复读目前没有任何机制覆盖（loopDetection 看不见没有固定工具调用的纯文本空转，精确匹配的 PRM 规则也抓不住内容不断变化的复读）。用户让 workspace 的 CLI 拉了具体原文样本（`separate_student_20260805_204436` 的 `reasoning_samples/`，P57 turn3/5/8、P58 turn4、P59 turn5，外加 P57 turn7 顶格截断对照）并做了统计分析，随后讨论该用什么方案。
+
+**原文分析结果（CLI 提供，已核实）：**
+1. **重复粒度两种都有，主体是"换皮语义空转"**：逐字/近逐字重复的具体句子存在（如 "But the problem says to return a tool call." 重复 17 次），但更大量的篇幅是同一个卡点反复用不同措辞绕（要不要再 read、用户是不是还要答案……），纯字符串规则盖不住大部分长度。
+2. **单 turn 内空转 + 跨 turn 卡死两层都有，但机制不同**：单次生成内部能自己写到 1-3 万字在论证同一件事，这是长度的主要来源；跨 turn 虽然连续多轮在干同一件事（反复 read 同 path），但相邻 turn 的 reasoning 文本彼此并不像（SequenceMatcher ratio 仅 0.02-0.15）——是"状态卡住"不是"文本复制粘贴"，说明跨 turn 层面该比的是动作/路径重复（Rule 1a 已经在管），不是跨 turn 文本相似度。
+3. **多数长负样本是自然结束，不是被截断**：`th>10k & eval_score=-1` 的确认样本 `rtok` 在 2551-6458，远未顶格且无 TRUNCATED 日志，推断 `finish_reason=stop`；真正 `finish_reason=length` 的顶格样本在这几题上反而更少，且其中至少 2 条被误判成 `+1`（P58 turn3: `rtok=8197, score=+1, max_sentence_copies=12`；类似地另一条 `max_sentence_copies=45`）。
+
+**能否用"句子精确重复 ≥ N 次"定安全阈值：不能，现有日志定不了。** 全文 reasoning 目前只在两条路径下才会被 dump：`repeat-thinking`（精确重复 tool_call 时触发）和 TRUNCATED（`finish_reason=length` 时触发）——这是 07-16/07-24 两个调试补丁自身的设计限制，不是查漏。核实结果：`eval_score=+1` 全量配对里只有 2/190（1.1%）有全文 dump，且这 2 条都是顶格误判 +1（毒样本），不是"正常写对作业的长 thinking"；`+1 & th≥10k` 的 45 条里 43 条根本没有原文可看。**用这 2 条污染样本的重复次数（12、45）去反推"真正好答案最多自然重复几次"是不成立的**，同意 CLI 不强行凑阈值的判断。
+
+**为什么"多打负分"这条路本身可能不够（补一句结构性原因）：** `-1` 样本的 thinking 长度随训练推进不降反升（早期均值 5665 → 晚期 9996 字符），如果负分惩罚真的在压制这个行为，应该看到相反趋势。合理解释：RL 稀疏标量奖励对"抑制某种具体生成行为"是弱信号，尤其这次复读是语义换皮（每次具体token序列都不同），策略模型很难从"这次这一大段话被打 -1"里提炼出"以后别绕圈子"这个通用行为准则；且训练全程 KL 系数为 0，没有锚定参考模型的力，进一步降低了负分对这类退化生成的约束力。这意味着**生成阶段的直接干预可能是必要的补充，不能只指望打分层事后纠正**。
+
+**生成阶段重复惩罚（`repetition_penalty`/`frequency_penalty`）——本轮先不加，理由：**
+1. 核实采样现状（`training.log` 里 SGLang 打印的 `default chat sampling params`）：`repetition_penalty=1.0`（中性/未启用）、`temperature=0.6`、`top_k=20`、`top_p=0.95`；训练脚本（`run_qwen3_4b_openclaw_topk_select.sh`/`run_openclaw_topk_select_modelfactory.sh`）均未显式设置这些参数，是模型默认值，不是论文脚本定死的旋钮——加惩罚属于主动新增控制，需要按复现忠实性单独记账，不是版本漂移修复。
+2. 论文主方法（topk-select）依赖对同一 prompt 采样 k=4 候选、靠彼此差异做 group-relative 打分选优；惩罚调太猛会压低采样多样性，可能伤到 RL 训练本身依赖的探索空间，副作用可能比"修复复读"这个收益更大。
+3. 本轮复读的主体是语义换皮（不同数据显示跨 turn 文本相似度极低），`repetition_penalty` 更擅长压制 token/短语级的字面复读，对"换句话再说一遍"这种复读可能偏弱，力度也难以一次调对。
+→ 决定：下一轮单独、小步评估（极轻力度，如 `repetition_penalty 1.05-1.1` 或很小的 `frequency_penalty`），配合 shadow 统计对比句重复次数/长度/+1 率的变化，再决定是否保留。
+
+**决策：本轮只做两项低风险、不依赖未知阈值的修复：**
+
+1. **顶格截断强制 -1**（`is_truncated`）：`finish_reason == "length"` 时模型还没说完就被切断，不能代表这是完整正确的回答，即使判官凑巧给了正分也不该采信。解决的是一个独立的小问题（顶格 +1 污染，全量占比约 0.58%-1%），不解决"原地复读"本身（多数长负样本本来就不是顶格），但便宜、精确、该做——顺带清掉了污染句重复阈值校准数据的 2 条毒样本。
+2. **Shadow 统计日志**（不改 reward）：对每一个 turn（不限 score、不限是否有 tool_calls）都计算 `max_sentence_copies`（同句原样重复最多几次，句子按标点/换行切分、只统计长度 ≥40 的句子，跟人工分析口径一致），连同 `finish_reason`、`is_invalid_tool_use`（是否已被 Rule 1a/1b/2a/2b/3 判负）一起打一行日志。之前只有 repeat-thinking/TRUNCATED 两条路径能看到全文，是有偏子集；这里改成对全量 turn 都算一次统计量（不用 dump 全文，只是切句计数，代价接近零），能拿到无偏的完整分布。**目的是给下一轮定"句子精确重复 ≥ N 次强制判负分"这条候选规则的安全阈值**——预期 N 会明显高于本次污染样本看到的 4（很可能要 ≥8-12，或"重复次数 ≥N 且 thinking 长度 ≥某阈值"的双条件），但要等这轮 shadow 数据回来、看到干净的 +1 样本分布之后才能定。
+
+**明确推迟到下一轮的项目：**
+- 句子精确重复 ≥N 次强制判负分的正式规则（方向类似 Rule 1a，同一哲学，但阈值 N 待 shadow 数据定）
+- 生成阶段 `repetition_penalty`/`frequency_penalty`（上面已说明理由和风险）
+- CLI 额外提出、属于"减少坏样本产出"而非"事后打分"的编排类杠杆（同一 session 进批占比上限、Rule 1a 命中后提前结束该 turn 或降权入队、Student 侧连续无进展熔断）——方向合理，但本轮不做，先看两项低风险修复 + shadow 数据的效果再评估要不要加。
+
+**实现：**
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `_max_sentence_copies()`（模块级 helper，句子切分正则 + 长度过滤 + 计数，纯文本统计不读写 reward）；`turn_data` 新增 `"is_truncated": _finish_reason == "length"`；在 `if tool_calls:` 判断之外新增一行 `[openclaw-rl-shadow-sentence-repeat]` 日志，对每个 turn 都打印 `session_id/turn_type/thinking_chars/max_sentence_copies/finish_reason/is_invalid_tool_use`。
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-truncation-penalty` 覆盖块，读取 `turn_data.get("is_truncated")`，命中时强制 `eval_score = -1.0`（跟 `is_invalid_tool_use`/`tool-error-penalty` 是同一模式）。
+
+**验证：** 用真实官方源码模拟生成两个补丁脚本，均无报错；`py_compile` 两个生成文件均编译通过；独立测试 `_max_sentence_copies()` 复现了 CLI 报告的原始数字（"But the problem says to return a tool call."×17 → 17，"Now the user is asking to read the file again."×5 → 5），短句正确被 `min_len=40` 过滤（返回 0）；`grep`/`Read` 确认新代码缩进正确——shadow 日志语句位于 `if tool_calls:` 判断之外（8 空格缩进，跟 `if tool_calls:` 同级），确保无工具调用的纯文本 turn（含规则 3 的 NO_REPLY 情形）和 `turn_type=="side"` 的 turn 也会被记录，不会因为在 if 分支里而被跳过。**尚未用真实训练验证**——下次训练需要观察 `[openclaw-rl-truncation-penalty]` 日志是否对顶格样本生效，以及收集 `[openclaw-rl-shadow-sentence-repeat]` 全量数据供下一步定阈值。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

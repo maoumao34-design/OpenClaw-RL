@@ -1434,15 +1434,27 @@
 - `scripts/prepare_openclaw_test_scripts.sh`：`FIRST_MESSAGE_TEMPLATE` 把"Show me the answer first"改成"Show me your full solution with all the steps first"，其余文案不变
 - 均已用真实官方源码模拟生成 + `py_compile` 验证通过
 
+**"超长 thinking 原地复读"的完整讨论结论：** 用户让 CLI 拉了具体原文样本分析后（P57/58/59 若干 turn 全文），确认重复形态是"跨 turn 状态卡住 + 单 turn 内语义换皮空转"混合，不是简单的逐字复读——跨 turn 的 reasoning 文本彼此并不像（SequenceMatcher 0.02-0.15），该管跨 turn 卡死的是动作/路径重复（Rule 1a 已覆盖），单 turn 内部的换皮空转才是真正没人管的缺口。尝试用"句子精确重复次数"给这个缺口定安全阈值时发现：**全文 reasoning 目前只在两条有偏路径（repeat-thinking/TRUNCATED）下才会被记录**，`+1` 样本里只有 2/190 有全文、还都是顶格误判的毒样本，定不出干净基线。同时确认负分样本长度随训练不降反升（早期 5665→晚期 9996 字符），说明纯打分层的事后惩罚可能不足以压制这类退化生成，生成阶段的直接干预（如 `repetition_penalty`）是需要认真考虑的补充方向，但核实采样现状后（`repetition_penalty=1.0` 中性未启用，训练脚本从未碰过）判断本轮不动它——topk-select 方法依赖 k=4 采样多样性，惩罚调猛了可能伤探索、且力度难以一次调对，何况本轮复读主体是语义换皮而非字面 token 复读，`repetition_penalty` 对此可能偏弱。
+→ 详见 [`issues_log.md`](issues_log.md) 又一条 2026-08-06 条目
+
+**决策：本轮只做两项不依赖未知阈值的低风险修复，句重复正式规则和生成阶段惩罚都推迟到下一轮看 shadow 数据再定：**
+1. 顶格截断（`finish_reason=="length"`）强制 `eval_score=-1`——解决的是独立的"顶格 +1 污染"问题（全量占比约 1%），不解决复读本身，但便宜精确、顺带清掉了污染阈值校准的 2 条毒样本
+2. Shadow 统计日志：对每个 turn 无条件计算并记录 `max_sentence_copies`（同句原样重复次数，跟人工分析同一口径）+ `finish_reason` + `is_invalid_tool_use`，不改 reward，纯 observability，为下一轮定"句子重复 ≥N 次判负分"规则的安全阈值收集无偏全量数据
+
+**实现：**
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `_max_sentence_copies()` helper；`turn_data` 新增 `is_truncated` 字段；新增 `[openclaw-rl-shadow-sentence-repeat]` 日志（放在 `if tool_calls:` 判断之外，确保纯文本 turn 也被记录）
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-truncation-penalty` 覆盖块，读取 `is_truncated` 强制 `eval_score=-1.0`
+- 均已用真实官方源码模拟生成 + `py_compile` 验证通过；`_max_sentence_copies()` 独立测试复现了 CLI 报告的原始数字（×17→17，×5→5）
+
 **下一步：**
-1. 提交新训练，验证 NO_REPLY 规则 3、`FIRST_MESSAGE_TEMPLATE` 改动是否生效（training.log 里对应日志/短答现象出现频率是否下降）
-2. **仍待讨论方向**：超长 thinking 原地复读目前完全没有对策（loopDetection 和现有 PRM 规则都覆盖不到），需要另外想办法（比如基于相似度而非精确匹配的检测，或别的思路）——本次讨论中途先插入了 FIRST_MESSAGE_TEMPLATE 这个独立修复，原问题本身还没有方案
-3. "force -1 on 顶格截断样本"这条用户提出的方案：已评估为合理可加但不解决主要矛盾（顶格样本太少，不是主因），是否实施待用户决定
+1. 提交新训练，验证 NO_REPLY 规则 3、`FIRST_MESSAGE_TEMPLATE` 改动、顶格截断规则是否生效，并收集 `[openclaw-rl-shadow-sentence-repeat]` 全量数据
+2. 数据回来后：用干净的 +1/-1 分布定"句子重复 ≥N 次"规则的安全阈值 N，再评估是否要加生成阶段的轻力度 `repetition_penalty`
+3. CLI 提出的编排类杠杆（同 session 进批占比上限、Rule 1a 命中后提前结束/降权、Student 侧无进展熔断）——方向合理，本轮不做，待前两项效果明确后再评估
 
 ## 当前状态（2026-08-06）
 
 ### 已就绪
-（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）+ `FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义均已实现并本地验证）
+（同 07-29，未变——见上方"历史状态（2026-07-29）"完整列表。另加：答辩用训练循环图两处表述问题已根据反馈修正；`tools.loopDetection` 开启 + `student_chat.py` 单题异常容错 + PRM 规则 3（NO_REPLY 误用判负分）+ `FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义 + 顶格截断强制判负分 + shadow 句重复统计日志均已实现并本地验证）
 
 ### 已知限制 / 未解决
 （同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表。另加：`tools.loopDetection` 确认零触发根因是"本轮失效形态不在其设计检测范围内"（实测同 session 最大 exact 重复仅 9 次，远低于阈值 20），不是配置/时序问题，但也意味着它对本轮实际问题基本无效；唯一目前完全没有机制覆盖的一类失效是超长 thinking 原地复读（无固定工具调用，loopDetection 和精确匹配的 PRM 规则都覆盖不到）；`postCompactionGuard` 确认不适用于 07-29 的压缩死循环，那个问题仍无对策；"verbose CoT 自我强化"假说已被 n=342 全量数据推翻，真实模式是"失败轨迹在训练后期变长"这一更窄的现象，尚无对应修复；PRM 规则 3 已实现但尚未用真实训练验证效果）
@@ -1453,13 +1465,15 @@
 3. 其余同 07-29（见上方"历史状态（2026-07-29）"完整列表）
 
 ### 产出
-- `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）
+- `scripts/prepare_patched_openclaw_opd.sh`：新增规则 3（NO_REPLY 误用判负分）+ 顶格截断标记（`is_truncated`）+ shadow 句重复统计日志
 - `scripts/prepare_openclaw_test_scripts.sh`：`FIRST_MESSAGE_TEMPLATE` 去 bare-answer 歧义
-- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 两条条目
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-truncation-penalty` 覆盖块
+- 详细核实过程见 [`issues_log.md`](issues_log.md) 2026-08-06 三条条目
 
 ### 未验证
 - [ ] PRM 规则 3 能否在真实训练里正确识别并惩罚 NO_REPLY 误用（已实现，待真实训练验证）
 - [ ] `FIRST_MESSAGE_TEMPLATE` 改动能否降低"短答/只给 answer"类失效的出现频率（已实现，待真实训练验证）
+- [ ] 顶格截断强制判负分是否生效、shadow 句重复统计日志能否覆盖全量无偏分布（已实现，待真实训练验证）
 - [ ] `student_chat.py` 单题异常容错后，训练能否在某题崩溃后继续跑完剩余题目（已实现，待真实训练验证）
 （其余同 07-29，未变，见上方"历史状态（2026-07-29）"完整列表）
 
