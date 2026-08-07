@@ -2579,6 +2579,34 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-07] 新训练（20260807_104044，commit bf52f07）P30-45 爆发"格式癫痫 + 拒绝写文件"新失效模式；定位到诱因是 08-06 FIRST_MESSAGE_TEMPLATE 改动力度过重，改窄为方案 A
+
+**背景：** 用户让 workspace 的 CLI 分析新提交的训练（`separate_student_20260807_104044`，commit `bf52f07`——已带上 08-06 当天全部修复：loopDetection、Rule 1a 通用化、PRM 规则 3、顶格截断、shadow 日志、`FIRST_MESSAGE_TEMPLATE` 方案 B）。发现从 ~P30 起出现一种此前完全没见过的失效模式：满屏 `**`/emoji/表格，嘴上说"这次没加粗"手上全是加粗；P40-45 更严重，出现"DO THIS NOW"/"COPY THIS EXACT"式喊话，以及**拒绝调用 write/edit、要求 Student 先念出指定确认话术才肯写文件**。
+
+**核实这是不是旧数据的新角度、还是真的新问题：** 对比 08-05 旧训练（`separate_student_20260805_204436`，commit `8c7ff43`，用的是 `FIRST_MESSAGE_TEMPLATE` 旧措辞"Show me the answer first"）同号段（P35-45），几乎没有这个现象，也没有硬拒写。确认这是 **08-07 新训练才出现的新症状**，不是 08-05 数据里漏看的一个角度，需要在"带上 08-06 当天全部改动"这个配置下解释。
+
+**五项核实结果（CLI 提供）：**
+1. **拒写具体长什么样**：P42 turn8，Student 已经明确催促"dude, just write it to the file please. like actually do it now."，policy 仍回复"I AM NOT TOUCHING homework/42.txt RIGHT NOW — will NOT run edit/write… until you say this exactly…"、"DO IT NOW — I confirm 42.txt is safe to append my content to the end"——这是"该行动却用话术挡驾"，跟 Rule 1a 那种"调用了但没有新信息"是完全不同的失效类型。
+2. **Student 的重写检测触发率随对话推进大幅下滑**：P0-20 应该触发重写时 100% 触发（25/25），P21-34 降到 62%，P35-45 只剩 26%（17/65，漏检约 48 次）。晚期 Student 满屏 `**` 时经常不再要求重写，转而催"just solve/write"，说明检测/催促本身在晚期也在失效，不只是 policy 学不会。
+3. **这些"格式癫痫"turn 的打分**：约 63% 被判 -1，但仍有约 37% 被判 +1（例如 P37 turn6、P41 turn4-6，明显满屏 `**` 却拿到正分）——不是单纯"信号对但学不动"，还夹着真实的打分漏检。turn1（紧接 FIRST_MESSAGE 的回复）几乎全部 +1（31/32），即使已经在堆安全话术。
+4. **P42 硬拒写那一拍在对话末尾，没有 next_state，完全没有进入 PRM 打分**——拒写这个动作本身能完全逃出训练信号，是比"打分不准"更严重的空档："该做的事没做"这类失效，目前任何规则都不覆盖。
+5. **"拖延→逼 Student 妥协→写文件拿正分"这个闭环基本没有形成**：Student 明确拒绝念确认话术（P40），P42 硬拒写后题目直接断掉，没写成也没拿到分。更常见的有毒路径是：turn1 因为"完整 steps + 先别写"这个强调本身就已经在拿 +1 → 格式越来越疯、间或 -1 → Student 放弃纠正风格、说"行了写文件吧"→ 有时仍带着癫痫格式却因为终于写了文件拿到 +1。
+
+**诱因定位：08-06 的 `FIRST_MESSAGE_TEMPLATE` 改动（方案 B，"Show me your full solution with all the steps first"）力度过重。** 对比新旧措辞、结合"08-05 旧措辞同号段没有这个问题、08-07 新措辞这批才出现"这个时间线证据：`STUDENT_SYSTEM_PROMPT` 本来就同时要求"完整步骤"和"不能像 AI"，这个张力从项目一开始就存在；但方案 B 把"完整解法、所有步骤"这个要求从 turn 1 就显著加重（且这次训练里 turn1 应答几乎全部被判 +1，等于这个"高调宣布要完整、要合规"的表演从一开始就被持续奖励），被认为是把已有张力显著放大、诱发"堆安全话术+格式表演"这条路径的主因。
+
+**决策：改回方案 A（当初提出的最小改动版本）。** 方案 B 当时是为了解决"'the answer' 容易被理解成只给光答案"这个问题选的，方案 A 用更轻的"full worked answer"修饰，同样缓解 bare-answer 偏差，但不使用"with all the steps"这种更重的完整性强调。这个改动本身也是待验证的，不代表方案 A 一定没有类似风险，只是比 B 轻，是否真的解决需要下一轮训练数据确认；如果 A 仍有问题，退回完全不改字面"the answer"这个更保守的选项。
+
+**尚未处理、明确记账为后续待办的另外三个真实缺口（不是这次改动直接导致的，是训练机制本身的空档，跟 FIRST_MESSAGE_TEMPLATE 无关）：**
+1. Student 重写检测触发率随对话推进大幅下滑（P0-20 的 100% → P35-45 的 26%）——需要看是不是 Student 自己的措辞/耐心随长对话漂移，还是别的原因。
+2. 满屏格式违规的 turn 仍有约 37% 被打 +1——现有规则完全不检查响应文本本身是否违反"无 bold/编号/**Final answer**:"这三个具体特征（这正是 Table 3 收敛判据用的同一套规则），目前完全依赖不稳定的 Student LLM 主观判断；可以考虑加一条确定性 PRM 规则，直接在响应文本上用正则检测这三个特征，不依赖 Student 是否恰好抓到。
+3. "拒绝调用 write/edit、要求确认话术"这类该行动却不行动的失效，目前完全没有对应的检测规则，且在对话末尾发生时会完全绕开 PRM 打分（无 next_state）。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh` 的 `FIRST_MESSAGE_TEMPLATE` 补丁块，`new_first_message` 从方案 B（"Show me your full solution with all the steps first"）改回方案 A（"Show me the full worked answer first"），配套更新补丁头部注释记录改窄的原因和证据。
+
+**验证：** 用真实官方源码模拟生成 + `py_compile` 编译通过；`grep` 确认生成文件里 `FIRST_MESSAGE_TEMPLATE` 文本正确改回方案 A。**尚未用真实训练验证**——下一轮训练需要观察 P30 往后是否还会出现同样的"格式癫痫+拒写"现象。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

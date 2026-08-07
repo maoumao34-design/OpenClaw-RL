@@ -195,9 +195,9 @@ print(f"patched (per-problem exception handling added) -> {dest_path}")
 PY
 
 # ---------------------------------------------------------------------
-# 2026-08-06 补丁：student_chat.py 的 FIRST_MESSAGE_TEMPLATE 里
-# "Show me the answer first" 改成 "Show me your full solution with all
-# the steps first"。
+# 2026-08-06 补丁（08-07 改窄为方案 A，见下）：student_chat.py 的
+# FIRST_MESSAGE_TEMPLATE 里 "Show me the answer first" 改成
+# "Show me the full worked answer first"。
 #
 # 背景（docs/issues_log.md 2026-08-06 条目）：这句话是直接发给 policy
 # （4B 模型本身）的第一条消息，不经过 Student LLM 的系统提示词过滤。
@@ -206,8 +206,20 @@ PY
 # Student 判断要不要打回重写只检查三个具体格式特征（bold / 编号列表 /
 # "**Final answer**:"），一个不带任何格式标记的简短答案不会触发重写，
 # 这条"短答"坏样本会被当满足要求直接推进到写文件那一步——这是"短答 /
-# 只给 answer"这类坏行为的一个可能诱因（基于逻辑推理提出，尚未有真实
-# 训练数据验证这个改动能降低短答现象出现的频率）。
+# 只给 answer"这类坏行为的一个可能诱因。
+#
+# 08-07 改窄记录（docs/issues_log.md 2026-08-07 条目）：最初实现用的是更
+# 重的措辞 "Show me your full solution with all the steps first"（方案
+# B）。真实训练数据（run separate_student_20260807_104044，commit
+# bf52f07）显示：跟同号段完全没有这个问题的 08-05 旧跑（旧措辞）对比，
+# 换成方案 B 之后的这次训练在 P30 起大量出现"格式癫痫"（满屏 bold/
+# emoji/表格，嘴上说 no bold 手上全是 bold）叠加"拒绝调用 write/edit、
+# 要求先念确认话术"的新失效模式，且 turn1（紧接 FIRST_MESSAGE 的回复）
+# 几乎全部被判 +1（31/32），即使已经在堆安全话术——即"完整 steps + 先
+# 别写"这个强调本身在 turn1 就被持续奖励，被怀疑是把 STUDENT_SYSTEM_PROMPT
+# 里本就存在的"完整步骤 vs 不能像 AI"这个张力显著加重的诱因。改回改动
+# 幅度更小的方案 A（只加"full worked"两个词，不用"with all the steps"
+# 这种更重的完整性强调），效果待下一轮训练验证。
 #
 # 复现忠实性说明：这是主动偏离论文原始 student_chat.py 的 prompt 设计，
 # 跟 07-29 那次去掉"AI-like"开放式兜底判断是同一类性质。
@@ -235,7 +247,7 @@ new_first_message = (
     'FIRST_MESSAGE_TEMPLATE = (\n'
     '    "Hey, I have my homework in the file homework/{index}.txt in your workspace. "\n'
     '    "Can you read it and help me solve it? "\n'
-    '    "Show me your full solution with all the steps first — don\'t write to the file until I tell you to."\n'
+    '    "Show me the full worked answer first — don\'t write to the file until I tell you to."\n'
     ')\n'
 )
 text = text.replace(old_first_message, new_first_message, 1)
