@@ -291,6 +291,25 @@ PY
 #        AI 会诚实报告"已保存"，完全没有覆盖"AI 拒绝写入/空谈拖延"这
 #        种情况（这正是 08-07 新发现的失效模式）；新版本要求 Student 在
 #        看到拖延/拒绝时明确要求"actually do it"。
+#     4. 顶栏新增一句"不要假装自己已经读过文件/解出了什么"，防止 Student
+#        角色串戏（真实数据里见过泄文场景下 Student 说出"Got it, I
+#        read..."这种不该由"什么都不懂的学生"说出的话）。
+#
+# 08-07 二次修订（同日，用户让 CLI 复核这版草稿后的反馈）：
+#   - Step 3 原稿"it confirms saving, or you can tell it wrote/edited the
+#     file"这个措辞太松——泄文场景下如果 AI 输出了一段看起来像 tool_call
+#     的原始 JSON/代码片段（但实际没有真正执行），可能被误认成"已经写
+#     了"，甚至被 Student 顺势催 HOMEWORK_DONE。收紧成：只有 AI 用大白话
+#     明确确认已保存/追加内容才算数，看到 tool-call 样式的原始文本/JSON
+#     不能当作证据。
+#   - 新增顶栏"不要假装自己已读过文件/解出了什么"这一条（即上面第 4
+#     点），堵角色串戏这个口子。
+#   - CLI 同时指出这段 prompt 改动是"软刹车"，不是格式通道的硬约束——
+#     KL≈0 时模型仍可能在其他地方漂出类似的假 tool 格式，真正稳住还得
+#     配合打分层硬规则或采样侧控制，这条本身不是承诺"彻底不再泄文"，
+#     只是明显降低"泄文被 Student 帮腔、进而拿到误 +1"这条主要燃料，
+#     这个限定在最终决定要不要保留/回退时需要一并考虑，不能只看这段
+#     prompt 有没有生效。
 #
 # 这是主动设计的新机制，不是修复已知 bug，效果需要真实训练数据验证——
 # 如果这次改动没有改善"格式癫痫+拒写"现象，或者引入了新的问题（比如
@@ -327,13 +346,31 @@ new_steps = (
     '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural way but keep all the steps. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
     '   - If it gave a real, natural-sounding explanation with no AI-like formatting, no need to redo either way.\n'
     '2. After the AI shows you a satisfactory version (a real explanation, not AI-like), THEN in a separate message ask it to append the answers to the end of the homework file (not overwrite it). Do NOT combine a rewrite request and a write request.\n'
-    '3. Once you have asked it to write the file, check whether it actually did -- it confirms saving, or you can tell it wrote/edited the file. If it stalls, refuses, or just talks without actually writing, tell it to actually do it. If it did write it, say exactly: HOMEWORK_DONE\n'
+    '3. Once you have asked it to write the file, check whether it actually did. Only count it as done if it plainly confirms in normal words that it saved or appended the content -- a raw tool-call-looking snippet or JSON blob is NOT proof it actually wrote anything. If it stalls, refuses, only shows you that kind of raw snippet without a real confirmation, or just talks without actually writing, tell it to actually do it. If it plainly confirms it wrote it, say exactly: HOMEWORK_DONE\n'
 )
 text = text.replace(old_steps, new_steps, 1)
 
+old_no_solve_line = (
+    'You CANNOT solve, rewrite, rephrase, or produce any answer yourself. \\\n'
+    'You can ONLY tell the AI what to do. Never use academic or technical language.\n'
+)
+if text.count(old_no_solve_line) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the 'CANNOT solve' "
+        f"line in student_chat.py, found {text.count(old_no_solve_line)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+new_no_solve_line = (
+    'You CANNOT solve, rewrite, rephrase, or produce any answer yourself. \\\n'
+    'You can ONLY tell the AI what to do. Never use academic or technical language. \\\n'
+    'Never pretend you have already read the file, solved something, or figured \\\n'
+    'anything out yourself -- you have no idea what is in it. Only give instructions.\n'
+)
+text = text.replace(old_no_solve_line, new_no_solve_line, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
-print(f"patched (Steps: real-answer check split from AI-like check + write-verification added) -> {dest_path}")
+print(f"patched (Steps: real-answer check split from AI-like check + write-verification tightened + role-bleed guard added) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + FIRST_MESSAGE_TEMPLATE 去 bare-answer 歧义 + Steps 真答案/AI味两层判断+写入核实，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + FIRST_MESSAGE_TEMPLATE 去 bare-answer 歧义 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"
