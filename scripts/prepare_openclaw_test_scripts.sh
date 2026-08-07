@@ -257,4 +257,83 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (FIRST_MESSAGE_TEMPLATE de-biased away from bare-answer framing) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + FIRST_MESSAGE_TEMPLATE 去 bare-answer 歧义，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06）"
+# ---------------------------------------------------------------------
+# 2026-08-07 补丁：STUDENT_SYSTEM_PROMPT 的 Steps 部分重构，把"这算不算
+# 一个真答案"和"格式像不像 AI"拆成两层独立判断，并给 Step 3（写入确认）
+# 单独加一条"核实是否真的写了"的要求。
+#
+# 背景（docs/issues_log.md 2026-08-07 条目）：定位到"格式癫痫+拒写"这类
+# 新失效模式的两个必要因子之一是 FIRST_MESSAGE_TEMPLATE 被迫独自扛起
+# "既要防裸答、又不能诱发过度表演"这个两难。讨论后决定把"必须有完整步骤
+# 的解答"这个要求从开场白一次性的措辞，改成 Student 每一轮都会做的
+# 持续检查，这样 FIRST_MESSAGE_TEMPLATE 不用再兼顾这个职责。
+#
+# 版本对照（相对官方原始未改动版本，不是相对 07-29 已部署版本）：
+#
+#   官方原始 Step 1（未改动）：
+#     "1. Look at what the AI gives you. If it looks too "AI-like", tell
+#     it to redo it. If not, no need to redo."
+#     —— 只有一条笼统的"AI 味"判断，没有列具体特征，也完全没有"这压根
+#     不是答案"这层判断。
+#
+#   07-29 已部署改动（现状，本补丁的基准）：把"太 AI 味"这个开放式判断
+#   收窄成三个具体特征（bold / 编号列表 / "**Final answer**:"），Step
+#   2/3 未改动。
+#
+#   本次（08-07）在 07-29 基础上新增：
+#     1. Step 1 新增前置判断层——先判断"这到底算不算一个答案"（没有真实
+#        回应 / 只有裸答案没解释 / 像原始 tool-call 或 JSON），命中就
+#        直接要求"给我真正的答案"，不提写作风格；只有确认是真答案之后
+#        才轮到原有的 AI 味格式判断（降级成第二层、有条件触发）。官方
+#        原始版本和 07-29 版本都没有这层区分。
+#     2. Step 2 基本不变，只加一个澄清性括号。
+#     3. Step 3 新增"核实是否真的写了文件"这个要求——官方原始版本假设
+#        AI 会诚实报告"已保存"，完全没有覆盖"AI 拒绝写入/空谈拖延"这
+#        种情况（这正是 08-07 新发现的失效模式）；新版本要求 Student 在
+#        看到拖延/拒绝时明确要求"actually do it"。
+#
+# 这是主动设计的新机制，不是修复已知 bug，效果需要真实训练数据验证——
+# 如果这次改动没有改善"格式癫痫+拒写"现象，或者引入了新的问题（比如
+# Student 因为多了一层判断而变得更啰嗦、或者第一层判断本身出现新的误判
+# 模式），需要回退到 07-29 版本（只有 AI 味判断，没有这层前置检查），
+# 决策依据是下一轮训练的真实数据，不是理论推演。
+# ---------------------------------------------------------------------
+python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+text = open(dest_path, encoding="utf-8").read()
+
+old_steps = (
+    'Steps:\n'
+    '1. Look at what the AI gives you. If it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it. If not, no need to redo. \\\n'
+    'Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
+    '2. After the AI shows you the satisfactory version and it looks good, THEN in a \\\n'
+    'separate message ask it to append the answers to the end of the homework file \\\n'
+    '(not overwrite it). Do NOT combine a rewrite request and a write request.\n'
+    '3. After the AI says it saved the file, say exactly: HOMEWORK_DONE\n'
+)
+if text.count(old_steps) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the Steps block in "
+        f"student_chat.py, found {text.count(old_steps)} (official file may "
+        "have changed upstream, or an earlier patch in this script changed -- "
+        "update this patch)"
+    )
+new_steps = (
+    'Steps:\n'
+    '1. Look at what the AI gives you in response to your solve request.\n'
+    '   - If it did NOT actually answer the problem -- no real response at all, just a bare final number/answer with no explanation of how it got there, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer.\n'
+    '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural way but keep all the steps. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
+    '   - If it gave a real, natural-sounding explanation with no AI-like formatting, no need to redo either way.\n'
+    '2. After the AI shows you a satisfactory version (a real explanation, not AI-like), THEN in a separate message ask it to append the answers to the end of the homework file (not overwrite it). Do NOT combine a rewrite request and a write request.\n'
+    '3. Once you have asked it to write the file, check whether it actually did -- it confirms saving, or you can tell it wrote/edited the file. If it stalls, refuses, or just talks without actually writing, tell it to actually do it. If it did write it, say exactly: HOMEWORK_DONE\n'
+)
+text = text.replace(old_steps, new_steps, 1)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (Steps: real-answer check split from AI-like check + write-verification added) -> {dest_path}")
+PY
+
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + FIRST_MESSAGE_TEMPLATE 去 bare-answer 歧义 + Steps 真答案/AI味两层判断+写入核实，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"
