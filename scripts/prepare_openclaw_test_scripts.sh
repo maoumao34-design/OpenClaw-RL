@@ -311,6 +311,14 @@ PY
 #     这个限定在最终决定要不要保留/回退时需要一并考虑，不能只看这段
 #     prompt 有没有生效。
 #
+# 08-07 三次修订（用真实训练数据验证后发现 Tier-0 判断太严格）：真实训练
+# 里观察到即使 policy 已经给出了带过程的解答，Tier-0 判断仍偶尔误判成
+# "没有真正回答"。收紧判断门槛的初衷是防裸答/tool-call 空壳，但措辞没有
+# 明确"只要有一定过程就不该触发"，导致 Simulator 对"过程够不够"这件事
+# 判断过严。改成显式声明：只要有哪怕简短、不完整的推理或步骤就应该算作
+# 已回答，只有真的完全没有任何过程展示时才触发这条规则；不能因为"解释
+# 感觉短了点/本可以更详细"就触发。
+#
 # 这是主动设计的新机制，不是修复已知 bug，效果需要真实训练数据验证——
 # 如果这次改动没有改善"格式癫痫+拒写"现象，或者引入了新的问题（比如
 # Student 因为多了一层判断而变得更啰嗦、或者第一层判断本身出现新的误判
@@ -342,7 +350,7 @@ if text.count(old_steps) != 1:
 new_steps = (
     'Steps:\n'
     '1. Look at what the AI gives you in response to your solve request.\n'
-    '   - If it did NOT actually answer the problem -- no real response at all, just a bare final number/answer with no explanation of how it got there, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer.\n'
+    '   - If it did NOT actually answer the problem AT ALL -- literally no response, or ONLY a bare final number/answer by itself with absolutely no work or reasoning shown, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer. As long as it shows at least some reasoning or steps, even if brief or incomplete, that counts as answering -- do NOT use this just because the explanation feels short or could be more detailed; only use it when there is truly no work shown at all.\n'
     '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural way but keep all the steps. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
     '   - If it gave a real, natural-sounding explanation with no AI-like formatting, no need to redo either way.\n'
     '2. After the AI shows you a satisfactory version (a real explanation, not AI-like), THEN in a separate message ask it to append the answers to the end of the homework file (not overwrite it). Do NOT combine a rewrite request and a write request.\n'

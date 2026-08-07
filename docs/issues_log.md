@@ -2701,6 +2701,34 @@ function isValidEditReplacement(value) {
 
 ---
 
+## [2026-08-07] 新增规则 4：write/edit 写到旁路文件（非该 session 对应的 homework 路径）判负分；Steps 的 Tier-0 判断收紧过头，改回宽松版
+
+**背景：** 用户报了一轮新训练（带上最新 Steps 重构）的两个真实问题：一是 Rule 1a 只能抓"紧邻完全相同的 tool call"，抓不住 read↔write 交替这种模式；二是新加的 Steps Tier-0"是否真答案"判断似乎太严格，即使 policy 已经给出了带过程的解答，Student 仍偶尔误判成"没有真正回答"。
+
+**问题一，P17 实锤（session `a0b1e908`）：** 模型没有写入任务要求的 `homework/17.txt`，而是反复写入/读取一个旁路文件 `17_solution.md`。因为每一拍的工具名在 read/write 之间交替（不是"紧邻完全相同"），逃过了 Rule 1a 的检测：
+```
+T1 read 17.txt          -> +1
+T2 首次 write 17_solution.md -> +1（旁路写文件被当成"成功"）
+T3 首次 read 17_solution.md  -> +1
+T4 再 write（上一拍是 read） -> +1
+T6 又 write（上一拍是 read） -> +1
+```
+之后进入连续 read 阶段才被 Rule 1b 的 EOF 覆盖检测大量判 -1（该 session 最终 5 条 +1、38 条 -1 都提交进了训练）。**核实这不是泛泛的"交替读写逃过检测"问题，而是更具体、更好修的"写到了错误的文件路径"问题**——`FIRST_MESSAGE_TEMPLATE` 明确只要求把答案写到 `homework/{index}.txt`，写别的文件没有任何合法理由，这是任务设计层面的必然错误，不需要解决"通用无进展检测"这个更大的问题就能修。
+
+**新增规则 4：** `session_id` 本身编码了 problem_index（`student_chat.py` 里 `session_user = f"student-hw-{problem_index}-{os.getpid()}"`，经既有的 session_id 解析机制流转到 `openclaw_opd_api_server.py`），可以直接算出这个 session 唯一正确的目标路径 `homework/{index}.txt`，不需要依赖"第一次 read 的路径"这种可能被绕过的信号。规则：`write`/`edit` 的目标 `path` 如果跟这个算出来的期望路径不一致，判定为无效动作，强制 -1。正则只匹配 `student-hw-` 这个命名惯例，`TA_chat.py`/`teacher_chat.py` 等其他 session 类型自动不受影响（返回 `None`，规则不生效）。
+
+**跟"read↔write 交替逃过检测"这个更大问题的关系：** 规则 4 精确覆盖了 P17 这个具体案例（写错路径），但**不是**"跨工具无进展检测"这个更通用问题的完整解——如果模型交替 read/write 的都是正确路径（`homework/{index}.txt`）、只是内容没有实质进展，规则 4 不会触发，这类更抽象的"无进展"检测仍然是之前讨论过的、更复杂的待办项，本次不解决。
+
+**问题二，Steps Tier-0 判断过严：** 之前的措辞"no real response at all, just a bare final number/answer with no explanation of how it got there"理论上已经要求"有解释就不该触发"，但真实数据显示 Simulator 对"解释够不够"的判断偏严格，把带过程的回答也误判成"没有真正回答"。**收紧改回宽松版**：显式加一句"只要有哪怕简短、不完整的推理或步骤就该算作已回答，不能因为'解释感觉短了点/本可以更详细'就触发，只有真的完全没有任何过程展示时才用这条"。
+
+**实现：**
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `_HOMEWORK_SESSION_RE`/`_expected_homework_path()` helper + 规则 4（write/edit 路径校验，判负分）。
+- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 Tier-0 判断措辞加宽松声明。
+
+**验证：** 两个补丁均用真实官方源码模拟生成 + `py_compile` 编译通过；`_expected_homework_path()` 独立测试确认 `student-hw-17-48213` 正确解析出 `homework/17.txt`，非 `student-hw-` 格式的 session_id（如 TA session）正确返回 `None`；用 `ast` 解析打印 `STUDENT_SYSTEM_PROMPT` 运行时字符串，确认 Tier-0 收紧后的宽松声明正确拼接进对应段落。**尚未用真实训练验证**——下一轮需要观察 P17 型旁路写入是否被规则 4 正确拦截、Tier-0 误判"没有真正回答"的频率是否下降。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

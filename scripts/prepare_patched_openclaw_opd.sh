@@ -128,6 +128,24 @@ def _is_poll_style_call(tool_name, args_raw):
     return isinstance(action, str) and action.strip().lower() == "poll"
 
 
+# openclaw-rl-invalid-tool-use-penalty 规则 4（2026-08-07）：见该规则定义处
+# 的注释。student_chat.py 把 session_user 设成
+# f"student-hw-{problem_index}-{os.getpid()}"，这个值经由 Runtime 行/
+# RL-TRAINING-META 等既有机制最终成为这里看到的 session_id，所以
+# problem_index 可以直接从 session_id 里解析出来，不需要猜测或依赖"第一次
+# read 的路径"这种可能被绕过的信号。只匹配 student_chat.py 的这个命名
+# 惯例，TA_chat.py/teacher_chat.py 等其他 session 类型的 session_id 不会
+# 命中这个正则，返回 None，规则 4 对它们自动不生效。
+_HOMEWORK_SESSION_RE = re.compile(r"student-hw-(\\d+)-")
+
+
+def _expected_homework_path(session_id):
+    match = _HOMEWORK_SESSION_RE.search(session_id or "")
+    if not match:
+        return None
+    return f"homework/{match.group(1)}.txt"
+
+
 def _extract_session_id_from_system_prompt(messages):
     """Fallback session id when X-Session-Id/body.session_id/RL-TRAINING-META
     marker are all absent.
@@ -481,6 +499,26 @@ tool_calls_log_new = (
     '                self._has_spawned_subagent[session_id] = True\n'
     '            if _tool_name == "sessions_yield" and not self._has_spawned_subagent.get(session_id, False):\n'
     '                _is_invalid_tool_use = True\n'
+    '\n'
+    '            # 规则 4（2026-08-07）：write/edit 的目标 path 跟这个 session\n'
+    '            # 对应的正确 homework 文件不符 -- 判定为绕开任务要求的旁路写入。\n'
+    '            # 跟"有没有新信息"无关，是任务设计层面的必然错误：\n'
+    '            # FIRST_MESSAGE_TEMPLATE 明确只要求把答案写到\n'
+    '            # homework/{index}.txt，写别的路径没有任何合法理由。真实数据\n'
+    '            # 实锤（docs/issues_log.md 2026-08-07 条目，Problem 17、session\n'
+    '            # a0b1e908）：模型反复写入/读取旁路文件 17_solution.md 而不是\n'
+    '            # homework/17.txt，因为跟上一拍工具名不同（read/write 交替），\n'
+    '            # 逃过了规则 1a 的紧邻精确匹配检测，连续拿到 +1 进入训练。\n'
+    '            if _tool_name in ("write", "edit"):\n'
+    '                _expected_hw_path = _expected_homework_path(session_id)\n'
+    '                if _expected_hw_path is not None:\n'
+    '                    try:\n'
+    '                        _wr_args = json.loads(_tool_args_raw) if _tool_args_raw else {}\n'
+    '                    except (TypeError, ValueError):\n'
+    '                        _wr_args = {}\n'
+    '                    _wr_path = _wr_args.get("path") if isinstance(_wr_args, dict) else None\n'
+    '                    if _wr_path is not None and _wr_path != _expected_hw_path:\n'
+    '                        _is_invalid_tool_use = True\n'
     '\n'
     '            self._last_tool_call[session_id] = _cur_call\n'
     '\n'
