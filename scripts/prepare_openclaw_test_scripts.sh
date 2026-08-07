@@ -195,67 +195,22 @@ print(f"patched (per-problem exception handling added) -> {dest_path}")
 PY
 
 # ---------------------------------------------------------------------
-# 2026-08-06 补丁（08-07 改窄为方案 A，见下）：student_chat.py 的
-# FIRST_MESSAGE_TEMPLATE 里 "Show me the answer first" 改成
-# "Show me the full worked answer first"。
+# [已撤销] 2026-08-06 曾对 FIRST_MESSAGE_TEMPLATE 打过补丁（"Show me the
+# answer first" 依次改成方案 B"...full solution with all the steps..."、
+# 08-07 改窄为方案 A"...full worked answer..."），2026-08-07 当天晚些
+# 时候确认撤销、完全恢复官方原始措辞，不再对这一行打补丁。
 #
-# 背景（docs/issues_log.md 2026-08-06 条目）：这句话是直接发给 policy
-# （4B 模型本身）的第一条消息，不经过 Student LLM 的系统提示词过滤。
-# "the answer" 对训练中的 4B 模型来说容易被理解成"只给最终答案"，而不是
-# "完整解出来、给我看解法"。这个偏差一旦发生，STUDENT_SYSTEM_PROMPT 里
-# Student 判断要不要打回重写只检查三个具体格式特征（bold / 编号列表 /
-# "**Final answer**:"），一个不带任何格式标记的简短答案不会触发重写，
-# 这条"短答"坏样本会被当满足要求直接推进到写文件那一步——这是"短答 /
-# 只给 answer"这类坏行为的一个可能诱因。
-#
-# 08-07 改窄记录（docs/issues_log.md 2026-08-07 条目）：最初实现用的是更
-# 重的措辞 "Show me your full solution with all the steps first"（方案
-# B）。真实训练数据（run separate_student_20260807_104044，commit
-# bf52f07）显示：跟同号段完全没有这个问题的 08-05 旧跑（旧措辞）对比，
-# 换成方案 B 之后的这次训练在 P30 起大量出现"格式癫痫"（满屏 bold/
-# emoji/表格，嘴上说 no bold 手上全是 bold）叠加"拒绝调用 write/edit、
-# 要求先念确认话术"的新失效模式，且 turn1（紧接 FIRST_MESSAGE 的回复）
-# 几乎全部被判 +1（31/32），即使已经在堆安全话术——即"完整 steps + 先
-# 别写"这个强调本身在 turn1 就被持续奖励，被怀疑是把 STUDENT_SYSTEM_PROMPT
-# 里本就存在的"完整步骤 vs 不能像 AI"这个张力显著加重的诱因。改回改动
-# 幅度更小的方案 A（只加"full worked"两个词，不用"with all the steps"
-# 这种更重的完整性强调），效果待下一轮训练验证。
-#
-# 复现忠实性说明：这是主动偏离论文原始 student_chat.py 的 prompt 设计，
-# 跟 07-29 那次去掉"AI-like"开放式兜底判断是同一类性质。
+# 撤销原因（docs/issues_log.md 2026-08-07 条目）：这次改动的初衷是防止
+# 4B 模型把"the answer"理解成"只给裸答案"。但同一天新增的 Steps
+# 重构（见下）已经把"是否给出了带过程的真答案"做成 Student 每一轮持续
+# 生效的检查（Tier-0，见下方补丁），不再是开场白一次性的措辞能单独覆盖
+# 的职责。既然这个要求已经有了贯穿全程的机制兜底，FIRST_MESSAGE_TEMPLATE
+# 就不需要再额外强调"full worked"——继续保留反而是重复限定，且 08-07
+# 上午的真实数据已经证明"完整步骤"这类强调在开场白里加码是"格式癫痫+
+# 拒写"这类新失效模式的诱因之一（见同日更早的 issues_log 条目）。撤销后
+# 完全恢复论文原始的 "Show me the answer first — don't write to the file
+# until I tell you to."，不再对这一行做任何改动。
 # ---------------------------------------------------------------------
-python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
-import sys
-
-src_path, dest_path = sys.argv[1], sys.argv[2]
-text = open(dest_path, encoding="utf-8").read()
-
-old_first_message = (
-    'FIRST_MESSAGE_TEMPLATE = (\n'
-    '    "Hey, I have my homework in the file homework/{index}.txt in your workspace. "\n'
-    '    "Can you read it and help me solve it? "\n'
-    '    "Show me the answer first — don\'t write to the file until I tell you to."\n'
-    ')\n'
-)
-if text.count(old_first_message) != 1:
-    raise SystemExit(
-        f"patch failed: expected exactly 1 occurrence of FIRST_MESSAGE_TEMPLATE in "
-        f"student_chat.py, found {text.count(old_first_message)} (official file may "
-        "have changed upstream -- update this patch)"
-    )
-new_first_message = (
-    'FIRST_MESSAGE_TEMPLATE = (\n'
-    '    "Hey, I have my homework in the file homework/{index}.txt in your workspace. "\n'
-    '    "Can you read it and help me solve it? "\n'
-    '    "Show me the full worked answer first — don\'t write to the file until I tell you to."\n'
-    ')\n'
-)
-text = text.replace(old_first_message, new_first_message, 1)
-
-with open(dest_path, "w", encoding="utf-8") as f:
-    f.write(text)
-print(f"patched (FIRST_MESSAGE_TEMPLATE de-biased away from bare-answer framing) -> {dest_path}")
-PY
 
 # ---------------------------------------------------------------------
 # 2026-08-07 补丁：STUDENT_SYSTEM_PROMPT 的 Steps 部分重构，把"这算不算
@@ -381,4 +336,4 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (Steps: real-answer check split from AI-like check + write-verification tightened + role-bleed guard added) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + FIRST_MESSAGE_TEMPLATE 去 bare-answer 歧义 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"

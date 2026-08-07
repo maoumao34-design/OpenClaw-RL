@@ -2729,6 +2729,21 @@ T6 又 write（上一拍是 read） -> +1
 
 ---
 
+## [2026-08-07] 撤销 FIRST_MESSAGE_TEMPLATE 补丁，完全恢复论文原始措辞
+
+**背景：** `FIRST_MESSAGE_TEMPLATE` 08-06 起打过两版补丁（方案 B"full solution with all the steps"→方案 A"full worked answer"），初衷是防止 4B 模型把"the answer"理解成"只给裸答案"。同一天晚些时候，`STUDENT_SYSTEM_PROMPT` 的 Steps 重构上线，把"是否给出了带过程的真答案"做成 Student 每一轮持续生效的检查（Tier-0，见 08-07 更早的条目）——这个要求现在已经有贯穿全程的机制兜底，不再需要开场白单独扛。
+
+**决策：撤销 FIRST_MESSAGE_TEMPLATE 补丁，完全恢复论文原始措辞** "Show me the answer first — don't write to the file until I tell you to."，不再对这一行做任何改动。理由：
+1. 继续保留"full worked"这类强调是重复限定——Tier-0 已经覆盖了同一个职责。
+2. 08-07 上午的真实数据已经证明：开场白里加码"完整步骤"类强调，是"格式癫痫+拒写"这类新失效模式的诱因之一（方案 B 那次的实锤）。既然不再需要这层强调，继续留着只有下行风险、没有额外收益。
+3. 这是复现忠实性上的净收益——少一处主动偏离论文原始 `student_chat.py` 设计的地方。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh` 移除整个 FIRST_MESSAGE_TEMPLATE 补丁段（python3 heredoc），原位置留一段说明性注释记录曾经打过什么、为什么撤销，供后续查阅历史。
+
+**验证：** 用真实官方源码模拟生成，`py_compile` 编译通过；`grep` 确认生成文件里 `FIRST_MESSAGE_TEMPLATE` 逐字等于官方原始文本，没有任何改动。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
