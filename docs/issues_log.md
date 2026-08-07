@@ -2727,6 +2727,31 @@ T6 又 write（上一拍是 read） -> +1
 
 **验证：** 两个补丁均用真实官方源码模拟生成 + `py_compile` 编译通过；`_expected_homework_path()` 独立测试确认 `student-hw-17-48213` 正确解析出 `homework/17.txt`，非 `student-hw-` 格式的 session_id（如 TA session）正确返回 `None`；用 `ast` 解析打印 `STUDENT_SYSTEM_PROMPT` 运行时字符串，确认 Tier-0 收紧后的宽松声明正确拼接进对应段落。**尚未用真实训练验证**——下一轮需要观察 P17 型旁路写入是否被规则 4 正确拦截、Tier-0 误判"没有真正回答"的频率是否下降。
 
+### 后续追加（同一天）：规则 4 的 `session_id` 假设被证伪——实际取值是 UUID 不是 `student-hw-N-pid`，规则 4 部署后从未真正生效过
+
+**用户让 CLI 复核规则 4，发现一个致命 bug：训练日志里的 `session_id` 全程是 UUID（如 `a0b1e908-...`），不是上面假设的 `student-hw-{index}-{pid}`。**
+
+**根因（读源码逐层核实，非推测）：**
+1. `prepare_patched_rl_training_headers.sh`（rl-training-headers 插件补丁）第 132-135 行：`appendSystemContext` 塞进 system prompt 的 `[RL-TRAINING-META] session_id=${sessionId}...` 标记，这个 `sessionId` 来自 `ctx.sessionId ?? ""`——是 **OpenClaw 自己内部的 session 标识（UUID）**，跟 `student_chat.py` 传的 OpenAI `user` 字段完全无关。
+2. `prepare_patched_openclaw_opd.sh` 里 `session_id` 的实际派生优先级是：`x_session_id or body.get("session_id") or _rl_meta_session_id or _extract_session_id_from_system_prompt(...) or "unknown"`——`_rl_meta_session_id`（上面那个 UUID）排在 `_extract_session_id_from_system_prompt`（从 Runtime 行解析出 `student-hw-{index}-{pid}` 的那个 fallback）**前面**。只要 RL-TRAINING-META 标记正常工作（它本来就是为了正常工作而部署的），`_rl_meta_session_id` 就不会是 None，Runtime-line fallback 根本轮不到执行。
+3. 结论：`session_id` 参数从写下来那一刻起就一直是 UUID，规则 4 的 `_HOMEWORK_SESSION_RE` 对 UUID 永远匹配不上，**规则 4 部署以来是死代码，从未真正拦截过任何旁路写入**。这不影响其他规则（1a/1b/2a/2b/3/shadow 统计）——它们只把 `session_id` 当不透明字典 key 用，UUID 完全够用，不需要解析内容。
+
+**核实修法可行性（CLI 用真实落盘数据核实，非代码推理）：**
+1. **Runtime 行是不是每轮都有**：有（main 作业轮）。`qwen3_4b_topk_select_record.jsonl` 里同一 UUID session 的 turn=5 与 turn=6 的 `messages[system]`/`prompt_text` 都有完整 Runtime 行（`buildAgentSystemPrompt` 每次都会拼 `## Runtime` + `buildRuntimeLine(...)`）。没有 Runtime 行的只有 side 请求（如 context summarization），而这些请求本来就不会有 write/edit 调用，规则 4 的工具名判断天然把它们挡在外面。
+2. **解析值是否精确等于 `student-hw-{index}-{pid}`**：是，未被截断/改写。真实 Runtime 行实录：`session=agent:main:openai-user:student-hw-21-405674 | sessionId=3eacc585-...`，现有正则 `_RUNTIME_SESSION_RE`（`openai-user:(\S+)`）解析出 `student-hw-21-405674`，`\S+` 在空格处截断，不会吃到后面的 `sessionId=...`。
+
+**修复：不改全局 `session_id` 派生优先级**（其他规则依赖它是稳定 key，UUID 完全够用，不应该为这一条规则改全局行为）。改成规则 4 检查点自己单独调用已有的 `_extract_session_id_from_system_prompt(messages)`，从 Runtime 行独立解析出 `student-hw-{index}-{pid}`，完全绕开 `session_id` 参数：
+```python
+if _tool_name in ("write", "edit"):
+    _expected_hw_path = _expected_homework_path(
+        _extract_session_id_from_system_prompt(messages)
+    )
+    ...
+```
+`messages` 在规则 4 所在的 `_handle_request()` 里本来就是本地变量（`messages = body.get("messages")`），同一函数作用域内可以直接拿到，不用额外传参。`_expected_homework_path()` 函数本身不用改，只是换了个正确的输入。
+
+**验证：** 用真实官方源码模拟生成 + `py_compile` 编译通过；独立模拟测试用 CLI 提供的真实 Runtime 行格式（`session=agent:main:openai-user:student-hw-21-405674 | sessionId=...`）验证端到端解析链路，确认正确解析出 `homework/21.txt`；side 请求（无 Runtime 行）正确返回 `None`、规则跳过。**尚未用真实训练验证**——下一轮需要确认规则 4 在真实训练里真的会触发（之前从未触发过，这次修复后要看到 `[openclaw-rl-invalid-tool-use-penalty]` 日志对旁路写入生效才算数）。
+
 ---
 
 ## [2026-08-07] 撤销 FIRST_MESSAGE_TEMPLATE 补丁，完全恢复论文原始措辞

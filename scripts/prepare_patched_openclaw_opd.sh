@@ -128,19 +128,33 @@ def _is_poll_style_call(tool_name, args_raw):
     return isinstance(action, str) and action.strip().lower() == "poll"
 
 
-# openclaw-rl-invalid-tool-use-penalty 规则 4（2026-08-07）：见该规则定义处
-# 的注释。student_chat.py 把 session_user 设成
-# f"student-hw-{problem_index}-{os.getpid()}"，这个值经由 Runtime 行/
-# RL-TRAINING-META 等既有机制最终成为这里看到的 session_id，所以
-# problem_index 可以直接从 session_id 里解析出来，不需要猜测或依赖"第一次
-# read 的路径"这种可能被绕过的信号。只匹配 student_chat.py 的这个命名
-# 惯例，TA_chat.py/teacher_chat.py 等其他 session 类型的 session_id 不会
-# 命中这个正则，返回 None，规则 4 对它们自动不生效。
+# openclaw-rl-invalid-tool-use-penalty 规则 4（2026-08-07，08-07 二次修订
+# 见下）：见该规则定义处的注释。student_chat.py 把 session_user 设成
+# f"student-hw-{problem_index}-{os.getpid()}"，这个值本来会作为 Runtime
+# 行的 openai-user:<user> 字段出现在 system prompt 里，可以用已有的
+# _extract_session_id_from_system_prompt() 解析出来。
+#
+# 二次修订原因：最初实现误以为这个值经由既有机制最终会成为这里看到的
+# session_id 参数本身，实测证伪——RL-TRAINING-META 标记里的
+# ctx.sessionId（OpenClaw 自己内部的 UUID）在 session_id 派生优先级链条
+# 里排在 Runtime-line fallback 前面（见 chat_completions() 里 session_id
+# 的 or 链），只要这个标记正常工作，session_id 参数拿到的永远是 UUID，
+# Runtime-line fallback 根本轮不到执行，规则 4 对着 UUID 跑
+# student-hw-(\\d+)- 永远匹配不上，之前是死代码。
+#
+# 修复：不动全局 session_id 优先级（其他规则依赖 session_id 是稳定 key，
+# UUID 完全够用，不应该为了这一条规则改全局行为）。改成规则 4 检查点
+# 自己单独调用 _extract_session_id_from_system_prompt(messages)，从
+# Runtime 行独立解析出 student-hw-{index}-{pid}，不经过 session_id 变量。
+# 只匹配 student_chat.py 的这个命名惯例，TA_chat.py/teacher_chat.py 等
+# 其他 session 类型解析不出来，返回 None，规则 4 对它们自动不生效；
+# side 请求（如 context summarization）没有 Runtime 行，但这些请求本来
+# 就不会有 write/edit 调用，规则 4 的工具名判断已经天然把它们挡在外面。
 _HOMEWORK_SESSION_RE = re.compile(r"student-hw-(\\d+)-")
 
 
-def _expected_homework_path(session_id):
-    match = _HOMEWORK_SESSION_RE.search(session_id or "")
+def _expected_homework_path(session_id_or_runtime_user):
+    match = _HOMEWORK_SESSION_RE.search(session_id_or_runtime_user or "")
     if not match:
         return None
     return f"homework/{match.group(1)}.txt"
@@ -500,17 +514,25 @@ tool_calls_log_new = (
     '            if _tool_name == "sessions_yield" and not self._has_spawned_subagent.get(session_id, False):\n'
     '                _is_invalid_tool_use = True\n'
     '\n'
-    '            # 规则 4（2026-08-07）：write/edit 的目标 path 跟这个 session\n'
-    '            # 对应的正确 homework 文件不符 -- 判定为绕开任务要求的旁路写入。\n'
-    '            # 跟"有没有新信息"无关，是任务设计层面的必然错误：\n'
+    '            # 规则 4（2026-08-07，08-07 二次修订见 _expected_homework_path\n'
+    '            # 定义处的注释）：write/edit 的目标 path 跟这个 session 对应的\n'
+    '            # 正确 homework 文件不符 -- 判定为绕开任务要求的旁路写入。跟\n'
+    '            # "有没有新信息"无关，是任务设计层面的必然错误：\n'
     '            # FIRST_MESSAGE_TEMPLATE 明确只要求把答案写到\n'
     '            # homework/{index}.txt，写别的路径没有任何合法理由。真实数据\n'
     '            # 实锤（docs/issues_log.md 2026-08-07 条目，Problem 17、session\n'
     '            # a0b1e908）：模型反复写入/读取旁路文件 17_solution.md 而不是\n'
     '            # homework/17.txt，因为跟上一拍工具名不同（read/write 交替），\n'
     '            # 逃过了规则 1a 的紧邻精确匹配检测，连续拿到 +1 进入训练。\n'
+    '            # 注意：这里传的是 _extract_session_id_from_system_prompt(messages)\n'
+    '            # 从 Runtime 行独立解析出来的值，不是 session_id 参数本身\n'
+    '            # （session_id 参数拿到的是 RL-TRAINING-META 里的 UUID，优先级\n'
+    '            # 高于 Runtime-line fallback，对它跑 student-hw-(\\d+)- 永远\n'
+    '            # 匹配不上）。\n'
     '            if _tool_name in ("write", "edit"):\n'
-    '                _expected_hw_path = _expected_homework_path(session_id)\n'
+    '                _expected_hw_path = _expected_homework_path(\n'
+    '                    _extract_session_id_from_system_prompt(messages)\n'
+    '                )\n'
     '                if _expected_hw_path is not None:\n'
     '                    try:\n'
     '                        _wr_args = json.loads(_tool_args_raw) if _tool_args_raw else {}\n'
