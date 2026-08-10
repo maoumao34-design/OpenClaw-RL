@@ -2769,6 +2769,30 @@ if _tool_name in ("write", "edit"):
 
 ---
 
+## [2026-08-07] 新增规则 5：句子原样重复 ≥12 次强制判负分（阈值由 shadow 数据实测校准）
+
+**背景：** 承接同日更早"超长 thinking 空转把训练顶垮"的诊断（run 20260807_183828：thinking 从 P18-27 持续膨胀，P28 起系统性溃败，`couldn't generate` 大面积出现）。CLI 定位到一个具体奖励漏洞：`finish_reason=length` 的顶格样本已经被 08-06 的 truncation-penalty 规则稳定判 -1，但**"巨长 thinking 后摸到工具、`finish_reason=tool_calls`"这类样本仍能拿 +1**（P16/19/23 实锤，thinking 2.8-3 万字符、response 近 8000 token），强化了"狂想很久再随便调个工具"这条路径。
+
+**分四轮用真实 shadow 数据校准阈值，过程完整、不是拍脑袋：**
+1. 确认 P16/19/23 这三条泄漏样本的 `max_sentence_copies` 分别是 12/21/30——都是"复读驱动"的坏样本，不是单纯"想得久但没有重复"。
+2. 检查 `finish_reason=length` 的已 -1 样本（305 条）：68% `copies=1`（纯粹一坨不可切分或换皮不成句的巨型 thinking），确认句子重复规则对这批是冗余（truncation-penalty 已经罚了），不是主要目标。
+3. 按 `finish_reason × score` 分组核对 `copies` 分布，确认 `tool_calls/+1`（n=78）长尾很脏（copies≥11 有 23 条），`stop/+1`（干净对照组，n=34）分布干净（max=9, median=2）。
+4. 核对候选阈值 N=8/12/15/20/30 分别命中多少 +1 样本、有没有碰到 `stop/+1` 这个对照组：**N=12 对 `stop/+1` 零误伤（0/34），三条已知泄漏全部命中（12/21/30 都 ≥12）**；N=8 虽然也能全部命中，但会误伤 1 条真实存在的长可见解（P30 turn5，copies=9，是自然收束的正常长答案，不是复读）。额外核实 `tool_calls/+1` 里没有"copies≤3 但 thinking≥15000"这种"低 copies 高 thinking"的语义换皮漏网形态（0 条），确认不需要再补一条独立的"高 thinking 非顶格"规则。
+
+**决策：定阈值 N=12。** 干净对照组零误伤、已知泄漏全部命中、且排除了另开新规则的必要性，这是这批规则里少见的"定量证据链完整、没有需要权衡取舍的模糊地带"的情况。
+
+**实现：** `scripts/prepare_patched_openclaw_opd.sh`：
+- 新增常量 `_SENTENCE_REPEAT_INVALID_THRESHOLD = 12`，跟 `_max_sentence_copies()` 定义放在一起。
+- 在 shadow 统计日志那个位置（`if tool_calls:` 判断之外，纯文本 turn 也会执行）插入规则 5：`_max_sentence_copies_count = _max_sentence_copies(reasoning)`，`>= 12` 则 `_is_invalid_tool_use = True`；shadow 日志改成复用这个已经算好的值，不再重复计算。
+- 顺带修正两处此前不准确的注释（不改逻辑）：`_max_sentence_copies()` 的 docstring 原来写"不影响 reward"，现在会被规则 5 使用，已更新；shadow 日志段头注释原来写"纯 observability"，现在也是规则 5 判定结果的可观测记录，已更新说明。
+- 位置选在 `tool_calls` 判断之外的原因：复读发生在 `reasoning` 本身，跟这一拍有没有调用工具无关（P16/19/23 虽然是 `tool_calls`，但判断依据是 thinking 内容），纯文本 turn（比如规则 3 的 NO_REPLY 情形）也需要被检查。
+
+**验证：** 用真实官方源码模拟生成 + `py_compile` 编译通过；独立测试确认阈值边界行为正确（copies=12 触发，copies=9 不触发，精确对应 P16 和 P30 turn5 这两个真实边界案例）；`grep`/`Read` 确认生成文件里规则 5 位于正确位置（8 空格缩进，`if tool_calls:` 判断之外），shadow 日志正确复用同一个计算结果。**尚未用真实训练验证**——下一轮需要观察：P20 前 `max_sentence_copies`/首答 thinking_chars 是否不再单调爬升；近 8k+`tool_calls` 的样本 +1 是否降为 0；是否还会出现"P28 起大面积 couldn't generate"这种整段死亡。
+
+**明确未做的（按讨论结果延后）：** P1（顶格/高复读样本直接不进训练批次而不只是判 -1，涉及样本准入逻辑，风险量级不同，需要先查训练代码现有的 reward/loss 长度归一化机制）；P2 后半段（对连续 length 失败的 session 提前结束，本质是熔断，跟之前"熔断没有普适性"的判断冲突，需要用户重新表态才能做）；P3（尝试非零 KL 系数，训练算法层面改动，需要先确认 KL=0 是不是论文明确设计）。均未实施，留待后续讨论。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

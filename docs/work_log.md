@@ -1522,10 +1522,13 @@
 **再追加：规则 4 从写下来就是死代码，已修复。** 让 CLI 复核规则 4 时发现，训练日志里 `session_id` 全程是 UUID，不是当初假设的 `student-hw-{index}-{pid}`——根因是 RL-TRAINING-META 标记里的 `ctx.sessionId`（OpenClaw 自己的 UUID）在 `session_id` 派生优先级链条里排在 Runtime-line fallback 前面，规则 4 对 UUID 跑正则永远匹配不上，**部署以来从未真正拦截过任何旁路写入**。CLI 用真实落盘数据核实了修法可行性（Runtime 行每个 main 作业轮都有、`_RUNTIME_SESSION_RE` 能精确解析出 `student-hw-N-pid` 不被截断）后，改成规则 4 检查点自己单独调用已有的 `_extract_session_id_from_system_prompt(messages)`，不碰全局 `session_id` 派生逻辑（其他规则依赖它当稳定 key，UUID 够用，不该为这一条规则改全局行为）。
 → 详见 [`issues_log.md`](issues_log.md) 2026-08-07 又一条条目"后续追加"部分
 
+**再追加：新一轮训练（run `20260807_183828`）暴露"超长 thinking 空转顶垮训练"，新增规则 5。** thinking 从 P18-27 持续膨胀（首答 thinking_chars ~2.5k→~8.5k），P28 起系统性溃败，`couldn't generate` 大面积出现；定位到具体奖励漏洞——顶格截断已有 truncation-penalty 稳定判 -1，但"巨长 thinking 后摸到工具、`finish_reason=tool_calls`"这类样本仍能拿 +1（P16/19/23 实锤）。分四轮用真实 shadow 数据校准阈值：确认三条泄漏样本 `max_sentence_copies` 为 12/21/30；确认 `length/-1` 组 68% `copies=1`（句子重复规则对这批冗余，truncation-penalty 已覆盖）；确认候选阈值 N=12 对干净对照组 `stop/+1`（n=34）零误伤、三条泄漏全部命中，N=8 会误伤 1 条真实长解；核实 `tool_calls/+1` 里不存在"低 copies 高 thinking"的漏网形态，不需要额外规则。**定阈值 N=12，新增规则 5**：句子原样重复 ≥12 次强制判负分，复用已有的 `_max_sentence_copies()`，位置在 `tool_calls` 判断之外（复读发生在 reasoning 本身，跟有没有调用工具无关）。已实现、验证（含阈值边界行为测试：copies=12 触发、copies=9 不触发，精确对应真实边界案例）。P1（顶格/高复读样本直接不进批次）、P2 后半段（连续失败提前结束 session，本质是熔断，跟之前"熔断没有普适性"的判断冲突）、P3（尝试非零 KL）均讨论后明确不做，留待后续。
+→ 详见 [`issues_log.md`](issues_log.md) 2026-08-07 又一条条目
+
 ## 当前状态（2026-08-07）
 
 ### 已就绪
-（同 08-06，未变——见上方"历史状态（2026-08-06）"完整列表。另加：`STUDENT_SYSTEM_PROMPT` Steps 重构（真答案/AI 味两层判断 + 写入核实严格版 + 角色串戏防护）+ 规则 4（旁路写入判负分，**已修复"取值是 UUID 不是 student-hw-N-pid"这个致命 bug，之前部署即死代码，现在改成从 Runtime 行独立解析**）均已实现并本地验证；`FIRST_MESSAGE_TEMPLATE` 补丁已完全撤销，逐字恢复论文原始措辞——这几处合起来是本轮训练要验证的核心改动组合，本轮训练已提交，**结果下周查看**）
+（同 08-06，未变——见上方"历史状态（2026-08-06）"完整列表。另加：`STUDENT_SYSTEM_PROMPT` Steps 重构（真答案/AI 味两层判断 + 写入核实严格版 + 角色串戏防护）+ 规则 4（旁路写入判负分，**已修复"取值是 UUID 不是 student-hw-N-pid"这个致命 bug**）+ 规则 5（句子原样重复 ≥12 次判负分，阈值经真实 shadow 数据校准）均已实现并本地验证；`FIRST_MESSAGE_TEMPLATE` 补丁已完全撤销，逐字恢复论文原始措辞——这几处合起来是本轮训练要验证的核心改动组合，本轮训练已提交，**结果下周查看**）
 
 ### 已知限制 / 未解决
 （同 08-06，未变，见上方"历史状态（2026-08-06）"完整列表。另加：
@@ -1550,6 +1553,7 @@
 ### 未验证
 - [ ] 本轮训练（已提交，**结果下周查看**）：Steps 重构 + `FIRST_MESSAGE_TEMPLATE` 恢复原文能否解决"格式癫痫+拒写"
 - [ ] 规则 4 修复取值 bug 后能否真正触发（之前部署即死代码，从未真正生效过）、能否正确拦截旁路写入、有没有误伤合法的多文件操作
+- [ ] 规则 5（句子重复 ≥12 判负分）能否解决"超长 thinking 空转顶垮训练"这条主线问题，thinking 增长趋势和 P28 式整段死亡是否消失
 - [ ] Rule 1a 通用化、shadow 句重复统计、顶格截断规则、PRM 规则 3、单题异常容错——均延续自 08-06，仍待真实训练验证
 
 ---

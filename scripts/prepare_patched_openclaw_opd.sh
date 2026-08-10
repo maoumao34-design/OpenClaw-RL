@@ -84,17 +84,27 @@ _RL_META_RE = re.compile(r"\\[RL-TRAINING-META\\] session_id=(\\S*) turn_type=(\
 # 不敏感，允许以空白分隔的重复 token）。
 _NO_REPLY_ONLY_RE = re.compile(r"^\\s*NO_REPLY(?:\\s+NO_REPLY)*\\s*$", re.IGNORECASE)
 
-# openclaw-rl-shadow-sentence-repeat（2026-08-06，temporary，observability only）：
-# 句子切分正则，跟 docs/issues_log.md 2026-08-06 条目里人工统计"同句原样重复
-# 几次"用的口径一致（按句末标点/换行切分，只统计长度 >= min_len 的句子）。
+# openclaw-rl-shadow-sentence-repeat（2026-08-06 引入，2026-08-07 起同时是
+# 规则 5 的输入，见该规则定义处）：句子切分正则，跟 docs/issues_log.md
+# 2026-08-06 条目里人工统计"同句原样重复几次"用的口径一致（按句末标点/
+# 换行切分，只统计长度 >= min_len 的句子）。
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\\s+|\\n+")
+
+# 规则 5（2026-08-07）判负分用的阈值，由真实 shadow 数据校准（run
+# 20260807_183828）：干净对照组 stop/+1（n=34, max copies=9）零误伤；已知
+# 的 3 条近顶格 tool_calls 泄漏样本（copies=12/21/30）全部命中；核实过
+# tool_calls/+1 里不存在"低 copies 高 thinking"的语义换皮漏网形态，不需要
+# 额外规则兜底。见规则 5 定义处的完整说明。
+_SENTENCE_REPEAT_INVALID_THRESHOLD = 12
 
 
 def _max_sentence_copies(text, min_len=40):
     """Max number of times any single normalized sentence (len >= min_len)
     repeats verbatim within `text`. Mirrors the manual analysis methodology in
     docs/issues_log.md 2026-08-06 so results are directly comparable. Pure
-    text statistic -- does not read or affect eval_score/reward.
+    text statistic on its own -- but its result also feeds openclaw-rl-
+    invalid-tool-use-penalty 规则 5 (2026-08-07), which can force eval_score
+    to -1.0 when the count reaches _SENTENCE_REPEAT_INVALID_THRESHOLD.
     """
     if not text:
         return 0
@@ -544,19 +554,32 @@ tool_calls_log_new = (
     '\n'
     '            self._last_tool_call[session_id] = _cur_call\n'
     '\n'
+    '        # --- openclaw-rl-invalid-tool-use-penalty 规则 5 (2026-08-07) ---\n'
+    '        # docs/issues_log.md 2026-08-07 条目：句子原样重复 >=\n'
+    '        # _SENTENCE_REPEAT_INVALID_THRESHOLD 次 -> 判定为已知无效动作，强制\n'
+    '        # -1。阈值由真实 shadow 数据校准（run 20260807_183828）：干净对照组\n'
+    '        # stop/+1（n=34, max copies=9）零误伤；已知的 3 条近顶格 tool_calls\n'
+    '        # 泄漏样本（P16/19/23, copies=12/21/30）全部命中；核实过\n'
+    '        # tool_calls/+1 里不存在"低 copies 高 thinking"的语义换皮漏网形态，\n'
+    '        # 不需要额外规则兜底。跟有没有调用工具无关（复读发生在 reasoning\n'
+    '        # 本身，不依赖有没有调用工具），位置放在 tool_calls 判断之外，纯\n'
+    '        # 文本 turn（比如规则 3 的 NO_REPLY 情形）也会被检查。\n'
+    '        _max_sentence_copies_count = _max_sentence_copies(reasoning)\n'
+    '        if _max_sentence_copies_count >= _SENTENCE_REPEAT_INVALID_THRESHOLD:\n'
+    '            _is_invalid_tool_use = True\n'
+    '\n'
     '        # --- openclaw-rl-shadow-sentence-repeat (2026-08-06, temporary, safe to\n'
-    '        # remove) --- docs/issues_log.md 2026-08-06 条目：为"同句原样重复 >= N 次\n'
-    '        # 强制判负分"这条候选规则收集校准数据。之前只有 repeat-thinking/TRUNCATED\n'
-    '        # 两条路径能拿到 reasoning 全文，是有偏子集（唯二拿到的"+1"全文样本本身都是\n'
-    '        # 顶格误判 +1，不能代表真正做对的长 thinking）。这里对每一个 turn 都算一次\n'
-    '        # 统计量（不需要 dump 全文，只是切句计数，代价接近零），覆盖全量、无偏，\n'
-    '        # 不改 reward/训练逻辑，纯 observability。位置放在 tool_calls 判断之外，\n'
-    '        # 确保没有工具调用的纯文本 turn（比如规则 3 的 NO_REPLY 情形）也会被记录。\n'
+    '        # remove) --- docs/issues_log.md 2026-08-06 条目：最初只是为"同句原样\n'
+    '        # 重复 >= N 次强制判负分"这条候选规则收集校准数据，之前只有\n'
+    '        # repeat-thinking/TRUNCATED 两条路径能拿到 reasoning 全文，是有偏子集。\n'
+    '        # 2026-08-07 起数据已经用于校准并落地成上面的规则 5，这里的日志继续\n'
+    '        # 保留，是规则 5 判定结果的可观测记录，不再是纯 observability——\n'
+    '        # is_invalid_tool_use 字段现在会反映规则 5（以及其他规则）的效果。\n'
     '        logger.info(\n'
     '            "[openclaw-rl-shadow-sentence-repeat] session=%s turn_type=%s "\n'
     '            "thinking_chars=%d max_sentence_copies=%d finish_reason=%s "\n'
     '            "is_invalid_tool_use=%s",\n'
-    '            session_id, turn_type, len(reasoning), _max_sentence_copies(reasoning),\n'
+    '            session_id, turn_type, len(reasoning), _max_sentence_copies_count,\n'
     '            _finish_reason, _is_invalid_tool_use,\n'
     '        )\n'
 )
