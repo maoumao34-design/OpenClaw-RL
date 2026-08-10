@@ -88,7 +88,8 @@ text = open(dest_path, encoding="utf-8").read()
 old_criteria = (
     'is the WRITING STYLE. If the AI\'s answer has stuff like bold text, numbered \\\n'
     'lists, "**Final answer**:", or anything too AI-like, tell it to \\\n'
-    'rewrite in a more natural way but keep all the steps.'
+    'rewrite in a more natural way but keep all the steps. Just tell it to fix \\\n'
+    'the style — don\'t fix it yourself.'
 )
 if text.count(old_criteria) != 1:
     raise SystemExit(
@@ -99,10 +100,21 @@ if text.count(old_criteria) != 1:
 # Narrow WHAT counts as AI-like to the three concrete markers the Table 3
 # regex actually checks, but keep "AI-like" itself as the framing concept --
 # not a bare checklist disconnected from it (see docs/issues_log.md 2026-07-29).
+#
+# 08-07 二次修订（docs/issues_log.md 2026-08-07 条目，跟下面 new_steps 的
+# 四次修订是同一批改动）：去掉 "but keep all the steps" -- 这句话跟 Step 1
+# "otherwise" 分支里同一句话（见下面 new_steps）是同一个诱因的两处来源，
+# 真实数据显示 Simulator 会机械念这句话，逼着已经有紧凑步骤的正确回答
+# 继续"加内容"，是"越改越长"两拍循环的燃料之一。改成明确"别要求加
+# 内容"，因为走到这个分支说明内容本身已经通过前置的 Tier-0 判断（见
+# new_steps），这里只该管格式/语气，不该再管内容完整性。old_criteria 的
+# 匹配范围顺带往后扩到 "don't fix it yourself." 这句，是为了把新加的
+# "别要求加内容"这半句干净地插进去，避免跟后面未改动的原文重复。
 new_criteria = (
     'is the WRITING STYLE. If the AI\'s answer looks AI-like -- stuff like bold \\\n'
     'text, numbered lists, or "**Final answer**:" -- tell it to \\\n'
-    'rewrite in a more natural way but keep all the steps.'
+    'rewrite in a more natural way. Just tell it to fix the style -- don\'t ask \\\n'
+    'it to add more or redo the math, and don\'t fix it yourself.'
 )
 text = text.replace(old_criteria, new_criteria, 1)
 
@@ -279,6 +291,25 @@ PY
 # Student 因为多了一层判断而变得更啰嗦、或者第一层判断本身出现新的误判
 # 模式），需要回退到 07-29 版本（只有 AI 味判断，没有这层前置检查），
 # 决策依据是下一轮训练的真实数据，不是理论推演。
+#
+# 08-07 四次修订（新训练 run 20260807_183828 的完整原因排查，见
+# docs/issues_log.md 2026-08-07 条目）：定位到"超长 thinking 空转顶垮训练"
+# 这条主线问题的上游诱因，不在生成侧，而在 Student 这层——
+#   1. Tier-0 判断对"紧凑算式"（如 "5x5=25, 4x10=40, 40-25=15"，没有连接
+#      散文句子）经常误判成"没有真正回答"（真实数据约 35% 的"要
+#      step-by-step"请求打在已经有算式的回复上，P16/P17/P20 等题实锤）；
+#   2. AI 味重写分支里写死的 "but keep all the steps"（跟上面 new_criteria
+#      里同一句话是同一个诱因），逼着已经通过 Tier-0、内容本身没问题的
+#      回答在"改自然语气"的同时被迫继续"加步骤"。
+# 这两条叠加形成"加长→重写→再加长"的两拍循环，policy 学会用更长、更
+# 口语化的方式"表演"完整解答，thinking 里反复打磨措辞草稿（真实数据里
+# 见过同一句"Let me try to break it down..."类型的草稿句重复 16-25 次），
+# 最终烧光 maxTokens 预算、产生空回复，形成本轮训练从 P28 起系统性崩溃
+# 的因果链上游。这次改动清的是这条链条最上游的燃料，不是给 length 加
+# 物理硬顶（那是另一条独立方向，讨论后本轮未做，见 issues_log），也不
+# 直接解决失败后期的 tool_call XML 元循环二次崩溃（那是这条链条下游的
+# 独立症状，本身应该会因为上游触发频率下降而减少，但不是这次改动直接
+# 针对的目标）。
 # ---------------------------------------------------------------------
 python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
 import sys
@@ -305,8 +336,8 @@ if text.count(old_steps) != 1:
 new_steps = (
     'Steps:\n'
     '1. Look at what the AI gives you in response to your solve request.\n'
-    '   - If it did NOT actually answer the problem AT ALL -- literally no response, or ONLY a bare final number/answer by itself with absolutely no work or reasoning shown, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer. As long as it shows at least some reasoning or steps, even if brief or incomplete, that counts as answering -- do NOT use this just because the explanation feels short or could be more detailed; only use it when there is truly no work shown at all.\n'
-    '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural way but keep all the steps. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
+    '   - If it did NOT actually answer the problem AT ALL -- literally no response, or ONLY a bare final number/answer by itself with absolutely no work or reasoning shown, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer. As long as it shows at least some reasoning or steps, even if brief or incomplete, that counts as answering -- do NOT use this just because the explanation feels short or could be more detailed; only use it when there is truly no work shown at all. Compact math (like writing out "5x5=25, 4x10=40, 40-25=15" with no connecting sentences) still counts as showing work -- it does not need to be explained in full prose to count as an answer.\n'
+    '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
     '   - If it gave a real, natural-sounding explanation with no AI-like formatting, no need to redo either way.\n'
     '2. After the AI shows you a satisfactory version (a real explanation, not AI-like), THEN in a separate message ask it to append the answers to the end of the homework file (not overwrite it). Do NOT combine a rewrite request and a write request.\n'
     '3. Once you have asked it to write the file, check whether it actually did. Only count it as done if it plainly confirms in normal words that it saved or appended the content -- a raw tool-call-looking snippet or JSON blob is NOT proof it actually wrote anything. If it stalls, refuses, only shows you that kind of raw snippet without a real confirmation, or just talks without actually writing, tell it to actually do it. If it plainly confirms it wrote it, say exactly: HOMEWORK_DONE\n'

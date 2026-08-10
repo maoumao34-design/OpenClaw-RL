@@ -2793,6 +2793,36 @@ if _tool_name in ("write", "edit"):
 
 ---
 
+## [2026-08-10] STUDENT_SYSTEM_PROMPT 四次修订：定位"超长 thinking 空转"上游诱因是 Student 侧假 Tier-0 误判 + 提示词里写死的"keep all the steps"
+
+**背景：** 承接 08-07 那批诊断（run `20260807_183828`：thinking 从 P18-27 持续膨胀，P28 起系统性溃败，规则 5 已经上线拦截奖励层面的复读）。用户让 CLI 进一步查复读的**上游**根因，而不只是打分层怎么补救。
+
+**CLI 核实的因果链（真实数据，非推测）：**
+1. **假 Tier-0 误判**：Tier-0（"是否给出真答案"这层判断）经常把已经有紧凑算式的正确回答误判成"没有真正回答"——真实数据里约 35% 的"要 step-by-step/完整解答"这类要求，打在已经写出 `5×5=25、4×10=40、40-25=15` 这种紧凑算式的回复上（P16/P17/P20/P7/P13/P14/P19/P22 实锤）。08-07 那次 Tier-0 收紧（"哪怕简短不完整的推理也算已回答"）不够精确——Simulator 显然默认"过程"要写成连贯散文句子，紧凑算式没被认成"有过程"。
+2. **提示词里写死的"but keep all the steps"**：这句话在两处地方（顶部 criteria 段落 + Step 1"otherwise"分支）**逐字出现**，不是 Simulator 自己加的措辞。每次触发 AI 味重写请求，Student 都会机械带上这句——这次 run 里出现约 25 次。
+3. **两拍循环**：假 Tier-0 误判 → 逼着已经答对的紧凑回复"加长、写全"→ policy 写成 bold/编号格式（想显得更完整）→ 触发 AI 味重写分支 → Student 说"太机器味，改自然语气，**但要保留所有步骤**"→ policy 再往回复里加口语化内容/场景化描述，同时不敢删任何步骤 → 循环往复，回复越来越长。
+4. **thinking 里在复读什么**：从本轮 TRUNCATED 的 reasoning 全文看，烧穿 8192 token 预算时，主要不是"重新算一遍数学"，而是卡在两类自言自语：(a) 反复打磨"怎么说才够步骤、够友好"的口语化草稿（P34 实锤："Let me try to break it down in a way that's easier to follow" 类型的句子重复 16-25 次，夹杂 emoji/GIF 场景化排练）；(b) 失败后二次崩溃——上一轮已经 `couldn't generate`，Student 再催"show all steps"，policy 更懵，thinking 陷入"tool_call 的 XML 标签到底是什么"这类工具协议自我怀疑，机械粘贴同一段 JSON 片段几十到上百次（P35-38 常见）。
+
+**排除的可能性：** 不是 Rule 5 没生效（打分侧对高复读样本已经在罚 -1，这次要解决的是复读为什么会发生，不是复读发生后有没有被扣分）；不是单纯 maxTokens 配置问题（P30 那种纠缠、P32 短答复读是同一压力的变体，假裸答误判在 P7/P16/P17/P20 等题早就大量出现，先于顶格问题）。
+
+**方案（三处文字改动，缺一不可）：**
+
+1. **Tier-0 判断补一句明确声明**：紧凑算式（如"5x5=25, 4x10=40, 40-25=15"，没有连接散文句子）也算"有过程"，不需要写成完整散文才算回答。
+2. **Step 1"otherwise"分支去掉"but keep all the steps"**：走到这个分支说明内容已经通过 Tier-0 确认有真实步骤，这里只该管语气/格式，不该再叠加"步骤要齐全"这个已经满足的条件。改成明确"别要求加内容"。
+3. **顶部 criteria 段落同一句话一起改**：这句话在两处独立出现，只改 Step 1 会被"捡回去念"（criteria 段落还留着一份）。`old_criteria` 的匹配范围顺带扩到"don't fix it yourself."，避免新加的"别要求加内容"半句跟后面未改动的原文重复。
+
+**CLI 提醒但本轮不处理的边角（观察项，不是否决项）：**
+- 顶部"必须包含完整解答过程"那句话（"NEVER ask the AI to remove steps... You need the complete work."）先不动——这条防"删步骤"，跟"重写时别加料"不矛盾，但跟"紧凑算式已经够"有一点张力；如果改完后 Simulator 仍拿这句当理由催散文，再考虑收窄。
+- 验收标准是"假 Tier-0 触发**频率下降**"，不是降到零——32B/Simulator 指令遵循本来就不稳（Student 重写检测触发率随对话推进大幅下滑是同一类问题），精确化措辞能显著降误判率，不能当硬闸。
+- 改完之后紧凑答案如果仍带 bold/编号，还是会触发 AI 味重写分支，这是预期内的——修复去掉的是"重写时叠加加料"，不是去掉重写本身。
+- 这个方案清的是复读链条最上游的燃料，**不解决后半程 tool_call XML 元循环这种二次崩溃**（那是假 Tier-0 之后的独立下游症状），也**不是给 length 加物理硬顶**（生成侧限位——降 maxTokens、加 repetition_penalty、流式熔断——讨论后本轮均未做，见 08-07"物理方法"讨论）。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh` 三处改动——`new_criteria`（扩大 `old_criteria` 匹配范围到含"don't fix it yourself."，去掉"keep all the steps"，加"don't ask it to add more or redo the math"）、Step 1 Tier-0 bullet（加紧凑算式声明）、Step 1"otherwise"bullet（去掉"keep all the steps"，加"content is already fine"）。
+
+**验证：** 用真实官方源码模拟生成，五段补丁全部按顺序应用成功；`py_compile` 编译通过；用 `ast` 解析打印完整运行时 `STUDENT_SYSTEM_PROMPT` 字符串，**通读全文确认"keep all the steps"出现次数为 0**（不只是检查改的两处，是对整个渲染结果做字符串搜索），确认 criteria 段落改动没有跟后面未改动的原文重复。**尚未用真实训练验证**——下一轮需要观察假 Tier-0 触发频率是否下降、"加长→重写→再加长"两拍循环是否减少、thinking 增长趋势是否放缓。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
