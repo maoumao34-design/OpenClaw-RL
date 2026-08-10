@@ -310,6 +310,36 @@ PY
 # 直接解决失败后期的 tool_call XML 元循环二次崩溃（那是这条链条下游的
 # 独立症状，本身应该会因为上游触发频率下降而减少，但不是这次改动直接
 # 针对的目标）。
+#
+# 08-10 五次修订（新一轮训练仍见误判，跟用户+CLI 逐轮核实后重新设计
+# Step 1，见 docs/issues_log.md 2026-08-10 另一条条目）：
+#   背景——四次修订版本只有两分支（没答 / otherwise 直接查 AI 味），完全
+#   没有"只有最终答案、没有过程"这类检测；用户澄清真实观察到的问题方向
+#   是过度触发（把有过程的正确答案误判成没答/只有答案），不是漏判（裸
+#   答案被放过）。一开始按"代码判、Simulator 只管措辞"设计了方案，用户
+#   要求仍然全程交给 Simulator 判断，只是把判断标准写得更precise；随后
+#   发现"只有答案"最初设计漏掉了②分支，加回来时又发现"判断有没有过程"
+#   如果只看有没有运算符号（+ - × / =），会把用大白话叙述计算过程（比如
+#   "4 guppies, plus 2 he bought, so that's 6 guppies... 16 minus 11
+#   equals 5"，全程没有一个符号）的正确回答误判成"只有答案"。
+#
+#   最终方案：Step 1 从两分支改成三分支（①有没有真答案 → ②是不是只有
+#   答案没过程 → ③才查 AI 味）：
+#   - ①从"找不到理由才算没答"（负向排除）改写成"主动列举证据"（正向
+#     枚举：孤立数字/Answer 模板/收尾句数字/紧凑算式），减少 Simulator
+#     凭感觉判断的空间。
+#   - ②新增，判断依据不是"有没有符号"，而是"整段回复里数字个数是不是
+#     只有一个"——不管过程是用符号（"5x5=25"）还是大白话（"4 plus 2 is
+#     6"）表达，只要出现第二个数字就说明有推导，不算"只有答案"；只有
+#     从头到尾真的只提过一个数字（比如"The answer is $93."）才会触发这
+#     条，专门堵之前"催过程"完全没有对应检测的缺口。
+#   - ③（AI 味重写）文字基本不变，只是判断前提改成"确认有真实过程之后"
+#     才检查。
+#   - Step 2/3（写入请求 + 写入核实）完全不动——用户明确要求这部分维持
+#     现有判断，这次训练的真实数据显示这部分工作得很好，不需要跟着改。
+#   顶部 criteria 段落里"must still include the full solution process
+#   with all steps shown"这句是论文原文（核实过官方源码从未被任何补丁
+#   动过），保留②之后不再跟这句话冲突，不需要软化。
 # ---------------------------------------------------------------------
 python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
 import sys
@@ -335,10 +365,10 @@ if text.count(old_steps) != 1:
     )
 new_steps = (
     'Steps:\n'
-    '1. Look at what the AI gives you in response to your solve request.\n'
-    '   - If it did NOT actually answer the problem AT ALL -- literally no response, or ONLY a bare final number/answer by itself with absolutely no work or reasoning shown, or something that looks like raw tool-call/code/JSON instead of actually talking to you -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer. As long as it shows at least some reasoning or steps, even if brief or incomplete, that counts as answering -- do NOT use this just because the explanation feels short or could be more detailed; only use it when there is truly no work shown at all. Compact math (like writing out "5x5=25, 4x10=40, 40-25=15" with no connecting sentences) still counts as showing work -- it does not need to be explained in full prose to count as an answer.\n'
-    '   - Otherwise (it DID give you a real explanation): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite.\n'
-    '   - If it gave a real, natural-sounding explanation with no AI-like formatting, no need to redo either way.\n'
+    '1. Look at what the AI gives you in response to your solve request. Check in this order:\n'
+    '   - Is there any real, identifiable final answer or worked calculation anywhere in the reply? This includes: a number standing on its own (possibly with $, a unit, or bold, like "14" or "$93" or "**6**"), a template like "Answer: X" / "Final answer: X" / "The answer is X" / boxed{X}, a closing sentence stating a concluding number (like "...so the total is $93."), OR any calculation shown anywhere, even compact and without full prose (like "5x5=25, 4x10=40, 40-25=15"). If you cannot find ANY of this -- it\'s empty, off-topic, confused, just restates the problem, just chats, just asks you something, or is a raw tool-call/JSON/code block with no real answer sentence -- tell it plainly that it did not really answer and you need to see the actual worked-out solution. Do NOT mention writing to the file or style in this message -- just ask for the real answer.\n'
+    '   - If you DID find something like that: check if the ENTIRE reply mentions only ONE number in total (the final answer itself), with no other numbers, quantities, or intermediate values mentioned anywhere -- e.g. it\'s ONLY something like "90 liters." or "The answer is $93." or just "6" and nothing else. If there is more than one number anywhere in the reply -- whether the calculation is shown with symbols (like "5x5=25, 4x10=40") or described in plain words (like "4 plus 2 is 6" or "16 minus 11 equals 5"), that already counts as showing work -- do NOT treat it as "only the answer" just because it\'s brief, phrased in words instead of symbols, or doesn\'t use "=" signs. Only use this check when there is truly a single number and nothing else in the whole reply. If it\'s truly bare like that, tell it you need to see the actual steps/calculation, not just the final number -- do NOT mention writing to the file or style in this message either.\n'
+    '   - Otherwise (it has real work/calculation shown, in any form): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite. If it\'s already natural-sounding with no AI-like formatting, no need to redo.\n'
     '2. After the AI shows you a satisfactory version (a real explanation, not AI-like), THEN in a separate message ask it to append the answers to the end of the homework file (not overwrite it). Do NOT combine a rewrite request and a write request.\n'
     '3. Once you have asked it to write the file, check whether it actually did. Only count it as done if it plainly confirms in normal words that it saved or appended the content -- a raw tool-call-looking snippet or JSON blob is NOT proof it actually wrote anything. If it stalls, refuses, only shows you that kind of raw snippet without a real confirmation, or just talks without actually writing, tell it to actually do it. If it plainly confirms it wrote it, say exactly: HOMEWORK_DONE\n'
 )
