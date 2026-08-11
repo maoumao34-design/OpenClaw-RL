@@ -173,6 +173,70 @@ eval_score_new = eval_score_old + (
 )
 text = text.replace(eval_score_old, eval_score_new, 1)
 
+# ---------------------------------------------------------------------
+# 2026-08-11 补丁：openclaw-rl-repeat-thinking-hint
+#
+# 背景（docs/issues_log.md 2026-08-11 条目）：规则 5（同句原样重复 >=
+# _SENTENCE_REPEAT_INVALID_THRESHOLD 次强制判 -1）本身阈值已经用真实数据
+# 校准过、没有误伤好样本，但连续两轮训练发现它仍然高频触发——诊断结论是
+# 阈值没问题，是"信用分配"太糊：负分打在整个 turn 上（哪怕 write 已经
+# 成功、PRM 也投了 +1），模型学不到"具体是因为哪句话复读了才被打分"，
+# 更容易学成"这种写文件上下文倒霉"而不是"别在 thinking 里复读"。
+#
+# 这里用 OPD 现成的 hint 机制补一条更贴原因的信号：_append_hint_to_messages()
+# 只是把一段文字拼进最后一条 user 消息、再对同一段 response_text 重新算一遍
+# teacher 分布，不要求这段 hint 来自 PRM 投票。命中 Rule 5 时，直接把这次
+# turn 的 accepted 列表整体替换成一条写死的"别复读"提醒，而不是继续用
+# PRM 自己投的（很可能文不对题，因为判官提示词根本不知道要查复读）hint——
+# 这正好堵上"PRM 不投复读 -> accepted 为空 -> OPD 完全没有该 turn 样本、
+# 只剩 GRPO 的 -1"这个缺口。
+#
+# 替换必须放在 accepted = accepted[: _max_cand()] 截断之后、
+# if not accepted: 判定之前，否则命中 Rule 5 但 PRM 恰好也没投出 hint 的
+# turn 仍然会被当成"no valid hint"整条丢弃，起不到补信号的作用。
+#
+# 只针对 is_repeat_thinking_violation（Rule 5 专属标记，跟 1-5 通用的
+# is_invalid_tool_use 分开，见 prepare_patched_openclaw_opd.sh 里的对应
+# 改动）生效，Rule 1-4 命中的 turn 不受影响，仍然只有 eval_score 强制
+# -1（上面那段补丁），没有强制 hint。
+#
+# 这是主动设计的新机制，"罚 + 教"逻辑上说得通（hint 条件化的 teacher 在
+# 复读发生的具体 token 位置概率会明显被压低，天然是逐 token 定位的，不需要
+# 额外去找复读句子的 token 区间），但是否真的让模型学会不复读，需要下一轮
+# 训练之后用真实 shadow 数据验证，不是这次改动就能保证的。
+# ---------------------------------------------------------------------
+accepted_cap_old = (
+    '        accepted.sort(key=lambda v: len(v["hint"]))\n'
+    '        accepted = accepted[: _max_cand()]\n'
+)
+if text.count(accepted_cap_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the accepted-cap block "
+        f"in {src_path}, found {text.count(accepted_cap_old)} (official file may "
+        "have changed upstream -- re-verify this patch)"
+    )
+accepted_cap_new = accepted_cap_old + (
+    '\n'
+    '        # --- openclaw-rl-repeat-thinking-hint (temporary, safe to remove) ---\n'
+    '        if turn_data.get("is_repeat_thinking_violation"):\n'
+    '            logger.info(\n'
+    '                "%s[openclaw-rl-repeat-thinking-hint] session=%s turn=%d "\n'
+    '                "sentence-repeat violation -- overriding accepted hint(s) with "\n'
+    '                "fixed repetition-reminder hint%s",\n'
+    '                _CYAN, session_id, turn_num, _RESET,\n'
+    '            )\n'
+    '            accepted = [{\n'
+    '                "score": 1,\n'
+    '                "hint": (\n'
+    '                    "You repeated the exact same sentence in your reasoning many "\n'
+    '                    "times instead of making progress. Do not restate the same "\n'
+    '                    "sentence or idea again -- after thinking something once, move "\n'
+    '                    "on to the next step or give your final answer."\n'
+    '                ),\n'
+    '            }]\n'
+)
+text = text.replace(accepted_cap_old, accepted_cap_new, 1)
+
 if "\nimport json\n" not in text:
     text = text.replace("import logging\n", "import json\nimport logging\n", 1)
 

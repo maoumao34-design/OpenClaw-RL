@@ -660,6 +660,16 @@ turn_data_new = (
     '                # remove): finish_reason == "length" 说明模型还没说完就被切断，\n'
     '                # 见 docs/issues_log.md 2026-08-06 条目。\n'
     '                "is_truncated": _finish_reason == "length",\n'
+    '                # openclaw-rl-repeat-thinking-hint (2026-08-11): 跟 is_invalid_tool_use\n'
+    '                # 分开的单独标记——is_invalid_tool_use 是规则 1-5 的 OR，无法区分这次\n'
+    '                # 具体是哪条触发；openclaw_combine_select_api_server.py 那边要挂"别\n'
+    '                # 复读"这句针对性提醒，只能认这条单独的标记，不能认 is_invalid_tool_use，\n'
+    '                # 否则会在 Rule 4 等其他规则触发时也错误地挂上这句文不对题的提醒。\n'
+    '                # 复用规则 5 已经算出的 _max_sentence_copies_count/\n'
+    '                # _SENTENCE_REPEAT_INVALID_THRESHOLD，不单独再算一遍、不用第二个阈值，\n'
+    '                # 避免两处判断口径不一致。见 prepare_patched_openclaw_combine_select.sh\n'
+    '                # 里的对应改动。\n'
+    '                "is_repeat_thinking_violation": _max_sentence_copies_count >= _SENTENCE_REPEAT_INVALID_THRESHOLD,\n'
     '            }\n'
 )
 text = text.replace(turn_data_old, turn_data_new, 1)
