@@ -1600,7 +1600,7 @@
 **完成内容：**
 - 新训练暴露 3 个真实误判样本（多数字白话叙述被要求补显式等式 ×2；已有完整分步计算被同时催 step-by-step 和去 AI 味）。诊断为 Simulator 未严格执行已经写清楚的判断标准，不是文字歧义。加数数字 CoT 步骤 + 针对这三个样本的具体反例锚点（Step 1 六次修订，commit `8f90615`）
 - 两轮训练规则 5（复读 >=12 强制判 -1）仍高频触发；诊断阈值 12 本身合理（已用真实数据校准，零误伤好样本），问题是信用分配太糊——负分打在整个 turn 上，模型学不到"具体是哪句话复读了"。走 OPD 现成的 hint 条件化 teacher 机制，命中规则 5 时把该 turn 的 `accepted` hint 整体替换成写死的复读提醒，天然逐 token 定位到复读发生的位置，不需要额外找 token 区间（新增 `is_repeat_thinking_violation` 标记，跟 1-5 通用的 `is_invalid_tool_use` 分开，避免误挂到其他规则，commit `d4a584f`）
-- 手动核对 `separate_student_20260811_141207`（commit `edd247b`，早于以上两处改动）：72 题完整跑完主动停训，done 68/incomplete 4/couldn't-generate 24/overflow 11，OPD+RL +1/-1=113/129，update_weights≈21 次，是目前几轮里 pipeline 健康度最好的一次。人工核对每个成功 session，Simulator 反馈和 4B 调整都符合预期，但始终没能在 turn 1 就直接给出满足要求的回复，未观察到收敛
+- 手动核对 `separate_student_20260811_141207`（commit `edd247b`，早于以上两处改动）：72 题完整跑完主动停训，done 68/incomplete 4/couldn't-generate 24/overflow 11，OPD+RL +1/-1=113/129，update_weights≈21 次，是目前几轮里 pipeline 健康度最好的一次。人工核对大部分成功 session，Simulator 反馈和 4B 调整符合预期，但仍存在实际问题（即上面①②两条——Simulator ②③误判、规则 5 信用分配太糊，均已在本条打了对应补丁），且始终没能在 turn 1 就直接给出满足要求的回复，未观察到收敛
 
 **关键决策：** turn-1 不收敛暂判断为训练量不足（约 21 次权重更新对覆盖基座模型格式偏好来说偏少），不是反馈环路本身有问题——单轮修正机制已验证健康，问题范围收窄到"学习信号密度/质量"，正是上面规则 5 hint 补丁想解决的方向；待新一轮训练结果与 `separate_student_20260811_141207` 对照
 
