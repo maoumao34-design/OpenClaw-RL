@@ -1595,30 +1595,30 @@
 
 ## 2026-08-11
 
-**目标：** 修复 Simulator 在 Step 1 ②③上的真实误判样本；解决规则 5"罚了但没教清楚"的信用分配问题；记录当前最健康的一轮训练作为参考基线
+**目标：** 修复 Simulator 在 Step 1 ②③上的真实误判；解决规则 5"罚了但没教清楚"的信用分配问题；追踪 turn-1 不收敛的真实瓶颈
 
 **完成内容：**
-- 新训练暴露 3 个真实误判样本（多数字白话叙述被要求补显式等式 ×2；已有完整分步计算被同时催 step-by-step 和去 AI 味）。诊断为 Simulator 未严格执行已经写清楚的判断标准，不是文字歧义。加数数字 CoT 步骤 + 针对这三个样本的具体反例锚点（Step 1 六次修订，commit `8f90615`）
-- 两轮训练规则 5（复读 >=12 强制判 -1）仍高频触发；诊断阈值 12 本身合理（已用真实数据校准，零误伤好样本），问题是信用分配太糊——负分打在整个 turn 上，模型学不到"具体是哪句话复读了"。走 OPD 现成的 hint 条件化 teacher 机制，命中规则 5 时把该 turn 的 `accepted` hint 整体替换成写死的复读提醒，天然逐 token 定位到复读发生的位置，不需要额外找 token 区间（新增 `is_repeat_thinking_violation` 标记，跟 1-5 通用的 `is_invalid_tool_use` 分开，避免误挂到其他规则，commit `d4a584f`）
-- 手动核对 `separate_student_20260811_141207`（commit `edd247b`，早于以上两处改动）：72 题完整跑完主动停训，done 68/incomplete 4/couldn't-generate 24/overflow 11，OPD+RL +1/-1=113/129，update_weights≈21 次，是目前几轮里 pipeline 健康度最好的一次。人工核对大部分成功 session，Simulator 反馈和 4B 调整符合预期，但仍存在实际问题（即上面①②两条——Simulator ②③误判、规则 5 信用分配太糊，均已在本条打了对应补丁），且始终没能在 turn 1 就直接给出满足要求的回复，未观察到收敛
+- 规则 5（复读判负分）连续两轮训练仍高频触发。诊断为信用分配太糊——负分打在整拍，模型学不到具体是哪句话复读——不是阈值问题。走 OPD 现成的 hint 条件化 teacher 机制，命中时把该 turn 的 `accepted` hint 整体替换成写死的复读提醒（新增 `is_repeat_thinking_violation` 标记，commit `d4a584f`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-11"规则 5...连续两轮训练仍高频触发"条目
+- 新训练暴露 Step 1 ②③三个真实误判样本，Simulator 未严格执行已写清楚的判断标准。加数数字 CoT 步骤 + 针对性反例锚点（Step 1 六次修订，commit `8f90615`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-11"Step 1 ②③真实误判样本"条目
+- 同日晚些时候又出现同一类误判（P17），判定②这条判断对当前 Simulator 不可靠，用户决定整条删除②，七次修订（commit `5f69bc4`）——**当晚已撤销**，见下
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-11"Step 1 七次修订"条目
+- `separate_student_20260811_170852`（commit `d4a584f`）30 题完整数据分析：**policy 侧已经学会给出合格 turn-1（P17 起分界清晰），但 Simulator 几乎全部误判打回（10/11），③型误判比②更多，还出现规则外编造的反对理由**——推翻了"训练量不足"的早先猜测，改判为 Simulator 本身系统性偏严；为让代码基线对齐这批数据，用 `git revert` 撤销七次修订（保留六次修订——170852 实际运行的 `d4a584f` 快照本身含六次修订）。撤销过程中一度误把六次修订也撤销掉，用户看 `git pull` 结果发现改动量不对当场指出，已修正，`md5sum` 核对确认当前文件与 `d4a584f` 快照哈希完全一致
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-11"170852 完整数据分析"条目
+- 手动核对 `separate_student_20260811_141207`（commit `edd247b`）：72 题完整跑完主动停训，done 68/incomplete 4/couldn't-generate 24/overflow 11，OPD+RL +1/-1=113/129，update_weights≈21 次，是 pipeline 健康度最好的一次，记作参考基线（早于本次会话改动，仅供后续对照）
 
-**关键决策：** turn-1 不收敛暂判断为训练量不足（约 21 次权重更新对覆盖基座模型格式偏好来说偏少），不是反馈环路本身有问题——单轮修正机制已验证健康，问题范围收窄到"学习信号密度/质量"，正是上面规则 5 hint 补丁想解决的方向；待新一轮训练结果与 `separate_student_20260811_141207` 对照
+**关键决策：** turn-1 不收敛的真实瓶颈是 Simulator 系统性拒绝合格答案，不是训练量不足——170852 数据推翻了早先的猜测。下一步方向待讨论（候选：全局"默认接受、除非能具体举证"框架调整 / 重新评估 DeepSeek V4 替代模型的校准问题 / 核实误判是否在污染 PRM 打分）
 
 **产出：**
-- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 六次修订（②③加数数字 CoT + 反例锚点）
+- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 六次修订（当前生效）+ 七次修订（已 revert，历史保留）
 - `scripts/prepare_patched_openclaw_opd.sh` / `scripts/prepare_patched_openclaw_combine_select.sh`：规则 5 OPD hint 纠正信号
 - `docs/personal_agent_self_evolution_concept.svg`/`.png`：新增自进化理念图（开篇理念图，跟实验细节图配套，两栏对话循环/训练循环结构）
-
-**再追加：`separate_student_20260811_170852`（commit `d4a584f`，未含六/七次修订）数据分析——policy 训练已经成功，卡住的是 Simulator 不认可合格 turn-1。** CLI 核对已完成的 30 题：11/30（37%）Turn1 同时过 Table 3 正则 + 有真实过程；以 P17 为界，之前 Turn1 多数仍是 formal、Student 合理要求重写（17 条），**P17 起只要 Turn1 合格，Simulator 几乎全部误判打回**（10/11 条），0 条被正确带入 Step 2 写入，另 1 条（P18）合格后直接说"Thanks, that's all I need"收工、跳过写入请求。误判细分：假 rewrite（没 bold/编号仍被要求"改自然"，纯③型）6 条，假要步骤/催重新读文件 4 条——**③ 比②更常见**，且"催重新读文件"不属于 Step 1 任何一条已写的检查项，是 Simulator 编造出的规则外反对理由。判定为 Simulator 本身对"turn 1 是否够好"存在系统性偏严倾向，不是某条具体规则文字不够精确（呼应 07-29 提出、一直未证实的"DeepSeek V4 替代 Qwen3-32B 可能本身判断更严格"假设，现在有更强证据支持）。进一步推论（尚待 CLI 核实，未当结论）：Student 的重写请求会作为 next_state 喂进 PRM 打分（`_build_prm_eval_prompt` 把"user 要求 redo"当强 -1 证据），这批误判可能在直接给已经正确的 turn 打负分，不只是对话数据质量问题。
-
-为让接下来讨论"如何解决 Simulator 拒绝合格 turn-1"时代码基线跟这批数据实际对应，用 `git revert` 撤销六次修订（`8f90615`）和七次修订（`5f69bc4`）（非破坏性，历史不变，新增 `3ac9f66`/`3dfd459` 两个回退提交），仓库回到 `edd247b`+`d4a584f`，`git diff edd247b -- scripts/prepare_openclaw_test_scripts.sh` 为空，已确认跟 170852 实际运行代码完全对齐。
-
-**关键决策（修正同日早些时候的判断）：** turn-1 不收敛不是训练量不足——170852 证明 policy 侧已学会给出合格 Turn1（P17 起分界清晰），瓶颈 100% 在 Simulator/环境侧不认可正确答案，且偏严倾向跨②③、甚至规则外理由都在发生，更像判官模型本身校准问题，不是某条 prompt 规则写得不够精确。六/七次修订"精修具体判断文字"的思路收益可能有限，下一步方向待讨论。
 
 ### 当前状态（2026-08-11）
 
 ### 已就绪
-（同 08-10，未变——见下方"历史状态（2026-08-10）"完整列表。规则 5 补充 OPD hint 纠正信号仍在——`is_repeat_thinking_violation` 标记 + `accepted` 强制替换，已实现并本地验证。**STUDENT_SYSTEM_PROMPT 六/七次修订已撤销**（`git revert`，非破坏性），仓库回到 `edd247b` 状态，跟本次训练 170852 实际运行代码对齐）
+（同 08-10，未变——见下方"历史状态（2026-08-10）"完整列表。规则 5 补充 OPD hint 纠正信号——`is_repeat_thinking_violation` 标记 + `accepted` 强制替换，已实现并本地验证。**STUDENT_SYSTEM_PROMPT 七次修订已撤销**（`git revert`，非破坏性，六次修订保留），当前仓库状态跟本次训练 170852 实际运行代码对齐，已用 `md5sum` 核对一致）
 
 ### 已知限制 / 未解决
 （同 08-10，未变——见下方"历史状态（2026-08-10）"完整列表。另加：**170852 实锤 turn-1 不收敛的真实瓶颈**——policy 侧已学会给出合格 Turn1，Simulator 几乎 100% 误判打回（10/11），③型误判比②更多，还出现规则外的"编造"反对理由，判定为 Simulator 本身对"turn 1 是否够好"存在系统性偏严倾向，不是某条具体规则文字不精确；`separate_student_20260811_141207` 当时"训练量不足"的猜测已被这批更新的数据推翻）
