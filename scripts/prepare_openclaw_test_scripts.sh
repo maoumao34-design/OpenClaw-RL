@@ -397,4 +397,80 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (Steps: real-answer check split from AI-like check + write-verification tightened + role-bleed guard added) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07）"
+# ---------------------------------------------------------------------
+# 08-11 六次修订（新一轮训练用 Step 1 三分支版本后，仍观测到 Simulator 在
+# ②③文字已经写得很明确的情况下继续误判，见 docs/issues_log.md 2026-08-11
+# 条目）：
+#
+#   三个真实误判样本：
+#   - 误判 A/B：回复用大白话叙述多个数字（"20 (Carol) + 44 (Jennifer) =
+#     64...100-64=36" / "Carol has 20...Jennifer has 44...together 64...
+#     36 more"），按②文字逐字核对本该判定为"已有过程"，但 Simulator 仍
+#     要求"show me the whole work" / "show those as part of the
+#     explanation"——按字面语义等同于要求补一个显式 "20+44=64" 等式。
+#   - 误判 C：回复已经用 $ 符号把每一步都列出来了（还带着粗体），命中的
+#     应该只是③（去 AI 味），但 Simulator 把②③混在一起提，同时要求
+#     "full solution step by step" 和"更自然/不要 bold"。
+#
+#   诊断：不是规则文字有歧义（逐字核对三个 case 都已经被②③的现有文字
+#   覆盖），是 Simulator 这个 LLM 在实际判断时没有严格执行给定标准，而是
+#   被自己"过程应该长成 a+b=c 这种显式等式"的习惯偏好覆盖。用户确认方向：
+#   加具体的 few-shot 反例 + 让它先做一步"数数字"的显式中间步骤（CoT），
+#   而不是继续在抽象措辞上加码（前几轮已经把抽象措辞打磨到接近上限）。
+#
+#   改动：
+#   - ②开头插入"先数一遍整段回复里出现了几个不同的数字（含拼写出来的
+#     数字词，比如 "four"）"这一步显式计数动作，数到 >=2 就直接跳过这条，
+#     不再进入"是不是只有一个数字"的判断；并在结尾追加一个直接对应误判
+#     A/B 的具体反例（Carol/Jennifer 那句），明确点出"没有 + 或 = 符号也
+#     算完整过程，不该要求补等式"。
+#   - ③结尾追加一个直接对应误判 C 的具体反例（$ 符号+粗体的完整分步
+#     计算），明确点出"这种情况只该要自然语气，不该再要 step by step"。
+#   - 不改判断逻辑本身（仍然是①②③三分支、仍然全部交给 Simulator 主观
+#     判断，不下放到代码），只是给同样的标准加计数脚手架和具体锚点例子，
+#     跟之前"代码判断意图"被用户否决的方向不同。
+#
+#   这是主动设计的新机制，不是修复已知 bug，效果需要下一轮真实训练数据
+#   验证——如果 few-shot/CoT 之后误判仍然复现，说明纯 Simulator-prompt
+#   层面的手段可能已经到头，需要重新考虑之前被否决的"代码判断意图"方向。
+# ---------------------------------------------------------------------
+python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+text = open(dest_path, encoding="utf-8").read()
+
+old_bullet2 = (
+    '   - If you DID find something like that: check if the ENTIRE reply mentions only ONE number in total (the final answer itself), with no other numbers, quantities, or intermediate values mentioned anywhere -- e.g. it\'s ONLY something like "90 liters." or "The answer is $93." or just "6" and nothing else. If there is more than one number anywhere in the reply -- whether the calculation is shown with symbols (like "5x5=25, 4x10=40") or described in plain words (like "4 plus 2 is 6" or "16 minus 11 equals 5"), that already counts as showing work -- do NOT treat it as "only the answer" just because it\'s brief, phrased in words instead of symbols, or doesn\'t use "=" signs. Only use this check when there is truly a single number and nothing else in the whole reply. If it\'s truly bare like that, tell it you need to see the actual steps/calculation, not just the final number -- do NOT mention writing to the file or style in this message either.\n'
+)
+if text.count(old_bullet2) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of Step 1 bullet 2 in "
+        f"student_chat.py, found {text.count(old_bullet2)} (an earlier patch "
+        "in this script may have changed -- update this patch)"
+    )
+new_bullet2 = (
+    '   - First, actually count: how many distinct numbers appear anywhere in the reply (spelled-out number words like "four" or "sixteen" count too)? If you count 2 or more, that already counts as showing work -- skip straight to the next bullet below, no matter how compact or word-based the phrasing is. Only if you count exactly 1 should you check further: does the ENTIRE reply mention only ONE number in total (the final answer itself), with no other numbers, quantities, or intermediate values mentioned anywhere -- e.g. it\'s ONLY something like "90 liters." or "The answer is $93." or just "6" and nothing else? If there is more than one number anywhere in the reply -- whether the calculation is shown with symbols (like "5x5=25, 4x10=40") or described in plain words (like "4 plus 2 is 6" or "16 minus 11 equals 5"), that already counts as showing work -- do NOT treat it as "only the answer" just because it\'s brief, phrased in words instead of symbols, or doesn\'t use "=" signs. Only use this check when there is truly a single number and nothing else in the whole reply. If it\'s truly bare like that, tell it you need to see the actual steps/calculation, not just the final number -- do NOT mention writing to the file or style in this message either. Example of what NOT to do: a reply like "Carol has 20 signatures and Jennifer has 44, so together that\'s 64. They need 36 more to reach 100." has four numbers (20, 44, 64, 36) -- even with no "+" or "=" sign anywhere, this already shows full work; do NOT ask for it to be rewritten as an explicit equation like "20 + 44 = 64" -- that reply already passes, move on to the next bullet.\n'
+)
+text = text.replace(old_bullet2, new_bullet2, 1)
+
+old_bullet3 = (
+    '   - Otherwise (it has real work/calculation shown, in any form): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite. If it\'s already natural-sounding with no AI-like formatting, no need to redo.\n'
+)
+if text.count(old_bullet3) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of Step 1 bullet 3 in "
+        f"student_chat.py, found {text.count(old_bullet3)} (an earlier patch "
+        "in this script may have changed -- update this patch)"
+    )
+new_bullet3 = (
+    '   - Otherwise (it has real work/calculation shown, in any form): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite. If it\'s already natural-sounding with no AI-like formatting, no need to redo. Example: a reply that already has bold text AND every step spelled out with dollar signs (like "$30 (jacket) + 2 × $20 (shoes) = **$70**" ... "$40 ÷ $4 = **10 times**") already has full work shown -- if you ask for a rewrite here, ONLY ask it to sound more natural/less bold, do NOT also ask it to "show the full solution step by step" -- the steps are already there.\n'
+)
+text = text.replace(old_bullet3, new_bullet3, 1)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (Step 1 bullet 2/3: added number-counting CoT step + concrete counter-examples) -> {dest_path}")
+PY
+
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护 + 数数字 CoT/few-shot 反例，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07 / 2026-08-11）"
