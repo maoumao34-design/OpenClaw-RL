@@ -1,0 +1,63 @@
+<svg width="920" height="520" viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>Personal Agent 自进化理念图：对话与训练同时发生</title>
+<desc>开篇理念图，跟配套的实验细节图（personal_agent_dialogue_vs_training_loop.svg）使用同一套视觉语言和结构骨架——同一个 Agent 输出同时分叉进对话循环（左，回应正常送回去继续对话）和训练循环（右，同一段对话自动变成训练信号、权重更新后又同步回同一个 Agent）。核心是强调"对话"和"训练"不是先后两件事，而是同时发生——权重随对话持续更新，"部署"和"训练"是同一回事，这才是自进化。机制细节（判官、GRPO/OPD、Megatron）压缩成一个箱子，不展开，不展示收敛数据。</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<path d="M2 1L8 5L2 9" fill="none" stroke="#3d3d3a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</marker>
+</defs>
+<rect x="0" y="0" width="920" height="520" fill="#ffffff"/>
+
+<text x="460" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#2d2c2a">对话即训练：Agent 在服务用户的同时自我进化</text>
+<text x="460" y="52" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" font-style="italic" fill="#8A887E">Train Any Agent Simply by Talking</text>
+
+<g>
+<rect x="310" y="70" width="300" height="56" rx="8" fill="#F1EFE8" stroke="#5F5E5A" stroke-width="1"/>
+<text x="460" y="88" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#444441">Persona</text>
+<text x="460" y="108" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#5F5E5A">跟 Agent 自然对话（不为了训练而对话）</text>
+</g>
+
+<line x1="460" y1="126" x2="460" y2="160" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<g>
+<rect x="310" y="160" width="300" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
+<text x="460" y="178" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#3C3489">Agent（Policy 模型）</text>
+<text x="460" y="198" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">同一次回应，同时喂给下面两条路</text>
+</g>
+
+<line x1="380" y1="216" x2="240" y2="252" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="540" y1="216" x2="680" y2="252" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<line x1="460" y1="234" x2="460" y2="440" stroke="#C9C6BC" stroke-width="1" stroke-dasharray="4 4"/>
+
+<text x="240" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">← 对话循环</text>
+<text x="680" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#534AB7">训练循环 →</text>
+
+<g>
+<rect x="70" y="266" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
+<text x="240" y="284" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#3C3489">回应正常送回 Persona</text>
+<text x="240" y="304" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">对话照常继续，不会因为训练而中断</text>
+</g>
+
+<path d="M70,294 L30,294 L30,98 L310,98" fill="none" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="14" y="196" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#444441" transform="rotate(-90 14 196)">继续对话</text>
+
+<g>
+<rect x="510" y="266" width="340" height="64" rx="8" fill="#E1F5EE" stroke="#0F6E56" stroke-width="1"/>
+<text x="680" y="288" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#085041">对话实时判定为 OPD + RL 信号</text>
+<text x="680" y="308" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#0F6E56">规则自动判定，不是人工逐条打分</text>
+</g>
+
+<line x1="680" y1="330" x2="680" y2="364" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+<g>
+<rect x="510" y="364" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
+<text x="680" y="382" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#3C3489">Policy 权重立刻更新</text>
+<text x="680" y="402" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">"部署"和"训练"是同一回事，不是先后两步</text>
+</g>
+
+<path d="M850,392 L890,392 L890,188 L610,188" fill="none" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+<text x="906" y="290" text-anchor="middle" font-family="Arial, sans-serif" font-size="12" fill="#444441" transform="rotate(-90 906 290)">同步新权重</text>
+
+<text x="460" y="466" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" fill="#444441">对话还没聊完，权重已经在更新——同一个 Agent，一边服务用户，一边悄悄进化</text>
+</svg>
