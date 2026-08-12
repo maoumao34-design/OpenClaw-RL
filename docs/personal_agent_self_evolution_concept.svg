@@ -1,6 +1,6 @@
 <svg width="920" height="520" viewBox="0 0 920 520" xmlns="http://www.w3.org/2000/svg" role="img">
 <title>Personal Agent 自进化理念图：对话与训练同时发生</title>
-<desc>开篇理念图，跟配套的实验细节图（personal_agent_dialogue_vs_training_loop.svg）使用同一套视觉语言和结构骨架——同一个 Agent 输出同时分叉进对话循环（左，回应正常送回去继续对话）和训练循环（右，同一段对话自动变成训练信号、权重更新后又同步回同一个 Agent）。核心是强调"对话"和"训练"不是先后两件事，而是同时发生——权重随对话持续更新，"部署"和"训练"是同一回事，这才是自进化。机制细节（判官、GRPO/OPD、Megatron）压缩成一个箱子，不展开，不展示收敛数据。</desc>
+<desc>开篇理念图，跟配套的实验细节图（personal_agent_dialogue_vs_training_loop.svg）使用同一套视觉语言和结构骨架——同一个 Agent 输出分叉进对话循环（左，回应正常送回去继续对话）和训练循环（右，同一段对话自动变成训练信号、权重更新后又同步回同一个 Agent）。核心是强调部署和训练异步并行进行，不需要像传统模式那样停机重训——对话持续对外服务的同时，训练在背后持续进行、周期性把新权重同步回来，这才是自进化。机制细节（判官、GRPO/OPD、Megatron）压缩成一个箱子，不展开，不展示收敛数据。</desc>
 <defs>
 <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M2 1L8 5L2 9" fill="none" stroke="#3d3d3a" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -22,16 +22,16 @@
 <g>
 <rect x="310" y="160" width="300" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
 <text x="460" y="178" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#3C3489">Agent（Policy 模型）</text>
-<text x="460" y="198" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">同一次回应，同时喂给下面两条路</text>
+<text x="460" y="198" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">回应照常送出，训练在背后异步进行</text>
 </g>
 
-<line x1="380" y1="216" x2="240" y2="252" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
-<line x1="540" y1="216" x2="680" y2="252" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="380" y1="216" x2="240" y2="238" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
+<line x1="540" y1="216" x2="680" y2="238" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
 
 <line x1="460" y1="234" x2="460" y2="440" stroke="#C9C6BC" stroke-width="1" stroke-dasharray="4 4"/>
 
-<text x="240" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">← 对话循环</text>
-<text x="680" y="250" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#534AB7">训练循环 →</text>
+<text x="240" y="261" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#0F6E56">← 对话循环</text>
+<text x="680" y="261" text-anchor="middle" font-family="Arial, sans-serif" font-size="13" font-weight="600" fill="#534AB7">训练循环 →</text>
 
 <g>
 <rect x="70" y="266" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
@@ -53,7 +53,7 @@
 <g>
 <rect x="510" y="364" width="340" height="56" rx="8" fill="#EEEDFE" stroke="#534AB7" stroke-width="1"/>
 <text x="680" y="382" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="14" font-weight="600" fill="#3C3489">Policy 权重立刻更新</text>
-<text x="680" y="402" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">"部署"和"训练"是同一回事，不是先后两步</text>
+<text x="680" y="402" text-anchor="middle" dominant-baseline="central" font-family="Arial, sans-serif" font-size="12" fill="#534AB7">跟对话异步并行进行，不需要停机重训</text>
 </g>
 
 <path d="M850,392 L890,392 L890,188 L610,188" fill="none" stroke="#3d3d3a" stroke-width="1.5" marker-end="url(#arrow)"/>
