@@ -473,4 +473,52 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (Step 1 bullet 2/3: added number-counting CoT step + concrete counter-examples) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护 + 数数字 CoT/few-shot 反例，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07 / 2026-08-11）"
+# ---------------------------------------------------------------------
+# 08-11 八次修订（170852 完整数据分析后，见 docs/issues_log.md 2026-08-11
+# "170852 完整数据分析"条目）：
+#
+# 背景：170852 数据显示，一旦 policy 能稳定给出合格 turn-1（P17 起），
+# Simulator 几乎 100% 误判打回（10/11），③型（AI 味）比②型更常见，还
+# 出现规则外编造的反对理由（催重新读文件，不属于 Step 1 任何一条已写
+# 的检查项）。用户提出：这很可能不是某条规则文字的问题，是提示词本身
+# 的结构性缺陷——Steps 被拆成多个独立步骤（先查质量、再单独一条消息
+# 要求写入、再单独核实），这种结构可能诱导 Simulator 觉得"轮到我在
+# Step 1 说点什么"是隐含的任务要求，哪怕回复其实已经完全合格、没有
+# 真正毛病可挑，也倾向于编一个理由来"完成"这一步的动作，而不是识别出
+# "这里不需要做任何事，直接跳过"本身就是合法、被期待的结果。用户还
+# 指出：论文自己把 Table 3 的指标定义成"需要几个 session 才能收敛"而
+# 不是"turn 1 是否总是直接通过"，这个指标设计本身暗示这个倾向很可能
+# 从论文原始提示词起就存在，不是这次会话的补丁引入的新问题。
+#
+# 方案：在 Step 1 开头（"Check in this order:" 之前）加一句框架性说明，
+# 直接对冲这个结构性压力——明确"已经合格就是真正的成功，直接跳过，
+# 不要因为轮到自己发言就觉得必须挑点什么，也不要编造清单之外的理由
+# （比如要求重新读题）"。只加这一条框架，不改①②③本身的判断标准，
+# 不碰 Step 2/3。
+# ---------------------------------------------------------------------
+python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+text = open(dest_path, encoding="utf-8").read()
+
+old_step1_lead = (
+    '1. Look at what the AI gives you in response to your solve request. Check in this order:\n'
+)
+if text.count(old_step1_lead) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the Step 1 lead-in line "
+        f"in student_chat.py, found {text.count(old_step1_lead)} (an earlier "
+        "patch in this script may have changed -- update this patch)"
+    )
+new_step1_lead = (
+    '1. Look at what the AI gives you in response to your solve request. Important: if the reply already satisfies everything below, that IS a genuine success -- move straight on to the next step. Don\'t feel like you need to ask for something at this step just because it\'s your turn to respond, and don\'t invent objections that aren\'t in the checks below (like asking it to re-read the problem, re-derive something it already got right, or add anything not actually missing). Check in this order:\n'
+)
+text = text.replace(old_step1_lead, new_step1_lead, 1)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (Step 1: added anti-perfectionism framing to counter structural pressure to always object) -> {dest_path}")
+PY
+
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护 + 数数字 CoT/few-shot 反例 + Step 1 默认接受框架，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07 / 2026-08-11）"
