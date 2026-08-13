@@ -5,7 +5,11 @@
 # class docstring's truth table) -- to drop turns flagged by
 # prepare_patched_openclaw_opd.sh's `is_aborted`/`generated_while_paused`/
 # `is_duplicate_user_retry` markers before they reach ANY of the three
-# branches.
+# branches, AND (temporary diagnostic experiment, 2026-08-13, see
+# docs/issues_log.md) turns flagged `skip_forced_negative_override` by
+# prepare_patched_openclaw_combine_select.sh's `_opd_evaluate()` -- turns
+# where the PRM originally scored +1 but one of the existing eval_score
+# overrides (invalid-tool-use-penalty/truncation-penalty) forced it to -1.
 #
 # Why this file specifically (docs/issues_log.md 2026-08-13 entry): actual
 # training imports `OpenClawCombineSelectAPIServer`, which subclasses
@@ -163,9 +167,54 @@ new_loop_head = (
 )
 text = text.replace(old_loop_head, new_loop_head, 1)
 
+# ---------------------------------------------------------------------
+# openclaw-rl-skip-forced-negative-override (2026-08-13, temporary
+# diagnostic experiment, see docs/issues_log.md 2026-08-13 entry). This is
+# a SECOND, independent check point in the same function -- deliberately
+# NOT merged into the is_aborted/generated_while_paused/is_duplicate_user_retry
+# check above, because that one reads `td` (turn_data, known before the PRM
+# judge ever runs); this one reads `opd_result` (only known after
+# `task.result()` succeeds -- see prepare_patched_openclaw_combine_select.sh
+# for where `skip_forced_negative_override` is computed inside
+# _opd_evaluate()). Placed BEFORE `eval_score = opd_result.get("eval_score")`
+# and the `_eval_scores.append(eval_score)` call that follows it -- if this
+# ran after eval_scores.append, the -1 would still get recorded (polluting
+# eval-mode/wandb bookkeeping) even though the sample itself gets skipped,
+# making it impossible to tell from that bookkeeping whether the skip
+# actually took effect.
+# ---------------------------------------------------------------------
+skip_forced_neg_old = (
+    '                if self._eval_mode:\n'
+    '                    with self._eval_scores_lock:\n'
+    '                        self._eval_scores.append(0.0)\n'
+    '                continue\n'
+    '\n'
+    '            eval_score = opd_result.get("eval_score")\n'
+)
+if text.count(skip_forced_neg_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the task.result() "
+        f"failure-handling + eval_score assignment block in {src_path}, "
+        f"found {text.count(skip_forced_neg_old)} (official file may have "
+        "changed upstream -- update this patch)"
+    )
+skip_forced_neg_new = (
+    '                if self._eval_mode:\n'
+    '                    with self._eval_scores_lock:\n'
+    '                        self._eval_scores.append(0.0)\n'
+    '                continue\n'
+    '\n'
+    '            # --- openclaw-rl-skip-forced-negative-override (temporary, safe to remove) ---\n'
+    '            if opd_result.get("skip_forced_negative_override"):\n'
+    '                continue\n'
+    '\n'
+    '            eval_score = opd_result.get("eval_score")\n'
+)
+text = text.replace(skip_forced_neg_old, skip_forced_neg_new, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
-print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry turns, gates both OPD and RL submission paths) -> {dest_path}")
+print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override turns, gates both OPD and RL submission paths) -> {dest_path}")
 PY
 
-echo "已生成 openclaw_combine_api_server.py 补丁: ${DEST_DIR}/openclaw_combine_api_server.py（_maybe_submit_ready_samples 拦截 is_aborted/generated_while_paused/is_duplicate_user_retry，OPD+RL 两条提交路径一起挡住，见 docs/issues_log.md 2026-08-13 条目）"
+echo "已生成 openclaw_combine_api_server.py 补丁: ${DEST_DIR}/openclaw_combine_api_server.py（_maybe_submit_ready_samples 拦截 is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override，OPD+RL 两条提交路径一起挡住，见 docs/issues_log.md 2026-08-13 条目）"

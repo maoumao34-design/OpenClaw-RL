@@ -125,6 +125,13 @@ if text.count(eval_score_old) != 1:
         "changed upstream -- re-verify this patch)"
     )
 eval_score_new = eval_score_old + (
+    '            # --- openclaw-rl-skip-forced-negative-override (2026-08-13, temporary\n'
+    '            # diagnostic experiment, see docs/issues_log.md 2026-08-13 entry) ---\n'
+    '            # Captured BEFORE any of the three override blocks below run, so it\n'
+    '            # reflects the PRM\'s own original judgment, not an already-overridden\n'
+    '            # value (matters if more than one override condition fires on the same\n'
+    '            # turn -- want "was this originally +1" not "was it +1 a moment ago").\n'
+    '            _original_eval_score = eval_score\n'
     '            # --- openclaw-rl-invalid-tool-use-penalty (temporary, safe to remove) ---\n'
     '            if turn_data.get("is_invalid_tool_use"):\n'
     '                logger.info(\n'
@@ -170,6 +177,31 @@ eval_score_new = eval_score_old + (
     '                    _CYAN, session_id, turn_num, eval_score, _RESET,\n'
     '                )\n'
     '                eval_score = -1.0\n'
+    '\n'
+    '            # --- openclaw-rl-skip-forced-negative-override (2026-08-13, temporary\n'
+    '            # diagnostic experiment) --- see docs/issues_log.md 2026-08-13 entry for\n'
+    '            # the full investigation (170852 vs 160713/143003 batch-composition\n'
+    '            # comparison). Real data shows the decisive factor in whether a run\n'
+    '            # "unlocks" clean turn-1s is whether these specific samples -- PRM\n'
+    '            # originally scored the turn +1 (the file usually did get written\n'
+    '            # correctly), but one of the three overrides above forced it to -1\n'
+    '            # because of tool-decision spinning (repeat/truncation), not because\n'
+    '            # the content was actually bad -- happen to pile into the same async\n'
+    '            # training batch. This is a plain predicate on the before/after values,\n'
+    '            # not a rule-name allowlist: deliberately does NOT special-case which of\n'
+    '            # the three overrides fired, and deliberately does NOT touch a genuine\n'
+    '            # PRM-native -1 (real style-rewrite feedback -- Table 3\'s actual signal,\n'
+    '            # must stay) or a 0.0 -> -1.0 transition (not "was +1", seen in 160713).\n'
+    '            _skip_forced_negative_override = (\n'
+    '                _original_eval_score in (1.0, 1) and eval_score == -1.0\n'
+    '            )\n'
+    '            if _skip_forced_negative_override:\n'
+    '                logger.info(\n'
+    '                    "%s[openclaw-rl-skip-forced-negative-override] session=%s "\n'
+    '                    "turn=%d original=+1 final=-1 -- will not be submitted to "\n'
+    '                    "OPD or RL%s",\n'
+    '                    _CYAN, session_id, turn_num, _RESET,\n'
+    '                )\n'
 )
 text = text.replace(eval_score_old, eval_score_new, 1)
 
@@ -236,6 +268,74 @@ accepted_cap_new = accepted_cap_old + (
     '            }]\n'
 )
 text = text.replace(accepted_cap_old, accepted_cap_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-skip-forced-negative-override (2026-08-13, temporary
+# diagnostic experiment): carry the flag computed above out of
+# _opd_evaluate() via its return dict, since the dispatch point that
+# decides whether to submit (_maybe_submit_ready_samples, in the parent
+# class's file openclaw_combine_api_server.py) only sees this function's
+# return value (`opd_result`), not its local variables. Both return points
+# (accepted-hint path and no-valid-hint path) need it -- either one could
+# be reached by a turn where the eval_score override fired.
+# ---------------------------------------------------------------------
+return_no_hint_old = (
+    '            return {\n'
+    '                "accepted": False,\n'
+    '                "teacher_tokens_candidates": None,\n'
+    '                "hint": "",\n'
+    '                "hints": [],\n'
+    '                "votes": votes,\n'
+    '                "eval_score": eval_score,\n'
+    '            }\n'
+)
+if text.count(return_no_hint_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the no-valid-hint "
+        f"return dict in {src_path}, found {text.count(return_no_hint_old)} "
+        "(official file may have changed upstream -- re-verify this patch)"
+    )
+return_no_hint_new = (
+    '            return {\n'
+    '                "accepted": False,\n'
+    '                "teacher_tokens_candidates": None,\n'
+    '                "hint": "",\n'
+    '                "hints": [],\n'
+    '                "votes": votes,\n'
+    '                "eval_score": eval_score,\n'
+    '                "skip_forced_negative_override": _skip_forced_negative_override,\n'
+    '            }\n'
+)
+text = text.replace(return_no_hint_old, return_no_hint_new, 1)
+
+return_accepted_old = (
+    '        return {\n'
+    '            "accepted": True,\n'
+    '            "teacher_tokens_candidates": candidates,\n'
+    '            "hint": hints[0],   # for log-line back-compat with parent\n'
+    '            "hints": hints,\n'
+    '            "votes": votes,\n'
+    '            "eval_score": eval_score,\n'
+    '        }\n'
+)
+if text.count(return_accepted_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the accepted return "
+        f"dict in {src_path}, found {text.count(return_accepted_old)} "
+        "(official file may have changed upstream -- re-verify this patch)"
+    )
+return_accepted_new = (
+    '        return {\n'
+    '            "accepted": True,\n'
+    '            "teacher_tokens_candidates": candidates,\n'
+    '            "hint": hints[0],   # for log-line back-compat with parent\n'
+    '            "hints": hints,\n'
+    '            "votes": votes,\n'
+    '            "eval_score": eval_score,\n'
+    '            "skip_forced_negative_override": _skip_forced_negative_override,\n'
+    '        }\n'
+)
+text = text.replace(return_accepted_old, return_accepted_new, 1)
 
 if "\nimport json\n" not in text:
     text = text.replace("import logging\n", "import json\nimport logging\n", 1)
