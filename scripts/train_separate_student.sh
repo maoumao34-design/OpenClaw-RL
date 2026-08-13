@@ -157,6 +157,14 @@ bash "${SCRIPTS_DIR}/prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_
 PATCHED_COMBINE_SELECT_DIR="${LOGS_DIR}/patched-openclaw-combine-select"
 bash "${SCRIPTS_DIR}/prepare_patched_openclaw_combine_select.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_SELECT_DIR}"
 
+# 408/503 重试链污染训练信号 A/B 两类的拦截点（_maybe_submit_ready_samples，
+# OPD+RL 两条提交路径共用的分发函数）在 openclaw_combine_api_server.py 里，
+# 这个文件之前没有补丁脚本，训练实际 import 的是 OpenClawCombineSelectAPIServer
+# （继承自这个文件的 OpenClawCombineAPIServer，不 override 这个分发函数）。
+# 见 docs/issues_log.md 2026-08-13 条目。
+PATCHED_COMBINE_DIR="${LOGS_DIR}/patched-openclaw-combine"
+bash "${SCRIPTS_DIR}/prepare_patched_openclaw_combine.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_DIR}"
+
 # =====================================================================
 # conda
 # =====================================================================
@@ -281,6 +289,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
+  PATCHED_COMBINE_DIR="${PATCHED_COMBINE_DIR}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   bash "${SCRIPTS_DIR}/run_openclaw_topk_select_modelfactory.sh" \

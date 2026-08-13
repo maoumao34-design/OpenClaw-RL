@@ -122,11 +122,26 @@ text = text.replace(old_ray, new_ray, 1)
 # guessed. See scripts/prepare_patched_openclaw_combine_select.sh. No-op
 # when PATCHED_COMBINE_SELECT_DIR is unset; safe to stop wiring this in once
 # no longer needed for debugging.
+#
+# PATCHED_COMBINE_DIR (optional, set by caller): same mechanism, for a
+# patched openclaw_combine_api_server.py ahead of the official
+# openclaw-combine/ -- this is where _maybe_submit_ready_samples() (the
+# single dispatch point shared by both the OPD and RL submission paths)
+# lives. Real training imports OpenClawCombineSelectAPIServer, which
+# subclasses this file's OpenClawCombineAPIServer WITHOUT overriding
+# _maybe_submit_ready_samples() -- patching only openclaw_opd_api_server.py
+# or openclaw_combine_select_api_server.py leaves this dispatch function
+# unpatched and the fix silently inert. See
+# scripts/prepare_patched_openclaw_combine.sh (docs/issues_log.md 2026-08-13
+# entry). Only needs to be ahead of the official openclaw-combine/ path
+# below (its order relative to PATCHED_COMBINE_SELECT_DIR does not matter --
+# they patch different files). No-op when PATCHED_COMBINE_DIR is unset.
 old_pythonpath = (
     '\\"PYTHONPATH\\": \\"${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
 )
 new_pythonpath = (
     '\\"PYTHONPATH\\": \\"${PATCHED_OPD_DIR:+${PATCHED_OPD_DIR}:}'
+    '${PATCHED_COMBINE_DIR:+${PATCHED_COMBINE_DIR}:}'
     '${PATCHED_COMBINE_SELECT_DIR:+${PATCHED_COMBINE_SELECT_DIR}:}'
     '${REPO_ROOT}/Megatron-LM:${SCRIPT_DIR}:${REPO_ROOT}/openclaw-opd:${SLIME_ROOT}\\",'
 )

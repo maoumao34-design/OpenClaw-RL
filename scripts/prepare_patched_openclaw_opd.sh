@@ -670,6 +670,18 @@ turn_data_new = (
     '                # 避免两处判断口径不一致。见 prepare_patched_openclaw_combine_select.sh\n'
     '                # 里的对应改动。\n'
     '                "is_repeat_thinking_violation": _max_sentence_copies_count >= _SENTENCE_REPEAT_INVALID_THRESHOLD,\n'
+    '                # openclaw-rl-degraded-turn-drop (2026-08-13): 408/503 重试链污染\n'
+    '                # 训练信号的 A/B 两类——见 docs/issues_log.md 2026-08-13 条目。\n'
+    '                # A：这次生成本身被 SGLang 中断（pause_generation 打断 in-flight\n'
+    '                # 生成），finish_reason 是 "abort"，不是正常的 stop/tool_calls/\n'
+    '                # length，内容通常是半截，不该进训练。\n'
+    '                "is_aborted": _finish_reason == "abort",\n'
+    '                # B：这次生成吐出结果的那一刻，submission 已经被训练步暂停\n'
+    '                # （weight sync 期间的正常暂停窗口）——不管内容本身好不好，\n'
+    '                # 产生它的环境当时是不可信的，同一批 in-flight 请求会在暂停期间\n'
+    '                # 陆续吐出结果。判断点选在生成结束、写入 turn_data 这一刻（不是\n'
+    '                # 请求刚进来的时候），因为暂停可能发生在生成过程中途。\n'
+    '                "generated_while_paused": not self.submission_enabled.is_set(),\n'
     '            }\n'
 )
 text = text.replace(turn_data_old, turn_data_new, 1)
