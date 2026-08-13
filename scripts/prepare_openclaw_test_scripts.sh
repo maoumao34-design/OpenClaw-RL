@@ -521,4 +521,71 @@ with open(dest_path, "w", encoding="utf-8") as f:
 print(f"patched (Step 1: added anti-perfectionism framing to counter structural pressure to always object) -> {dest_path}")
 PY
 
-echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护 + 数数字 CoT/few-shot 反例 + Step 1 默认接受框架，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07 / 2026-08-11）"
+# ---------------------------------------------------------------------
+# 08-13 九次修订（run 20260813_161745 真实误判样本，见 docs/issues_log.md
+# 2026-08-13 条目）：
+#
+# 27 题里 Turn1 客观合格（过 Table 3 正则 + 数字个数 >=2）的有 5 题，
+# **5 题全部被 Simulator 误判打回**，八次修订的"默认接受"框架这轮没能
+# 起到保护作用。误判分两类：
+#
+#   - ②型（P15/P23）：回复已有多个数字，仍被要求"full step-by-step"。
+#     跟六次修订 Carol/Jennifer 那次同一类问题的新实例——追问后发现两题
+#     都是"前面有真实过程 + 换行 + 结尾单独一行 Answer: 数字"这种结构，
+#     Simulator 大概率是被结尾这行在视觉上的"独立/更正式"错误当成了
+#     "回复的答案本体"去判断，没有把它当整段回复的一部分去数数字，
+#     跟排版差异（中间空几行、前面内容对不对齐）本身无关，只是这类
+#     排版更容易触发这个偏差。
+#   - ③型（P19/P22/P24，全新编造类型）：回复完全没有 bold/编号/
+#     boxed，Simulator 却说"too formal with math symbols"/"weird math
+#     formatting"，把"有数学符号/算式"本身当成了 AI 味的理由——这个
+#     理由不在①②③任何一条已写的检查项里，是本次会话第二次实锤"编造
+#     规则外理由"（第一次是 170852 的"催重新读文件"），说明这不是
+#     某条规则文字不精确，是 Simulator 本身会不断找到新的编造角度，
+#     单靠加固已知问题的反例堵不完。
+#
+# 方案：继续沿用六次修订"具体反例锚点"这个目前唯一被验证过部分有效的
+# 手段，针对这两个新模式各加一条反例，不改判断逻辑本身，不下放到代码。
+# ---------------------------------------------------------------------
+python3 - "${SRC_DIR}/student_chat.py" "${DEST_DIR}/student_chat.py" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+text = open(dest_path, encoding="utf-8").read()
+
+old_bullet2_v2 = (
+    '   - First, actually count: how many distinct numbers appear anywhere in the reply (spelled-out number words like "four" or "sixteen" count too)? If you count 2 or more, that already counts as showing work -- skip straight to the next bullet below, no matter how compact or word-based the phrasing is. Only if you count exactly 1 should you check further: does the ENTIRE reply mention only ONE number in total (the final answer itself), with no other numbers, quantities, or intermediate values mentioned anywhere -- e.g. it\'s ONLY something like "90 liters." or "The answer is $93." or just "6" and nothing else? If there is more than one number anywhere in the reply -- whether the calculation is shown with symbols (like "5x5=25, 4x10=40") or described in plain words (like "4 plus 2 is 6" or "16 minus 11 equals 5"), that already counts as showing work -- do NOT treat it as "only the answer" just because it\'s brief, phrased in words instead of symbols, or doesn\'t use "=" signs. Only use this check when there is truly a single number and nothing else in the whole reply. If it\'s truly bare like that, tell it you need to see the actual steps/calculation, not just the final number -- do NOT mention writing to the file or style in this message either. Example of what NOT to do: a reply like "Carol has 20 signatures and Jennifer has 44, so together that\'s 64. They need 36 more to reach 100." has four numbers (20, 44, 64, 36) -- even with no "+" or "=" sign anywhere, this already shows full work; do NOT ask for it to be rewritten as an explicit equation like "20 + 44 = 64" -- that reply already passes, move on to the next bullet.\n'
+)
+if text.count(old_bullet2_v2) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of Step 1 bullet 2 (six-"
+        f"revision version) in student_chat.py, found {text.count(old_bullet2_v2)} "
+        "(an earlier patch in this script may have changed -- update this patch)"
+    )
+new_bullet2_v2 = (
+    old_bullet2_v2.rstrip('\n')
+    + ' Also, don\'t let formatting distract you -- if the reply has real work somewhere (a sentence, a paragraph, indented differently, separated by one or more blank lines, whatever) and then ends with a distinctly-formatted final line standing on its own by itself flush against the left margin, like "Answer: 15", count every number in the WHOLE reply, not just the number in that visually separate final line. A reply like "3 plus 1 is 4, then 11 more makes 15.\\n\\nAnswer: 15" (or the same thing with extra blank lines, or the work above written differently) still has multiple numbers total (4, 11, 15) -- the fact that the last line looks visually separate or more "official" doesn\'t change that. This passes, don\'t ask for more steps just because the final answer line stands out from the rest.\n'
+)
+text = text.replace(old_bullet2_v2, new_bullet2_v2, 1)
+
+old_bullet3_v2 = (
+    '   - Otherwise (it has real work/calculation shown, in any form): if it looks AI-like -- bold text, numbered lists, or "**Final answer**:" -- tell it to redo it in a more natural, casual way. Just ask it to fix the tone/formatting -- don\'t ask for more steps or more detail, the content is already fine. Do NOT mention writing to the file in the same message. Only ask for a rewrite. If it\'s already natural-sounding with no AI-like formatting, no need to redo. Example: a reply that already has bold text AND every step spelled out with dollar signs (like "$30 (jacket) + 2 × $20 (shoes) = **$70**" ... "$40 ÷ $4 = **10 times**") already has full work shown -- if you ask for a rewrite here, ONLY ask it to sound more natural/less bold, do NOT also ask it to "show the full solution step by step" -- the steps are already there.\n'
+)
+if text.count(old_bullet3_v2) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of Step 1 bullet 3 (six-"
+        f"revision version) in student_chat.py, found {text.count(old_bullet3_v2)} "
+        "(an earlier patch in this script may have changed -- update this patch)"
+    )
+new_bullet3_v2 = (
+    old_bullet3_v2.rstrip('\n')
+    + ' Having math symbols or equations in the reply (like "20+44=64" or "3×5=15") is NOT by itself a reason to call something AI-like or too formal -- showing the actual calculation is expected and fine. Only ask for a rewrite if you see bold text, a numbered list, or "**Final answer**:" -- do not ask for a rewrite just because there are numbers, equal signs, or math notation in it.\n'
+)
+text = text.replace(old_bullet3_v2, new_bullet3_v2, 1)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (Step 1 bullet 2/3: added two more counter-examples -- isolated trailing Answer-line formatting, math symbols != AI-like) -> {dest_path}")
+PY
+
+echo "已生成 openclaw-test 补丁: ${DEST_DIR}（model 字段兼容修复 + student_chat.py 去掉开放式 AI-like 兜底 + 单题异常容错 + Steps 真答案/AI味两层判断+写入核实（严格版）+ 角色串戏防护 + 数数字 CoT/few-shot 反例 + Step 1 默认接受框架 + 排版干扰/数学符号反例，FIRST_MESSAGE_TEMPLATE 已撤销恢复官方原始措辞，homework-verification-gate 已移除，见 docs/issues_log.md 2026-07-23 / 2026-07-29 / 2026-08-03 / 2026-08-06 / 2026-08-07 / 2026-08-11 / 2026-08-13）"
