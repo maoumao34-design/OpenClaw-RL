@@ -243,6 +243,27 @@ def _strip_rl_meta_from_messages(messages):
         cleaned.append(msg)
     return cleaned
 
+
+# openclaw-rl-duplicate-user-retry-penalty (2026-08-13): see the full design
+# note near _fire_opd_task below. OpenClaw prefixes every user message with
+# a "[Day YYYY-MM-DD HH:MM GMT+N]" timestamp before it reaches the model --
+# Student's mechanical retries (send_to_openclaw() re-POSTs the exact same
+# message text on 408/503) resend byte-identical content, but the timestamp
+# differs across retries when they land in different minutes (confirmed via
+# real run 20260813_094000: P7/P17's retries only match after stripping this
+# prefix; P11's retry happened to land in the same minute and would have
+# matched even without stripping, which is why it looked deceptively simple
+# before this was checked against more than one sample). Comparing raw
+# next_state_text without stripping this prefix would silently miss most
+# real retries.
+_OPENCLAW_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^\\[[A-Za-z]{3} \\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2} GMT[+-]\\d+\\]\\s*"
+)
+
+
+def _strip_openclaw_timestamp_prefix(text):
+    return _OPENCLAW_TIMESTAMP_PREFIX_RE.sub("", text or "", count=1)
+
 '''
 
 text = text.replace(class_marker, helper + "\n" + class_marker, 1)
@@ -611,6 +632,12 @@ init_dict_new = init_dict_old + (
     '        # (path, limit)，在下一轮看到它的真实结果时回填进\n'
     '        # self._read_coverage（见 turn_type=="main" 那段的注释）。\n'
     '        self._pending_read: dict[str, tuple] = {}\n'
+    '        # openclaw-rl-duplicate-user-retry-penalty (2026-08-13): per-session\n'
+    '        # set of user-message texts (timestamp-prefix stripped) already seen\n'
+    '        # either as an existing message in a turn\'s prompt or as a previously\n'
+    '        # accepted next_state -- see _fire_opd_task for how this is populated\n'
+    '        # and checked. Cleared at session_done alongside self._turn_counts.\n'
+    '        self._seen_user_messages: dict[str, set] = {}\n'
 )
 text = text.replace(init_dict_old, init_dict_new, 1)
 
@@ -717,6 +744,104 @@ empty_response_new = empty_response_old + (
     '                return {"response": output}\n'
 )
 text = text.replace(empty_response_old, empty_response_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-duplicate-user-retry-penalty (2026-08-13): D 的最终方案，见
+# docs/issues_log.md 2026-08-13 条目完整讨论过程。
+#
+# 背景：Student 撞 408/503 后机械重发同一句指令（send_to_openclaw() 的
+# 重试循环里 message 变量不变，不会让 Simulator 重新措辞），导致这句指令
+# 在同一 session 的对话历史里重复出现。真实数据（run 20260813_094000）
+# 证实：一开始怀疑的"P17 整个 run 都因为 408 而不可信"是错的——P17 里
+# 真正把题做完的那次 write（+1）就发生在重试之后，同一个 run_id 下既有
+# 该丢的重复指令 turn，也有该留的正常完成 turn，按 run_id 整体拉黑会
+# 连坐好样本。真正该丢的只是"next_state 是一句已经在这个 session 里
+# 出现过的 user 消息"这一类具体特征的 turn，不是整个重试 run。
+#
+# 检测点选在 _fire_opd_task（PRM 判分之前），不在 _opd_evaluate：省一次
+# judge 调用，而且命中时可以直接不 create_task，turn 天然落入
+# openclaw_combine_api_server.py 的 `if task is None` 分支之前那道拦截
+# （跟 is_aborted/generated_while_paused 共用同一处，见
+# prepare_patched_openclaw_combine.sh），不会滞留在 _pending_turn_data
+# 里等到 session_done 才被动清理。
+#
+# 集合怎么攒：只靠"历史上出现过的 next_state"不够——对话第一条 user
+# 消息（题面本身）从来不会是某个 turn 的 next_state，如果题面本身因为
+# 超时被重发，纯粹这样攒集合会漏判。所以 fire 时先把 turn_data["messages"]
+# 里已经存在的所有 user 正文（剥完时间戳前缀）灌进这个 session 的已见
+# 集合，再拿 next_state 去查，两类来源都覆盖。
+#
+# 处置方式是丢弃（不提交），不是强制 eval_score=-1：这条 turn 本身的
+# 内容可能完全正常（P11 T4 就是开始写入的正常内容，只是配对的
+# next_state 是重试进来的重复指令）——错的是"这次评价用的 next_state
+# 配对坏了"，不是"这个动作本身该罚"，跟 tool-error-penalty 那类"动作
+# 本身有问题"的规则性质不同，不应该用同一种"强制 -1 仍然提交"的处理。
+# ---------------------------------------------------------------------
+fire_opd_task_old = (
+    '    def _fire_opd_task(self, session_id: str, turn_num: int, turn_data: dict[str, Any], next_state: dict[str, Any]):\n'
+    '        if not self._prm_enabled or not next_state:\n'
+    '            return\n'
+    '        task = asyncio.create_task(self._opd_evaluate(session_id, turn_num, turn_data, next_state))\n'
+    '        task.add_done_callback(self._task_done_cb)\n'
+    '        task.add_done_callback(lambda _t: self._maybe_submit_ready_samples(session_id))\n'
+    '        self._prm_tasks.setdefault(session_id, {})[turn_num] = task\n'
+    '        turn_data["has_next_state"] = True\n'
+)
+if fire_opd_task_old not in text:
+    raise SystemExit(
+        "patch failed: expected _fire_opd_task body not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+fire_opd_task_new = (
+    '    def _fire_opd_task(self, session_id: str, turn_num: int, turn_data: dict[str, Any], next_state: dict[str, Any]):\n'
+    '        if not self._prm_enabled or not next_state:\n'
+    '            return\n'
+    '\n'
+    '        # --- openclaw-rl-duplicate-user-retry-penalty (temporary, safe to remove) ---\n'
+    '        _seen = self._seen_user_messages.setdefault(session_id, set())\n'
+    '        for _msg in turn_data.get("messages") or []:\n'
+    '            if isinstance(_msg, dict) and _msg.get("role") == "user":\n'
+    '                _text = _strip_openclaw_timestamp_prefix(_flatten_message_content(_msg.get("content")))\n'
+    '                if _text:\n'
+    '                    _seen.add(_text)\n'
+    '        if next_state.get("role") == "user":\n'
+    '            _next_text = _strip_openclaw_timestamp_prefix(_flatten_message_content(next_state.get("content")))\n'
+    '            if _next_text and _next_text in _seen:\n'
+    '                turn_data["is_duplicate_user_retry"] = True\n'
+    '                logger.info(\n'
+    '                    "[openclaw-rl-duplicate-user-retry] session=%s turn=%d dropped "\n'
+    '                    "(next_state repeats an earlier user message in this session) -- "\n'
+    '                    "not submitted to OPD or RL",\n'
+    '                    session_id, turn_num,\n'
+    '                )\n'
+    '                self._maybe_submit_ready_samples(session_id)\n'
+    '                return\n'
+    '            if _next_text:\n'
+    '                _seen.add(_next_text)\n'
+    '\n'
+    '        task = asyncio.create_task(self._opd_evaluate(session_id, turn_num, turn_data, next_state))\n'
+    '        task.add_done_callback(self._task_done_cb)\n'
+    '        task.add_done_callback(lambda _t: self._maybe_submit_ready_samples(session_id))\n'
+    '        self._prm_tasks.setdefault(session_id, {})[turn_num] = task\n'
+    '        turn_data["has_next_state"] = True\n'
+)
+text = text.replace(fire_opd_task_old, fire_opd_task_new, 1)
+
+session_done_cleanup_old = (
+    '            self._turn_counts.pop(session_id, None)\n'
+)
+if text.count(session_done_cleanup_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the session_done "
+        f"_turn_counts.pop cleanup line in openclaw_opd_api_server.py, found "
+        f"{text.count(session_done_cleanup_old)} (official file may have "
+        "changed upstream -- update this patch)"
+    )
+session_done_cleanup_new = (
+    '            self._turn_counts.pop(session_id, None)\n'
+    '            self._seen_user_messages.pop(session_id, None)\n'
+)
+text = text.replace(session_done_cleanup_old, session_done_cleanup_new, 1)
 
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
