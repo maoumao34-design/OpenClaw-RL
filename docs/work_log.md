@@ -1615,7 +1615,50 @@
 - `scripts/prepare_patched_openclaw_opd.sh` / `scripts/prepare_patched_openclaw_combine_select.sh`：规则 5 OPD hint 纠正信号
 - `docs/personal_agent_self_evolution_concept.svg`/`.png`：新增自进化理念图（开篇理念图，跟实验细节图配套，两栏对话循环/训练循环结构）
 
-### 当前状态（2026-08-11）
+---
+
+## 2026-08-13
+
+**目标：** Step 1 八次修订上线验证准备；排查 408/503 污染训练信号的完整链路，落地 Wave 1（A+B）+ Wave 2（D）
+
+**完成内容：**
+- Step 1 八次修订：Step 1 开头加"默认接受"框架，对冲多步骤结构诱发的挑刺倾向（commit `ae48df2`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-13"Step 1 八次修订"条目
+- 完整排查 408/503 如何污染训练信号，定型 A（SGLang abort）/B（暂停期间生成）/C（网关判断与 SGLang 实际状态时序错位）/D（重复 user 重试指令当 next_state）四类。中途否定了"整个 run 因 408 而不可信"的早期假设——P17 真正做完题的 `+1`（write 成功）就发生在重试之后，按 run_id 整体拉黑会连坐好样本；进一步查明 P17 根本不是"等训练超时"类型，是模型 `edit` 工具用错精确匹配语义反复空转拖出的 408，是独立的第三类问题（潜在 Wave 3，本轮不实现）
+- **Wave 1（A+B）落地**：新增 `is_aborted`/`generated_while_paused` 标记 + 新建 `prepare_patched_openclaw_combine.sh`（此前这个文件——训练实际 import 的 `_maybe_submit_ready_samples` 所在地——完全没有补丁脚本，是排查中发现的真实"补丁打错文件会静默失效"陷阱）+ `PATCHED_COMBINE_DIR` 全链路接入四条训练脚本（commit `799c500`）
+- **Wave 2（D）落地**：不按 run_id 拉黑（会连坐 P17 的成功 write），改成单 turn 本地检测——`_fire_opd_task` 里比对剥离 OpenClaw 时间戳前缀后的 `next_state` 与已见 user 消息集合，命中则丢弃（不强制 `-1`，因为内容本身可能完全正常，错的是配对关系）（commit `b28968a`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-13"408/503 污染训练信号完整排查"条目
+- 用 `separate_student_20260813_094000` 真实提交记录（`submitted OPD+RL`/`submitted RL` 日志）逐类核对是否真的造成训练标签污染，不只看机制：**只有 A 是实锤的标签污染**（至少 3 条错 `+1` + 1 条乱码内容进 OPD 蒸馏）；B 机制真实但这轮未捕获独立错标案例；D 独有增量这轮全部已经是 `-1`，价值是减少劣质蒸馏/占坑而非纠正错误方向；C 这轮没有独立样本；P17 的 `edit` 误用**没有标反**——失败 edit 正确拿到 `-1`、成功 write 正确拿到 `+1`，不是训练标签事故，只是同质失败样本效率低 + OpenClaw 展示层成功写入后仍挂旧的 `lastToolError` 警告（产品层 bug，不在本项目补丁范围）
+
+**关键决策：** C 和 P17 的 `edit` 误用问题（潜在 Wave 3）本轮均不实现——真实数据核实后确认都不是当前紧急的训练标签污染源，A 才是唯一必须修的
+
+**产出：**
+- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 八次修订
+- `scripts/prepare_patched_openclaw_opd.sh`：`is_aborted`/`generated_while_paused`/`is_duplicate_user_retry` 三个标记
+- `scripts/prepare_patched_openclaw_combine.sh`（新建）：Wave 1+2 共用的 `_maybe_submit_ready_samples` 拦截点
+- `scripts/run_openclaw_topk_select_modelfactory.sh` + 四条 `train_*.sh`：`PATCHED_COMBINE_DIR` 全链路接入
+
+### 当前状态（2026-08-13）
+
+### 已就绪
+（同 08-11，未变——见下方"历史状态（2026-08-11）"完整列表。另加：Step 1 八次修订已实现并本地验证；408/503 污染信号 Wave 1（A+B）+ Wave 2（D）均已实现、本地验证、并用真实 094000 数据核实过对训练标签的实际影响，尚未用于新一轮实际训练验证线上效果）
+
+### 已知限制 / 未解决
+（同 08-11，未变——见下方"历史状态（2026-08-11）"完整列表。另加：C（网关/SGLang 时序错位）和 P17 `edit` 误用问题（潜在 Wave 3）设计已明确但未实现，均判定为非紧急；OpenClaw 展示层在成功 write 之后仍挂旧的 `lastToolError` 警告是独立的产品/展示层 bug，不在本项目补丁范围）
+
+### 下一步
+1. 提交新一轮训练，验证：Step 1 八次修订能否降低 Simulator 对合格 turn-1 的误判率；Wave 1+2 补丁上线后 A 类错 `+1`/乱码蒸馏是否真的消失
+2. 视效果决定要不要投入 C（插件 `agent_end` 通知）或 Wave 3（`edit` 误用/`lastToolError` 展示 bug）
+3. 其余同 08-11（见下方历史状态）
+
+### 未验证
+- [ ] Step 1 八次修订对 Simulator 误判率的真实线上影响
+- [ ] Wave 1（A+B）+ Wave 2（D）上线后，A 类错 `+1` 是否真的消失，B/D 的实际触发频率
+- [ ] Simulator 拒绝合格 turn-1 是否在污染 PRM 打分（承接 08-11，仍未验证）
+
+---
+
+## 历史状态（2026-08-11，已被 8/13 结果取代）
 
 ### 已就绪
 （同 08-10，未变——见下方"历史状态（2026-08-10）"完整列表。规则 5 补充 OPD hint 纠正信号——`is_repeat_thinking_violation` 标记 + `accepted` 强制替换，已实现并本地验证。**STUDENT_SYSTEM_PROMPT 七次修订已撤销**（`git revert`，非破坏性，六次修订保留），当前仓库状态跟本次训练 170852 实际运行代码对齐，已用 `md5sum` 核对一致）

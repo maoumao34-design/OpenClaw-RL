@@ -2957,6 +2957,50 @@ if _tool_name in ("write", "edit"):
 
 ---
 
+## [2026-08-13] Step 1 八次修订：加"默认接受"框架，对冲多步骤结构诱发的挑刺倾向
+
+**背景：** 170852 数据显示 policy 学会合格 turn-1 后（P17 起）Simulator 几乎 100% 误判打回，用户提出根因可能是提示词结构性缺陷——Steps 被拆成多个独立步骤，诱导 Simulator 觉得"轮到自己在 Step 1 发言"就该挑点什么，即使回复已经完全合格。用户还指出：论文自己把 Table 3 定义成"需要几个 session 才能收敛"而非"turn 1 是否总是直接通过"，暗示这个倾向可能从原始提示词起就存在。
+
+**方案：** 在 Step 1 开头（"Check in this order:" 之前）加一句框架性说明——"已经合格就是真正的成功，直接跳过，不要因为轮到自己发言就觉得必须挑点什么，也不要编造清单之外的理由（比如要求重新读题）"。只加框架，不改①②③判断标准本身，不碰 Step 2/3。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh`，Step 1 lead-in 一处文字插入。commit `ae48df2`。
+
+**验证：** 真实官方源码模拟应用全部 6 层补丁无冲突；`py_compile` 通过；渲染完整 `STUDENT_SYSTEM_PROMPT` 确认新框架句正确插入在①②③之前。**尚未用真实训练验证**——待下一轮训练观察 turn-1 合格后被误判打回的比例（对照 170852 的 10/11）有没有下降。
+
+---
+
+## [2026-08-13] 408/503 污染训练信号完整排查：确认真正的信号污染点是 A（SGLang abort），落地 Wave 1（A+B）+ Wave 2（D），C 和"P17 edit 误用"经真实数据核实均非当前必须修的训练标签事故
+
+**背景：** CLI 分析 408/503（`student_chat.py` 调 OpenClaw gateway 180s 超时）如何进入训练链路。确认两条污染路径：① harness 重试 × 同一 OpenClaw session（同一逻辑 turn 可能产生多条样本）；② Simulation 与训练并行抢 GPU（训练步 `pause_submission` 触发 503，重试放大 session 污染）。
+
+**分类演进过程（多轮真实数据核实，最终定型为 A/B/C/D 四类）：**
+- **A**：SGLang 自己中断生成（`finish_reason=="abort"`，`pause_generation` 打断 in-flight 生成）。单 turn 级，本地可判断。
+- **B**：生成结束、写入 `turn_data` 那一刻 `submission_enabled` 已关（训练步暂停窗口内产生）。单 turn 级，本地可判断。
+- **C**：网关判定请求中断（`AbortError`/`stopReason=aborted`），但 SGLang 自己那次生成其实已经 `finish_reason=stop` 正常完成——网关层判断和生成层实际状态的时序错位。OPD 单侧看不到网关层信号，需要跨进程通知（OpenClaw `agent_end`/`model_call_ended` 插件钩子，本身存在且能打到插件层，已核实——见下方"曾考虑但放弃"部分）。
+- **D**：Student 因 408/503 机械重发同一句指令（`send_to_openclaw()` 的重试循环不会让 Simulator 重新措辞），导致该指令在同一 session 里被重复插入对话历史，当作某个 turn 的 `next_state`。
+
+**关键修正（否定了"整个 run 因 408 而不可信"这个早期假设）：** 最初设计过两版更重的机制——① run 级 `tentative` 缓冲（扣住整个 run 直到 `agent_end` 判定成功/失败再放行/整批丢弃）；② `_bad_run_ids` + `output_queue`/`_drain_output_queue` 消费时过滤。用户追问"这不就是等训练吗，能不能从收集侧下手"把方案带向更轻量的方向；但真正推翻"整 run 拉黑"的是对 P17（run `20260813_094000`，session `a6451ab4`）的逐 turn 核实：**P17 真正把题做完的那条 +1（write 成功，turn 13）就发生在 408 重试之后的新 run 里**，如果按 run_id 整体拉黑，会把这条好样本一起杀掉。进一步深挖发现 **P17 根本不是"等训练超时"类型**——它是模型把 `edit` 工具的精确子串匹配语义用错（拿裸 `"\n"`/`"\\n"` 当"追加锚点"，定位不到文件里的唯一位置），反复交近似失败参数拖过 180s 才被 Student 判 408，408 是这段空转的**下游症状，不是成因**，跟等待训练暂停无关。
+
+**最终方案：**
+- **A/B**（Wave 1，已实现推送）：`turn_data` 新增 `is_aborted`（`finish_reason=="abort"`）、`generated_while_paused`（写入时 `submission_enabled` 已关）两个标记；新建 `scripts/prepare_patched_openclaw_combine.sh`（此前这个文件——`openclaw-combine/openclaw_combine_api_server.py`——完全没有补丁脚本，训练实际 import 的 `OpenClawCombineSelectAPIServer` 继承自这里的 `_maybe_submit_ready_samples`，只改 OPD/Combine-Select 会让拦截对训练完全不可见，这是排查中发现的一个真实的"补丁打错文件会静默失效"陷阱）；`_maybe_submit_ready_samples` 见标记直接 `continue`+pop+cancel PRM task，同时挡住 `_submit_turn_sample`（OPD+RL/OPD-only）和 `_submit_rl_turn_sample`（RL-only）。`PATCHED_COMBINE_DIR` 接入 `run_openclaw_topk_select_modelfactory.sh` 的 PYTHONPATH + 全部四条训练启动脚本。commit `799c500`。
+- **D**（Wave 2，已实现推送）：不按 run_id 拉黑，改成单 turn 级本地检测——`_fire_opd_task`（PRM 判分之前，省一次 judge 调用）里维护 per-session 的"已见 user 消息"集合（种子来自 `turn_data["messages"]` 里已有的 user 正文，覆盖"题面本身因超时被重发"这种从未当过 `next_state` 的情况），`next_state`（`role=="user"`）剥离 OpenClaw 自动加的时间戳前缀（`[Thu 2026-08-13 HH:MM GMT+8]`，跨分钟重试正文相同但带时间戳会导致整段 exact match 漏判，已用 094000 真实数据——P7 09:51/09:52 两次重试——验证剥离前不匹配、剥离后匹配）后比对，命中则标记 `is_duplicate_user_retry`，走跟 A/B 相同的 Combine 侧拦截点。命中后**丢弃（不提交），不强制 `-1`**——这条 turn 本身内容可能完全正常（比如 P11 turn4 是正常的"开始写入"内容，只是配对的 `next_state` 是重试插入的重复指令），错的是"这次评价用的 next_state 配对坏了"，不是"这个动作本身该罚"，跟 tool-error-penalty 那类"动作本身有问题"的规则性质不同。commit `b28968a`。
+- **C**：设计已定（单 turn 级，需要插件 `agent_end` 通知，机制上可行），**本轮不实现**——见下方真实数据核实部分，样本太稀疏、不值得现在投入插件改动。
+- **"P17 edit 误用"（潜在 Wave 3）**：**本轮不实现**——见下方真实数据核实，不是标签污染问题。
+
+**真实数据核实各类别是否真的造成了训练标签污染（不只看机制，用 094000 的 `submitted OPD+RL`/`submitted RL` 日志逐条核对）：**
+
+| 类别 | 这轮有没有进训练 | 有没有错 `+1`/乱码蒸馏 | 结论 |
+|------|------|------|------|
+| A | main abort 8/8 全部 submitted | **有，至少 3 条错 `+1`（P11 turn4、P20 turn2 等空回复/abort 仍被判 `+1`）+ 1 条乱码内容仍做 OPD hint 蒸馏（reward=0）** | **唯一实锤"标反"的一类，必须做，已做** |
+| B | 有（P7 turn4，pause 09:51:59 之后 09:52:02 才写完 `turn_data`） | 这轮该样本恰好被另一条已有规则（`is_invalid_tool_use`，同句重复 14 次）独立打成 `-1`，未观测到本轮因 B 单独导致的错 `+1` | 机制真实存在（下次 in-flight 若恰好是正常 write/stop 就会错标 `+1`），跟 A 同一处拦截、成本几乎为零，跟着 A 一起做，不算这轮的紧急污染源 |
+| D | 有（P11 turn4/P20 turn2/P7 turn4/P17 turn8+turn14） | 其中两条错 `+1`（P11 turn4、P20 turn2）**已经被 A 覆盖**，D 独有的增量样本这轮**全部已经是 `-1`**（P7 turn4、P17 turn8/turn14），标签本身不算反，伤害是"占坑 + 给配对错误的 next_state 蒸馏 OPD hint" | 机制成立、值得做（已做），但这轮实际增量价值小于 A，不能替代 A |
+| C | 训练日志里没有独立的 `AbortError`/`stopReason=aborted` 提交链，唯一候选（P17 turn14）也已经被 D 覆盖 | 仅有候选样本已是 `-1` | 这轮没有独立证据支撑，不值得为它单独改插件 |
+| P17 edit 误用 | 反复失败 edit（turn5/6/7/9/10/11/12/15）大量 `submitted`，但**全部已经是 `-1`**（`tool-error-penalty`/`invalid-tool-use-penalty` 已覆盖，PRM 自己多数也投 `[-1,-1,-1]`）；该留的也留对了（turn1 read `+1`、turn3 改写完 `+1`、**turn13 write 成功 `+1`——文件确实写对了，这条正样本是真的**） | **没有标反**，是在教"别这么用 edit"，跟论文"tool error → -1"设计一致 | **不是训练标签事故**，唯一比较冤的是 turn14（写成功后的确认句，因为 `next_state` 又是重试插入的重复指令被打 `-1`）——这条已经被 D 盖住，不需要单独为 edit 开规则；剩下的是同质失败样本效率问题 + OpenClaw 展示层在成功 write 之后仍挂旧的 `⚠️ Edit failed` 警告（产品/展示层 bug，不是训练过滤能修的，需要改 OpenClaw payload/`lastToolError` 逻辑，不在这个项目的补丁范围内） |
+
+**结论：** 真正会把训练带偏方向的只有 A（abort 内容被错判 `+1`/乱码进 OPD）。B 是同一补丁里几乎零成本的保险，这轮未捕获到独立的错标案例。D 有真实机制、这轮增量价值主要是减少"劣质 hint 蒸馏 + 占坑"而不是纠正错误方向。C 和 P17 的 edit 误用问题都不是当前训练标签事故，不需要现在处理。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述
