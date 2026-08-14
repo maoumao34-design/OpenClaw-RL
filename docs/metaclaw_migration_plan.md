@@ -175,15 +175,19 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 4. **MetaClaw 自己怎么解决"中间轮次没有确定性 ground truth"的**：不解决——中间轮次和最终轮次一视同仁，都扔给 `prm_scorer.py` 的通用主观判官打分（"这个回复对完成任务有没有帮助"，¬感知具体任务/checker），不做任何按 round 聚合。这正是本项目这次迁移想避开的东西（迁移的核心卖点就是用确定性 checker 替掉主观判官噪声）。
 
-5. **最终采纳的方案（方案 B，用户已确认）**：改代理的缓冲逻辑——MetaClaw 场景的 session 不要一有下一轮就立刻评估上一轮，而是把整个 round 的轮次都攒着，等 round 跑完、checker 判完，最终轮次（拿到最终答案、能跑 checker 的那一轮）用**确定性 checker 结果**评估；round 内其余中间轮次（工具调用探索步骤）不再套用 Personal Agent Track 那套跟 tool-call 完全不匹配的判分标准，而是仿照 **`toolcall-rl::_judge_step_with_prm`/`_build_prm_step_messages`**（444-530 行，通用、跟具体任务无关的"给定 problem/history/action/observation，判断这一步是否有帮助"±1 PRM 步骤判官，OpenClaw-RL 论文自己的现成设计，不是 MetaClaw 的 `prm_scorer.py`，也不是 Personal Agent Track 的 Student/TA/Teacher 判分标准）新写一个 MetaClaw 专用的步骤判官 prompt，独立打分、不聚合进 round 的最终 reward。
+5. **最终采纳的方案（方案 B，用户已确认，已实现，见下方"已实现"小节）**：round 最终轮次（拿到最终答案、能跑 checker 的那一轮）用**确定性 checker 结果**评估；round 内其余中间轮次（工具调用探索步骤）不再套用 Personal Agent Track 那套跟 tool-call 完全不匹配的判分标准，而是仿照 **`toolcall-rl::_judge_step_with_prm`/`_build_prm_step_messages`**（444-530 行，通用、跟具体任务无关的"给定 history/action/observation，判断这一步是否有帮助"±1 PRM 步骤判官，OpenClaw-RL 论文自己的现成设计，不是 MetaClaw 的 `prm_scorer.py`，也不是 Personal Agent Track 的 Student/TA/Teacher 判分标准）新写一个 MetaClaw 专用的步骤判官 prompt，独立打分、不聚合进 round 的最终 reward。
    这样：真实 `openclaw agent` CLI 子进程和真实 `"coding"` 工具画像都保留（不放弃保真度）；round 最终结果用确定性 checker（迁移的核心卖点保留）；中间步骤有一个跟任务/工具调用场景匹配的独立信号来源（参照 OpenClaw-RL 自己的方法，不是硬套不匹配的判分标准，也不是完全没有信号）。
-   这是同一个进程（代理）内部的缓冲窗口调整，不需要跨进程追踪轮次编号，工程量比最初以为的"跨进程追踪"小，但比"只训最后一轮"的方案 A 大（需要改 `_handle_request` 里 main 轮次的缓冲/触发逻辑，不只是改 `_opd_evaluate` 内部）。
+   **实现时发现比预想的更简单**：不需要改 `_handle_request` 里 main 轮次的缓冲/触发时机——中间轮次继续用现有的"下一次工具调用一到就立刻评估上一轮"机制，只是把评估内容从 Personal Agent Track 判官换成新的步骤判官；round 的最终轮次天然会在 round 结束后保持"待评估"状态（因为它的下一条真实消息要等到下一个 round 才会出现，或者当天已经是最后一个 round），driver 主动发一条合成的"下一轮"消息（带 `{"metaclaw_verdict": true, ...}` JSON）去触发它评估，复用的是 Personal Agent Track 早就验证过的"下一条消息内容 = 上一轮 next_state"这个反应式机制，不用新开 admin 端点，也不用改缓冲时机。区分"这个 session 是不是 MetaClaw round"靠 `session_id` 前缀模式匹配（`^metaclaw-`），不是靠请求体自定义字段——因为 round 内部中间轮次是真实 `openclaw agent` 子进程内部自己发出的请求，driver 根本没机会往请求体里塞自定义字段（跟当年 SSRF-guard 那次踩过的坑是同一个约束，body 字段这条路走不通，只有 `session_id` 这种已经被验证能可靠透传的东西才行）。
+
+### 已实现（2026-08-14）
+
+- [x] `openclaw-rl/scripts/metaclaw/metaclaw_rollout_driver.py`（新文件）：day01→day30 严格顺序、concurrency=1，直接 `import` 官方 `_copy_workspace_for_test`/`_copy_eval_scripts`/`_prepare_work_copy`/`_start_work_gateway`/`_run_openclaw_agent`/`_compute_inline_score`/`_build_feedback_text` 等函数（不重新实现），真实驱动 `openclaw agent` CLI。每个 round 跑完后把 `{"metaclaw_verdict": true, "eval_score", "hint"}` 通过一条合成的"下一轮"消息发给代理。`file_check` 的 hint 改用 checker 实际 stdout/stderr（不是静态 `feedback.incorrect`，对应查证记录一），`multi_choice` 沿用官方 `_build_feedback_text`（天然准确）。本地对着真实 `MetaClaw-official` 克隆验证过：真实 import 解析、真实读取 day01 的 10 道题、真实跑 checker 脚本（含 `_copy_eval_scripts` 这一步，验证过程中发现漏掉这步会导致 checker 恒定"文件不存在"失败，已修复）。
+- [x] `openclaw-rl/scripts/prepare_patched_openclaw_opd.sh`（扩展）：新增 `_METACLAW_SESSION_RE`（`^metaclaw-`，判定 session 是否属于 MetaClaw round mode）、`_build_metaclaw_step_judge_messages`（步骤判官 prompt，仿 toolcall-rl）、`turn_data["metaclaw_round_mode"]` 字段。
+- [x] `openclaw-rl/scripts/prepare_patched_openclaw_combine_select.sh`（扩展）：`_opd_evaluate` 新增三路分派——`next_state_text` 能解析出 verdict JSON → 用确定性 `eval_score`/`hint`，跳过所有 LLM 判官调用；`turn_data["metaclaw_round_mode"]` 为真但不是 verdict → 用新步骤判官（复用现成的 `_query_prm_eval_once`/`_prm_eval_majority_vote`，只换了 prompt 来源），RL-only 独立提交，不进 OPD；两者都不是 → 原 Personal Agent Track 逻辑完全不变。两个脚本都已对着本地真实 `OpenClaw-RL-official` 克隆跑过 `py_compile` 验证。
 
 ### 下一步工程任务（待实现，未开始）
 
-- [ ] 写一个新的 rollout driver，让 Qwen3-4B 通过真实 `openclaw agent` CLI（真实 `"coding"` 工具画像）跑 MetaClaw-Bench 的任务，**concurrency=1 严格按 day01→day30 顺序处理**（不能照搬 `openclaw_env_rollout.py` 现成的 `random.choices` 随机连续采样循环，那是给别的场景用的），接入代理侧
-- [ ] 代理侧改缓冲逻辑（方案 B）：MetaClaw session 的轮次评估从"下一轮一到就立刻评估上一轮"改成"攒住整个 round，round 结束时统一处理"——最终轮次用 checker 确定性结果，中间轮次用新写的 `_judge_step_with_prm` 风格步骤判官（独立打分，不聚合进 round reward）
-- [ ] `file_check` 的 OPD hint 用 checker 实际 stdout（不是静态 `feedback.incorrect`），`multi_choice` 的 OPD hint 用 `feedback.options` 里对应错误选项的说明——这条只用于 round 最终轮次
+- [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）
 - [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
 - [ ] 设计一种手段，用来监控"某天的训练是否真的让权重产生了可观测变化"（呼应查证记录第 3 条的风险），否则没法判断某天没提升是模型能力上限还是训练没生效

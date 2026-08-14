@@ -264,6 +264,61 @@ _OPENCLAW_TIMESTAMP_PREFIX_RE = re.compile(
 def _strip_openclaw_timestamp_prefix(text):
     return _OPENCLAW_TIMESTAMP_PREFIX_RE.sub("", text or "", count=1)
 
+
+# openclaw-rl-metaclaw (temporary, safe to remove): a MetaClaw round\'s
+# intermediate tool-call turns are generated INSIDE the real `openclaw agent`
+# CLI subprocess\'s own internal loop -- the rollout driver never constructs
+# those individual HTTP requests itself, so it cannot attach a custom JSON
+# body field to them (this is the exact same constraint that made
+# X-Session-Id/X-Turn-Type headers unusable and forced the RL-TRAINING-META
+# system-prompt-marker workaround above). session_id, however, IS reliably
+# propagated into every one of those requests via that same already-proven
+# marker mechanism (it is what session_id derivation depends on in the first
+# place) -- so "is this session a MetaClaw round" is derived from session_id
+# itself, not from a body field. The rollout driver is responsible for using
+# this exact prefix when it calls `openclaw agent --session-id`.
+_METACLAW_SESSION_RE = re.compile(r"^metaclaw-")
+
+
+# openclaw-rl-metaclaw (temporary, safe to remove) -- see
+# docs/metaclaw_migration_plan.md "查证记录（三）" for the full design
+# rationale. Judges an INTERMEDIATE tool-call turn inside a MetaClaw-Bench
+# round (a turn that is not the round\'s final, checker-scored answer).
+# Modeled directly on OpenClaw-RL\'s own toolcall-rl track
+# (generate_with_retool.py::_build_prm_step_messages) rather than on this
+# file\'s _build_prm_eval_prompt (that one is Personal Agent Track dialogue-
+# correction criteria -- bold text, redo requests, etc. -- which do not apply
+# to a tool-call action and would inject mismatched signal if reused here).
+# Deliberately task-agnostic and strictly \\boxed{1}/\\boxed{-1} (no neutral
+# option), matching toolcall-rl\'s own step judge exactly -- reuses the
+# existing _query_prm_eval_once/_prm_eval_majority_vote machinery unchanged,
+# only the prompt differs.
+#
+# Takes `history` only (no separate `problem` argument): the same body-field
+# constraint explained above for _METACLAW_SESSION_RE also rules out passing
+# a separate task-description field for this prompt -- `history` is the
+# turn\'s own fully-rendered chat-template prompt_text, which already starts
+# with this round\'s question as the first user message, so the task is
+# implicitly present without needing a second channel.
+def _build_metaclaw_step_judge_messages(history, action, observation):
+    system = (
+        "You are a process reward model (PRM).\\n"
+        "Judge whether the current step is helpful and correct for completing the task "
+        "described at the start of the conversation below.\\n"
+        "You may think first, but your final output MUST be a strict decision format.\\n"
+        "Valid decision is exactly one of: \\\\boxed{1} or \\\\boxed{-1}."
+    )
+    user = (
+        f"Conversation so far (task + trajectory):\\n{history}\\n\\n"
+        f"Current action:\\n{action}\\n\\n"
+        f"Next state / observation:\\n{observation}\\n\\n"
+        "Now output your evaluation on the quality of the current action, "
+        "then output your final decision, \\\\boxed{1} or \\\\boxed{-1}\\n"
+        "Do NOT continue the task. Your job is to judge the quality of the current "
+        "action, not to continue it."
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
 '''
 
 text = text.replace(class_marker, helper + "\n" + class_marker, 1)
@@ -709,6 +764,14 @@ turn_data_new = (
     '                # 陆续吐出结果。判断点选在生成结束、写入 turn_data 这一刻（不是\n'
     '                # 请求刚进来的时候），因为暂停可能发生在生成过程中途。\n'
     '                "generated_while_paused": not self.submission_enabled.is_set(),\n'
+    '                # openclaw-rl-metaclaw (temporary, safe to remove): lets\n'
+    '                # openclaw_combine_select_api_server.py tell an intermediate\n'
+    '                # tool-call turn inside a MetaClaw round apart from an unrelated\n'
+    '                # Personal Agent Track turn. Derived from session_id (see\n'
+    '                # _METACLAW_SESSION_RE above), not a body field -- see that\n'
+    '                # comment for why. False for every non-MetaClaw session, so this\n'
+    '                # has no effect on existing training paths.\n'
+    '                "metaclaw_round_mode": bool(_METACLAW_SESSION_RE.match(session_id or "")),\n'
     '            }\n'
 )
 text = text.replace(turn_data_old, turn_data_new, 1)

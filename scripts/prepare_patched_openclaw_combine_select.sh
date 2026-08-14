@@ -61,6 +61,185 @@ if marker in text:
         "the source may already be patched. Investigate before proceeding."
     )
 
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw (temporary, safe to remove): see
+# docs/metaclaw_migration_plan.md "查证记录（三）" for the full design.
+#
+# Two MetaClaw-specific cases short-circuit the normal PRM judge path in
+# _opd_evaluate() entirely; every other session/turn (all of Personal Agent
+# Track, plus MetaClaw sessions before this patch existed) falls through to
+# the original, unmodified logic unchanged:
+#
+#   1. next_state_text parses as {"metaclaw_verdict": true, "eval_score":
+#      ..., "hint": ...} -- the rollout driver already ran MetaClaw-Bench's
+#      deterministic checker for this round's FINAL turn and is handing us
+#      the result directly. No LLM judge call at all.
+#   2. turn_data["metaclaw_round_mode"] is true but next_state_text is NOT a
+#      verdict -- an INTERMEDIATE tool-call turn inside a MetaClaw round.
+#      Personal Agent Track's judge prompts (bold text / numbered list /
+#      redo-request criteria) do not apply to a tool-call action and would
+#      inject mismatched signal if reused here; use a task-agnostic step
+#      judge instead (_build_metaclaw_step_judge_messages, added to
+#      openclaw_opd_api_server.py by prepare_patched_openclaw_opd.sh,
+#      modeled on OpenClaw-RL's own toolcall-rl track). RL-only, independent
+#      of the round's eventual checker outcome, no OPD hint.
+# ---------------------------------------------------------------------
+opd_evaluate_head_old = (
+    '        next_state_text = (\n'
+    '            _flatten_message_content(next_state.get("content")) if next_state else ""\n'
+    '        )\n'
+    '        next_state_role = next_state.get("role", "user") if next_state else "user"\n'
+    '        judge_msgs = _build_hint_judge_messages(\n'
+    '            turn_data["response_text"], next_state_text, next_state_role,\n'
+    '        )\n'
+    '        if self._prm_tokenizer:\n'
+    '            judge_prompt = self._prm_tokenizer.apply_chat_template(\n'
+    '                judge_msgs, tokenize=False, add_generation_prompt=True,\n'
+    '            )\n'
+    '        else:\n'
+    '            judge_prompt = "\\n".join(m["content"] for m in judge_msgs)\n'
+    '\n'
+    '        votes = await asyncio.gather(\n'
+    '            *[self._query_judge_once(judge_prompt, i) for i in range(self._prm_m)]\n'
+    '        )\n'
+    '\n'
+    '        # PRM eval branch (unchanged from parent).\n'
+    '        if self._eval_mode:\n'
+)
+if text.count(opd_evaluate_head_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the _opd_evaluate head "
+        f"block in {src_path}, found {text.count(opd_evaluate_head_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+opd_evaluate_head_new = (
+    '        next_state_text = (\n'
+    '            _flatten_message_content(next_state.get("content")) if next_state else ""\n'
+    '        )\n'
+    '        next_state_role = next_state.get("role", "user") if next_state else "user"\n'
+    '\n'
+    '        # --- openclaw-rl-metaclaw (temporary, safe to remove) ---\n'
+    '        _metaclaw_verdict = None\n'
+    '        try:\n'
+    '            _metaclaw_parsed = json.loads(next_state_text) if next_state_text else None\n'
+    '        except (TypeError, ValueError):\n'
+    '            _metaclaw_parsed = None\n'
+    '        if isinstance(_metaclaw_parsed, dict) and _metaclaw_parsed.get("metaclaw_verdict") is True:\n'
+    '            _metaclaw_verdict = _metaclaw_parsed\n'
+    '\n'
+    '        if _metaclaw_verdict is not None:\n'
+    '            eval_score = float(_metaclaw_verdict.get("eval_score", 0.0))\n'
+    '            _metaclaw_hint = (_metaclaw_verdict.get("hint") or "").strip()\n'
+    '            logger.info(\n'
+    '                "%s[openclaw-rl-metaclaw-deterministic-reward] session=%s turn=%d "\n'
+    '                "checker eval_score=%.1f hint_len=%d%s",\n'
+    '                _CYAN, session_id, turn_num, eval_score, len(_metaclaw_hint), _RESET,\n'
+    '            )\n'
+    '            votes = (\n'
+    '                [{"vote_id": 0, "score": 1, "hint": _metaclaw_hint, "raw": ""}]\n'
+    '                if len(_metaclaw_hint) > 10 else []\n'
+    '            )\n'
+    '        elif turn_data.get("metaclaw_round_mode"):\n'
+    '            _step_judge_msgs = _build_metaclaw_step_judge_messages(\n'
+    '                turn_data["prompt_text"],\n'
+    '                turn_data["response_text"],\n'
+    '                next_state_text,\n'
+    '            )\n'
+    '            if self._prm_tokenizer:\n'
+    '                _step_judge_prompt = self._prm_tokenizer.apply_chat_template(\n'
+    '                    _step_judge_msgs, tokenize=False, add_generation_prompt=True,\n'
+    '                )\n'
+    '            else:\n'
+    '                _step_judge_prompt = "\\n".join(m["content"] for m in _step_judge_msgs)\n'
+    '            async with self._teacher_lp_semaphore:\n'
+    '                _step_raw = await asyncio.gather(\n'
+    '                    *[self._query_prm_eval_once(_step_judge_prompt, i) for i in range(self._prm_m)]\n'
+    '                )\n'
+    '            eval_score = _prm_eval_majority_vote(_step_raw)\n'
+    '            logger.info(\n'
+    '                "%s[openclaw-rl-metaclaw-step-judge] session=%s turn=%d "\n'
+    '                "intermediate step votes=%s -> eval_score=%.1f%s",\n'
+    '                _CYAN, session_id, turn_num,\n'
+    '                [s if s is not None else "fail" for s in _step_raw],\n'
+    '                eval_score, _RESET,\n'
+    '            )\n'
+    '            return {\n'
+    '                "accepted": False,\n'
+    '                "teacher_tokens_candidates": None,\n'
+    '                "hint": "",\n'
+    '                "hints": [],\n'
+    '                "votes": [],\n'
+    '                "eval_score": eval_score,\n'
+    '            }\n'
+    '        else:\n'
+    '            judge_msgs = _build_hint_judge_messages(\n'
+    '                turn_data["response_text"], next_state_text, next_state_role,\n'
+    '            )\n'
+    '            if self._prm_tokenizer:\n'
+    '                judge_prompt = self._prm_tokenizer.apply_chat_template(\n'
+    '                    judge_msgs, tokenize=False, add_generation_prompt=True,\n'
+    '                )\n'
+    '            else:\n'
+    '                judge_prompt = "\\n".join(m["content"] for m in judge_msgs)\n'
+    '\n'
+    '            votes = await asyncio.gather(\n'
+    '                *[self._query_judge_once(judge_prompt, i) for i in range(self._prm_m)]\n'
+    '            )\n'
+    '\n'
+    '        # PRM eval branch (unchanged from parent, only runs for non-MetaClaw\n'
+    '        # turns -- the metaclaw_verdict branch above already assigned eval_score).\n'
+    '        if self._eval_mode and _metaclaw_verdict is None:\n'
+)
+text = text.replace(opd_evaluate_head_old, opd_evaluate_head_new, 1)
+
+opd_evaluate_else_old = (
+    '        else:\n'
+    '            eval_score = None\n'
+)
+if text.count(opd_evaluate_else_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the eval_score=None "
+        f"else block in {src_path}, found {text.count(opd_evaluate_else_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+opd_evaluate_else_new = (
+    '        elif _metaclaw_verdict is None:\n'
+    '            eval_score = None\n'
+)
+text = text.replace(opd_evaluate_else_old, opd_evaluate_else_new, 1)
+
+if "\nimport json\n" not in text:
+    text = text.replace("import logging\n", "import json\nimport logging\n", 1)
+
+import_block_old = (
+    'from openclaw_opd_api_server import (\n'
+    '    _append_hint_to_messages,\n'
+    '    _build_hint_judge_messages,\n'
+    '    _build_prm_eval_prompt,\n'
+    '    _flatten_message_content,\n'
+    '    _normalize_messages_for_template,\n'
+    '    _prm_eval_majority_vote,\n'
+    ')\n'
+)
+if import_block_old not in text:
+    raise SystemExit(
+        "patch failed: expected openclaw_opd_api_server import block not found "
+        "in openclaw_combine_select_api_server.py (official file may have changed "
+        "upstream -- update this patch)"
+    )
+import_block_new = (
+    'from openclaw_opd_api_server import (\n'
+    '    _append_hint_to_messages,\n'
+    '    _build_hint_judge_messages,\n'
+    '    _build_metaclaw_step_judge_messages,\n'
+    '    _build_prm_eval_prompt,\n'
+    '    _flatten_message_content,\n'
+    '    _normalize_messages_for_template,\n'
+    '    _prm_eval_majority_vote,\n'
+    ')\n'
+)
+text = text.replace(import_block_old, import_block_new, 1)
+
 old_block = (
     '            eval_score = _prm_eval_majority_vote(eval_raw)\n'
     '            logger.info(\n'
