@@ -108,4 +108,57 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 ---
 
+## 完整方案（2026-08-14 确认，可展示版本）
+
+### 一句话概述
+
+把 OpenClaw-RL 论文 Hybrid RL（GRPO + OPD topk-select）方法本身——已经在 Personal Agent Track 上复现、校准过一整套奖励信号修正规则——原样迁移到 MetaClaw-Bench 这个全新的任务场景/数据上，验证该方法的**普适性**：不是复现 MetaClaw 论文的结果，是用我们自己的方法去训一个新场景，看能不能训出提升。
+
+### 目标与成功标准
+
+- **目标**：Qwen3-4B policy 模型经过我们的 Hybrid RL 方法在 MetaClaw-Bench 上训练后，相对**它自己不训练的基线**（同一模型、同一 prompt、无任何适应机制）有明显提升。
+- **不作为目标**：不要求接近或达到论文报告的 GPT-5.2（41.1%）/Kimi-K2.5 Full（40.6%）绝对分数——那些模型量级远大于 4B，绝对分数主要反映模型底子而非训练方法优劣，不是一个公平的对照。
+- **补充验收信号**：逐日准确率曲线是否出现类似论文 Figure 2 的"训练信号攒够后明显提升"的拐点趋势（结构上可对照，不要求幅度一致）——用来证明"是这套在线训练机制在起作用"，不只是"最终分数好看"。
+
+### 核心方法映射
+
+| 环节 | Personal Agent Track（已复现） | MetaClaw 迁移版本 |
+|------|------|------|
+| 训练后端 | 本地 Megatron + slime | **不变**，继续用本地 Megatron + slime，不接 MetaClaw 自带的 Tinker 云端 LoRA |
+| RL 主算法 | GRPO + OPD topk-select（Hybrid RL） | **不变**，同一套训练循环、同一套 loss 组合（`w_opd*L_opd + w_rl*L_rl`） |
+| RL 标量奖励来源 | Simulator/PRM 主观判断（`_build_prm_eval_prompt`）+ 本项目校准的多条代码层规则 | **换成 MetaClaw-Bench 自带的确定性 checker**：`file_check` 题看 checker 脚本 exit code，`multi_choice` 题按 `max(0,1-(FP+FN)/n_options)` 精确匹配打分，不需要 LLM 判官 |
+| OPD hint 来源 | PRM 投票生成候选 hint（多个模型调用） | **换成题目自带的 `feedback.incorrect`/`feedback.correct` 文字**——已经是人工撰写好的、针对具体错误的说明，直接走现成的 `_append_hint_to_messages` → hint 条件化 teacher → 蒸馏机制（跟这次会话给规则 5 做的"别复读"固定 hint是同一套已验证机制），不需要 PRM 生成候选 |
+| 训练环境/数据流 | Simulator 扮演 Student/TA/Teacher，多轮对话，GSM8K 题库 | Qwen3-4B 扮演 CLI agent（`run_command` 工具），跟真实 OpenClaw 环境交互，MetaClaw-Bench 的 30 天任务流 |
+| 在线更新特性 | rollout 持续生成 + 训练持续进行 + 权重热更新，同一长任务内交替 | **保持不变**——这是要验证的核心属性，不是重新实现；关键是任务数据必须**按 day01→day30 顺序流式喂入，不能 shuffle**，让后续天数的 rollout 能用上前面天数训练更新过的权重 |
+| 数据有效性保护 | 本项目校准的 A（abort）/B（暂停期间生成）/D（重复 user 重试） | **沿用同一套机制**，检测逻辑不变（对应的降级场景在新环境里应该同样存在：网关/生成中断、训练暂停窗口内生成、Student 侧因超时机械重发指令） |
+
+### 不迁移的部分
+
+- **技能库（skill library）机制**：MetaClaw 特有的 gradient-free 快通路，本项目复现范围不含这条通路，不迁移。
+- **OMLS 空闲窗口调度**：MetaClaw 用来避免打断真实用户的机制；我们是做训练实验，不涉及真实部署场景，不需要。
+- **Skill generation versioning（support/query 分离）**：机制上类似我们的"环境降级样本不该进训练"，但触发条件是"技能库版本切换"，我们没有技能库这条通路，不适用；我们自己的 A/B/D 系列规则已经覆盖了对应的数据有效性问题。
+
+### 验收方案
+
+1. **主指标**：Qwen3-4B 在 MetaClaw-Bench Part I（30 天，file-check 完成率 + 整体准确率）训练前 vs 训练后的对比。
+2. **过程指标**：逐日准确率曲线（3 日滚动平均，对照论文 Figure 2 的画法），看有没有出现"前几天攒信号、之后明显提升"的结构性拐点。
+3. **训练健康度指标**：沿用这次会话验证过的一套（A/B/D 触发频率、`+1`/`-1` 分布、batch 组成、是否出现类似"170852 vs 160713"那种概率性成功/失败的现象）。
+
+### 已知风险 / 限制（如实列出，展示时需要一并说明）
+
+- Qwen3-4B 在文件操作/JSON 结构化/shell 脚本这类任务上的底子未知，跟 GSM8K 数学题是完全不同的能力域，训练效果存在不确定性。
+- MetaClaw-Bench 是作者自己编写的模拟基准，不是真实用户会话采集，论文原文也提醒"绝对数值可能不直接迁移到生产场景"，我们的结果同样适用这条限制。
+- "按天顺序流式喂入保持在线更新特性"这个设计还没有具体工程实现，需要验证跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合是否顺畅。
+- OPD hint 直接复用题目自带的 `feedback` 文字这个设计还未实测，需要验证是否真的能像 PRM 生成的 hint 一样有效指导蒸馏。
+
+### 下一步工程任务（待实现，未开始）
+
+- [ ] 写一个新的 rollout driver（对标 `student_chat.py`），让 Qwen3-4B 通过 `run_command` 工具跑 MetaClaw-Bench 的任务，接入现有 OPD/Combine 服务器
+- [ ] 在 OPD/Combine 服务器侧接入 checker 脚本执行 + `feedback` 字段读取，替换 PRM 判分路径
+- [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
+- [ ] 设计按天顺序流式喂数据的具体实现，验证不打乱训练顺序的前提下现有 batch 收集机制能否正常工作
+- [ ] 跑通训练前基线评测（不训练，直接跑 MetaClaw-Bench 拿一个基线分数）
+
+---
+
 *后续讨论和实现记录追加在本文档下方，或视规模拆分到独立文档（参照 openclaw-rl 项目 `docs/` 的组织方式）。*
