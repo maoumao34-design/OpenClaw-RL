@@ -162,10 +162,28 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 3. **跨天没有工作区/状态持久化，此前的判断是错的，已改正**。前一轮只看了 `workspaces/shared/` 目录里同时摆着 `day01/`～`day04/` 等子目录，就推断"可能是持久化的共享工作区"——这是没有查证代码就下的错误结论。实际读了 `benchmark/src/infer/infer_cmd.py::_copy_workspace_for_test`（162-193 行）和 `_prepare_work_copy`（86-126 行）：**每一天开跑前都会从最原始的 `workspace_src`/`openclaw_state_dir` 重新复制一份全新、隔离的工作区和 agent 状态**，`_copy_workspace_for_test` 的文档字符串原话是"Other dayXX directories are excluded so the agent cannot accidentally see content from other test days"，明确禁止模型看到其他天的内容或前一天写过的文件。也就是说：**MetaClaw-Bench 评测协议里，唯一能把"前一天学到的教训"带到"第二天"的载体是模型权重本身（θ）**，不是任何文件/会话状态——这跟论文"meta-model = (θ, S)"的核心主张是一致的（技能库 S 我们不迁移，那么在我们的迁移版本里能带教训跨天走的就只剩 θ）。这个发现直接把上面第二条风险（如果某天训练没有产生可观测的权重变化，后续天数学不到前面的教训）坐实成一个需要认真监控的真实风险，不是理论假设。
 
+### 查证记录（三）：2026-08-14 续，round 内多轮 tool-call 怎么给训练信号（第一批实验文件设计过程中发现的核心问题）
+
+开始写第一批实验文件（rollout driver + 代理侧 checker 奖励接入）时，发现"一道题内模型连续调用好几次 `run_command` 才给最终答案，中间轮次怎么给奖励"这个问题两篇论文都没有现成答案，来回查证了好几轮，记录完整过程和最终结论：
+
+1. **先查两边论文各自的多步 tool-call 处理方式**：`toolcall-rl/generate_with_retool.py`（OpenClaw-RL 论文 Figure 5 的 tool-call 方法）和 `swe-rl/generate_with_swe_remote.py`（同样是 Figure 5 的方法，真实 bash 操作 Docker 容器，跟 MetaClaw 场景最像）**做法一致**：RL 训练进程自己直接控制生成循环（自己调 sglang、自己调 tool 执行后端），整条多步轨迹拼成一个 `Sample(tokens, loss_mask, reward)`，一个 outcome-level reward 共享给整条轨迹。这是 OpenClaw-RL 论文 General Agent 赛道（gui-rl/swe-rl/terminal-rl/toolcall-rl，注意"General Agent"是 OpenClaw-RL 论文自己的术语，MetaClaw 论文没有这个概念）里贯穿始终的架构，不是 toolcall-rl 一家的特例。
+
+2. **一度误判为"没法迁移"，原因是想在这套架构和"真实 openclaw agent CLI 子进程"之间选一个**：OpenClaw-RL 这套"自己控制生成循环"的架构，前提是绕开真实 `openclaw` CLI、自己实现 tool 执行；但读了 MetaClaw-Bench 真实用的 `benchmark/data/metaclaw-bench/openclaw_cfg/openclaw.json` 后确认，任务是按 OpenClaw 内置的 **`"tools": {"profile": "coding"}`**（真实的、结构化的 read/write/edit/bash 等工具画像）设计的，不是笼统的单个 shell 命令——换成自己实现的工具集会有真实的保真度损失（这正是本项目"复现保真度"红线要卡的东西）。一度把这个当成"要不要放弃真实 CLI 子进程换取完整训练信号"的两难。
+
+3. **用户追问"MetaClaw 论文自己怎么拿到中间态反馈来生成 skill"，查出了真正的技术点**：`metaclaw/skill_evolver.py::evolve()` 操作的是 `ConversationSample` 列表，每个 sample = 代理（`api_server.py`）自己视角里的**一次独立 LLM 调用**（`api_server.py` 1340-1436 行：`evolution_every_n_turns`，代理自己按 session 攒够 N 个轮次的 `ConversationSample` 就触发一次技能演化）。这说明：**中间轮次的可见性问题，根子不在"编排层看不看得到"**（`infer_cmd.py` 确实看不到，这个之前判断对了）**，而在"代理自己的评估时机"**——不管上层是真实 `openclaw agent` 子进程还是别的驱动方式，子进程内部每一次单独的 LLM 调用最终都要真的发请求出去，打的就是代理，代理天然能看到每一个中间轮次，不需要编排层告诉它是第几轮。之前"要跨进程追踪轮次编号才能做"的说法是错的，是把"编排层看不见"和"代理看不见"混为一谈了。
+   真正的问题是**代理现有的评估时机太快**：`openclaw_opd_api_server.py` 的机制是"下一轮请求一到，立刻用它的内容评估上一轮"（`_fire_opd_task`，同一 session 任何时刻只有一个轮次处于"待评估"状态）——round 还没跑完、checker 还没判，中间轮次早就已经被"下一次工具调用的内容"当 next_state 评估掉、提交或丢弃了，根本等不到 round 结束时我们注入的 checker verdict。
+
+4. **MetaClaw 自己怎么解决"中间轮次没有确定性 ground truth"的**：不解决——中间轮次和最终轮次一视同仁，都扔给 `prm_scorer.py` 的通用主观判官打分（"这个回复对完成任务有没有帮助"，¬感知具体任务/checker），不做任何按 round 聚合。这正是本项目这次迁移想避开的东西（迁移的核心卖点就是用确定性 checker 替掉主观判官噪声）。
+
+5. **最终采纳的方案（方案 B，用户已确认）**：改代理的缓冲逻辑——MetaClaw 场景的 session 不要一有下一轮就立刻评估上一轮，而是把整个 round 的轮次都攒着，等 round 跑完、checker 判完，最终轮次（拿到最终答案、能跑 checker 的那一轮）用**确定性 checker 结果**评估；round 内其余中间轮次（工具调用探索步骤）不再套用 Personal Agent Track 那套跟 tool-call 完全不匹配的判分标准，而是仿照 **`toolcall-rl::_judge_step_with_prm`/`_build_prm_step_messages`**（444-530 行，通用、跟具体任务无关的"给定 problem/history/action/observation，判断这一步是否有帮助"±1 PRM 步骤判官，OpenClaw-RL 论文自己的现成设计，不是 MetaClaw 的 `prm_scorer.py`，也不是 Personal Agent Track 的 Student/TA/Teacher 判分标准）新写一个 MetaClaw 专用的步骤判官 prompt，独立打分、不聚合进 round 的最终 reward。
+   这样：真实 `openclaw agent` CLI 子进程和真实 `"coding"` 工具画像都保留（不放弃保真度）；round 最终结果用确定性 checker（迁移的核心卖点保留）；中间步骤有一个跟任务/工具调用场景匹配的独立信号来源（参照 OpenClaw-RL 自己的方法，不是硬套不匹配的判分标准，也不是完全没有信号）。
+   这是同一个进程（代理）内部的缓冲窗口调整，不需要跨进程追踪轮次编号，工程量比最初以为的"跨进程追踪"小，但比"只训最后一轮"的方案 A 大（需要改 `_handle_request` 里 main 轮次的缓冲/触发逻辑，不只是改 `_opd_evaluate` 内部）。
+
 ### 下一步工程任务（待实现，未开始）
 
-- [ ] 写一个新的 rollout driver（对标 `student_chat.py`），让 Qwen3-4B 通过 `run_command` 工具跑 MetaClaw-Bench 的任务，**concurrency=1 严格按 day01→day30 顺序处理**（不能照搬 `openclaw_env_rollout.py` 现成的 `random.choices` 随机连续采样循环），接入现有 OPD/Combine 服务器
-- [ ] 在 OPD/Combine 服务器侧接入 checker 脚本执行 + 结果读取，替换 PRM 判分路径；`file_check` 的 OPD hint 用 checker 实际 stdout（不是静态 `feedback.incorrect`），`multi_choice` 的 OPD hint 可以直接用 `feedback.options` 里对应错误选项的说明
+- [ ] 写一个新的 rollout driver，让 Qwen3-4B 通过真实 `openclaw agent` CLI（真实 `"coding"` 工具画像）跑 MetaClaw-Bench 的任务，**concurrency=1 严格按 day01→day30 顺序处理**（不能照搬 `openclaw_env_rollout.py` 现成的 `random.choices` 随机连续采样循环，那是给别的场景用的），接入代理侧
+- [ ] 代理侧改缓冲逻辑（方案 B）：MetaClaw session 的轮次评估从"下一轮一到就立刻评估上一轮"改成"攒住整个 round，round 结束时统一处理"——最终轮次用 checker 确定性结果，中间轮次用新写的 `_judge_step_with_prm` 风格步骤判官（独立打分，不聚合进 round reward）
+- [ ] `file_check` 的 OPD hint 用 checker 实际 stdout（不是静态 `feedback.incorrect`），`multi_choice` 的 OPD hint 用 `feedback.options` 里对应错误选项的说明——这条只用于 round 最终轮次
 - [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
 - [ ] 设计一种手段，用来监控"某天的训练是否真的让权重产生了可观测变化"（呼应查证记录第 3 条的风险），否则没法判断某天没提升是模型能力上限还是训练没生效
