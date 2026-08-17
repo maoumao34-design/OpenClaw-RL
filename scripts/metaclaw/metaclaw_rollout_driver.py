@@ -130,6 +130,11 @@ async def _send_verdict_turn(
     calling any LLM judge. max_tokens is kept small since this call's own
     completion is never read -- only its message content (used as
     next_state) and headers matter.
+
+    Only call this when the round's `openclaw agent` CLI call actually
+    succeeded (rc == 0) -- see _send_session_close_only for the
+    infrastructure-failure case, and the comment at its call site in
+    run_day for why these must not be conflated.
     """
     verdict_payload = json.dumps(
         {"metaclaw_verdict": True, "eval_score": eval_score, "hint": hint},
@@ -153,6 +158,47 @@ async def _send_verdict_turn(
     except Exception as e:
         logger.warning(
             "[MetaClawRollout] session=%s verdict submission failed: %s", session_id, e
+        )
+
+
+async def _send_session_close_only(client: httpx.AsyncClient, session_id: str) -> None:
+    """Close the day's session WITHOUT submitting a verdict for the pending turn.
+
+    Used when the round's `openclaw agent` CLI call itself failed (rc != 0 --
+    gateway hiccup, subprocess crash/timeout, not a genuine task attempt) and
+    this was the day's last round. Mirrors OpenClaw-RL's own General Agent
+    tracks (toolcall-rl/swe-rl): both explicitly set ``Sample.Status.ABORTED``
+    and return BEFORE the sample reaches reward_func/normal submission when
+    generation/execution infrastructure fails mid-attempt, so the failure
+    never produces a false training signal -- see
+    docs/metaclaw_migration_plan.md for the full comparison.
+
+    X-Turn-Type is deliberately "side" (not "main"): this skips
+    _handle_request's whole "main" branch (no attempt to fire evaluation for
+    the previous turn using this request's content as next_state) and goes
+    straight to the session_done cleanup path, which drops any turn that
+    never got a real next_state -- exactly the outcome we want, achieved
+    with existing proxy machinery, no new endpoint or turn-buffering change
+    needed.
+    """
+    try:
+        await client.post(
+            PROXY_URL,
+            json={
+                "model": _MODEL_ID,
+                "messages": [{"role": "user", "content": "(session closed after agent failure)"}],
+                "temperature": 0.0,
+                "max_tokens": 8,
+            },
+            headers={
+                "X-Session-Id": session_id,
+                "X-Turn-Type": "side",
+                "X-Session-Done": "true",
+            },
+        )
+    except Exception as e:
+        logger.warning(
+            "[MetaClawRollout] session=%s session-close submission failed: %s", session_id, e
         )
 
 
@@ -199,13 +245,22 @@ async def _run_round(
     workspace_path: Path,
     gateway_port: int,
     round_timeout: float | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], bool]:
     """Run one round via the real `openclaw agent` CLI.
 
     Mirrors src.infer.infer_cmd._run_group's per-round logic (agent
     invocation + inline scoring), simplified for live training rather than
     resumable batch evaluation -- no infer_result.json files, no
     resume-skip.
+
+    Returns (inline_score, agent_succeeded). agent_succeeded=False means the
+    CLI call itself failed (gateway hiccup, subprocess crash/timeout) --
+    NOT that the model attempted the task and got it wrong. The caller MUST
+    NOT submit inline_score as a real training verdict in that case (see
+    _send_session_close_only and its call site) -- _compute_inline_score is
+    still called here (mirroring MetaClaw-official's own infer_cmd.py, which
+    does the same on agent failure) purely for logging visibility, its
+    result is not a trustworthy training signal when agent_succeeded=False.
     """
     rc, stdout, stderr = await _run_openclaw_agent(
         session_id=session_id,
@@ -216,9 +271,11 @@ async def _run_round(
         gateway_port=gateway_port,
         timeout=round_timeout,
     )
-    if rc != 0:
+    agent_succeeded = rc == 0
+    if not agent_succeeded:
         logger.warning(
-            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d): %s",
+            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d): %s "
+            "-- treating as infrastructure failure, will NOT submit a training verdict",
             session_id, round_record["id"], rc, stderr[:500],
         )
         answer_text = ""
@@ -228,10 +285,10 @@ async def _run_round(
     inline_score = _compute_inline_score(round_record, answer_text, workspace_path)
     passed = inline_score.get("passed", False)
     logger.info(
-        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s{_RESET}",
-        session_id, round_record["id"], passed,
+        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
+        session_id, round_record["id"], passed, agent_succeeded,
     )
-    return inline_score
+    return inline_score, agent_succeeded
 
 
 async def run_day(
@@ -308,7 +365,7 @@ async def run_day(
                         if feedback_text else question_text
                     )
 
-                    inline_score = await _run_round(
+                    inline_score, agent_succeeded = await _run_round(
                         session_id=session_id,
                         round_record=round_record,
                         query=query,
@@ -320,14 +377,26 @@ async def run_day(
                         round_timeout=None,
                     )
 
-                    passed = inline_score.get("passed", False)
-                    eval_score = 1.0 if passed else -1.0
-                    hint = "" if passed else _build_opd_hint(round_record, inline_score)
-
                     is_last_round = idx == len(rounds) - 1
-                    await _send_verdict_turn(
-                        client, session_id, eval_score, hint, session_done=is_last_round,
-                    )
+
+                    if agent_succeeded:
+                        passed = inline_score.get("passed", False)
+                        eval_score = 1.0 if passed else -1.0
+                        hint = "" if passed else _build_opd_hint(round_record, inline_score)
+                        await _send_verdict_turn(
+                            client, session_id, eval_score, hint, session_done=is_last_round,
+                        )
+                    else:
+                        # Infrastructure failure, not a real task attempt -- do NOT
+                        # submit a verdict (would fabricate a false -1 training
+                        # signal). Mirrors toolcall-rl/swe-rl's Sample.Status.ABORTED
+                        # early-return; see _send_session_close_only's docstring.
+                        # Only need to actually talk to the proxy if this was the
+                        # day's last round (otherwise the round's turn, if any was
+                        # even submitted, simply stays pending and gets picked up
+                        # normally by whatever comes next).
+                        if is_last_round:
+                            await _send_session_close_only(client, session_id)
 
                     prev_inline_score = inline_score
                     prev_round_record = round_record
