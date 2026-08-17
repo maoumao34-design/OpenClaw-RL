@@ -1688,33 +1688,40 @@
 - 训练规模/checkpoint 策略：确认一遍 30 天（不循环多个 epoch）跟 MetaClaw 自己实际训练方式一致（`--scene-per-train` 默认禁用，代码里没有 epoch 循环）；确认 checkpoint 是完整独立可用的模型快照，新增 `METACLAW_MIGRATION_PROFILE=1` 把 `--save-interval` 从官方默认 100 调到 10，目标一遍存约 5 个 checkpoint 供中途观察训练进度（粗估算，待真实训练后校准）
 - 断点续跑：先按天粒度实现了一版，追问后直接读 MetaClaw 官方 `_run_one_test` 代码，发现它自己的 round 级"断点续传"如果真用于跨进程重启恢复，会撞上同样的 workspace 不一致问题——不是它解决了我们没解决的问题。最终决定崩溃后直接从 day01 完整重跑（一遍训练总耗时有限），撤回断点续跑机制
 - 新发现一个跨 round 污染 bug（agent 在非最后一个 round 中途崩溃时，挂起轮次会被下一个 round 内容误评估），需要真实训练日志才能判断触发频率、值不值得精确修，记录后暂缓
+- 查证 MetaClaw 自己用的 OpenClaw 版本：确认不锁定具体版本（插件 README 明确写"OpenClaw (any version)"，`package.json` peerDependencies 是通配符 `*`），论文提交时间 `arXiv:2603.17187v1 17 Mar 2026`，落在项目已有的 `march_2026_3_8` 版本基准附近，没有证据指向作者用的是更晚的版本
+- 讨论要不要为 MetaClaw 关掉现有 5 个系统级版本漂移补丁先测试：逐个重读补丁根因说明，确认全部是 OpenClaw 核心机制层面的通用 bug（上下文压缩、系统提示词段落、silent reply 策略），不是 GSM8K 场景专属，MetaClaw 文件密集型任务只会更容易触发这些 bug——决定全部保留，不做关闭测试
+- 修正 modelfactory 仓库路径大小写：CLI 确认服务器上只有大写 `/dfs/data/openclaw-rl-project/OpenClaw-RL`，`reproduction_guide.md`/`train_separate_student.sh`/`train_with_services.sh` 三处沿用的小写路径是错的，全部改回
+- 用户在 modelfactory 完成两项训练前准备：`MetaClaw-official` 浅克隆（`--depth 1`，TLS 中断后改用）、`openclaw-rl` 仓库 `git pull` 同步到最新
+- 新增 `METACLAW_MAX_DAYS` 环境变量，支持训练前只跑前 N 天冒烟测试，不用手动改 `all_tests.json`
+- 给出训练前清单（环境变量确认、day01 冒烟测试命令、日志里要重点看的几个标记）后，**用户已实际提交训练**（`METACLAW_MAX_DAYS` 冒烟测试或正式训练，具体规模见提交时的命令），预计次日查看结果
 
-**关键决策：** 详细设计过程和技术决策全部记录在 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)，本条目只做汇总，跳转链接查完整推理过程
+**关键决策：** 详细设计过程和技术决策全部记录在 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)，本条目只做汇总，跳转链接查完整推理过程。**MetaClaw 迁移第一次真实训练已提交，结果待查**
 
 **产出：**
-- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新建）：训练启动编排
-- `scripts/metaclaw/metaclaw_rollout_driver.py`：rc!=0 基础设施故障保护、可选重试（`METACLAW_AGENT_RETRY`/`METACLAW_VERDICT_RETRY`，默认关闭）
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新建）：训练启动编排，`METACLAW_MAX_DAYS` 冒烟测试开关
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：rc!=0 基础设施故障保护、可选重试（`METACLAW_AGENT_RETRY`/`METACLAW_VERDICT_RETRY`，默认关闭）、`METACLAW_MAX_DAYS`
 - `scripts/run_openclaw_topk_select_modelfactory.sh`：新增 `METACLAW_MIGRATION_PROFILE=1` 分支（`--save-interval` 100→10）
-- `docs/metaclaw_migration_plan.md`：三方对照表、查证记录（四）、训练起点/checkpoint 策略/断点续跑决策全部记录
+- `docs/reproduction_guide.md`/`scripts/train_separate_student.sh`/`scripts/train_with_services.sh`：仓库路径大小写修正
+- `docs/metaclaw_migration_plan.md`：三方对照表、查证记录（四）、训练起点/checkpoint 策略/断点续跑决策/OpenClaw 版本核查全部记录
 
 ### 当前状态（2026-08-17）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：[x] 启动脚本 `run_metaclaw_migration_modelfactory.sh`；[x] 训练信号安全性核查（基础设施故障保护已修复，A/B/D 确认不需调整）；[x] 训练起点/checkpoint 策略确定；[x] 三方对照表、完整设计文档。整体已具备提交训练的条件，仅剩 modelfactory 侧真实环境的联调验证。
+**MetaClaw 迁移**：[x] 启动脚本 + `METACLAW_MAX_DAYS` 冒烟测试开关；[x] 训练信号安全性核查（基础设施故障保护已修复，A/B/D 确认不需调整）；[x] 训练起点/checkpoint 策略确定；[x] modelfactory 两项训练前准备（MetaClaw-official 克隆、仓库同步）已完成；[x] 三方对照表、完整设计文档。**第一次真实训练已提交，等待次日结果**。
 
 ### 已知限制 / 未解决
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变，见下方历史状态）。
-**MetaClaw 迁移**：新步骤判官 prompt 零历史数据验证；中间轮次缺确定性锚点这个风险差异未处理（暂缓，见查证记录）；跨 round 污染 bug 未修（需要真实数据判断是否值得修）；`BENCHMARK_BASE_URL` 等 URL 形状假设未在真实链路验证。
+**MetaClaw 迁移**：新步骤判官 prompt 零历史数据验证；中间轮次缺确定性锚点这个风险差异未处理（暂缓，见查证记录）；跨 round 污染 bug 未修（需要真实数据判断是否值得修）；`BENCHMARK_BASE_URL` 等 URL 形状假设未在真实链路验证——这次真实训练能直接检验这几条。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：提交新一轮训练，验证 Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实效果（用户自行提交）
-2. **MetaClaw 迁移**：提交训练前完成 `metaclaw_migration_plan.md` 里的训练前清单，然后提交训练；重点关注真实环境下能否验证"round 边界无杂音请求"这个假设、`agent_succeeded=False` 的真实触发频率和触发时机
+2. **MetaClaw 迁移**：**查看这次已提交训练的结果**——重点确认 `session_id` 是否正确以 `metaclaw-` 开头传递、`[openclaw-rl-metaclaw-deterministic-reward]`/`[openclaw-rl-metaclaw-step-judge]` 两个标记有没有出现、checker 是否真实执行、`agent_succeeded=False` 的触发频率和时机
 3. 其余同 08-13（见下方历史状态）
 
 ### 未验证
+- [ ] **本次已提交训练的真实结果**（session_id 传递、verdict/步骤判官分派是否生效、checker 真实执行情况）
 - [ ] Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实训练效果
-- [ ] MetaClaw rollout driver 在真实 `openclaw agent` CLI + 真实代理端口下能否正常打通
 - [ ] MetaClaw 新步骤判官 prompt 对 `run_command` 调用的判断质量
 - [ ] 两个 round 之间会不会有杂音请求落进代理（决定要不要给中间轮次补确定性锚点）
 - [ ] `agent_succeeded=False` 的真实触发频率/时机（决定跨 round 污染 bug 值不值得精确修）
