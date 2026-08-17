@@ -234,8 +234,24 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 4. **提交失败默认丢弃这条设计是否干净——没有直接可比对象**：查 `toolcall-rl` 发现它的架构里根本没有"跨进程 HTTP 提交 Sample"这一步——`generate()` 直接把 Sample 对象 return 给 slime 框架自己的代码消费，是同进程函数返回，没有网络提交、也就没有"提交失败"这个故障面。这是我们（和 Personal Agent Track）"代理跟生成进程分离、靠 HTTP 传数据"架构特有的问题，两篇论文其他部分都没有直接可比对象——不是漏查，是确实不存在对应场景。`_send_verdict_turn` 提交失败时静默丢弃（不重试）这条设计本身是安全的（回合最终轮次会在 `session_done` 时因缺少 `next_state` 被丢弃，是数据丢失不是数据污染），只是没有先例可以对照，纯靠我们自己的架构分析确认。
 
+### 待验证：中间轮次缺确定性锚点这个风险差异，要不要照抄 toolcall-rl 补上（2026-08-17，暂缓，等真实环境验证后再定）
+
+**问题**：`toolcall-rl` 的 `reward_func`（907-919 行）里 `final_score = base_score + prm_step_coef * prm_step_mean`——`base_score` 是确定性的 `\boxed{}` 对错判断，**永远**跟判官打的 `prm_step_mean` 加在一起，构成同一个 Sample 的最终 reward。哪怕判官这次判错了，`base_score` 这个确定性锚点还在，误差不会让整条训练信号完全脱离真实情况。
+我们现在的设计里，round 内中间轮次是**独立提交的 RL-only 样本**，reward 就是步骤判官的分数本身，没有任何确定性分量兜底——判官用的机制（多票投票、同尺寸判官模型）跟 toolcall-rl 完全一致，但如果判官判错了，这次错误是未经稀释地直接进训练，风险等级比 toolcall-rl 高。
+
+**能不能补上确定性锚点**：技术上可以——把中间轮次的评估从"下一条消息一到就立刻触发"改成"攒住整个 round，等 driver 发来 checker 的确定性结果后，一次性把这个 round 攒住的所有轮次都取出来，每个都用 `最终分数 = 步骤判官分数 + checker确定性结果` 提交"，照抄 toolcall-rl 的组合公式。副作用是会顺带修掉"round 跑到一半崩溃、已提交的中间样本没法追溯撤回"这个之前记录过的残留风险（因为改完之后中间轮次不会提前提交，round 崩溃时是整批一起被丢弃）。
+
+**为什么暂缓，没有直接实现**：这个改动不碰任何 MetaClaw 官方代码（改动全部在我们自己的 `openclaw_opd_api_server.py`/`openclaw_combine_select_api_server.py` 里），但会让代理第一次需要依赖一个**MetaClaw/OpenClaw 真实运行时行为的假设**——代理本身完全没有"round"这个概念，只能靠"driver 严格串行调用（concurrency=1，一个 round 的 `_run_openclaw_agent` 完全跑完才发下一个）"这个前提，把"上一次 verdict 之后新攒下来的所有轮次"当成"这个 round 的全部轮次"。这个推断依赖两个前提：
+1. **每个 round 是单独一次 `_run_openclaw_agent` 子进程调用**，不是一个长进程内部处理多个 round——已核实 `_run_group`（864/922 行）代码层面确实如此，`_prepare_session` 在 round 循环开始前只调一次，同一个 `session_id` 靠 OpenClaw 自己持久化的 session transcript 文件串起跨子进程的对话连续性。
+2. **两个 round 之间不会有"杂音请求"落进代理**——比如 OpenClaw 自己的 context 压缩/内部重试机制，会不会在两次 `_run_openclaw_agent` 调用的间隙里偷偷再打一次请求过来。这一点**只核实了代码层面，没有真实跑过验证**——Personal Agent Track 训练过程中已知 OpenClaw 确实存在"context summarization"这类内部兜底调用（历史上多次造成 `session_id` 误标为 `unknown` 之类的问题），不能默认 MetaClaw 场景下不会有同类行为。
+
+现在的"立刻触发"方案完全不依赖这两条假设——每个轮次独立处理，代理不需要知道 round 是什么，对 MetaClaw/OpenClaw 内部任何没预料到的行为都更健壮，这大概率是当初选这个方向时隐约在意但没有明说的顾虑，不只是"改动量小"。
+
+**需要真实验证的具体问题**：modelfactory 上真实跑起来后，观察同一个 session 里两个连续 round（对应两次 `_run_openclaw_agent` 调用）之间，代理侧的 turn 计数/请求日志有没有出现不属于任一 round 真实工作内容的额外请求（比如 context 压缩触发的调用）。如果确认没有杂音、"round 边界=子进程边界"这个假设站得住，再回来实现"攒住+组合确定性锚点"这个改动；如果发现有杂音，说明"立刻触发"这个更简单、更健壮的方案就是对的选择，不用再改。
+
 ### 下一步工程任务（待实现，未开始）
 
+- [ ] **verify** 上面"待验证"一节的具体问题：真实环境下两个连续 round 之间会不会有杂音请求落进代理——决定要不要给中间轮次补确定性锚点
 - [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过，两篇论文都没有内置判官校准机制可以参考，见查证记录四第 2 条，处理方式待定）、`BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1"` 这个假设的 URL 形状（没有 trailing `/chat/completions`）在真实 OpenClaw `openai-completions` provider 客户端下是否正确
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
 - [ ] 设计一种手段，用来监控"某天的训练是否真的让权重产生了可观测变化"（呼应查证记录第 3 条的风险），否则没法判断某天没提升是模型能力上限还是训练没生效
