@@ -3001,6 +3001,41 @@ if _tool_name in ("write", "edit"):
 
 ---
 
+## [2026-08-13] "skip forced negative override" 诊断实验：不提交 PRM 原判 +1 被强制改判 -1 的样本，测试能否复现 170852 的成功模式
+
+**背景：** 对比训练成功的 `separate_student_20260811_170852`（P17 起 turn-1 干净）和失败的 `160713`/`143003`：async rollout 通过 `_drain_output_queue` 把陆续完成的样本装进固定大小 batch，batch2（约 P7-P10）恰好由短的、PRM 原判 `+1` 的正常样本主导时训练成功；失败的两次 batch2 被"超长 `-1`"样本挤占主导，`grpo_pg_loss` 被拉向"惩罚长度"而不是预期的"惩罚不合规格式"信号。**"超长 -1" 根因**（真实轨迹分析）：这些是模型已经做对了（PRM 原本判 `+1`）但陷入工具决策空转的 turn——具体是 `read`/`edit`/`write` 之间的混淆（"append，不要 overwrite" 的指示碰上 OpenClaw `write` 是整文件覆盖语义），触发规则 5（复读 ≥12 次）或截断惩罚，把 PRM 原判的 `+1` 强制改成了 `-1`。这些 `-1` 标签方向本身没错（确实是低效空转，该罚），问题是这类 turn 通常有 6000-8000 token，一旦主导某个训练 batch，就会把 loss 拉向"惩罚长度"而不是"惩罚不合规格式"。
+
+**实验设计（预期是诊断性的，不保证一定复现 170852 的成功）：** 不提交（不是改判成 `+1`）满足以下条件的样本：`_original_eval_score`（三个覆盖块运行**之前**捕获的 PRM 原始判断）为 `+1`，且覆盖后的最终 `eval_score` 为 `-1`。明确排除三种情况：① 不碰真正的 PRM 原生 `-1`（Table 3 的真实训练信号，必须留）；② 不把强制 `-1` 翻回 `+1`（会奖励空转，违背规则 5 本意）；③ 基于取值谓词而非规则名单（`_original_eval_score in (1.0, 1) and eval_score == -1.0`，不是"只排除 invalid-tool-use-penalty/truncation-penalty 这两条规则"），这样天然也排除掉 `160713` 里观察到的 `0.0 → -1.0` 变化（那种不算"本来是 +1"）。
+
+**实现要点（CLI 提出四点修正后落地）：**
+- 检查点必须独立于 `_maybe_submit_ready_samples` 里已有的 A/B/D 检查——A/B/D 读 `turn_data`（PRM 运行前就知道），这个新检查读的是 `opd_result`（`task.result()` 成功后才知道），不能合并成一个 `if`。
+- 丢弃判断必须放在 `eval_score = opd_result.get("eval_score")` 和 `self._eval_scores.append(eval_score)` **之前**——否则被跳过样本的 `-1` 还是会计入 wandb/eval 统计，没法从统计数据验证实验真实效果。
+- 独立打日志（`[openclaw-rl-skip-forced-negative-override]`），标注 `original=+1 final=-1`，供训练后核对实际跳过了多少样本。
+
+**实现：** `scripts/prepare_patched_openclaw_combine_select.sh`——`_original_eval_score` 在三个覆盖块之前捕获，`_skip_forced_negative_override` 标记计算，通过 `_opd_evaluate` 的两条 `return` 路径（accepted / no-valid-hint）传出。`scripts/prepare_patched_openclaw_combine.sh`——独立检查点，`task.result()` 之后、`eval_score = opd_result.get(...)` 之前 `continue`。commit `c6c9ebb`。
+
+**验证：** 对真实官方源码模拟应用，`py_compile` 通过，生成代码检查确认 `_original_eval_score`/`_skip_forced_negative_override` 计算位置和两处 `return` 插入位置正确。**尚未用于实际训练**——用户表示会自行提交训练验证效果，待训练结果核实是否真的降低了 batch2 类型污染复现的概率（不保证复现 170852，因为 170852 本身 batch0/1 也含超长 `-1` 样本仍然成功，成功的关键是"不在 batch2 主导"而不是"完全没有"）。
+
+---
+
+## [2026-08-13] Step 1 九次修订：补两条反例（排版干扰、数学符号≠AI味）
+
+**背景：** 真实训练运行 `20260813_161745`（27 题，Turn1+Turn2 已完成）的误判分析：27 题里 5 道客观上满足 turn-1 合格标准（有真实答案 + ≥2 个不同数字 + 无 bold/编号/`\boxed{}`）的题目，**全部 5 道被误判**——2 道命中②"要求更多步骤"（P15、P23），3 道命中③"AI 味"（P19、P22、P24）。对照组：20/27 是③规则合理触发（回复确实有真 bold/编号排版），2/27 是②规则合理触发（P25=32、P26=107，确实是裸数字答案）。此前八次修订加的"默认接受"框架句对这一批新误判几乎没有防护效果（0/5）。
+
+**② 误判模式（新发现）：** P15/P23 的回复结尾是一行视觉上独立的 "Answer: X"（前面有时空一行、缩进不统一、"Answer:" 本身顶格），怀疑 Simulator 只看这行视觉上独立的结尾、误判成"只有答案没有过程"，而不是按六次修订已经要求的"数整个回复里的数字"——尽管六次修订已经用 Carol/Jennifer 反例强化过一次这条要求，这次说明该反例没有覆盖"结尾单独一行 Answer: 格式"这种新的视觉排版触发形态。
+
+**③ 误判模式（新发现，跟此前"催重新读文件"是同一类"编造清单外理由"问题，但具体表现不同）：** P19/P22/P24 的③误判理由是"数学符号太正式/奇怪的数学格式"——纯粹因为回复里出现了数学符号/等式，跟③本身明确列出的触发条件（bold 文本、编号列表、`"**Final answer**:"`）完全无关。
+
+**顺带核实：** `"**Final answer**:"` 是不是本项目引入的——直接 grep `OpenClaw-RL-official/openclaw-test/student_chat.py` 第 45 行确认这是官方论文原文，历次补丁的 old/new 文本里都原样保留，不是本项目加的，结构上只是"bold 文本"的一个具体例子（本身含 `**`，已经被③已有的 `\*\*` 正则覆盖），不是独立的第四条判断标准。
+
+**方案：** 在六次修订已有的②③两条 bullet 末尾各追加一条新反例：② 追加"如果回复某处有真实解题过程（一句话、一段、缩进不同、隔了一或多行空行都算），即使结尾是一行视觉独立的 'Answer: 15' 也要数整个回复里的所有数字，不要因为最后一行看起来更'正式'就要求补步骤"，附具体例句；③ 追加"回复里出现数学符号/等式（比如 '20+44=64'）本身不构成 AI 味/太正式的理由，展示实际计算是预期行为，只有出现 bold/编号/'Final answer:' 才该要求重写"。
+
+**实现：** `scripts/prepare_openclaw_test_scripts.sh`，九次修订，两处文字追加（分别接在六次修订原有 bullet2/bullet3 之后）。commit `a60b959`。
+
+**验证：** 全部 7 层补丁对真实官方源码模拟应用无冲突，`py_compile` 通过；用 `ast` 解析运行时提取渲染完整 `STUDENT_SYSTEM_PROMPT`，确认两处新增文字（含②例句里嵌入的真实换行）正确插入在对应 bullet 末尾。**尚未用于实际训练**——用户表示会自行提交训练验证这批新反例能否降低 161745 观察到的误判率。
+
+---
+
 <!-- 格式模板：
 
 ## [YYYY-MM-DD] 问题描述

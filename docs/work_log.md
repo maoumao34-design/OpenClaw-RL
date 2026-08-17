@@ -1629,16 +1629,65 @@
 - **Wave 2（D）落地**：不按 run_id 拉黑（会连坐 P17 的成功 write），改成单 turn 本地检测——`_fire_opd_task` 里比对剥离 OpenClaw 时间戳前缀后的 `next_state` 与已见 user 消息集合，命中则丢弃（不强制 `-1`，因为内容本身可能完全正常，错的是配对关系）（commit `b28968a`）
 → 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-13"408/503 污染训练信号完整排查"条目
 - 用 `separate_student_20260813_094000` 真实提交记录（`submitted OPD+RL`/`submitted RL` 日志）逐类核对是否真的造成训练标签污染，不只看机制：**只有 A 是实锤的标签污染**（至少 3 条错 `+1` + 1 条乱码内容进 OPD 蒸馏）；B 机制真实但这轮未捕获独立错标案例；D 独有增量这轮全部已经是 `-1`，价值是减少劣质蒸馏/占坑而非纠正错误方向；C 这轮没有独立样本；P17 的 `edit` 误用**没有标反**——失败 edit 正确拿到 `-1`、成功 write 正确拿到 `+1`，不是训练标签事故，只是同质失败样本效率低 + OpenClaw 展示层成功写入后仍挂旧的 `lastToolError` 警告（产品层 bug，不在本项目补丁范围）
+- **"skip forced negative override" 诊断实验**：对比训练成功的 170852 和失败的 160713/143003，diagnosed 出 async batch 组成的"batch2 race"机制——"超长 `-1`"样本（PRM 原判 `+1` 但因工具决策空转被规则 5/截断惩罚强制改判）碰巧挤占某个训练 batch 时，loss 会被拉向"惩罚长度"而不是预期的格式信号。不提交（不是翻回 `+1`）`_original_eval_score` 为 `+1` 但最终 `eval_score` 为 `-1` 的样本，测试能否降低这种批次污染复现概率（commit `c6c9ebb`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-13"skip forced negative override 诊断实验"条目
+- **Step 1 九次修订**：`20260813_161745` 真实数据显示 5/27 客观合格的 turn-1 全部被误判——新发现两类"编造清单外理由"：②结尾单独一行"Answer: X"被当成"只有答案"（未数整个回复）、③把数学符号本身当成 AI 味理由。补两条反例锚点，顺带核实 `"**Final answer**:"` 是论文原文非本项目引入（commit `a60b959`）
+→ 详见 [`issues_log.md`](openclaw-rl/docs/issues_log.md) 2026-08-13"Step 1 九次修订"条目
 
 **关键决策：** C 和 P17 的 `edit` 误用问题（潜在 Wave 3）本轮均不实现——真实数据核实后确认都不是当前紧急的训练标签污染源，A 才是唯一必须修的
 
 **产出：**
-- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 八次修订
+- `scripts/prepare_openclaw_test_scripts.sh`：Step 1 八次修订、九次修订
 - `scripts/prepare_patched_openclaw_opd.sh`：`is_aborted`/`generated_while_paused`/`is_duplicate_user_retry` 三个标记
-- `scripts/prepare_patched_openclaw_combine.sh`（新建）：Wave 1+2 共用的 `_maybe_submit_ready_samples` 拦截点
+- `scripts/prepare_patched_openclaw_combine.sh`（新建）：Wave 1+2 共用的 `_maybe_submit_ready_samples` 拦截点 + skip-forced-negative-override 独立检查点
+- `scripts/prepare_patched_openclaw_combine_select.sh`：`_original_eval_score`/`skip_forced_negative_override` 计算与传递
 - `scripts/run_openclaw_topk_select_modelfactory.sh` + 四条 `train_*.sh`：`PATCHED_COMBINE_DIR` 全链路接入
 
-### 当前状态（2026-08-13）
+---
+
+## 2026-08-14
+
+**目标：** OpenClaw-RL Separate/Personal Agent Track 复现大体完成，启动下一阶段——把复现出来的 Hybrid RL 训练方法迁移到 MetaClaw（论文 arXiv:2603.17187）场景上做泛化性新实验
+
+**完成内容：**
+- 理解 MetaClaw 论文核心机制（skill-driven 快通路 + opportunistic policy optimization 慢通路），`git clone` 官方代码到 `MetaClaw-official/`，初步架构对照
+- 确认迁移目标（不是复现 MetaClaw 论文结果，是用已校准的 Hybrid RL 方法在 MetaClaw-Bench 上做新实验证明方法普适性）、范围（只迁移 RL/OPD 训练方法本身，不接技能库）
+- 查证 MetaClaw 官方 RL rollout 架构、`toolcall-rl`/`swe-rl`（OpenClaw-RL 论文 General Agent 赛道）的多步 tool-call 处理方式，三处早期设计假设被真实代码核查推翻并改正：OPD hint 不能直接用静态 `feedback.incorrect`（改用 checker 实际 stdout）；MetaClaw 官方"在线更新"是离散的暂停-同步训练-恢复机制、不是真并发（我们现有连续异步管线本身更强，不需要模仿）；跨天没有任何工作区/状态持久化（每天全新隔离复制，唯一能带教训跨天走的是模型权重本身）
+- **round 内多轮 tool-call 训练信号设计**（本阶段耗时最长的核心问题，两篇论文都没有现成答案）：核查 `toolcall-rl`/`swe-rl` 的"自己控制生成循环+一个 Sample 共享 outcome reward"架构后发现要求放弃真实 `openclaw agent` CLI（会损失真实 `"coding"` 工具画像保真度）；核查 MetaClaw 自己怎么给 skill 演化提供中间态反馈后发现真正的技术约束不是"编排层看不见中间轮次"，而是"代理评估触发得太快"；最终定型方案 B：round 最终轮次用确定性 checker 结果，中间轮次用新写的、仿 `toolcall-rl::_judge_step_with_prm` 的任务无关步骤判官独立打分，不聚合进 round reward
+- 落地第一批实验文件并本地验证（无 GPU，对着真实官方代码克隆验证 import/查询/checker 执行/`py_compile`）：新建 rollout driver，直接复用官方工作区隔离/网关/真实 CLI/inline scoring 函数；扩展两个已有代理 patch 脚本接入 verdict/步骤判官三路分派。验证过程中发现并修复两个真实 bug：漏了 `_copy_eval_scripts` 会导致 checker 恒定"文件不存在"、hint 一开始接错成静态 `feedback.incorrect`
+
+**关键决策：** 迁移工作的详细设计过程和技术决策记录在 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)，不写入 `issues_log.md`——`issues_log.md` 是 OpenClaw-RL 复现本身的问题追踪文档，迁移是另一条独立工作线，用独立文档承接
+
+**产出：**
+- `docs/metaclaw_migration_plan.md`（新建）：迁移方案、查证记录、已实现清单、下一步任务，全部细节见此文档
+- `scripts/metaclaw/metaclaw_rollout_driver.py`（新建）：day01→day30 严格顺序 rollout driver
+- `scripts/prepare_patched_openclaw_opd.sh`：`_METACLAW_SESSION_RE`、`_build_metaclaw_step_judge_messages`、`turn_data["metaclaw_round_mode"]`
+- `scripts/prepare_patched_openclaw_combine_select.sh`：`_opd_evaluate` 三路分派（verdict / 步骤判官 / 原逻辑）
+
+### 当前状态（2026-08-14）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
+**MetaClaw 迁移**（新开工作线）：[x] MetaClaw 论文理解 + 官方代码克隆；[x] 迁移方案确认（目标/范围/方法映射/验收标准，见 `metaclaw_migration_plan.md`）；[x] round 内多步 tool-call 训练信号设计（方案 B）；[x] 第一批实验文件（rollout driver + 代理侧 checker 奖励接入）已实现并本地验证（`py_compile` + 真实数据的 import/查询/checker 执行测试）
+
+### 已知限制 / 未解决
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变，见下方历史状态）。
+**MetaClaw 迁移**：新步骤判官 prompt 是全新设计，没有历史数据验证过判断质量；A/B/D 系列规则在 MetaClaw 场景下是否需要调整尚未核查（比如"重复 user 重试"判定，MetaClaw 场景没有 Student 角色）；`BENCHMARK_COMBINE_PROXY_URL` 等 modelfactory 侧真实部署细节尚未确定，均为占位
+
+### 下一步
+1. **OpenClaw-RL 复现**：提交新一轮训练，验证 Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实效果（用户自行提交）
+2. **MetaClaw 迁移**：modelfactory 侧真实联调（真实 CLI 子进程+真实代理端口打通、合成 verdict 请求触发是否符合预期、步骤判官 prompt 判断质量）；核查 A/B/D 规则在新场景下的适配性；跑通训练前基线评测
+3. 其余同 08-13（见下方历史状态）
+
+### 未验证
+- [ ] Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实训练效果
+- [ ] MetaClaw rollout driver 在真实 `openclaw agent` CLI + 真实代理端口下能否正常打通
+- [ ] MetaClaw 新步骤判官 prompt 对 `run_command` 调用的判断质量
+- [ ] Simulator 拒绝合格 turn-1 是否在污染 PRM 打分（承接 08-11，仍未验证）
+
+---
+
+## 历史状态（2026-08-13，已被 8/14 结果取代）
 
 ### 已就绪
 （同 08-11，未变——见下方"历史状态（2026-08-11）"完整列表。另加：Step 1 八次修订已实现并本地验证；408/503 污染信号 Wave 1（A+B）+ Wave 2（D）均已实现、本地验证、并用真实 094000 数据核实过对训练标签的实际影响，尚未用于新一轮实际训练验证线上效果）
