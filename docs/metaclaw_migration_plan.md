@@ -185,8 +185,19 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 - [x] `openclaw-rl/scripts/prepare_patched_openclaw_opd.sh`（扩展）：新增 `_METACLAW_SESSION_RE`（`^metaclaw-`，判定 session 是否属于 MetaClaw round mode）、`_build_metaclaw_step_judge_messages`（步骤判官 prompt，仿 toolcall-rl）、`turn_data["metaclaw_round_mode"]` 字段。
 - [x] `openclaw-rl/scripts/prepare_patched_openclaw_combine_select.sh`（扩展）：`_opd_evaluate` 新增三路分派——`next_state_text` 能解析出 verdict JSON → 用确定性 `eval_score`/`hint`，跳过所有 LLM 判官调用；`turn_data["metaclaw_round_mode"]` 为真但不是 verdict → 用新步骤判官（复用现成的 `_query_prm_eval_once`/`_prm_eval_majority_vote`，只换了 prompt 来源），RL-only 独立提交，不进 OPD；两者都不是 → 原 Personal Agent Track 逻辑完全不变。两个脚本都已对着本地真实 `OpenClaw-RL-official` 克隆跑过 `py_compile` 验证。
 
+### 训练起点（已确认，2026-08-17）
+
+从**干净的 base Qwen3-4B-Thinking-2507**（`torch_dist` 转换后的 checkpoint，不是 Personal Agent Track 训练完的 checkpoint）开始训练，不接着 separate_student 训完的 checkpoint 继续训。理由：迁移文档的目标是"验证 Hybrid RL 这套训练方法本身能不能在新场景生效"，如果接着旧 checkpoint 训，结果会跟"旧 checkpoint 是否已经过拟合/定型到 GSM8K 风格"这个因素纠缠在一起，说不清楚是方法不行还是起点不好；从 base 开始，结果只反映方法本身。
+
+### 启动脚本必须复用的现有依赖（写启动脚本前先确认，容易漏）
+
+- **`rl-training-headers` 插件必须部署+全局启用**：`_METACLAW_SESSION_RE` 整套按 `session_id` 前缀（`metaclaw-`）分派的机制，依赖代理能拿到真实 `session_id`——而这条链路（`--session-id` CLI 参数 → OpenClaw 内部 `ctx.sessionId` → `appendSystemContext` 写进 system prompt 的 `[RL-TRAINING-META]` 标记 → 代理侧正则解析）本身需要 `rl-training-headers` 插件生效才能工作。这个插件是**系统级全局部署**的（写到 `/usr/lib/node_modules/openclaw/dist/extensions/rl-training-headers/` + `openclaw plugins enable rl-training-headers`，不挂在某个具体 `openclaw.json` 里），`scripts/train_with_services.sh`/`scripts/train_separate_student.sh` 里都有这一步。MetaClaw 迁移的启动脚本必须原样复制这一步（`bash scripts/prepare_patched_rl_training_headers.sh ...` + 部署到系统目录 + `openclaw plugins enable`），否则 `session_id` 传不到代理，所有 `metaclaw-` 前缀判定会静默失效，全部回退到 Personal Agent Track 原逻辑。
+- 同理，`sglang execution-bias`/`embedded-agent overflow-recovery` 这两个系统级 OpenClaw 行为补丁（`scripts/prepare_patched_sglang_execution_bias.sh`/`scripts/prepare_patched_embedded_agent_overflow_recovery.sh`）修的是 OpenClaw 本身的通用 bug，跟具体训练场景无关，MetaClaw 启动脚本也应该原样部署一遍（如果同一台机器上已经因为跑过 Personal Agent Track 训练而全局生效，重复部署是幂等的，无副作用）。
+- PRM/judge 模型端点（`self._prm_url`）：MetaClaw 的步骤判官（`_build_metaclaw_step_judge_messages`）复用现成的 `_query_prm_eval_once`，走的是跟 Personal Agent Track 完全相同的 judge 模型服务，需要同样启动。
+
 ### 下一步工程任务（待实现，未开始）
 
+- [ ] 写 MetaClaw 迁移的启动脚本（对标 `run_openclaw_topk_select_modelfactory.sh`/`train_with_services.sh`）：串起 rollout driver + 两个已打补丁的代理文件（`PATCHED_OPD_DIR`/`PATCHED_COMBINE_SELECT_DIR` PYTHONPATH 注入）+ 上面"必须复用的现有依赖"三项 + Megatron/slime 训练进程，`--load` 指向 base Qwen3-4B 的 `torch_dist` checkpoint
 - [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）
 - [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
