@@ -199,6 +199,21 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 - [x] `openclaw-rl/scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新建）：对标 `run_openclaw_topk_select_modelfactory.sh`/`train_separate_student.sh` 的启动编排——生成三个补丁代理目录 → 起训练后端（`--load` 指向 base Qwen3-4B `torch_dist`，`SAVE_CKPT` 用独立于 Personal Agent Track 的新路径）→ 等 RL proxy 30000 就绪 → 部署六项 OpenClaw 系统级补丁（`rl-training-headers` 等，"启动脚本必须复用的现有依赖"一节列的三点全部覆盖）→ 用 `BENCHMARK_BASE_URL`/`BENCHMARK_API_KEY`/`BENCHMARK_MODEL` 环境变量把 `openclaw_cfg/openclaw.json` 的 model provider 指向这次训练起的代理 → 启动 `metaclaw_rollout_driver.py` → driver 跑完（day01→day30 全部处理完）后主动停止训练。跟 `train_separate_student.sh` 的一处关键简化：**MetaClaw 不需要外部 Simulator**——`wait_for_external_simulator`/`SIMULATOR_ENV` 整段没有对应物，因为 MetaClaw-Bench 的"提问方"是静态题目文本+确定性 checker，不需要另一个 LLM 扮演角色；步骤判官用的 PRM SGLang 引擎已经是 topk-select 8GPU 拓扑自带的一部分，不需要额外服务。`bash -n` 语法检查通过（本地无法做超出语法检查的验证，六项系统级补丁部署+真实 `BENCHMARK_BASE_URL` 路径拼接是否正确仍需 modelfactory 真实环境验证）。
 
+### 三方对照：迁移方法各环节分别用的哪种方式，跟 MetaClaw 自己、OpenClaw-RL tool-call 的差异（2026-08-17）
+
+前面几轮查证分散在"查证记录（三）"里，这里按"环节"重新整理成一张对照表，一次看全——**没有一个环节是三方完全一致的，每个环节都是单独核实、单独决定的，不是整体套用某一方的方案**：
+
+| 环节 | 我们的迁移方法 | MetaClaw 自己 | OpenClaw-RL tool-call（`toolcall-rl`/`swe-rl`） | 跟谁一致 / 跟谁不同 |
+|------|------|------|------|------|
+| **Agent 怎么跑多步 tool-call** | 真实 `openclaw agent` CLI 子进程，真实 `"coding"` 工具画像 | 训练用的 `openclaw_env_rollout.py`：自己直接控制生成循环，自己执行单个 `run_command`；评测用的 `infer_cmd.py`：真实 CLI 子进程 | 自己直接控制生成循环（直连 sglang），自己执行工具（本地沙箱/远程 exec server） | 跟 MetaClaw **评测**模式一致（保真度优先），跟 MetaClaw **训练**模式和 OpenClaw-RL tool-call 都不同（它们都放弃真实 CLI 换取生成循环的完全可控） |
+| **Round 最终结果的奖励来源** | 确定性 checker（`file_check` exit code / `multi_choice` 精确匹配） | 从不用 checker 做训练奖励，只有 `prm_scorer.py` 通用主观判官 | 确定性 outcome check（`\boxed{}` 答案匹配 / test suite 通过） | 跟 OpenClaw-RL tool-call 一致（都是确定性 outcome 信号），跟 MetaClaw 自己完全不同（MetaClaw 的确定性 checker 只用于离线算 Table 1，从没进过训练奖励） |
+| **Round 内中间 tool-call 轮次的信号** | 新写的任务无关步骤判官（仿 `_judge_step_with_prm`/`_build_prm_step_messages` 的 prompt 结构改写），独立打分，RL-only，不聚合进 round reward | 每个中间轮次也是独立 `ConversationSample`，用同一个 `prm_scorer.py` 通用判官打分，跟最终轮次一视同仁，没有"中间/最终"这个区分概念 | 不单独打分——整条轨迹一个 Sample，中间轮次跟最终轮次通过 `loss_mask` 共享同一个 outcome reward | **三方都不一样，是这次迁移自己合成的设计**——借了 toolcall-rl 判官 prompt 的写法，但没有借它"共享一个 reward"的机制（那个机制要求放弃真实 CLI，见上一行）；也没有照抄 MetaClaw"一视同仁"的处理方式（那样会引入跟任务不匹配的判分标准） |
+| **Sample 提交粒度** | 沿用 combine_select 现有的"每轮次一个 Sample"（dynamic-history paradigm） | 每次 LLM 调用一个 `ConversationSample` | 整条轨迹一个 Sample（`tokens` 拼接 + `loss_mask` 区分模型生成段/观察段） | 跟 MetaClaw 自己一致（逐轮提交），跟 OpenClaw-RL tool-call 不同（整条轨迹一个 Sample，我们的架构做不到这个，见 Agent 执行方式那一行） |
+| **OPD hint（蒸馏教师信号）** | round 最终轮：`file_check` 用 checker 实际 stdout，`multi_choice` 用 `feedback.options` 动态按错选项选；中间轮次没有 hint（RL-only） | 完全没有这个机制——MetaClaw 的训练通路是纯 GRPO + `prm_scorer` 判分，没有 Hybrid RL 那种 GRPO+OPD 组合损失 | 也没有——`toolcall-rl` 是纯 outcome reward（+可选 PRM 逐步分数直接相加），不是 loss 层面的 GRPO+OPD 组合 | **OPD 蒸馏是 Personal Agent Track Hybrid RL 独有机制，MetaClaw 和 OpenClaw-RL tool-call 都没有**——这次迁移的核心目的就是测试这个机制本身能不能搬到新场景，所以特意保留，只换了 hint 的来源（主观判官 → 确定性文本） |
+| **训练循环的顺序约束** | day01→day30 concurrency=1 严格顺序；本地 Megatron+slime 连续异步管线（生成/训练同时进行，权重热更新） | 评测/`scene_per_train` 训练：`workers=1` 严格顺序，但触发机制是离散的"跑完 N 天→暂停接收请求→同步一步 `train_step`→恢复"，不是真并发 | 没有"天/日序"这个概念，标准 slime 异步 rollout，多条轨迹并发生成，顺序无关紧要 | 顺序约束这一点跟 MetaClaw 一致（都要保证"权重更新影响后续天数"这条在线学习假设），但触发机制比 MetaClaw 自己更强（连续异步 vs 离散暂停-恢复，不需要模仿它的暂停机制）；跟 OpenClaw-RL tool-call 完全不同（tool-call 的训练样本互相独立同分布，不存在"日序"或"跨天教训传递"的设计） |
+
+**读这张表的方式**：每一行代表一次独立的技术判断（保真度 vs 可控性、复用 vs 新造、跟哪边一致跟哪边不一致），不是"选定一个阵营整体照搬"。这也是"查证记录（三）"里反复强调的——两篇论文对"round 内多步 tool-call 怎么给训练信号"这个具体问题都没有直接答案，逼着这次迁移在每个环节上分别做取舍，而不是找一个现成模板整体套用。
+
 ### 下一步工程任务（待实现，未开始）
 
 - [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）、`BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1"` 这个假设的 URL 形状（没有 trailing `/chat/completions`）在真实 OpenClaw `openai-completions` provider 客户端下是否正确
