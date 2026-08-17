@@ -49,7 +49,6 @@ import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -123,13 +122,19 @@ _SESSION_ID_PREFIX = "metaclaw-"
 AGENT_RETRY = int(os.environ.get("METACLAW_AGENT_RETRY", "0"))
 VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 
-# Resume support, matching MetaClaw-official's own granularity (per-round,
-# not just per-day -- see infer_cmd.py's `result_path.exists()`/
-# `existing_inline_score` resume logic in _run_question/_run_group). Must be
-# a PERMANENT path, not under a timestamped run log directory, or a restart
-# after a crash would never see the previous attempt's progress markers.
-_PROGRESS_DIR_RAW = os.environ.get("METACLAW_PROGRESS_DIR", "")
-PROGRESS_DIR = Path(_PROGRESS_DIR_RAW) if _PROGRESS_DIR_RAW else None
+# No day/round-level resume support (deliberate, 2026-08-17 decision -- see
+# docs/metaclaw_migration_plan.md). A day-granularity marker-based version
+# was implemented and then removed: MetaClaw-Bench's own per-round
+# `existing_inline_score` resume (infer_cmd.py) turns out to have the same
+# workspace-vs-recorded-feedback inconsistency risk this project first tried
+# to avoid by using day granularity instead -- and separately, the training
+# checkpoint's own save cadence is not synchronized with rollout-driver
+# progress at all (a "day done" marker doesn't mean that day's samples are
+# in a saved checkpoint yet). Given one full day01->day30 pass is bounded in
+# wall-clock time, a crash just means restarting the whole run from day01
+# with a fresh base checkpoint -- this trivially avoids every consistency
+# risk discussed (workspace reuse, checkpoint/day desync, cross-round
+# contamination) since there is no partial state to keep consistent at all.
 
 
 async def _post_with_retry(
@@ -357,28 +362,6 @@ async def _run_round(
     return inline_score, agent_succeeded
 
 
-def _day_marker_path(test_id: str) -> Path | None:
-    if PROGRESS_DIR is None:
-        return None
-    return PROGRESS_DIR / f"{test_id}.done"
-
-
-def _day_already_done(test_id: str) -> bool:
-    marker = _day_marker_path(test_id)
-    return marker is not None and marker.exists()
-
-
-def _mark_day_done(test_id: str) -> None:
-    marker = _day_marker_path(test_id)
-    if marker is None:
-        return
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    marker.write_text(
-        json.dumps({"completed_at": time.time()}, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
 async def run_day(
     test: dict[str, Any],
     all_tests: dict[str, Any],
@@ -498,16 +481,6 @@ async def run_day(
             gateway_proc.terminate()
             await gateway_proc.wait()
 
-    # Resume support (day granularity -- see module-level note on why NOT
-    # round granularity: our workspace is freshly recreated every run_day()
-    # call, so a skipped round's file-system effects would never exist in a
-    # resumed attempt's workspace, unlike MetaClaw-official's own per-round
-    # resume which reuses one still-on-disk workspace for a whole test).
-    # Marked only after the day's loop completes without raising -- a day
-    # that crashed partway through is NOT marked done and gets fully redone
-    # (fresh workspace, all rounds) on the next invocation.
-    _mark_day_done(test_id)
-
     logger.info(f"{_GREEN}[MetaClawRollout] day=%s done{_RESET}", test_id)
 
 
@@ -522,24 +495,17 @@ async def main() -> None:
 
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
-        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s{_RESET}",
-        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR,
+        f"strict order, agent_retry=%d, verdict_retry=%d{_RESET}",
+        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY,
     )
 
-    # concurrency=1, strict day01 -> day30 order -- see
-    # docs/metaclaw_migration_plan.md "查证记录（二）" 第 2 条: this is the
-    # property that preserves the "online update while running through the
-    # day-stream" design, mirroring how MetaClaw's own harness forces
-    # workers=1 whenever scene_per_train is set.
+    # concurrency=1, strict day01 -> day30 order, no resume -- always starts
+    # from day01 (see module-level note above on why crash recovery is a
+    # full restart, not a resume). This is the property that preserves the
+    # "online update while running through the day-stream" design, mirroring
+    # how MetaClaw's own harness forces workers=1 whenever scene_per_train
+    # is set.
     for test in test_list:
-        test_id = test["id"]
-        if _day_already_done(test_id):
-            logger.info(
-                f"{_YELLOW}[MetaClawRollout] day=%s already completed (resume, "
-                f"marker found under METACLAW_PROGRESS_DIR), skipping{_RESET}",
-                test_id,
-            )
-            continue
         await run_day(test, all_tests, project_root, retry=AGENT_RETRY)
 
 

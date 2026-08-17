@@ -23,7 +23,8 @@
 #     生成隔离的工作副本，替换的是那份副本，不是 ~/.openclaw/openclaw.json
 #
 # 共用不变的部分（跟 train_separate_student.sh 完全一致，直接复用）：
-#   GPU 训练启动（run_openclaw_topk_select_modelfactory.sh，未修改）、
+#   GPU 训练启动（run_openclaw_topk_select_modelfactory.sh 扩展了
+#   METACLAW_MIGRATION_PROFILE=1 只调 --save-interval，其余参数不变）、
 #   RL training proxy 三个补丁脚本（PATCHED_OPD_DIR/PATCHED_COMBINE_DIR/
 #   PATCHED_COMBINE_SELECT_DIR，本轮已扩展了 MetaClaw 三路分派逻辑但脚本
 #   本身位置不变）、6 个 OpenClaw 系统级版本漂移/行为补丁（rl-training-headers
@@ -98,12 +99,13 @@ METACLAW_ALL_TESTS_JSON=${METACLAW_ALL_TESTS_JSON:-${METACLAW_ROOT}/benchmark/da
 BENCHMARK_MODEL=${BENCHMARK_MODEL:-qwen3-4b}
 BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/data/metaclaw-bench/workspaces/shared}
 
-# 断点续跑标记目录（2026-08-17，见 docs/metaclaw_migration_plan.md）：day
-# 粒度（不是 round 粒度——workspace 每次 run_day() 都全新重建，round 粒度
-# resume 会导致被跳过的 round 实际文件效果从未在新 workspace 里重放过）。
-# 必须是永久路径，不能放在下面按时间戳生成的 LOGS_DIR 里，否则进程崩溃
-# 重启后（LOGS_DIR 换了新时间戳）永远看不到上次的进度标记。
-METACLAW_PROGRESS_DIR=${METACLAW_PROGRESS_DIR:-/dfs/data/openclaw-rl-project/table3-artifacts/metaclaw-migration-progress}
+# 不做断点续跑（2026-08-17 决定，见 docs/metaclaw_migration_plan.md）：
+# 最初做过一版按天粒度的续跑标记，后来发现 checkpoint 存盘节奏（按训练
+# 步数）跟 rollout driver 的天数进度完全不同步——"标记这天完成"不代表
+# 这天的样本已经真的进了某个存盘的 checkpoint，进程崩溃后重启会静默丢失
+# 一段训练贡献且没有办法发现。一遍 30 天训练总耗时有限，崩溃后直接从
+# day01 用干净的 base checkpoint 完整重跑，比维护一套不完全可靠的断点
+# 续跑机制更简单也更安全，不会有任何"部分完成状态对不对得上"的风险。
 
 # 可选的鲁棒性开关，默认 0（不重试，跟 MetaClaw 官方 infer_cmd.py 的
 # retry=0 默认值一致，见 docs/metaclaw_migration_plan.md 查证记录四）。
@@ -241,6 +243,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PATCHED_COMBINE_DIR="${PATCHED_COMBINE_DIR}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
+  METACLAW_MIGRATION_PROFILE="1" \
   bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
@@ -329,7 +332,6 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_ROOT="${METACLAW_ROOT}" \
   METACLAW_COMBINE_PROXY_URL="http://127.0.0.1:30000/v1/chat/completions" \
   METACLAW_MODEL_ID="${BENCHMARK_MODEL}" \
-  METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
   METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
   METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \

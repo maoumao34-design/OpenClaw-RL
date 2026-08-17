@@ -11,6 +11,9 @@
 #
 # SMOKE_PROFILE=1    applies 4-GPU smoke sed overrides (see smoke_run_qwen3_4b_openclaw_topk_select.sh).
 # MINITEST_PROFILE=1 applies 5-GPU pre-test sed overrides (see minitest_run_qwen3_4b_openclaw_topk_select.sh).
+# METACLAW_MIGRATION_PROFILE=1 lowers --save-interval only, for the MetaClaw
+# migration's much smaller per-pass data volume (see scripts/metaclaw/, and
+# docs/metaclaw_migration_plan.md for the sizing rationale).
 
 set -euo pipefail
 
@@ -19,6 +22,7 @@ OFFICIAL="${REPO_ROOT}/openclaw-combine/run_qwen3_4b_openclaw_topk_select.sh"
 PATCHED="${OPENCLAW_TOPK_SELECT_SCRIPT:-${TMPDIR:-/tmp}/run_qwen3_4b_openclaw_topk_select_modelfactory.sh}"
 SMOKE_PROFILE=${SMOKE_PROFILE:-0}
 MINITEST_PROFILE=${MINITEST_PROFILE:-0}
+METACLAW_MIGRATION_PROFILE=${METACLAW_MIGRATION_PROFILE:-0}
 
 if [ ! -f "${OFFICIAL}" ]; then
     echo "错误：找不到官方 topk-select 脚本: ${OFFICIAL}" >&2
@@ -73,6 +77,22 @@ elif [ "${MINITEST_PROFILE}" = "1" ]; then
         -e 's/^export TP="2"/export TP="1"/' \
         -e 's/--num-rollout 100000000/--num-rollout 300/' \
         -e 's/--save-interval 100/--save-interval 5/' \
+        "${PATCHED}"
+elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
+    # 2026-08-17：MetaClaw 迁移一遍 30 天数据量远小于 Personal Agent Track
+    # 一次训练的量级，官方默认 --save-interval 100 大概率整遍跑完都不到
+    # 100 步、一个 checkpoint 都存不下来。粗略估算：30 天 × 约 10
+    # round/天 = 约 300 round，每个 round 大约 1 条最终轮次样本 + 数条
+    # 中间轮次步骤判官样本（保守估计均值约 3 条/round）≈ 900 条样本；
+    # --rollout-batch-size 16（官方默认，未改动）下，约 900/16 ≈ 56
+    # 训练步——这个换算比例参照上面 MINITEST_PROFILE 注释"num-rollout
+    # 300 → 约 18 训练步"（300/18≈16.7，与 batch-size=16 基本吻合）。
+    # 目标一遍存下约 5 个 checkpoint，56/5≈11.2，向下取整到 10（宁可多存
+    # 几个也不要少于 5 个，估算本身不准，实际数字要等真实训练跑一次才知
+    # 道，见 docs/metaclaw_migration_plan.md）。只改这一处，并行度/
+    # batch-size/上下文窗口等其余参数不动，跟 8GPU 正式训练配置一致。
+    sed -i \
+        -e 's/--save-interval 100/--save-interval 10/' \
         "${PATCHED}"
 fi
 
