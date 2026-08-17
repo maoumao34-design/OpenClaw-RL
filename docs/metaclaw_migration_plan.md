@@ -195,10 +195,13 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 - 同理，`sglang execution-bias`/`embedded-agent overflow-recovery` 这两个系统级 OpenClaw 行为补丁（`scripts/prepare_patched_sglang_execution_bias.sh`/`scripts/prepare_patched_embedded_agent_overflow_recovery.sh`）修的是 OpenClaw 本身的通用 bug，跟具体训练场景无关，MetaClaw 启动脚本也应该原样部署一遍（如果同一台机器上已经因为跑过 Personal Agent Track 训练而全局生效，重复部署是幂等的，无副作用）。
 - PRM/judge 模型端点（`self._prm_url`）：MetaClaw 的步骤判官（`_build_metaclaw_step_judge_messages`）复用现成的 `_query_prm_eval_once`，走的是跟 Personal Agent Track 完全相同的 judge 模型服务，需要同样启动。
 
+### 已实现（续，2026-08-17）
+
+- [x] `openclaw-rl/scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新建）：对标 `run_openclaw_topk_select_modelfactory.sh`/`train_separate_student.sh` 的启动编排——生成三个补丁代理目录 → 起训练后端（`--load` 指向 base Qwen3-4B `torch_dist`，`SAVE_CKPT` 用独立于 Personal Agent Track 的新路径）→ 等 RL proxy 30000 就绪 → 部署六项 OpenClaw 系统级补丁（`rl-training-headers` 等，"启动脚本必须复用的现有依赖"一节列的三点全部覆盖）→ 用 `BENCHMARK_BASE_URL`/`BENCHMARK_API_KEY`/`BENCHMARK_MODEL` 环境变量把 `openclaw_cfg/openclaw.json` 的 model provider 指向这次训练起的代理 → 启动 `metaclaw_rollout_driver.py` → driver 跑完（day01→day30 全部处理完）后主动停止训练。跟 `train_separate_student.sh` 的一处关键简化：**MetaClaw 不需要外部 Simulator**——`wait_for_external_simulator`/`SIMULATOR_ENV` 整段没有对应物，因为 MetaClaw-Bench 的"提问方"是静态题目文本+确定性 checker，不需要另一个 LLM 扮演角色；步骤判官用的 PRM SGLang 引擎已经是 topk-select 8GPU 拓扑自带的一部分，不需要额外服务。`bash -n` 语法检查通过（本地无法做超出语法检查的验证，六项系统级补丁部署+真实 `BENCHMARK_BASE_URL` 路径拼接是否正确仍需 modelfactory 真实环境验证）。
+
 ### 下一步工程任务（待实现，未开始）
 
-- [ ] 写 MetaClaw 迁移的启动脚本（对标 `run_openclaw_topk_select_modelfactory.sh`/`train_with_services.sh`）：串起 rollout driver + 两个已打补丁的代理文件（`PATCHED_OPD_DIR`/`PATCHED_COMBINE_SELECT_DIR` PYTHONPATH 注入）+ 上面"必须复用的现有依赖"三项 + Megatron/slime 训练进程，`--load` 指向 base Qwen3-4B 的 `torch_dist` checkpoint
-- [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）
+- [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）、`BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1"` 这个假设的 URL 形状（没有 trailing `/chat/completions`）在真实 OpenClaw `openai-completions` provider 客户端下是否正确
 - [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
 - [ ] 设计一种手段，用来监控"某天的训练是否真的让权重产生了可观测变化"（呼应查证记录第 3 条的风险），否则没法判断某天没提升是模型能力上限还是训练没生效

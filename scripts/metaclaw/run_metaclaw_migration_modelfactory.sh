@@ -1,0 +1,340 @@
+#!/bin/bash
+# run_metaclaw_migration_modelfactory.sh
+#
+# MetaClaw 迁移训练编排——把已复现校准的 Hybrid RL 方法（GRPO+OPD
+# topk-select）应用到 MetaClaw-Bench 上做泛化性实验。详细设计见
+# docs/metaclaw_migration_plan.md（目标/方法映射/查证记录/方案 B 设计）。
+#
+# 跟 train_separate_student.sh 的区别：
+#   - 训练起点是干净 base Qwen3-4B（不是 Personal Agent Track 训完的
+#     checkpoint），SAVE_CKPT 用独立路径，不覆盖/污染已有 checkpoint
+#   - 没有外部 Simulator：MetaClaw-Bench 的"提问方"是静态题目文本 + 确定性
+#     checker 脚本，不需要另一个 LLM 扮演 Student/TA/Teacher；PRM 步骤判官
+#     用的是训练本身自带的 PRM SGLang 引擎（topk-select 8GPU 拓扑里的
+#     PRM SGLang×1），不是外部服务，不需要 wait_for_external_simulator
+#   - 用 scripts/metaclaw/metaclaw_rollout_driver.py（day01→day30 严格顺序，
+#     concurrency=1）代替 student_chat.py，"跑完就主动停止训练"这条编排逻辑
+#     保留（官方 --num-rollout 不会自己停）
+#   - 额外需要 MetaClaw-Bench 自己的 openclaw.json（openclaw_cfg/openclaw.json）
+#     模板，通过 BENCHMARK_BASE_URL/BENCHMARK_API_KEY/BENCHMARK_MODEL 三个
+#     环境变量把它的 model provider 指向本次训练起的代理（30000 端口）——
+#     这个配置文件本身不用 openclaw config set 改全局配置，rollout driver
+#     内部对每一天都会调用官方 _prepare_work_copy/_patch_agent_workspace
+#     生成隔离的工作副本，替换的是那份副本，不是 ~/.openclaw/openclaw.json
+#
+# 共用不变的部分（跟 train_separate_student.sh 完全一致，直接复用）：
+#   GPU 训练启动（run_openclaw_topk_select_modelfactory.sh，未修改）、
+#   RL training proxy 三个补丁脚本（PATCHED_OPD_DIR/PATCHED_COMBINE_DIR/
+#   PATCHED_COMBINE_SELECT_DIR，本轮已扩展了 MetaClaw 三路分派逻辑但脚本
+#   本身位置不变）、6 个 OpenClaw 系统级版本漂移/行为补丁（rl-training-headers
+#   等，全局部署，跟具体训练场景无关，必须部署——否则 session_id 传不到
+#   代理，见 metaclaw_migration_plan.md"启动脚本必须复用的现有依赖"一节）。
+#
+# modelfactory job 提交：
+#   代码解释器: /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i
+#   代码路径:   /dfs/data/openclaw-rl-project/openclaw-rl/scripts/metaclaw/run_metaclaw_migration_modelfactory.sh
+#   GPU 数量:   8（跟 Personal Agent Track 用同一套 topk-select 训练拓扑）
+#
+# 需要额外准备：MetaClaw-official 检出到 modelfactory（METACLAW_ROOT 指向的路径）
+#
+# 端口（训练机本机）：
+#   30000  → RL training proxy（同时服务 openclaw agent 的模型请求和 driver 的 verdict 提交）
+#   18789  → 未使用（MetaClaw 场景每天用独立临时网关端口，见 _start_work_gateway）
+
+set -euo pipefail
+
+SCRIPTS_DIR=$(dirname "$(realpath "$0")")
+OPENCLAW_RL_ROOT=$(cd "${SCRIPTS_DIR}/../.." && pwd)
+OPENCLAW_RL_GIT_SHA=$(cd "${OPENCLAW_RL_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+export OPENCLAW_RL_GIT_SHA
+
+# =====================================================================
+# 配置
+# =====================================================================
+# 训练起点：干净 base Qwen3-4B（已确认，2026-08-17，见
+# docs/metaclaw_migration_plan.md"训练起点"一节）——不接 Personal Agent
+# Track 训完的 checkpoint，避免"方法本身行不行"和"旧 checkpoint 是否已
+# 定型"两个因素纠缠在一起。
+POLICY_MODEL_PATH=${POLICY_MODEL_PATH:-/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507}
+POLICY_TORCH_DIST=${POLICY_TORCH_DIST:-/dfs/data/models/Qwen3-4B-Thinking-2507-torch-dist}
+
+SGLANG_API_KEY=${SGLANG_API_KEY:-openclaw-rl-key}
+
+NUM_TRAINING_GPUS=${NUM_TRAINING_GPUS:-8}
+TRAINING_CUDA_DEVICES=${TRAINING_CUDA_DEVICES:-$(seq -s, 0 $((NUM_TRAINING_GPUS - 1)))}
+
+# OPENCLAW_GATEWAY_TOKEN（跟 train_separate_student.sh 同一读取逻辑，仅用于
+# 系统级 `openclaw config`/`openclaw plugins` 命令的鉴权，不是 MetaClaw
+# 每天临时网关的 token）
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+    OPENCLAW_GATEWAY_TOKEN=$(python3 -c "
+import json, pathlib, sys
+cfg = pathlib.Path.home() / '.openclaw/openclaw.json'
+if not cfg.exists(): sys.exit(1)
+d = json.loads(cfg.read_text())
+v = (d.get('gateway') or {}).get('auth', {}).get('token', '')
+if v: print(v); sys.exit(0)
+v = (d.get('gateway') or {}).get('token', '') or d.get('token', '')
+if v: print(v); sys.exit(0)
+sys.exit(1)
+" 2>/dev/null) || true
+fi
+if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
+    echo "错误：无法读取 OPENCLAW_GATEWAY_TOKEN" >&2
+    exit 1
+fi
+
+# 独立 checkpoint 路径——不跟 Personal Agent Track 的 checkpoint 混用
+SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-metaclaw-migration}
+REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
+
+# MetaClaw-official 检出路径（需要额外准备，不是 openclaw-rl 仓库自带的）
+METACLAW_ROOT=${METACLAW_ROOT:-/dfs/data/openclaw-rl-project/MetaClaw-official}
+if [ ! -d "${METACLAW_ROOT}" ]; then
+    echo "错误：METACLAW_ROOT 不存在: ${METACLAW_ROOT}（需要先 git clone MetaClaw-official 到这个路径）" >&2
+    exit 1
+fi
+METACLAW_ALL_TESTS_JSON=${METACLAW_ALL_TESTS_JSON:-${METACLAW_ROOT}/benchmark/data/metaclaw-bench/all_tests.json}
+BENCHMARK_MODEL=${BENCHMARK_MODEL:-qwen3-4b}
+BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/data/metaclaw-bench/workspaces/shared}
+
+CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
+CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
+
+LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/metaclaw_migration_$(date +%Y%m%d_%H%M%S)}
+mkdir -p "${LOGS_DIR}"
+
+cat > "${LOGS_DIR}/RUN_MANIFEST.txt" <<EOF
+openclaw-rl commit: ${OPENCLAW_RL_GIT_SHA}
+started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+command: $0 $*
+metaclaw_root: ${METACLAW_ROOT}
+checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
+EOF
+
+echo "日志目录: ${LOGS_DIR}"
+echo "METACLAW_ROOT: ${METACLAW_ROOT}"
+echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
+
+# =====================================================================
+# 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
+# 扩展了 MetaClaw 三路分派逻辑——verdict / 步骤判官 / 原逻辑不变，见
+# docs/metaclaw_migration_plan.md"已实现"一节）
+# =====================================================================
+PATCHED_OPD_DIR="${LOGS_DIR}/patched-openclaw-opd"
+bash "${SCRIPTS_DIR}/../prepare_patched_openclaw_opd.sh" "${REPO_ROOT}" "${PATCHED_OPD_DIR}"
+
+PATCHED_COMBINE_SELECT_DIR="${LOGS_DIR}/patched-openclaw-combine-select"
+bash "${SCRIPTS_DIR}/../prepare_patched_openclaw_combine_select.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_SELECT_DIR}"
+
+PATCHED_COMBINE_DIR="${LOGS_DIR}/patched-openclaw-combine"
+bash "${SCRIPTS_DIR}/../prepare_patched_openclaw_combine.sh" "${REPO_ROOT}" "${PATCHED_COMBINE_DIR}"
+
+# =====================================================================
+# conda
+# =====================================================================
+if [ -n "${CONDA_ENV}" ]; then
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+    conda activate "${CONDA_ENV}"
+    echo "已激活 conda: ${CONDA_ENV}"
+fi
+
+# =====================================================================
+# 工具函数（同 train_separate_student.sh）
+# =====================================================================
+dump_log_tail() {
+    local logfile=$1
+    local lines=${2:-80}
+    if [ -f "${logfile}" ]; then
+        local total
+        total=$(wc -l < "${logfile}" | tr -d ' ')
+        echo "--- ${logfile} (${total} lines total; showing last ${lines}) ---" >&2
+        if [ "${total}" -le 200 ]; then
+            cat "${logfile}" >&2
+        else
+            tail -n "${lines}" "${logfile}" >&2
+        fi
+        echo "--- end ---" >&2
+    fi
+}
+
+wait_for_port() {
+    local name=$1
+    local port=$2
+    local max_wait=${3:-600}
+    local pid=${4:-}
+    local logfile=${5:-}
+    local waited=0
+    echo "等待 ${name} (port ${port})..."
+    while ! curl -s --max-time 5 "http://localhost:${port}/" > /dev/null 2>&1; do
+        sleep 10
+        waited=$((waited + 10))
+        if [ -n "${pid}" ] && ! kill -0 "${pid}" 2>/dev/null; then
+            echo "错误：${name} 进程已退出" >&2
+            dump_log_tail "${logfile}"
+            return 1
+        fi
+        if [ -n "${logfile}" ] && [ -f "${logfile}" ]; then
+            if grep -qE "Job 'raysubmit_.*' failed|can't open file '/workspace/train_async.py'|patch failed|Traceback|CUDA out of memory" "${logfile}" 2>/dev/null; then
+                echo "错误：Ray 训练 job 已失败（见 ${logfile}）" >&2
+                grep -E "failed|Error|error|Traceback|can't open|patch failed|OOM|CUDA" "${logfile}" 2>/dev/null | tail -20 >&2 || true
+                dump_log_tail "${logfile}" 120
+                return 1
+            fi
+        fi
+        if [ ${waited} -ge ${max_wait} ]; then
+            echo "超时：${name} 在 ${max_wait}s 内未启动" >&2
+            dump_log_tail "${logfile}"
+            return 1
+        fi
+        echo "  已等待 ${waited}s..."
+    done
+    echo "${name} 已就绪 (port ${port})"
+}
+
+# =====================================================================
+# 清理
+# =====================================================================
+DRIVER_PID=""
+
+cleanup() {
+    echo ""
+    echo "清理中..."
+    [ -n "${DRIVER_PID}" ] && kill "${DRIVER_PID}" 2>/dev/null || true
+    ray stop --force 2>/dev/null || true
+    wait 2>/dev/null || true
+    echo "清理完成。"
+}
+trap cleanup EXIT INT TERM
+
+# =====================================================================
+# 第1步：启动训练（GPU 0-7，跟 Personal Agent Track 用同一套 topk-select
+# 训练后端，未修改——PRM SGLang 引擎本身就在这套拓扑里，MetaClaw 步骤
+# 判官直接复用，不需要额外的外部服务）
+# =====================================================================
+echo ""
+echo "=== [1/3] 启动训练（GPU ${TRAINING_CUDA_DEVICES}，NUM_GPUS=${NUM_TRAINING_GPUS}）==="
+
+CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
+  REPO_ROOT="${REPO_ROOT}" \
+  NUM_GPUS="${NUM_TRAINING_GPUS}" \
+  HF_CKPT="${POLICY_MODEL_PATH}" \
+  REF_LOAD="${POLICY_TORCH_DIST}" \
+  SAVE_CKPT="${SAVE_CKPT}" \
+  PRM_MODEL_PATH="${POLICY_MODEL_PATH}" \
+  PRM_TEACHER_LOAD="${POLICY_TORCH_DIST}" \
+  SGLANG_API_KEY="${SGLANG_API_KEY}" \
+  PATCHED_OPD_DIR="${PATCHED_OPD_DIR}" \
+  PATCHED_COMBINE_DIR="${PATCHED_COMBINE_DIR}" \
+  PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
+  OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
+  bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
+  > "${LOGS_DIR}/training.log" 2>&1 &
+TRAINING_PID=$!
+
+echo "训练 PID: ${TRAINING_PID}，等待 Ray head (port 8265)..."
+until curl -sf http://127.0.0.1:8265/api/version > /dev/null 2>&1; do
+    sleep 5
+    if ! kill -0 "${TRAINING_PID}" 2>/dev/null; then
+        echo "错误：训练进程意外退出" >&2
+        dump_log_tail "${LOGS_DIR}/training.log"
+        exit 1
+    fi
+done
+echo "Ray head 已就绪"
+
+# =====================================================================
+# 第2步：RL proxy 就绪 + OpenClaw 系统级补丁部署（rl-training-headers 等
+# 六项，必须做——见 docs/metaclaw_migration_plan.md"启动脚本必须复用的
+# 现有依赖"一节，不做的话 session_id 传不到代理，MetaClaw 三路分派全部
+# 静默失效）
+# =====================================================================
+echo ""
+echo "=== [2/3] RL training proxy + OpenClaw 系统级补丁 ==="
+
+echo "等待 RL training proxy (port 30000)..."
+wait_for_port "RL training proxy" 30000 900 "" "${LOGS_DIR}/training.log"
+
+echo "部署 rl-training-headers 插件（appendSystemContext 版本，session_id 传递依赖此项）..." \
+    | tee -a "${LOGS_DIR}/openclaw.log"
+PATCHED_PLUGIN_DIR="${LOGS_DIR}/patched-rl-training-headers"
+bash "${SCRIPTS_DIR}/../prepare_patched_rl_training_headers.sh" "${REPO_ROOT}" "${PATCHED_PLUGIN_DIR}"
+SYSTEM_PLUGIN_DIR="/usr/lib/node_modules/openclaw/dist/extensions/rl-training-headers"
+mkdir -p "${SYSTEM_PLUGIN_DIR}"
+cp "${PATCHED_PLUGIN_DIR}/index.js" "${SYSTEM_PLUGIN_DIR}/index.js"
+cp "${PATCHED_PLUGIN_DIR}/openclaw.plugin.json" "${SYSTEM_PLUGIN_DIR}/openclaw.plugin.json"
+cp "${PATCHED_PLUGIN_DIR}/package.json" "${SYSTEM_PLUGIN_DIR}/package.json"
+openclaw plugins enable rl-training-headers >> "${LOGS_DIR}/openclaw.log" 2>&1 || true
+
+echo "部署 sglang execution-bias 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SGLANG_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/extensions/sglang/index.js"
+PATCHED_SGLANG_DIR="${LOGS_DIR}/patched-sglang"
+bash "${SCRIPTS_DIR}/../prepare_patched_sglang_execution_bias.sh" "${SGLANG_LIVE_FILE}" "${PATCHED_SGLANG_DIR}"
+cp "${PATCHED_SGLANG_DIR}/index.js" "${SGLANG_LIVE_FILE}"
+
+echo "部署 embedded-agent overflow-recovery 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+EMBEDDED_AGENT_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/embedded-agent-Cv16r2d1.js"
+PATCHED_EMBEDDED_AGENT_DIR="${LOGS_DIR}/patched-embedded-agent"
+bash "${SCRIPTS_DIR}/../prepare_patched_embedded_agent_overflow_recovery.sh" "${EMBEDDED_AGENT_LIVE_FILE}" "${PATCHED_EMBEDDED_AGENT_DIR}"
+cp "${PATCHED_EMBEDDED_AGENT_DIR}/embedded-agent-Cv16r2d1.js" "${EMBEDDED_AGENT_LIVE_FILE}"
+
+echo "部署 system-prompt output-directives 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SYSTEM_PROMPT_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/system-prompt-config-CLAPATdy.js"
+PATCHED_SYSTEM_PROMPT_DIR="${LOGS_DIR}/patched-system-prompt"
+bash "${SCRIPTS_DIR}/../prepare_patched_system_prompt_output_directives.sh" "${SYSTEM_PROMPT_LIVE_FILE}" "${PATCHED_SYSTEM_PROMPT_DIR}"
+cp "${PATCHED_SYSTEM_PROMPT_DIR}/system-prompt-config-CLAPATdy.js" "${SYSTEM_PROMPT_LIVE_FILE}"
+
+echo "部署 cli-compaction 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+CLI_COMPACTION_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/cli-compaction-B6C2IDnn.js"
+PATCHED_CLI_COMPACTION_DIR="${LOGS_DIR}/patched-cli-compaction"
+bash "${SCRIPTS_DIR}/../prepare_patched_cli_compaction.sh" "${CLI_COMPACTION_LIVE_FILE}" "${PATCHED_CLI_COMPACTION_DIR}"
+cp "${PATCHED_CLI_COMPACTION_DIR}/cli-compaction-B6C2IDnn.js" "${CLI_COMPACTION_LIVE_FILE}"
+
+echo "部署 silent-reply-policy 补丁..." | tee -a "${LOGS_DIR}/openclaw.log"
+SILENT_REPLY_LIVE_FILE="/usr/lib/node_modules/openclaw/dist/effective-reply-route-BnYlac-J.js"
+PATCHED_SILENT_REPLY_DIR="${LOGS_DIR}/patched-silent-reply-policy"
+bash "${SCRIPTS_DIR}/../prepare_patched_silent_reply_policy.sh" "${SILENT_REPLY_LIVE_FILE}" "${PATCHED_SILENT_REPLY_DIR}"
+cp "${PATCHED_SILENT_REPLY_DIR}/effective-reply-route-BnYlac-J.js" "${SILENT_REPLY_LIVE_FILE}"
+
+# =====================================================================
+# 第3步：MetaClaw rollout driver（day01→day30，concurrency=1，见
+# scripts/metaclaw/metaclaw_rollout_driver.py 顶部文档字符串）
+#
+# BENCHMARK_BASE_URL/BENCHMARK_API_KEY/BENCHMARK_MODEL 是
+# openclaw_cfg/openclaw.json 里 ${...} 占位符对应的环境变量——driver
+# 内部对每一天都会先用官方 _prepare_work_copy 生成隔离配置副本，这里设的
+# 环境变量在副本被 OpenClaw 自己加载时完成替换，不需要手工改 JSON 文件。
+# =====================================================================
+echo ""
+echo "=== [3/3] MetaClaw rollout driver（day01→day30）==="
+
+# BENCHMARK_BASE_URL 没有 trailing /chat/completions，假设 OpenClaw 的
+# "openai-completions" provider 客户端会自己拼接标准 OpenAI 路径（同
+# models.providers.sglang 在其他训练脚本里的用法）——这条假设未在真实
+# MetaClaw agent 请求链路上验证过，如果联调时发现 404，先查这里。
+METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
+  METACLAW_ROOT="${METACLAW_ROOT}" \
+  METACLAW_COMBINE_PROXY_URL="http://127.0.0.1:30000/v1/chat/completions" \
+  METACLAW_MODEL_ID="${BENCHMARK_MODEL}" \
+  BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
+  BENCHMARK_API_KEY="${SGLANG_API_KEY}" \
+  BENCHMARK_MODEL="${BENCHMARK_MODEL}" \
+  BENCHMARK_WORKSPACE_DIR="${BENCHMARK_WORKSPACE_DIR}" \
+  python "${SCRIPTS_DIR}/metaclaw_rollout_driver.py" \
+  > "${LOGS_DIR}/metaclaw_rollout.log" 2>&1 &
+DRIVER_PID=$!
+
+echo ""
+echo "所有服务已启动，训练进行中..."
+echo "  日志目录:         ${LOGS_DIR}/"
+echo "  METACLAW_ROOT:    ${METACLAW_ROOT}"
+echo "  训练日志:         tail -f ${LOGS_DIR}/training.log"
+echo "  rollout driver:   tail -f ${LOGS_DIR}/metaclaw_rollout.log"
+echo "  Ray dashboard:    http://127.0.0.1:8265"
+
+wait "${DRIVER_PID}" 2>/dev/null || true
+echo "day01→day30 全部跑完，主动停止训练..." | tee -a "${LOGS_DIR}/metaclaw_rollout.log"
+kill "${TRAINING_PID}" 2>/dev/null || true
+ray stop --force 2>/dev/null || true
+
+echo "训练完成（MetaClaw 迁移，day01→day30 跑完后主动停止）！检查点: ${SAVE_CKPT}"
