@@ -113,6 +113,13 @@ BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/da
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
+# 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
+# 建议先设 METACLAW_MAX_DAYS=1，确认整条链路（真实 openclaw agent 子
+# 进程、checker 执行、verdict 被代理正确识别、session_id 正确传递）
+# 走通了，再不设这个变量、正式跑全部 30 天。见 docs/metaclaw_migration_plan.md
+# 训练前清单。
+METACLAW_MAX_DAYS=${METACLAW_MAX_DAYS:-}
+
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
@@ -332,6 +339,7 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_ROOT="${METACLAW_ROOT}" \
   METACLAW_COMBINE_PROXY_URL="http://127.0.0.1:30000/v1/chat/completions" \
   METACLAW_MODEL_ID="${BENCHMARK_MODEL}" \
+  METACLAW_MAX_DAYS="${METACLAW_MAX_DAYS}" \
   METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
   METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \

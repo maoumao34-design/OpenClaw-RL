@@ -493,6 +493,18 @@ async def main() -> None:
     test_list = all_tests.get("test", [])
     project_root = get_project_root()
 
+    # Optional smoke-test knob (2026-08-17): only process the first N days
+    # instead of the full all_tests.json list. For verifying the pipeline
+    # end-to-end (real openclaw agent subprocess, checker execution, verdict
+    # recognized by the proxy, session_id propagation) before committing to
+    # a full day01->day30 run -- see docs/metaclaw_migration_plan.md
+    # pre-training checklist. Unset (default) processes every day, unchanged
+    # from prior behavior.
+    max_days_raw = os.environ.get("METACLAW_MAX_DAYS", "")
+    if max_days_raw:
+        max_days = int(max_days_raw)
+        test_list = test_list[:max_days]
+
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
         f"strict order, agent_retry=%d, verdict_retry=%d{_RESET}",
