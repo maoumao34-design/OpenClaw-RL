@@ -15,7 +15,7 @@
 | conda env | `/dfs/data/envs/openclaw-rl` |
 | 项目根目录 | `/dfs/data/openclaw-rl-project/` |
 | 官方仓库 | `/dfs/data/openclaw-rl-project/OpenClaw-RL-official/` |
-| 我们的仓库 | `/dfs/data/openclaw-rl-project/openclaw-rl/` |
+| 我们的仓库 | `/dfs/data/openclaw-rl-project/OpenClaw-RL/` |
 
 ---
 

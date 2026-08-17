@@ -12,7 +12,7 @@
 #              （2026-07-13 起：wandb.ai 需要走代理，start_tools.sh 负责
 #              起代理，-i 让 pon 这个 alias 能展开；纯 `bash` 提交代理会
 #              连不上，wandb 上报不了）
-#   代码路径:   /dfs/data/openclaw-rl-project/openclaw-rl/scripts/train_with_services.sh
+#   代码路径:   /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/train_with_services.sh
 #   GPU 数量:   8
 #
 # GPU 分配（论文 faithful，8×H20 全用于训练）：

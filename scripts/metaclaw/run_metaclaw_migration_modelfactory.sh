@@ -34,8 +34,6 @@
 # modelfactory job 提交：
 #   代码解释器: /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i
 #   代码路径:   /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/metaclaw/run_metaclaw_migration_modelfactory.sh
-#   （2026-08-17 CLI 确认的真实路径；docs/reproduction_guide.md 和另外几个
-#   既有训练脚本注释里写的小写 openclaw-rl 是否也需要同步更新，待确认）
 #   GPU 数量:   8（跟 Personal Agent Track 用同一套 topk-select 训练拓扑）
 #
 # 需要额外准备：MetaClaw-official 检出到 modelfactory（METACLAW_ROOT 指向的路径）

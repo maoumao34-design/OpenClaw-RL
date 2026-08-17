@@ -27,7 +27,7 @@
 #
 # modelfactory job 提交：
 #   代码解释器: /bin/bash -i /dfs/data/start_tools.sh && /bin/bash -i
-#   代码路径:   /dfs/data/openclaw-rl-project/openclaw-rl/scripts/train_separate_student.sh
+#   代码路径:   /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/train_separate_student.sh
 #   GPU 数量:   8（跟 Joint 用同一套训练基础设施配置，论文训练超参数不分 Joint/Separate）
 #
 # Simulator 地址：编辑 scripts/simulator.env（见 simulator.env.example）
