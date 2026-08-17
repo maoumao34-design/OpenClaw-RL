@@ -98,6 +98,19 @@ METACLAW_ALL_TESTS_JSON=${METACLAW_ALL_TESTS_JSON:-${METACLAW_ROOT}/benchmark/da
 BENCHMARK_MODEL=${BENCHMARK_MODEL:-qwen3-4b}
 BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/data/metaclaw-bench/workspaces/shared}
 
+# 断点续跑标记目录（2026-08-17，见 docs/metaclaw_migration_plan.md）：day
+# 粒度（不是 round 粒度——workspace 每次 run_day() 都全新重建，round 粒度
+# resume 会导致被跳过的 round 实际文件效果从未在新 workspace 里重放过）。
+# 必须是永久路径，不能放在下面按时间戳生成的 LOGS_DIR 里，否则进程崩溃
+# 重启后（LOGS_DIR 换了新时间戳）永远看不到上次的进度标记。
+METACLAW_PROGRESS_DIR=${METACLAW_PROGRESS_DIR:-/dfs/data/openclaw-rl-project/table3-artifacts/metaclaw-migration-progress}
+
+# 可选的鲁棒性开关，默认 0（不重试，跟 MetaClaw 官方 infer_cmd.py 的
+# retry=0 默认值一致，见 docs/metaclaw_migration_plan.md 查证记录四）。
+# 要不要开、开到多大，等真实训练观察效果后再决定，不预设。
+METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
+METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
+
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
@@ -316,6 +329,9 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_ROOT="${METACLAW_ROOT}" \
   METACLAW_COMBINE_PROXY_URL="http://127.0.0.1:30000/v1/chat/completions" \
   METACLAW_MODEL_ID="${BENCHMARK_MODEL}" \
+  METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
+  METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
+  METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
   BENCHMARK_API_KEY="${SGLANG_API_KEY}" \
   BENCHMARK_MODEL="${BENCHMARK_MODEL}" \

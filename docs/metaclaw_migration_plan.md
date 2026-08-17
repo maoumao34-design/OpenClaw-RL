@@ -234,6 +234,17 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 4. **提交失败默认丢弃这条设计是否干净——没有直接可比对象**：查 `toolcall-rl` 发现它的架构里根本没有"跨进程 HTTP 提交 Sample"这一步——`generate()` 直接把 Sample 对象 return 给 slime 框架自己的代码消费，是同进程函数返回，没有网络提交、也就没有"提交失败"这个故障面。这是我们（和 Personal Agent Track）"代理跟生成进程分离、靠 HTTP 传数据"架构特有的问题，两篇论文其他部分都没有直接可比对象——不是漏查，是确实不存在对应场景。`_send_verdict_turn` 提交失败时静默丢弃（不重试）这条设计本身是安全的（回合最终轮次会在 `session_done` 时因缺少 `next_state` 被丢弃，是数据丢失不是数据污染），只是没有先例可以对照，纯靠我们自己的架构分析确认。
 
+**追加核实（2026-08-17）——上面 2/3 项分别跟 MetaClaw 自己的默认行为对照**：
+- 第 2 项（agent 调用重试）：`infer_cmd.py` 765/1380 行、`run_cmd.py` 82 行，`retry: int = 0`——**MetaClaw 官方默认也不重试**，是个可选参数，需要调用方显式传更大的值。我们没接这个参数，效果上跟它的默认行为一致，只是它多留了一个开关。
+- 第 3 项（HTTP 提交重试）：搜了 `api_server.py` 里 `_query_teacher_logprobs`（自己那条走 HTTP 的教师 logprob 查询）相关的 retry/except 逻辑，零命中——**MetaClaw 自己的 HTTP 提交也没有重试**，跟我们是同一个宽松程度。
+- 第 4 项（断点续跑）：`_run_question`/`_run_group` 里 `result_path.exists()`/`existing_inline_score` 这类跳过已完成项的机制，MetaClaw **确实有、我们没有**，是真实缺口。
+- 第 1 项（跨 round 污染）：MetaClaw 自己的架构完全不会撞上这个问题——它的训练奖励从不按 round 聚合，每个 LLM 调用独立当场打分，没有"round 边界"这个概念，也就不需要处理"round 之间的残留轮次"。这个 bug 是我们自己发明"round 级确定性 verdict 注入"机制才带出来的，两篇论文都没有先例可循。
+
+**已实现（2026-08-17，对应第 2/3/4 项）**：
+- [x] **第 4 项，断点续跑，`Path | None` 判空、按天而不是按 round**：新增 `METACLAW_PROGRESS_DIR` 环境变量，`run_day()` 结束时（整个 day 的 round 循环正常跑完、没有异常）写一个 `<PROGRESS_DIR>/<test_id>.done` 标记；`main()` 每天开始前先查这个标记，命中就跳过整个 `run_day()` 调用。**故意没有照搬 MetaClaw 官方的 round 粒度**——`_run_group` 的 `existing_inline_score` 跳过检查依赖的是"同一个 test 的整个生命周期共用一份还在磁盘上的 workspace"，跳过的 round 不需要重放文件效果因为文件本来就还在；我们的 `workspace_copy` 是**每次 `run_day()` 调用都全新重建**的（`_copy_workspace_for_test` 每次生成新的 `work_dir`），如果照搬 round 粒度、在新 workspace 里跳过某个已"完成"的 round，那个 round 实际产生的文件效果在新 workspace 里根本不存在，会让"喂给下一 round 的 feedback 文本"和"workspace 里的真实文件状态"对不上——按天为粒度可以完全避开这个问题（要么整天重跑、要么整天跳过，不会有半天残留状态）。
+- [x] **第 2/3 项，可选重试，默认关闭**：新增 `METACLAW_AGENT_RETRY`（`_run_round` 内 `openclaw agent` CLI 调用失败时的重试次数，逻辑/日志风格照抄 `infer_cmd.py::_run_question` 的 `for attempt in range(retry + 1)`）、`METACLAW_VERDICT_RETRY`（`_send_verdict_turn`/`_send_session_close_only` 提交失败时的重试次数，新增 `_post_with_retry` 统一处理）两个环境变量，**默认都是 0（不重试），跟 MetaClaw 官方默认行为一致**，要不要开、开到多大留给真实训练观察效果后再决定。
+- 落地文件：`scripts/metaclaw/metaclaw_rollout_driver.py`（新增 `_day_marker_path`/`_day_already_done`/`_mark_day_done`/`_post_with_retry`，`_run_round`/`_send_verdict_turn`/`_send_session_close_only` 加 `retry` 参数）、`scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新增三个环境变量，`METACLAW_PROGRESS_DIR` 用永久路径、不放在按时间戳生成的 `LOGS_DIR` 里，否则进程崩溃重启后找不到上次的进度标记）。`py_compile` + 真实 import + 断点标记读写功能测试通过。
+
 ### 待验证：中间轮次缺确定性锚点这个风险差异，要不要照抄 toolcall-rl 补上（2026-08-17，暂缓，等真实环境验证后再定）
 
 **问题**：`toolcall-rl` 的 `reward_func`（907-919 行）里 `final_score = base_score + prm_step_coef * prm_step_mean`——`base_score` 是确定性的 `\boxed{}` 对错判断，**永远**跟判官打的 `prm_step_mean` 加在一起，构成同一个 Sample 的最终 reward。哪怕判官这次判错了，`base_score` 这个确定性锚点还在，误差不会让整条训练信号完全脱离真实情况。

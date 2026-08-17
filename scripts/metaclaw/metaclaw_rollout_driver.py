@@ -49,6 +49,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,55 @@ _MODEL_ID = os.environ.get("METACLAW_MODEL_ID", "qwen3-4b")
 # prepare_patched_openclaw_opd.sh's _METACLAW_SESSION_RE.
 _SESSION_ID_PREFIX = "metaclaw-"
 
+# Optional resilience knobs (2026-08-17) -- default to 0 (off), matching
+# MetaClaw-official's own defaults exactly (infer_cmd.py's `retry: int = 0`;
+# its HTTP-based _query_teacher_logprobs has no retry at all either -- see
+# docs/metaclaw_migration_plan.md 查证记录四 for the verification). Kept as
+# explicit opt-in env vars rather than turned on by default -- whether they
+# help is a real-training-data question, not something to decide from code
+# reading alone.
+AGENT_RETRY = int(os.environ.get("METACLAW_AGENT_RETRY", "0"))
+VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
+
+# Resume support, matching MetaClaw-official's own granularity (per-round,
+# not just per-day -- see infer_cmd.py's `result_path.exists()`/
+# `existing_inline_score` resume logic in _run_question/_run_group). Must be
+# a PERMANENT path, not under a timestamped run log directory, or a restart
+# after a crash would never see the previous attempt's progress markers.
+_PROGRESS_DIR_RAW = os.environ.get("METACLAW_PROGRESS_DIR", "")
+PROGRESS_DIR = Path(_PROGRESS_DIR_RAW) if _PROGRESS_DIR_RAW else None
+
+
+async def _post_with_retry(
+    client: httpx.AsyncClient,
+    session_id: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    retry: int,
+    label: str,
+) -> None:
+    """POST with up to `retry` extra attempts on failure, log style matches
+    MetaClaw-official's own `[retry N/M]` convention in infer_cmd.py.
+    retry=0 (the default -- see AGENT_RETRY/VERDICT_RETRY) means exactly one
+    attempt, no retry, matching MetaClaw's own default behavior and our own
+    prior behavior before this was added.
+    """
+    for attempt in range(retry + 1):
+        try:
+            await client.post(PROXY_URL, json=payload, headers=headers)
+            return
+        except Exception as e:
+            if attempt < retry:
+                logger.warning(
+                    "[MetaClawRollout] session=%s %s submission failed (attempt %d/%d), "
+                    "retrying: %s", session_id, label, attempt + 1, retry, e,
+                )
+            else:
+                logger.warning(
+                    "[MetaClawRollout] session=%s %s submission failed (final attempt): %s",
+                    session_id, label, e,
+                )
+
 
 async def _send_verdict_turn(
     client: httpx.AsyncClient,
@@ -119,6 +169,7 @@ async def _send_verdict_turn(
     eval_score: float,
     hint: str,
     session_done: bool,
+    retry: int = 0,
 ) -> None:
     """POST a synthetic next-turn carrying the round's deterministic verdict.
 
@@ -140,28 +191,27 @@ async def _send_verdict_turn(
         {"metaclaw_verdict": True, "eval_score": eval_score, "hint": hint},
         ensure_ascii=False,
     )
-    try:
-        await client.post(
-            PROXY_URL,
-            json={
-                "model": _MODEL_ID,
-                "messages": [{"role": "user", "content": verdict_payload}],
-                "temperature": 0.0,
-                "max_tokens": 8,
-            },
-            headers={
-                "X-Session-Id": session_id,
-                "X-Turn-Type": "main",
-                "X-Session-Done": "true" if session_done else "false",
-            },
-        )
-    except Exception as e:
-        logger.warning(
-            "[MetaClawRollout] session=%s verdict submission failed: %s", session_id, e
-        )
+    await _post_with_retry(
+        client, session_id,
+        payload={
+            "model": _MODEL_ID,
+            "messages": [{"role": "user", "content": verdict_payload}],
+            "temperature": 0.0,
+            "max_tokens": 8,
+        },
+        headers={
+            "X-Session-Id": session_id,
+            "X-Turn-Type": "main",
+            "X-Session-Done": "true" if session_done else "false",
+        },
+        retry=retry,
+        label="verdict",
+    )
 
 
-async def _send_session_close_only(client: httpx.AsyncClient, session_id: str) -> None:
+async def _send_session_close_only(
+    client: httpx.AsyncClient, session_id: str, retry: int = 0,
+) -> None:
     """Close the day's session WITHOUT submitting a verdict for the pending turn.
 
     Used when the round's `openclaw agent` CLI call itself failed (rc != 0 --
@@ -181,25 +231,22 @@ async def _send_session_close_only(client: httpx.AsyncClient, session_id: str) -
     with existing proxy machinery, no new endpoint or turn-buffering change
     needed.
     """
-    try:
-        await client.post(
-            PROXY_URL,
-            json={
-                "model": _MODEL_ID,
-                "messages": [{"role": "user", "content": "(session closed after agent failure)"}],
-                "temperature": 0.0,
-                "max_tokens": 8,
-            },
-            headers={
-                "X-Session-Id": session_id,
-                "X-Turn-Type": "side",
-                "X-Session-Done": "true",
-            },
-        )
-    except Exception as e:
-        logger.warning(
-            "[MetaClawRollout] session=%s session-close submission failed: %s", session_id, e
-        )
+    await _post_with_retry(
+        client, session_id,
+        payload={
+            "model": _MODEL_ID,
+            "messages": [{"role": "user", "content": "(session closed after agent failure)"}],
+            "temperature": 0.0,
+            "max_tokens": 8,
+        },
+        headers={
+            "X-Session-Id": session_id,
+            "X-Turn-Type": "side",
+            "X-Session-Done": "true",
+        },
+        retry=retry,
+        label="session-close",
+    )
 
 
 def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) -> str:
@@ -245,6 +292,7 @@ async def _run_round(
     workspace_path: Path,
     gateway_port: int,
     round_timeout: float | None,
+    retry: int = 0,
 ) -> tuple[dict[str, Any], bool]:
     """Run one round via the real `openclaw agent` CLI.
 
@@ -253,30 +301,48 @@ async def _run_round(
     resumable batch evaluation -- no infer_result.json files, no
     resume-skip.
 
+    retry mirrors infer_cmd.py's own `_run_question` retry loop exactly
+    (same `for attempt in range(retry + 1)` shape, same log style) -- see
+    AGENT_RETRY module constant for why this defaults to 0 (matching
+    MetaClaw-official's own default) rather than being enabled unconditionally.
+
     Returns (inline_score, agent_succeeded). agent_succeeded=False means the
-    CLI call itself failed (gateway hiccup, subprocess crash/timeout) --
-    NOT that the model attempted the task and got it wrong. The caller MUST
-    NOT submit inline_score as a real training verdict in that case (see
-    _send_session_close_only and its call site) -- _compute_inline_score is
-    still called here (mirroring MetaClaw-official's own infer_cmd.py, which
-    does the same on agent failure) purely for logging visibility, its
-    result is not a trustworthy training signal when agent_succeeded=False.
+    CLI call itself failed on every attempt (gateway hiccup, subprocess
+    crash/timeout) -- NOT that the model attempted the task and got it
+    wrong. The caller MUST NOT submit inline_score as a real training
+    verdict in that case (see _send_session_close_only and its call site) --
+    _compute_inline_score is still called here (mirroring MetaClaw-official's
+    own infer_cmd.py, which does the same on agent failure) purely for
+    logging visibility, its result is not a trustworthy training signal when
+    agent_succeeded=False.
     """
-    rc, stdout, stderr = await _run_openclaw_agent(
-        session_id=session_id,
-        message=query,
-        openclaw_config_path=openclaw_config_path,
-        openclaw_state_dir=openclaw_state_dir,
-        project_root=project_root,
-        gateway_port=gateway_port,
-        timeout=round_timeout,
-    )
+    rc, stdout, stderr = -1, "", ""
+    for attempt in range(retry + 1):
+        rc, stdout, stderr = await _run_openclaw_agent(
+            session_id=session_id,
+            message=query,
+            openclaw_config_path=openclaw_config_path,
+            openclaw_state_dir=openclaw_state_dir,
+            project_root=project_root,
+            gateway_port=gateway_port,
+            timeout=round_timeout,
+        )
+        if rc == 0:
+            break
+        if attempt < retry:
+            logger.warning(
+                "[MetaClawRollout] session=%s round=%s openclaw agent failed "
+                "(rc=%d), retry %d/%d: %s",
+                session_id, round_record["id"], rc, attempt + 1, retry, stderr[:500],
+            )
+
     agent_succeeded = rc == 0
     if not agent_succeeded:
         logger.warning(
-            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d): %s "
+            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d) "
+            "after %d attempt(s): %s "
             "-- treating as infrastructure failure, will NOT submit a training verdict",
-            session_id, round_record["id"], rc, stderr[:500],
+            session_id, round_record["id"], rc, retry + 1, stderr[:500],
         )
         answer_text = ""
     else:
@@ -291,10 +357,33 @@ async def _run_round(
     return inline_score, agent_succeeded
 
 
+def _day_marker_path(test_id: str) -> Path | None:
+    if PROGRESS_DIR is None:
+        return None
+    return PROGRESS_DIR / f"{test_id}.done"
+
+
+def _day_already_done(test_id: str) -> bool:
+    marker = _day_marker_path(test_id)
+    return marker is not None and marker.exists()
+
+
+def _mark_day_done(test_id: str) -> None:
+    marker = _day_marker_path(test_id)
+    if marker is None:
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps({"completed_at": time.time()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 async def run_day(
     test: dict[str, Any],
     all_tests: dict[str, Any],
     project_root: Path,
+    retry: int = 0,
 ) -> None:
     test_id = test["id"]
     agent_id = test["agent"]
@@ -375,6 +464,7 @@ async def run_day(
                         workspace_path=workspace_copy,
                         gateway_port=gateway_port,
                         round_timeout=None,
+                        retry=retry,
                     )
 
                     is_last_round = idx == len(rounds) - 1
@@ -384,7 +474,8 @@ async def run_day(
                         eval_score = 1.0 if passed else -1.0
                         hint = "" if passed else _build_opd_hint(round_record, inline_score)
                         await _send_verdict_turn(
-                            client, session_id, eval_score, hint, session_done=is_last_round,
+                            client, session_id, eval_score, hint,
+                            session_done=is_last_round, retry=VERDICT_RETRY,
                         )
                     else:
                         # Infrastructure failure, not a real task attempt -- do NOT
@@ -396,7 +487,9 @@ async def run_day(
                         # even submitted, simply stays pending and gets picked up
                         # normally by whatever comes next).
                         if is_last_round:
-                            await _send_session_close_only(client, session_id)
+                            await _send_session_close_only(
+                                client, session_id, retry=VERDICT_RETRY,
+                            )
 
                     prev_inline_score = inline_score
                     prev_round_record = round_record
@@ -404,6 +497,16 @@ async def run_day(
         if gateway_proc.returncode is None:
             gateway_proc.terminate()
             await gateway_proc.wait()
+
+    # Resume support (day granularity -- see module-level note on why NOT
+    # round granularity: our workspace is freshly recreated every run_day()
+    # call, so a skipped round's file-system effects would never exist in a
+    # resumed attempt's workspace, unlike MetaClaw-official's own per-round
+    # resume which reuses one still-on-disk workspace for a whole test).
+    # Marked only after the day's loop completes without raising -- a day
+    # that crashed partway through is NOT marked done and gets fully redone
+    # (fresh workspace, all rounds) on the next invocation.
+    _mark_day_done(test_id)
 
     logger.info(f"{_GREEN}[MetaClawRollout] day=%s done{_RESET}", test_id)
 
@@ -419,8 +522,8 @@ async def main() -> None:
 
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
-        f"strict order{_RESET}",
-        len(test_list), all_tests_path,
+        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s{_RESET}",
+        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR,
     )
 
     # concurrency=1, strict day01 -> day30 order -- see
@@ -429,7 +532,15 @@ async def main() -> None:
     # day-stream" design, mirroring how MetaClaw's own harness forces
     # workers=1 whenever scene_per_train is set.
     for test in test_list:
-        await run_day(test, all_tests, project_root)
+        test_id = test["id"]
+        if _day_already_done(test_id):
+            logger.info(
+                f"{_YELLOW}[MetaClawRollout] day=%s already completed (resume, "
+                f"marker found under METACLAW_PROGRESS_DIR), skipping{_RESET}",
+                test_id,
+            )
+            continue
+        await run_day(test, all_tests, project_root, retry=AGENT_RETRY)
 
 
 if __name__ == "__main__":
