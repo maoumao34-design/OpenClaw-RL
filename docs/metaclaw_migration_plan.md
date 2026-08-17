@@ -219,10 +219,24 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 **读这张表的方式**：每一行代表一次独立的技术判断（保真度 vs 可控性、复用 vs 新造、跟哪边一致跟哪边不一致），不是"选定一个阵营整体照搬"。这也是"查证记录（三）"里反复强调的——两篇论文对"round 内多步 tool-call 怎么给训练信号"这个具体问题都没有直接答案，逼着这次迁移在每个环节上分别做取舍，而不是找一个现成模板整体套用。
 
+### 查证记录（四）：2026-08-17，training-signal-safety 审查逐项对照两篇论文/官方代码有没有处理过
+
+上一轮（"已实现（续，2026-08-17）"）审查自己的实现有没有让误判/故障混进训练信号，一共发现四类问题，这里逐项查两篇论文/官方代码分别有没有先例。
+
+1. **基础设施故障不能被当训练信号（已在上方"已实现（续）"修复）**：参照对象是 `toolcall-rl`/`swe-rl` 的 `Sample.Status.ABORTED` 早退机制——两条 GA 赛道都在生成/执行基础设施失败时提前 return，Sample 从不到达 `reward_func`，这是 slime 框架级别的标准做法。我们的修复（`agent_succeeded=False` 时不发 verdict，交给代理侧现成的 `force_drop_without_next_state` 丢弃）是这个原则在跨进程 HTTP 架构下的等价翻译，细节见上方条目。
+
+2. **步骤判官 prompt 质量校验**：全仓库搜 `judge_accuracy`/`prm_accuracy`/`calibrat`/`ground_truth.*judge` 等关键词，OpenClaw-RL 和 MetaClaw 两边命中的全部是假阳性（loss 权重注释、内存重要性打分），**都没有内置的判官准确率校验/校准机制**。Personal Agent Track 判官系统性偏严是靠本项目自己反复训练+人工核对样本发现的，不是论文/官方代码自带的验证工序——我们的步骤判官"零验证直接上线"跟两边默认状态其实一致，只是我们还没走完这道人工核实的路。**这条待用户进一步指示后再处理，暂不下结论**。
+
+3. **A/B/D 系列环境降级样本过滤，四条 GA 赛道有没有对应物**：搜 `duplicate`/`retry.*drop`/`dedup`，四条赛道（`gui-rl`/`swe-rl`/`terminal-rl`/`toolcall-rl`）命中的两处全是假阳性（PRM prompt 文本去重、GUI 任务表格查重指标）。**四条赛道完全没有"重复 user 重试"检测，原因是架构上不存在这个失败模式**——它们不是"Simulator/Student 走 HTTP 重试循环"的架构，是自己在 Python 里直接控制生成循环，遇到基础设施失败走的是第 1 条的 `Sample.Status.ABORTED`，不需要检测重复指令。
+   **这个发现直接给"D 规则在 MetaClaw 场景下要不要调整"这条待办一个明确结论**：`metaclaw_rollout_driver.py` 现在也没有重试循环（`_run_round` 只调用一次 `_run_openclaw_agent`，不像 `student_chat.py` 那样 408/503 会机械重发），架构上跟四条 GA 赛道是同一类——**D 规则（`is_duplicate_user_retry`）在 MetaClaw 场景下是空转（不会触发，但也没有害处），不是缺口**，跟四条 GA 赛道不需要它的原因完全一样：没有对应的重试架构去触发它。
+   顺带确认 A（`is_aborted`）/B（`generated_while_paused`）**不需要任何调整**——这两个标记在 `_handle_request` 里对所有生成通用计算（基于 `finish_reason`/`submission_enabled`，不区分 Personal Agent Track 还是 MetaClaw），配套的丢弃拦截点也是通用的，MetaClaw 的步骤判官轮次和最终 verdict 轮次自动受到同样保护，不需要专门适配。
+   **结论：A/B/D 系列规则在 MetaClaw 场景下不需要调整**，原有的"下一步工程任务"里这一条可以关闭。
+
+4. **提交失败默认丢弃这条设计是否干净——没有直接可比对象**：查 `toolcall-rl` 发现它的架构里根本没有"跨进程 HTTP 提交 Sample"这一步——`generate()` 直接把 Sample 对象 return 给 slime 框架自己的代码消费，是同进程函数返回，没有网络提交、也就没有"提交失败"这个故障面。这是我们（和 Personal Agent Track）"代理跟生成进程分离、靠 HTTP 传数据"架构特有的问题，两篇论文其他部分都没有直接可比对象——不是漏查，是确实不存在对应场景。`_send_verdict_turn` 提交失败时静默丢弃（不重试）这条设计本身是安全的（回合最终轮次会在 `session_done` 时因缺少 `next_state` 被丢弃，是数据丢失不是数据污染），只是没有先例可以对照，纯靠我们自己的架构分析确认。
+
 ### 下一步工程任务（待实现，未开始）
 
-- [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过）、`BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1"` 这个假设的 URL 形状（没有 trailing `/chat/completions`）在真实 OpenClaw `openai-completions` provider 客户端下是否正确
-- [ ] 确认 A/B/D 系列规则在新环境下的检测逻辑是否需要调整（比如"重复 user 重试"的判定，MetaClaw 场景下 Student 角色不存在，需要重新定义"重复指令"从哪来）
+- [ ] modelfactory 侧真实联调：真实 `openclaw agent` CLI 子进程 + 真实代理端口打通、合成 verdict 请求能否正确触发、步骤判官 prompt 对 `run_command` 调用的判断质量（新写的 prompt，没有历史数据验证过，两篇论文都没有内置判官校准机制可以参考，见查证记录四第 2 条，处理方式待定）、`BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1"` 这个假设的 URL 形状（没有 trailing `/chat/completions`）在真实 OpenClaw `openai-completions` provider 客户端下是否正确
 - [ ] 验证 concurrency=1 严格串行的 rollout driver 跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合的吞吐和正确性
 - [ ] 设计一种手段，用来监控"某天的训练是否真的让权重产生了可观测变化"（呼应查证记录第 3 条的风险），否则没法判断某天没提升是模型能力上限还是训练没生效
 - [ ] 跑通训练前基线评测（不训练，直接跑 MetaClaw-Bench 拿一个基线分数）
