@@ -1664,25 +1664,60 @@
 - `scripts/prepare_patched_openclaw_opd.sh`：`_METACLAW_SESSION_RE`、`_build_metaclaw_step_judge_messages`、`turn_data["metaclaw_round_mode"]`
 - `scripts/prepare_patched_openclaw_combine_select.sh`：`_opd_evaluate` 三路分派（verdict / 步骤判官 / 原逻辑）
 
-### 当前状态（2026-08-14）
+### 历史状态（2026-08-14，已被 8/17 结果取代）
+
+- [x] MetaClaw 论文理解 + 官方代码克隆；迁移方案确认（目标/范围/方法映射/验收标准）；round 内多步 tool-call 训练信号设计（方案 B）；第一批实验文件（rollout driver + 代理侧 checker 奖励接入）本地验证通过
+
+---
+
+## 2026-08-17
+
+**目标：** MetaClaw 迁移从"方案+第一批文件"推进到"训练前准备就绪"——补齐启动脚本、核查训练信号安全性、定训练规模/checkpoint 策略，为实际提交训练做最后准备
+
+**完成内容：**
+- 确认训练起点为干净 base Qwen3-4B（不接 Personal Agent Track 训完的 checkpoint），避免"方法本身行不行"和"旧 checkpoint 是否已定型"两个因素纠缠
+- 发现并补上一个真实前置依赖：`_METACLAW_SESSION_RE` 按 `session_id` 分派机制依赖 `rl-training-headers` 插件全局启用（系统级部署，不是某个 `openclaw.json` 里的配置），启动脚本必须复用现有训练脚本里部署这个插件的步骤，否则整套 round-mode 判定会静默失效
+- 新建 `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`，对标 `train_separate_student.sh`——比 Personal Agent Track 少一整段：MetaClaw 不需要外部 Simulator
+- **发现并修复真实漏洞**：`openclaw agent` CLI 子进程失败（网关故障/超时）时，原实现会把这次纯环境性故障当"模型任务失败"提交 `eval_score=-1` 进训练。参照 OpenClaw-RL 自己的 General Agent 赛道（`toolcall-rl`/`swe-rl` 都显式设置 `Sample.Status.ABORTED` 并在 Sample 到达 `reward_func` 之前提前返回）翻译到我们的架构修复
+→ 详见 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)"已实现（续，2026-08-17）"
+- **系统性核查 training-signal-safety**（四项：基础设施故障保护/步骤判官质量校验/A-B-D 环境降级规则/提交失败默认丢弃），逐项对照两篇论文有没有处理过。核心发现：四条 General Agent 赛道完全没有"重复 user 重试"检测——不是没想到，是架构上不存在这个失败模式（不走 HTTP 重试循环），据此确认 A/B/D 规则在 MetaClaw 场景下不需要调整（D 规则空转但无害）
+→ 详见 `metaclaw_migration_plan.md`"查证记录（四）"
+- 深挖 OPD hint 蒸馏机制的独特性：确认四条 GA 赛道 + MetaClaw 全部没有对应机制（MetaClaw 自己也有一个叫"OPD"的机制，但是跟独立更强教师模型做标准知识蒸馏，不含纠正性文字，跟 Personal Agent Track 的 hint-conditioned 自蒸馏是同名不同实）；确认 skill 库机制是梯度无关的，论文原文明确"zero weight update"，跟 OPD hint 不是同一类东西
+- 写出三方对照表（迁移方法各环节 vs MetaClaw 自己 vs OpenClaw-RL tool-call），逐环节列出跟谁一致跟谁不同，核心结论：没有一个环节是整体照搬某一方
+- 讨论中间轮次要不要补确定性锚点（照抄 toolcall-rl 的 `base_score+prm_step_mean` 组合公式）：技术上可行，但依赖一个未经真实验证的假设（round 边界=子进程边界、两个 round 之间无杂音请求），暂缓，留给真实环境验证后再定
+- 训练规模/checkpoint 策略：确认一遍 30 天（不循环多个 epoch）跟 MetaClaw 自己实际训练方式一致（`--scene-per-train` 默认禁用，代码里没有 epoch 循环）；确认 checkpoint 是完整独立可用的模型快照，新增 `METACLAW_MIGRATION_PROFILE=1` 把 `--save-interval` 从官方默认 100 调到 10，目标一遍存约 5 个 checkpoint 供中途观察训练进度（粗估算，待真实训练后校准）
+- 断点续跑：先按天粒度实现了一版，追问后直接读 MetaClaw 官方 `_run_one_test` 代码，发现它自己的 round 级"断点续传"如果真用于跨进程重启恢复，会撞上同样的 workspace 不一致问题——不是它解决了我们没解决的问题。最终决定崩溃后直接从 day01 完整重跑（一遍训练总耗时有限），撤回断点续跑机制
+- 新发现一个跨 round 污染 bug（agent 在非最后一个 round 中途崩溃时，挂起轮次会被下一个 round 内容误评估），需要真实训练日志才能判断触发频率、值不值得精确修，记录后暂缓
+
+**关键决策：** 详细设计过程和技术决策全部记录在 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)，本条目只做汇总，跳转链接查完整推理过程
+
+**产出：**
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`（新建）：训练启动编排
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：rc!=0 基础设施故障保护、可选重试（`METACLAW_AGENT_RETRY`/`METACLAW_VERDICT_RETRY`，默认关闭）
+- `scripts/run_openclaw_topk_select_modelfactory.sh`：新增 `METACLAW_MIGRATION_PROFILE=1` 分支（`--save-interval` 100→10）
+- `docs/metaclaw_migration_plan.md`：三方对照表、查证记录（四）、训练起点/checkpoint 策略/断点续跑决策全部记录
+
+### 当前状态（2026-08-17）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**（新开工作线）：[x] MetaClaw 论文理解 + 官方代码克隆；[x] 迁移方案确认（目标/范围/方法映射/验收标准，见 `metaclaw_migration_plan.md`）；[x] round 内多步 tool-call 训练信号设计（方案 B）；[x] 第一批实验文件（rollout driver + 代理侧 checker 奖励接入）已实现并本地验证（`py_compile` + 真实数据的 import/查询/checker 执行测试）
+**MetaClaw 迁移**：[x] 启动脚本 `run_metaclaw_migration_modelfactory.sh`；[x] 训练信号安全性核查（基础设施故障保护已修复，A/B/D 确认不需调整）；[x] 训练起点/checkpoint 策略确定；[x] 三方对照表、完整设计文档。整体已具备提交训练的条件，仅剩 modelfactory 侧真实环境的联调验证。
 
 ### 已知限制 / 未解决
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变，见下方历史状态）。
-**MetaClaw 迁移**：新步骤判官 prompt 是全新设计，没有历史数据验证过判断质量；A/B/D 系列规则在 MetaClaw 场景下是否需要调整尚未核查（比如"重复 user 重试"判定，MetaClaw 场景没有 Student 角色）；`BENCHMARK_COMBINE_PROXY_URL` 等 modelfactory 侧真实部署细节尚未确定，均为占位
+**MetaClaw 迁移**：新步骤判官 prompt 零历史数据验证；中间轮次缺确定性锚点这个风险差异未处理（暂缓，见查证记录）；跨 round 污染 bug 未修（需要真实数据判断是否值得修）；`BENCHMARK_BASE_URL` 等 URL 形状假设未在真实链路验证。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：提交新一轮训练，验证 Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实效果（用户自行提交）
-2. **MetaClaw 迁移**：modelfactory 侧真实联调（真实 CLI 子进程+真实代理端口打通、合成 verdict 请求触发是否符合预期、步骤判官 prompt 判断质量）；核查 A/B/D 规则在新场景下的适配性；跑通训练前基线评测
+2. **MetaClaw 迁移**：提交训练前完成 `metaclaw_migration_plan.md` 里的训练前清单，然后提交训练；重点关注真实环境下能否验证"round 边界无杂音请求"这个假设、`agent_succeeded=False` 的真实触发频率和触发时机
 3. 其余同 08-13（见下方历史状态）
 
 ### 未验证
 - [ ] Step 1 八/九次修订 + skip-forced-negative-override 诊断实验的真实训练效果
 - [ ] MetaClaw rollout driver 在真实 `openclaw agent` CLI + 真实代理端口下能否正常打通
 - [ ] MetaClaw 新步骤判官 prompt 对 `run_command` 调用的判断质量
+- [ ] 两个 round 之间会不会有杂音请求落进代理（决定要不要给中间轮次补确定性锚点）
+- [ ] `agent_succeeded=False` 的真实触发频率/时机（决定跨 round 污染 bug 值不值得精确修）
 - [ ] Simulator 拒绝合格 turn-1 是否在污染 PRM 打分（承接 08-11，仍未验证）
 
 ---
