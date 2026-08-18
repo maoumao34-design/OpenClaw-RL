@@ -234,6 +234,21 @@ if RESUME and PROGRESS_DIR is None:
         "(pointing at the same directory the crashed run used)."
     )
 
+# report.json/report.md are this run's actual DELIVERABLE (see
+# _build_report/_render_report_markdown below) -- a separate concern from
+# day-level resume progress above, so a normal run gets its results saved
+# to a file without having to opt into resume-tracking just to get that.
+# Defaults to PROGRESS_DIR if set (one less directory to configure when
+# resume is already in use); falls back to print-only (module docstring's
+# original behavior) only if NEITHER is set -- the launch script always
+# sets METACLAW_REPORT_DIR (to <LOGS_DIR>/report), so in practice a real
+# training run always gets report.json/report.md on disk without the user
+# needing to set anything.
+REPORT_DIR_RAW = os.environ.get("METACLAW_REPORT_DIR", "")
+REPORT_DIR = Path(REPORT_DIR_RAW) if REPORT_DIR_RAW else PROGRESS_DIR
+if REPORT_DIR is not None:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _day_progress_path(test_id: str) -> Path:
     assert PROGRESS_DIR is not None
@@ -864,8 +879,10 @@ async def main() -> None:
 
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
-        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s, resume=%s{_RESET}",
+        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s, resume=%s, "
+        f"report_dir=%s{_RESET}",
         len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR, RESUME,
+        REPORT_DIR,
     )
 
     # concurrency=1, strict day01 -> day30 order. If METACLAW_RESUME=1 (see
@@ -910,14 +927,20 @@ async def main() -> None:
     report = _build_report(all_round_scores)
     md = _render_report_markdown(report) + f"\n**Compl. (file_check only)**: {compl_str}\n"
     print("\n" + md)
-    if PROGRESS_DIR is not None:
-        (PROGRESS_DIR / "report.json").write_text(
+    if REPORT_DIR is not None:
+        (REPORT_DIR / "report.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
         )
-        (PROGRESS_DIR / "report.md").write_text(md, encoding="utf-8")
+        (REPORT_DIR / "report.md").write_text(md, encoding="utf-8")
         logger.info(
             f"{_GREEN}[MetaClawRollout] report written: %s{_RESET}",
-            PROGRESS_DIR / "report.json",
+            REPORT_DIR / "report.json",
+        )
+    else:
+        logger.warning(
+            f"{_YELLOW}[MetaClawRollout] METACLAW_REPORT_DIR/METACLAW_PROGRESS_DIR "
+            f"not set -- report.json/report.md NOT written to disk, only printed "
+            f"above and to this log file{_RESET}"
         )
 
 

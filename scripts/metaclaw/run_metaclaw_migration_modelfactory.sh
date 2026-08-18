@@ -116,6 +116,9 @@ BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/da
 #     正常训练默认不设（=0），永远从 day01 完整跑——不会因为凑巧复用了
 #     一个已经有旧文件的目录就意外跳过某些天。只有确认要续跑一次真实的
 #     崩溃时，才手动加上 METACLAW_RESUME=1 重新提交这个脚本。
+# 注意这两个只管"按天续跑"，report.json/report.md 落盘是另一个独立开关
+# METACLAW_REPORT_DIR（见下面 LOGS_DIR 定义之后），不设 METACLAW_PROGRESS_DIR
+# 也照样会有 report 文件，不用为了拿到报告文件被迫开启续跑功能。
 # 详见 docs/metaclaw_migration_plan.md。
 METACLAW_PROGRESS_DIR=${METACLAW_PROGRESS_DIR:-}
 METACLAW_RESUME=${METACLAW_RESUME:-0}
@@ -138,6 +141,16 @@ CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
 LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/metaclaw_migration_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "${LOGS_DIR}"
+
+# report.json/report.md 落盘目录，跟上面断点续跑的 METACLAW_PROGRESS_DIR
+# 是两回事——这个是这次跑的实际交付结果，不应该要求用户手动设置才能拿到
+# 文件（否则默认情况下分数只会 print 进 metaclaw_rollout.log，没有独立
+# 文件，真实训练里发现的问题）。这里给一个总是有值的默认路径
+# （LOGS_DIR 下面的 report/ 子目录，每次跑都是新的时间戳目录，不会跟别的
+# 跑混在一起），除非显式指定 METACLAW_PROGRESS_DIR，report 也会跟着落到
+# 那个目录（driver 内部逻辑：METACLAW_REPORT_DIR 优先，没设就退回
+# METACLAW_PROGRESS_DIR）。
+METACLAW_REPORT_DIR=${METACLAW_REPORT_DIR:-${LOGS_DIR}/report}
 
 cat > "${LOGS_DIR}/RUN_MANIFEST.txt" <<EOF
 openclaw-rl commit: ${OPENCLAW_RL_GIT_SHA}
@@ -356,6 +369,7 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
   METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
   METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
+  METACLAW_REPORT_DIR="${METACLAW_REPORT_DIR}" \
   METACLAW_RESUME="${METACLAW_RESUME}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
   BENCHMARK_API_KEY="${SGLANG_API_KEY}" \

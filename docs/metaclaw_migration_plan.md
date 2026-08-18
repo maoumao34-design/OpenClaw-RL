@@ -187,6 +187,13 @@ run_cmd = [
 
 用合成数据验证过：两天的 multi_choice + file_check 混合记录，`_build_report` 算出的 summary/by_task 聚合数字和官方 `report_cmd.py::run_report` 手算结果一致；`_render_report_markdown` 渲染出的表格格式（列名、顺序、`-`占位）跟真实基线报告贴出来的样例逐列对得上。真实训练环境的 report 内容尚未验证。
 
+**补充修复（同日）：report 默认不落盘的问题**。CLI 核实发现：启动脚本默认 `METACLAW_PROGRESS_DIR` 是空的，而 report 生成之前挂在 `if PROGRESS_DIR is not None` 这个判断下——不设 `METACLAW_PROGRESS_DIR` 就意味着 `report.json`/`report.md`/按天分数文件全都不落盘，Acc./Compl. 只会 print 进 `metaclaw_rollout.log`，没有独立文件。这是把"按天续跑要不要开"和"report 要不要存文件"这两个本该独立的问题耦合到了同一个开关上——续跑确实该默认关（上面已经决定手动开），但 report 作为这次跑的实际交付结果，不应该要求用户额外设置才能拿到文件。
+
+**修复**：新增独立的 `METACLAW_REPORT_DIR`，专门管 report 落盘，不影响按天续跑：
+- driver 里 `REPORT_DIR` 默认取 `METACLAW_REPORT_DIR`，没设就退回 `METACLAW_PROGRESS_DIR`（省得两个都要配置），两个都没设才是"只 print 不落盘"（同时会打一条 WARNING 日志提醒）。
+- 启动脚本给 `METACLAW_REPORT_DIR` 一个**始终有值**的默认路径：`${LOGS_DIR}/report`（`LOGS_DIR` 本来就是每次跑都会生成的带时间戳目录）——不需要用户做任何配置，正常提交训练就会自动拿到 report 文件。
+- 用合成数据验证过三种组合：只设 `METACLAW_REPORT_DIR`（report 落盘，没有按天续跑文件）；只设 `METACLAW_PROGRESS_DIR`（report 退回落到这个目录，同时按天续跑文件也在）；两个都不设（不落盘，但会打 WARNING，不再是静默行为）。
+
 ### 已废弃：独立 SGLang + `metaclaw-bench run` 打分法（2026-08-18 提出，同日撤回）
 
 曾经想过"起独立 SGLang 服务 + 跑官方 `metaclaw-bench run`"给任意 checkpoint（包括训练前 base、训练后 checkpoint）单独打分，作为跟下面"边训练边算分"方法并存的补充手段。**用户指出这是错误做法后撤回**：这个方法打分用的 `all_tests.json` 跟训练用的是同一份 30 天数据，训练后的 checkpoint 拿这份数据打分，分数提升说不清是泛化能力还是记住了具体题目——挪到"训练完再单独测"并不能解决训练测试集重叠问题，只是把重叠发生的时间往后挪了一步，并没有比下面的实时聚合方法更干净，之前"更干净的补充手段"这个说法是错误判断。相应的 `scripts/metaclaw/compute_table1_scores.py` 已删除（`scripts/launch_simulator.sh` 本身是 Personal Agent Track 外部 Simulator 用的通用脚本，不受影响，未删除）。
@@ -200,6 +207,7 @@ Acc./Compl. 现在**唯一**的产生方式见下方"训练/评测数据重叠"�
 - `file_check` 题的 OPD hint 改用 checker stdout 而不是静态 `feedback.incorrect`（见下方查证记录第 1 条）——这条修正逻辑已经想清楚，但**实际接入代码、实测蒸馏效果是否真的比静态文字更好，还没做**。
 - 按天顺序、concurrency=1 串行喂数据这个设计，跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合是否顺畅、吞吐是否够用，还没有实测验证（架构上确认可行，性能上未知）。
 - 跨天没有任何文件/session 状态持久化（见下方查证记录第 3 条）——每天的"记忆"完全依赖模型权重本身的更新，如果某天的训练没有真正让权重产生可观测变化，后续天数就学不到前面天数的教训，这是一个比"batch 组成随机性影响训练成功率"（本项目在 separate 阶段反复验证过的现象）更敏感的失败模式，需要在正式跑之前想清楚怎么监控。
+- **`rl-training-headers` 插件对训练/基线两条链路的实际效果不对称，直接影响可比性**（2026-08-18 发现）：这个插件的注入是无条件的——只要启用，每次 `before_prompt_build` 都往系统提示词末尾追加 `[RL-TRAINING-META] session_id=... turn_type=...`（见上"启动脚本必须复用的现有依赖"一节）。这条标记只有**训练代理**（30000 端口，`openclaw_opd_api_server.py::_strip_rl_meta_from_messages`）才会在转发给 SGLang 之前剥掉——训练时模型看到的是干净提示词。但如果基线评测走的是"直连 SGLang"（不经过训练代理，比如已废弃的独立打分法当时用的那种链路），这条标记不会被剥，模型会看到训练时从没见过的这行怪异后缀，可能是干扰输出格式的一个真实原因（不确定，未验证，仅是合理怀疑）。**已有的一份训练前基线报告（`run_20260818_101454`）大概率受此影响，`Compl.=0.0%` 有可能部分归因于此**。要拿干净基线，重跑前应 `openclaw plugins disable rl-training-headers`（比想办法接入剥除逻辑更简单）。
 
 ### 训练故障复盘与修复：metaclaw_migration_20260817_181404（2026-08-18）
 
