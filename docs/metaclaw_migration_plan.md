@@ -289,6 +289,24 @@ CLI 观察到每天结束时 30000 端口的 close/verdict POST 返回 401。核
 
 **补充修复：`print()` 内容在真实训练里没有实时出现（2026-08-18 当天发现）**。第三次真实训练提交后，CLI 核实 `metaclaw_rollout.log` 里只看到 `logger.info` 那一行摘要，没有 `>> Query -> OpenClaw`——诊断：Python 的 `stdout` 一旦不连终端（`> metaclaw_rollout.log 2>&1 &` 这种重定向）就会从行缓冲切换成全块缓冲（4-8KB 才刷新一次），而 `logging` 默认走 `stderr`，`stderr` 不受这个影响，所以只有 `logger.info` 那行实时可见，`print()` 的内容已经执行了，只是还堵在缓冲区里，要攒够量或者进程退出才会真正写进文件。**修复**：`if __name__ == "__main__":` 里加一行 `sys.stdout.reconfigure(line_buffering=True)`，强制 stdout 也变成行缓冲，跟 `stderr` 行为一致。用真实子进程重定向到文件的方式验证过（跟启动脚本的重定向写法完全一致）：不加这行时，子进程还在跑（没退出）的时候文件里读不到任何内容；加了这行后，子进程还没退出，文件里已经能读到之前打印的内容——修复前后各测了一遍，确认问题真实存在、修复真的有效。这次训练已经在跑，改动要下次重新提交训练才会生效；这次先靠现有的 `logger.info` 摘要行判断训练是否正常（`day01` 已出现 `agent_succeeded=True`/`passed=True`，训练链路本身是通的，只是详细转录这次看不到实时更新，得等进程退出或缓冲区攒满才能看到）。
 
+### 训练故障复盘与修复（三）：metaclaw_migration_20260818_175145，rl-training-headers 从未真正加载（2026-08-18）
+
+第三次真实训练（context overflow 修好之后提交的那次）表面上一切正常——agent 在正常答题，GPU 4/5 利用率 80%+，`day01` 10 题全部有分（3 道 multi_choice 满分 + 1 道部分分，file_check 仍全 0，这部分符合基线预期），`day02` 也在往前走。**但训练队列一直是 `waiting for combine samples: 0/16`，`submitted OPD/RL = 0`——权重完全没有在学**。
+
+**CLI 的现场诊断**：OpenClaw 自己发出的请求（包括真正干活的 read/write 工具调用轨迹）完全没有 `session_id`、也没有 `[RL-TRAINING-META]` 标记，代理只能记成 `session=unknown`/`turn_type=side`，直接当非训练数据丢弃；driver 自己直接 POST 的 checker verdict 能对上 `metaclaw-day01`（这条不依赖插件，是 driver 自己手动设置的 HTTP header），但 OpenClaw 自己产生的 MAIN 请求全部丢失，没有一条真正进入训练队列。CLI 把根因归到"work-copy 里 rl-training-headers 没把 session_id 打进 OpenClaw 内部请求"，方向是对的，但没有找到具体机制——**直接读了 OpenClaw 官方源码（`may_2026_5_11` 快照）确认了精确根因**：
+
+1. `openclaw plugins enable rl-training-headers` 只会写入**全局** `~/.openclaw/openclaw.json` 的 `plugins.enabled`，这个全局状态跟某个具体 config 自己的 `plugins.allow` 字段是两回事。
+2. MetaClaw-official 自己的 `openclaw_cfg/openclaw.json` **和** `metaclaw.json`（`_prepare_work_copy` 复制进每天隔离工作副本的那两份模板，两份都查证过）**都硬编码 `"plugins": {"allow": ["llm-prompt-logger"]}`**——完全没有 `rl-training-headers`。
+3. `src/plugins/config-activation-shared.ts::resolvePluginActivationDecisionShared` 有一条明确的判断：`if (config.allow.length > 0 && !explicitlyAllowed) return {enabled: false, cause: "not-in-allowlist"}`——**非空的 `plugins.allow` 是一个真正的白名单闸门，不在名单里的插件会被直接排除，不管全局有没有 enable**。
+
+也就是说：**`rl-training-headers` 从这次迁移一开始，就从没在任何一个 MetaClaw session 里真正加载过**——`before_prompt_build` 钩子从没触发过，标记从没注入过，OpenClaw 自己发出的每一条请求都因为拿不到 session_id 落进代理的默认分支被丢弃。这不是"某些中间轮次"的局部问题，是全局性的——之前几轮训练一直没能提交样本，除了网关鉴权和 context overflow 这两个已修的基础设施问题外，这条才是真正决定"能不能学到东西"的根因，而且此前一直被基础设施问题挡在前面，没机会暴露出来。
+
+**修复**（`metaclaw_rollout_driver.py`）：新增 `_ensure_plugins_allowlisted()`，在每天的工作副本 `openclaw.json` 生成后（`_patch_agent_workspace` 之后、起网关之前）把 `"rl-training-headers"` 追加进这份文件自己的 `plugins.allow` 列表——只改工作副本，不碰 MetaClaw-official 的模板源文件（跟"改副本不改官方源文件"的既有约定一致）。用真实的 MetaClaw 官方 `openclaw_cfg/openclaw.json` 模板验证过：改之前 `allow=['llm-prompt-logger']`，改之后变成 `allow=['llm-prompt-logger', 'rl-training-headers']`（保留原有条目，不影响 `llm-prompt-logger` 自己的配置）；也验证过幂等性（重复调用不会重复追加）和防御性场景（配置文件完全没有 `plugins` 字段时能正确从零构建）。
+
+**这次训练（`metaclaw_migration_20260818_175145`）已经在跑，且证实完全没有产生任何训练样本，不会有任何权重更新**——用户已知情，可以让它继续跑完只拿 Acc./Compl.（不影响这条数据的有效性，评测链路本身没问题），但这次的 checkpoint 学不到任何东西。这个修复要等下一次重新提交训练才会生效——**下次训练是第一次真正有条件验证"确定性 reward/步骤判官分派机制"是否按设计工作**，之前所有验证都因为更上游的基础设施问题（网关鉴权→ context overflow→ 插件白名单）依次卡住，从没真正走到这一步。
+
+**一个尚未解开的疑点，如实记录**：如果 `plugins.allow` 真的从一开始就无条件排除了 `rl-training-headers`（不受全局 enable/disable 影响，代码逻辑上确认是硬性早退），那"对齐基线"（关插件）和"不对齐基线"（开插件）两次评测理论上不应该有任何差异——但实测 Acc. 从 5.7% 变到了 8.1%。这两个结论字面上互相矛盾，还没有找到能同时解释两者的机制（比如全局配置和工作副本配置之间是否存在某种合并/继承关系，本次没有查证）。当前的判断是：**不管这个矛盾怎么解释，把 `rl-training-headers` 加进工作副本的 `plugins.allow` 都是必须且无害的修复**——这是训练场景下让确定性 reward 机制工作的必要条件，不依赖这个疑点的答案。但那两次基线 Acc. 差异的真正原因，眼下不能 100%确定就是插件标记污染，这条待下次训练验证（如果标记确实开始出现在真实请求里，能间接印证是这个机制在起作用；如果修完之后基线/训练的差异模式还是解释不通，需要重新查这个疑点）。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

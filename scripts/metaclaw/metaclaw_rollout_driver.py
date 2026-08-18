@@ -743,6 +743,64 @@ async def _run_round(
     return inline_score, agent_succeeded, official_score
 
 
+_REQUIRED_PLUGINS = ("rl-training-headers",)
+
+
+def _ensure_plugins_allowlisted(openclaw_json_path: Path, plugin_ids: tuple[str, ...]) -> None:
+    """Add *plugin_ids* to this work copy's openclaw.json plugins.allow list.
+
+    Root cause (2026-08-18, verified via direct read of the may_2026_5_11
+    OpenClaw snapshot, not the CLI's own vaguer guess): the real training run
+    showed OpenClaw's own generated requests carrying NO session_id and NO
+    [RL-TRAINING-META] marker at all -- not just intermediate tool-call
+    turns, everything OpenClaw itself sends. `openclaw plugins enable
+    rl-training-headers` only writes to the GLOBAL `~/.openclaw/openclaw.json`
+    plugins.enabled list; it does not affect a specific config's own
+    plugins.allow field. MetaClaw-official's own `openclaw_cfg/openclaw.json`
+    /`metaclaw.json` templates (which `_prepare_work_copy` copies into every
+    day's isolated work copy, completely separate from the global config)
+    both hard-code `"allow": ["llm-prompt-logger"]` -- and
+    `src/plugins/config-activation-shared.ts::resolvePluginActivationDecisionShared`
+    has an explicit gate: `if (config.allow.length > 0 && !explicitlyAllowed)
+    return {enabled: false, cause: "not-in-allowlist"}`. A non-empty
+    plugins.allow list silently excludes anything not named in it,
+    REGARDLESS of global enablement -- rl-training-headers was never
+    loaded for a single MetaClaw session, so before_prompt_build never fired,
+    so the marker was never injected, so every OpenClaw-generated request
+    fell through the proxy's session/turn_type parsing to the
+    session=unknown/turn_type=side default and got dropped as non-training
+    data. This is why the third real training run (2026-08-18) showed the
+    agent visibly working (day01 fully scored, GPU utilized) while
+    `waiting for combine samples: 0/16` never moved -- nothing was ever
+    reaching the training queue.
+
+    Patches the WORK COPY (not MetaClaw-official's own template files,
+    which stay untouched) after _prepare_work_copy/_patch_agent_workspace
+    build it, before the gateway starts -- the same "patch the copy, not
+    the official source" convention already used for driver-specific state.
+    """
+    try:
+        config = json.loads(openclaw_json_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(
+            "[MetaClawRollout] could not read %s to allowlist plugins (%s), "
+            "leaving as-is -- rl-training-headers may silently fail to load",
+            openclaw_json_path, e,
+        )
+        return
+    plugins_cfg = config.setdefault("plugins", {})
+    allow_list = plugins_cfg.setdefault("allow", [])
+    changed = False
+    for plugin_id in plugin_ids:
+        if plugin_id not in allow_list:
+            allow_list.append(plugin_id)
+            changed = True
+    if changed:
+        openclaw_json_path.write_text(
+            json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+
 async def run_day(
     test: dict[str, Any],
     all_tests: dict[str, Any],
@@ -795,6 +853,7 @@ async def run_day(
     workspace_copy = _copy_workspace_for_test(workspace_src, work_dir, test_id)
     _copy_eval_scripts(eval_dir, workspace_copy)
     _patch_agent_workspace(openclaw_json_path, agent_id, workspace_copy)
+    _ensure_plugins_allowlisted(openclaw_json_path, _REQUIRED_PLUGINS)
 
     gateway_port = _find_free_port()
     gateway_proc, gateway_log = await _start_work_gateway(work_openclaw_state_dir, gateway_port)
