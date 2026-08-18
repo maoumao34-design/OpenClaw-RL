@@ -203,16 +203,36 @@ VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 #     live single-pass method, which never claims a clean weight/day
 #     invariant either.
 #
-# Set METACLAW_PROGRESS_DIR to enable: each day's per-round scores are
-# written to <dir>/<test_id>.json immediately after that day finishes. On
-# startup, any day whose file already exists is skipped entirely (no
-# openclaw agent call, no verdict submission -- just reload its persisted
-# scores for the final aggregate). Unset (default) disables persistence,
-# matching prior behavior exactly (every crash is a full day01 restart).
+# Persistence and resume are two SEPARATE, independently-controlled
+# switches (2026-08-18) -- deliberately not "one env var does both", so a
+# normal training run can never accidentally skip a day just because it
+# happens to reuse a directory that already has leftover files in it from
+# an earlier run. Normal training always processes every day fresh,
+# unconditionally, regardless of what METACLAW_PROGRESS_DIR contains.
+#
+#   METACLAW_PROGRESS_DIR: if set, every day's per-round scores are written
+#     to <dir>/<test_id>.json after that day finishes -- pure logging,
+#     never changes what this run does. Safe (and recommended) to always
+#     set this so a future resume is *possible*, without opting into resume
+#     now.
+#   METACLAW_RESUME=1: the ONLY thing that makes startup actually check
+#     <dir>/<test_id>.json and skip days that already have one (no openclaw
+#     agent call, no verdict submission -- just reload the persisted scores
+#     for the final aggregate). Requires METACLAW_PROGRESS_DIR to also be
+#     set (pointing at the SAME directory the crashed run used). This is a
+#     manual, deliberate action after a real crash -- not something that
+#     happens implicitly.
 PROGRESS_DIR_RAW = os.environ.get("METACLAW_PROGRESS_DIR", "")
 PROGRESS_DIR = Path(PROGRESS_DIR_RAW) if PROGRESS_DIR_RAW else None
 if PROGRESS_DIR is not None:
     PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+
+RESUME = os.environ.get("METACLAW_RESUME", "0") == "1"
+if RESUME and PROGRESS_DIR is None:
+    raise RuntimeError(
+        "METACLAW_RESUME=1 requires METACLAW_PROGRESS_DIR to also be set "
+        "(pointing at the same directory the crashed run used)."
+    )
 
 
 def _day_progress_path(test_id: str) -> Path:
@@ -221,8 +241,10 @@ def _day_progress_path(test_id: str) -> Path:
 
 
 def _load_day_progress(test_id: str) -> list[dict[str, Any]] | None:
-    """Return the day's persisted round scores if already completed, else None."""
-    if PROGRESS_DIR is None:
+    """Return the day's persisted round scores if RESUME is on and the day
+    was already completed by a prior run, else None (always None when
+    RESUME is off, even if a progress file happens to exist)."""
+    if not RESUME or PROGRESS_DIR is None:
         return None
     path = _day_progress_path(test_id)
     if not path.exists():
@@ -271,9 +293,14 @@ def _score_round_official(round_record: dict[str, Any], answer_text: str,
 
 
 def _aggregate_acc_compl(all_round_scores: list[dict[str, Any]]) -> tuple[float, float | None]:
-    """Acc./Compl. over every round score collected so far -- see
-    compute_table1_scores.py for the same definitions applied to an offline
-    `metaclaw-bench run` output instead of this driver's own live run.
+    """Acc. (mean score, all rounds) / Compl. (mean score, file_check rounds
+    only) over every round score collected so far -- see paper Table 1's
+    caption for the same definitions. This is the ONLY place these numbers
+    are computed for this migration (see docs/metaclaw_migration_plan.md
+    "训练/评测数据重叠" -- a separate before/after eval against the same
+    all_tests.json used for training was tried and retracted: it does not
+    avoid train/test overlap, it just moves when the overlap happens, so it
+    added no rigor over this live aggregate).
     """
     if not all_round_scores:
         return 0.0, None
@@ -687,16 +714,17 @@ async def main() -> None:
 
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
-        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s{_RESET}",
-        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR,
+        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s, resume=%s{_RESET}",
+        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR, RESUME,
     )
 
-    # concurrency=1, strict day01 -> day30 order. If METACLAW_PROGRESS_DIR is
-    # set, a day already completed by a prior (crashed) run is skipped
-    # entirely -- no re-execution, no re-submission to the training proxy --
-    # and its persisted scores are reused for the final aggregate as-is (see
-    # module-level comment above on why this is now safe and necessary).
-    # Unset (default): every day always runs fresh, matching prior behavior.
+    # concurrency=1, strict day01 -> day30 order. If METACLAW_RESUME=1 (see
+    # module-level comment above), a day already completed by a prior
+    # (crashed) run is skipped entirely -- no re-execution, no
+    # re-submission to the training proxy -- and its persisted scores are
+    # reused for the final aggregate as-is. Off (default): every day always
+    # runs fresh, unconditionally, matching prior behavior exactly --
+    # normal training is never at risk of accidentally skipping a day.
     all_round_scores: list[dict[str, Any]] = []
     for test in test_list:
         test_id = test["id"]

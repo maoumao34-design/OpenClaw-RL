@@ -162,66 +162,24 @@ run_cmd = [
 ```
 `metaclaw-bench run` 本身就是"推理→打分→出报告"一条龙命令；`rl_run.py` 只是在外面套了一层代理，代理每完成 5 个 scene 触发一次训练权重更新——**代理返回给 agent 的每个真实回复，就是当时那一刻的权重生成的，`metaclaw-bench run` 自己的推理→打分流程照常跑，Table 1 的 Full 这行数字就是这一趟 30 天全部打分的聚合**，前几天用没怎么训练过的权重、后面天数用训练过几轮的权重，混在一起算平均分。论文原文（Section 4.1.1）另有一句可查证的话："MetaClaw (Full): the full pipeline combining skill-driven fast adaptation with opportunistic policy optimization via RL **(5-day training run)**"——RL 训练只在 30 天里的 5 天内触发，但具体是哪 5 天、跟评测窗口的精确关系，论文原文没有交代清楚。
 
-**设计改动（这次落地）**：把我们的迁移训练也改成跟论文一样——`metaclaw_rollout_driver.py` 现在在训练过程中直接用官方 `scoring_cmd.py` 的打分函数（`_score_multi_choice`/`_score_file_check`，跟 `metaclaw-bench scoring` 用的是同一段代码，不是简化版，multi_choice 有真实的部分正确分）给每一轮实时算分，全程跑完后聚合成 Acc./Compl. 输出——这才是跟论文 Table 1 方法学真正对得上的数字。之前"如何给任意一个 checkpoint 打分"那一节（起独立 SGLang 服务 + `metaclaw-bench run`）**仍然保留，作为一个论文没有做过的、更干净的补充手段**（训练前打一次干净 baseline、训练完打一次干净的冻结 checkpoint 分数），但不再是这次迁移的主要产出数字。
+**设计改动（这次落地）**：把我们的迁移训练也改成跟论文一样——`metaclaw_rollout_driver.py` 现在在训练过程中直接用官方 `scoring_cmd.py` 的打分函数（`_score_multi_choice`/`_score_file_check`，跟 `metaclaw-bench scoring` 用的是同一段代码，不是简化版，multi_choice 有真实的部分正确分）给每一轮实时算分，全程跑完后聚合成 Acc./Compl. 输出——这是跟论文 Table 1 方法学真正对得上的数字，也是这次迁移**唯一**的 Acc./Compl. 产出方式（曾经想过额外保留一个"独立 SGLang + `metaclaw-bench run`"的补充打分法，用户指出那个方法一样用同一份 30 天数据、并不比这个更干净，已撤回，见上方"已废弃"一节）。
 
-**连带的架构改动：checkpoint 的角色变了**。训练和打分现在共用同一趟运行，"崩溃后从 day01 完整重跑"会导致已经算过分的天用不同（更新过的）权重重新生成一次答案，污染最终聚合分数——不再只是浪费算力，是会算出错误结果。所以撤回了 08-17"不做断点续跑"的决定，重新加回按天粒度的进度持久化：
-- `metaclaw_rollout_driver.py` 新增 `METACLAW_PROGRESS_DIR`：设置后，每天跑完（且没有中途异常）就把这天的逐轮 official score 写入 `<dir>/<test_id>.json`；驱动启动时先检查每天是否已有进度文件，有就整天跳过（不重新调用 `openclaw agent`、不重新提交 verdict），直接复用已存的分数参与最终聚合；全部跑完后聚合出的 Acc./Compl. 写入 `<dir>/final_scores.json`。
+**连带的架构改动：checkpoint 的角色变了**。训练和打分现在共用同一趟运行，"崩溃后从 day01 完整重跑"会导致已经算过分的天用不同（更新过的）权重重新生成一次答案，污染最终聚合分数——不再只是浪费算力，是会算出错误结果。所以撤回了 08-17"不做断点续跑"的决定，重新加回按天粒度的进度持久化，**并且用户明确要求不能做成自动续跑，必须手动触发**：
+- `metaclaw_rollout_driver.py` 把"落盘进度"和"读进度并跳过"拆成两个独立开关：
+  - `METACLAW_PROGRESS_DIR`：设置后，每天跑完（且没有中途异常）就把这天的逐轮 official score 写入 `<dir>/<test_id>.json`——纯记录动作，不改变这次跑的任何行为，正常训练也建议一直设着，方便万一真崩溃了有数据可续。
+  - `METACLAW_RESUME=1`：**唯一**真正触发"跳过已完成的天"的开关，必须手动显式设置，且必须同时设了 `METACLAW_PROGRESS_DIR`（否则直接报错拒绝启动）。不设（默认）＝无论 `METACLAW_PROGRESS_DIR` 里有没有旧文件，永远从 day01 完整重新跑，正常训练不会因为凑巧复用了一个已有旧文件的目录就意外跳过某些天。
+  - 全部跑完后聚合出的 Acc./Compl. 写入 `<dir>/final_scores.json`。
 - 重新评估了之前否决按天续跑的两条理由，发现**都不再成立**：
   1. **workspace 一致性**：直接读 `_copy_workspace_for_test`（`infer_cmd.py:162-193`）确认每天的 workspace 都是从 `workspace_src` 全新拷贝，从不继承前一天的实际文件效果（跟已查证的"跨天无状态持久化"结论一致）——跳过某天的重新执行，不会让后面天数缺少任何文件状态，因为后面天数本来就不依赖前一天的真实文件效果。
   2. **checkpoint/天数进度不同步**：训练侧 `--load` 自动续训已经存在（`run_openclaw_topk_select_modelfactory.sh` 的既有修复），不受这次改动影响。剩下的风险变窄了：如果崩溃发生在"某天的 verdict 已经 POST 给代理"和"这个样本的梯度更新真正存进某个 checkpoint"之间，重启后从更早的 checkpoint 继续训练，那天的训练贡献会丢——但那天的**打分记录**（独立于训练 checkpoint 持久化）依然是模型当时真实产出的如实记录，最终聚合分数不会因此出错，只是权重轨迹有一小段缺口。这是被接受、不是被解决的权衡，跟论文自己的单趟边训边评方法本来就不承诺"最终模型跟每一天严格对应"是同一类取舍。
-- 启动脚本新增 `METACLAW_PROGRESS_DIR`（默认空=不开启，行为不变）；要用断点续跑，第一次提交训练时就固定这个目录（不要用默认按时间戳生成的 `LOGS_DIR`），崩溃后用同一个目录重新提交同一个脚本即可自动跳过已完成的天。
-- 两处改动均用合成数据做过功能测试：`_score_round_official` 对 multi_choice 部分正确的题目算出了正确的部分分（不是二元 0/1）；`main()` 级别的集成测试模拟"day01 已完成"场景，确认 day01 被正确跳过、day02 起正常继续跑、最终聚合分数正确包含了 day01 复用的分数。真实训练环境（真实崩溃/重启场景）尚未验证。
+- 启动脚本新增 `METACLAW_PROGRESS_DIR`/`METACLAW_RESUME`（均默认空/0＝不开启，行为不变）；要续跑，第一次提交训练时就固定一个 `METACLAW_PROGRESS_DIR`（不要用默认按时间戳生成的 `LOGS_DIR`），崩溃后手动加上 `METACLAW_RESUME=1`、指向同一个目录重新提交这个脚本，才会跳过已完成的天。
+- 三处改动均用合成数据做过功能测试：`_score_round_official` 对 multi_choice 部分正确的题目算出了正确的部分分（不是二元 0/1）；`main()` 级别的集成测试模拟"day01 已完成"场景，确认 `METACLAW_RESUME=1` 时 day01 被正确跳过、`METACLAW_RESUME` 不设时即使进度文件存在也正确忽略、`METACLAW_RESUME=1` 但没设 `METACLAW_PROGRESS_DIR` 时正确报错拒绝启动。真实训练环境（真实崩溃/重启场景）尚未验证。
 
-### 如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）
+### 已废弃：独立 SGLang + `metaclaw-bench run` 打分法（2026-08-18 提出，同日撤回）
 
-不管是训练前的 base 模型，还是训练中途/训练完的任意一个 checkpoint，打分方法都是同一套——MetaClaw 官方 CLI 自带"推理→打分→出报告"一条龙命令，不需要自己写评测代码。三步：
+曾经想过"起独立 SGLang 服务 + 跑官方 `metaclaw-bench run`"给任意 checkpoint（包括训练前 base、训练后 checkpoint）单独打分，作为跟下面"边训练边算分"方法并存的补充手段。**用户指出这是错误做法后撤回**：这个方法打分用的 `all_tests.json` 跟训练用的是同一份 30 天数据，训练后的 checkpoint 拿这份数据打分，分数提升说不清是泛化能力还是记住了具体题目——挪到"训练完再单独测"并不能解决训练测试集重叠问题，只是把重叠发生的时间往后挪了一步，并没有比下面的实时聚合方法更干净，之前"更干净的补充手段"这个说法是错误判断。相应的 `scripts/metaclaw/compute_table1_scores.py` 已删除（`scripts/launch_simulator.sh` 本身是 Personal Agent Track 外部 Simulator 用的通用脚本，不受影响，未删除）。
 
-**1. 起一个纯推理用的 SGLang 服务，指向要打分的那份权重**
-
-不走训练那套代理（不需要 OPD/combine_select、不需要 `rl-training-headers` 插件，那些是训练奖励机制专用的，纯打分不需要）。复用现成的独立 SGLang 启动脚本 `scripts/launch_simulator.sh`（本来给外部 Simulator 用，参数是通用的）：
-
-```bash
-MODEL_PATH=<要打分的权重路径，HF 格式> \
-PORT=30002 \
-MODEL_NAME=qwen3-4b \
-SGLANG_API_KEY=openclaw-rl-key \
-bash /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/launch_simulator.sh
-```
-
-（端口用不同于训练自己占用的 30000 的值，比如 30002，避免冲突。）
-
-**`MODEL_PATH` 怎么填，分两种情况**：
-- **打分 base 模型**（训练前基线）：直接填 HF 格式的原始路径，比如 `/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507`，不需要转换。
-- **打分训练中途/训练完的 checkpoint**：`SAVE_CKPT` 存的是 Megatron `torch_dist` 格式，SGLang 读不了，要先转成 HF 格式——`OpenClaw-RL-official/slime/tools/convert_torch_dist_to_hf.py`（跟准备 base 模型时用的 `convert_hf_to_torch_dist.py` 是反方向的配对工具），转换完的 HF 路径才能填进 `MODEL_PATH`。
-
-**2. 把 openclaw.json 的环境变量指向这个服务**
-
-```bash
-export BENCHMARK_BASE_URL="http://127.0.0.1:30002/v1"
-export BENCHMARK_API_KEY="openclaw-rl-key"
-export BENCHMARK_MODEL="qwen3-4b"
-```
-
-**3. 跑官方的完整评测流水线**
-
-```bash
-cd /dfs/data/openclaw-rl-project/MetaClaw-official/benchmark && python -m src.cli run -i data/metaclaw-bench/all_tests.json -o <这次打分结果的输出目录，建议按 checkpoint 名字区分>
-```
-
-跑完看输出目录下的 `reports.md`，里面是整体准确率——每次要对比不同 checkpoint 的分数，就把 `-o` 换成不同目录、重复这三步即可。
-
-**要拿论文 Table 1 那两个指标（Acc./Compl.）**：`reports.md` 里的 `Accuracy` 就是 **Acc.**（全部题目——`multi_choice`+`file_check`混在一起——的平均分，论文原话"mean per-question accuracy"）。但 **Compl.**（论文原话"file-check completion rate"，只看 `file_check` 这个子集单独的通过率）官方代码里从来没算过——全仓库搜 `completion` 关键词零命中，Table 1 这一列大概率是作者自己的临时分析脚本算的，没有随代码开源。
-`openclaw-rl/scripts/metaclaw/compute_table1_scores.py`（新建）补上这个缺口——直接读 `metaclaw-bench run` 输出目录下所有 `scoring.json`（不重新跑推理、不重新实现打分逻辑，只是聚合官方 `scoring_cmd.py` 已经算好的 `score`/`question_type` 字段），一次性给出 Acc. 和 Compl. 两个数：
-
-```bash
-python /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/metaclaw/compute_table1_scores.py <上面 -o 指定的输出目录>
-```
-
-用合成数据验证过计算逻辑正确（3 条样本手算 Acc.=50%/Compl.=50%，脚本输出一致）。
-
-**两点每次都要留意**：
-- **公平对比要用同一套系统级补丁**：训练前后两次评测如果 OpenClaw 行为不一样（比如中途才部署了那 5 个版本漂移补丁），分数差异就说不清是训练效果还是补丁效果。这几个补丁是系统级部署、不是每次训练重新装，一般装过一次就一直生效，正常不需要重复操作，但换机器/换环境时要记得先确认装没装。
-- **GPU 资源**：这个 SGLang 服务需要占一张卡，如果训练正占满全部 GPU，需要找一张空闲卡或者等训练间隙——但打分的是某一份固定权重，什么时候打分不影响分数本身，只是资源调度问题。
+Acc./Compl. 现在**唯一**的产生方式见下方"训练/评测数据重叠"一节——`metaclaw_rollout_driver.py` 自己在训练过程中实时算分聚合。**训练跑完保存的最终 checkpoint 仍然保留，作为最终交付结果的一部分**（跟 Acc./Compl. 数字本身是否"干净"无关，checkpoint 本身没有被拿去跟同一份数据重新对比评分的问题）——这部分不需要额外代码，Megatron `--save`/`--load` 机制本来就会持续存盘。
 
 ### 已知风险 / 限制（如实列出，展示时需要一并说明）
 

@@ -107,14 +107,18 @@ BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/da
 # --load 自动续训（见 run_openclaw_topk_select_modelfactory.sh），这里
 # 只需要让"这天已经打过分"这件事本身也能跨进程重启保留下来。
 #
-# 留空（默认）＝不开启，每次都从 day01 全新跑，跟旧行为一致。
-# 要用断点续跑：第一次提交训练时就设一个固定的 METACLAW_PROGRESS_DIR
-# （不要用默认的按时间戳生成的 LOGS_DIR，那个每次重新生成都不一样）；
-# 崩溃后重新提交这个脚本时，用同一个 METACLAW_PROGRESS_DIR 再跑一次即可
-# ——已经完成的天会被自动跳过（不重新调用 openclaw agent、不重新提交
-# verdict），只用它们已经存好的分数参与最终 Acc./Compl. 聚合；没跑完的
-# 天照常继续跑。详见 docs/metaclaw_migration_plan.md。
+# 有意分成两个独立开关（2026-08-18，用户明确要求不能做成自动续跑）：
+#   METACLAW_PROGRESS_DIR：设了就会把每天的分数落盘，纯记录，不改变这次
+#     跑的行为——正常训练也建议一直设着，这样万一真的崩溃了，之后才有
+#     数据可以续跑；不设就跟以前一样完全不记录。
+#   METACLAW_RESUME=1：唯一真正触发"跳过已完成的天"的开关，必须手动
+#     显式设置，且必须搭配同一个 METACLAW_PROGRESS_DIR 目录才生效。
+#     正常训练默认不设（=0），永远从 day01 完整跑——不会因为凑巧复用了
+#     一个已经有旧文件的目录就意外跳过某些天。只有确认要续跑一次真实的
+#     崩溃时，才手动加上 METACLAW_RESUME=1 重新提交这个脚本。
+# 详见 docs/metaclaw_migration_plan.md。
 METACLAW_PROGRESS_DIR=${METACLAW_PROGRESS_DIR:-}
+METACLAW_RESUME=${METACLAW_RESUME:-0}
 
 # 可选的鲁棒性开关，默认 0（不重试，跟 MetaClaw 官方 infer_cmd.py 的
 # retry=0 默认值一致，见 docs/metaclaw_migration_plan.md 查证记录四）。
@@ -352,6 +356,7 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
   METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
   METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
+  METACLAW_RESUME="${METACLAW_RESUME}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
   BENCHMARK_API_KEY="${SGLANG_API_KEY}" \
   BENCHMARK_MODEL="${BENCHMARK_MODEL}" \
