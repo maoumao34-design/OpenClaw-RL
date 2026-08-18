@@ -182,6 +182,15 @@ cd /dfs/data/openclaw-rl-project/MetaClaw-official/benchmark && python -m src.cl
 
 跑完看输出目录下的 `reports.md`，里面是整体准确率——每次要对比不同 checkpoint 的分数，就把 `-o` 换成不同目录、重复这三步即可。
 
+**要拿论文 Table 1 那两个指标（Acc./Compl.）**：`reports.md` 里的 `Accuracy` 就是 **Acc.**（全部题目——`multi_choice`+`file_check`混在一起——的平均分，论文原话"mean per-question accuracy"）。但 **Compl.**（论文原话"file-check completion rate"，只看 `file_check` 这个子集单独的通过率）官方代码里从来没算过——全仓库搜 `completion` 关键词零命中，Table 1 这一列大概率是作者自己的临时分析脚本算的，没有随代码开源。
+`openclaw-rl/scripts/metaclaw/compute_table1_scores.py`（新建）补上这个缺口——直接读 `metaclaw-bench run` 输出目录下所有 `scoring.json`（不重新跑推理、不重新实现打分逻辑，只是聚合官方 `scoring_cmd.py` 已经算好的 `score`/`question_type` 字段），一次性给出 Acc. 和 Compl. 两个数：
+
+```bash
+python /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/metaclaw/compute_table1_scores.py <上面 -o 指定的输出目录>
+```
+
+用合成数据验证过计算逻辑正确（3 条样本手算 Acc.=50%/Compl.=50%，脚本输出一致）。
+
 **两点每次都要留意**：
 - **公平对比要用同一套系统级补丁**：训练前后两次评测如果 OpenClaw 行为不一样（比如中途才部署了那 5 个版本漂移补丁），分数差异就说不清是训练效果还是补丁效果。这几个补丁是系统级部署、不是每次训练重新装，一般装过一次就一直生效，正常不需要重复操作，但换机器/换环境时要记得先确认装没装。
 - **GPU 资源**：这个 SGLang 服务需要占一张卡，如果训练正占满全部 GPU，需要找一张空闲卡或者等训练间隙——但打分的是某一份固定权重，什么时候打分不影响分数本身，只是资源调度问题。
