@@ -203,6 +203,33 @@ python /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/metaclaw/compute_table1
 - 按天顺序、concurrency=1 串行喂数据这个设计，跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合是否顺畅、吞吐是否够用，还没有实测验证（架构上确认可行，性能上未知）。
 - 跨天没有任何文件/session 状态持久化（见下方查证记录第 3 条）——每天的"记忆"完全依赖模型权重本身的更新，如果某天的训练没有真正让权重产生可观测变化，后续天数就学不到前面天数的教训，这是一个比"batch 组成随机性影响训练成功率"（本项目在 separate 阶段反复验证过的现象）更敏感的失败模式，需要在正式跑之前想清楚怎么监控。
 
+### 训练故障复盘与修复：metaclaw_migration_20260817_181404（2026-08-18）
+
+第一次真实训练（08-17 18:14→18:42）表面上"正常关闭"（driver 把 day01→day30 扫完后按设计主动 kill 训练），**但整次训练零有效样本**——从 day01 r1 起，346 次 `openclaw agent` 全部失败，`agent_succeeded=True` 0 次，训练侧一直卡在 `waiting for combine samples: 0/16`，checkpoint 目录从未创建。CLI 提供了详细日志诊断，以下是逐条代码级复核（不直接采信，按项目规则验证）后的结论：
+
+**根因 1（主因，100% 训练样本丢失）：网关鉴权 token 未在两个子进程间共享**
+
+日志报错：`GatewayCredentialsRequiredError: gateway agent requires credentials before opening a websocket`；网关日志：`Gateway auth token was missing. Generated a runtime token for this startup...`。
+
+- `metaclaw_rollout_driver.py` 的 `_start_work_gateway`（起网关）和 `_run_openclaw_agent`（起 agent 客户端）**都是直接从 MetaClaw 官方 `infer_cmd.py` 原样 import 的**（见文件头 import 列表），不是我们自己写的代码。两个函数各自单独 `env = {**os.environ, ...}` 起子进程，从不设置 `OPENCLAW_GATEWAY_TOKEN`，也没有任何机制在它们之间传递 token。
+- 核实这**不是我们移植时漏做的事**：直接读 MetaClaw 自己的 `_run_one_test`（`infer_cmd.py:999-1042`）调用序列，跟我们 driver 里的序列逐行一致——MetaClaw 自己的官方评测主线代码存在一模一样的 gap，只是从没暴露过。
+- 用 `git grep` 在本地 `openclaw` 仓库两个版本快照（`march_2026_3_8` / `may_2026_5_11` 标签）分别搜 `GatewayCredentialsRequiredError`：**march 零命中，may 大量命中**（`src/commands/agent-via-gateway.ts` 等）——确认这是三月之后才加入的强制网关鉴权机制，不是一直存在的行为。命中 CLAUDE.md 的判断框架："只在 may 才出现、march 没有的行为，默认按版本漂移处理"。
+- 顺带确认了 May 版自己的修复设计：`agent-via-gateway.ts` 的 `shouldRetryGatewayDispatchWithShellEnvFallback` 在遇到这个错误时会重试一次、改用 `OPENCLAW_GATEWAY_TOKEN` 环境变量兜底；`gateway/server.impl.ts` 也确认——网关启动时如果 `OPENCLAW_GATEWAY_TOKEN` 已经在环境变量里，就直接用这个值，不会生成随机 runtime token（`authBootstrap.generatedToken` 才会触发警告日志）。也就是说 May 版本身已经预留了"用环境变量共享同一个 token"这条路，只是 MetaClaw 官方代码没接上。
+- **修复**（`metaclaw_rollout_driver.py`）：driver 进程启动时，若 `OPENCLAW_GATEWAY_TOKEN` 未设置，用 `secrets.token_hex(16)` 生成一个并写回 `os.environ`。因为 `_start_work_gateway`/`_run_openclaw_agent` 都用 `{**os.environ, ...}` 构建子进程环境，设一次即可让每天的网关和当天所有 `openclaw agent` 调用自动共享同一个 token，不改 MetaClaw 官方代码。每天复用同一个 token 没有风险——网关是纯本地短生命周期进程，不对外暴露。
+
+**根因 2（次因，即使修好根因 1 也会持续存在）：driver 自己提交 verdict/close 时没带鉴权头**
+
+CLI 观察到每天结束时 30000 端口的 close/verdict POST 返回 401。核实：训练代理（`openclaw_opd_api_server.py:365-372` 的 `_check_auth`）只要 `SGLANG_API_KEY` 在服务端环境变量里设了值，就要求所有请求带 `Authorization: Bearer <SGLANG_API_KEY>`，没带或不对就 401。`openclaw agent` 自己的真实请求不受影响，是因为启动脚本把 `BENCHMARK_API_KEY=${SGLANG_API_KEY}` 接进了它的 `openclaw.json` provider 配置；但 driver 自己直接用 httpx POST 提交 verdict/close（`_send_verdict_turn`/`_send_session_close_only`）完全绕过了这层配置，从来没带过这个头。
+
+还发现一个连带问题：`_post_with_retry` 里 `client.post(...)` 从来没检查响应状态码（httpx 默认不对 4xx/5xx 抛异常），所以这些 401 会被当成"请求成功"，driver 自己的日志完全看不出异常——这也是为什么之前只能靠直接翻代理日志才发现，driver 日志本身没有任何警告。
+
+**修复**（`metaclaw_rollout_driver.py`）：
+- 新增 `_API_KEY = os.environ.get("SGLANG_API_KEY", "")`，`_post_with_retry` 内部统一在 headers 里补上 `Authorization: Bearer {_API_KEY}`（只改一处，两个调用方不用各自记得加）。
+- `_post_with_retry` 补上 `response.raise_for_status()`，401/5xx 现在会走已有的重试/日志分支，不再被静默吞掉。
+- 启动脚本 `run_metaclaw_migration_modelfactory.sh` 新增把 `SGLANG_API_KEY="${SGLANG_API_KEY}"` 传给 driver 进程（此前只传了语义相同但改了名字的 `BENCHMARK_API_KEY` 给 `openclaw agent` 用，driver 自己没拿到）。
+
+**验证方式**：两处修复均用合成数据做过功能测试（伪造 httpx client 直接检查生成的 `os.environ["OPENCLAW_GATEWAY_TOKEN"]`、检查 `_post_with_retry` 实际发出的 headers 里 `Authorization` 值正确、伪造一个真实 401 `httpx.Response` 确认现在会触发警告日志而不是静默"成功"），未在真实网关/代理上跑过——下一次训练提交后才能确认这两个根因是否真的被修复到位（比如 `agent_succeeded=True` 是否开始出现、checkpoint 目录是否开始创建）。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any
@@ -108,9 +109,42 @@ PROXY_URL = os.environ.get(
 )
 _MODEL_ID = os.environ.get("METACLAW_MODEL_ID", "qwen3-4b")
 
+# Authorization header for our own direct httpx POSTs to the proxy
+# (_send_verdict_turn/_send_session_close_only) -- the patched proxy's
+# _check_auth (openclaw_opd_api_server.py) rejects any request without
+# "Authorization: Bearer <SGLANG_API_KEY>" with 401 whenever SGLANG_API_KEY
+# is set server-side (verified via direct source read, 2026-08-18 -- real
+# training run metaclaw_migration_20260817_181404 hit this on every
+# close/verdict submission). `openclaw agent`'s own real-turn requests never
+# hit this because BENCHMARK_API_KEY=${SGLANG_API_KEY} is wired into that
+# subprocess's openclaw.json provider config by the launch script; our
+# synthetic verdict/close POSTs bypass that config entirely and need the
+# same value passed in explicitly.
+_API_KEY = os.environ.get("SGLANG_API_KEY", "")
+
 # Load-bearing prefix -- see module docstring and
 # prepare_patched_openclaw_opd.sh's _METACLAW_SESSION_RE.
 _SESSION_ID_PREFIX = "metaclaw-"
+
+# Shared gateway auth token for MetaClaw's own _start_work_gateway /
+# _run_openclaw_agent (imported verbatim above, not our code). Verified
+# root cause of metaclaw_migration_20260817_181404's 100%-failure run
+# (2026-08-18): neither function ever sets OPENCLAW_GATEWAY_TOKEN, so on
+# an OpenClaw build that enforces gateway auth (GatewayCredentialsRequiredError
+# exists in the may_2026_5_11 CLI snapshot, confirmed ABSENT in
+# march_2026_3_8 via `git grep` on both tags -- a real May-only addition,
+# not present when MetaClaw's own harness code was written), each day's
+# gateway subprocess auto-generates a random runtime-only token that the
+# separate `openclaw agent` client subprocess never learns, so every
+# websocket connection is rejected before any round can run. Both
+# functions build their subprocess env as `{**os.environ, ...}`, so setting
+# this once here (before any day runs) is enough to share one token between
+# every day's gateway and its own agent calls, with zero changes to
+# MetaClaw-official's vendored code. Harmless to reuse across all 30 days --
+# each day's gateway is a short-lived localhost-only process, not exposed
+# externally.
+if not os.environ.get("OPENCLAW_GATEWAY_TOKEN"):
+    os.environ["OPENCLAW_GATEWAY_TOKEN"] = secrets.token_hex(16)
 
 # Optional resilience knobs (2026-08-17) -- default to 0 (off), matching
 # MetaClaw-official's own defaults exactly (infer_cmd.py's `retry: int = 0`;
@@ -150,10 +184,21 @@ async def _post_with_retry(
     retry=0 (the default -- see AGENT_RETRY/VERDICT_RETRY) means exactly one
     attempt, no retry, matching MetaClaw's own default behavior and our own
     prior behavior before this was added.
+
+    Attaches Authorization here (not at each call site) so there is one
+    place that has to remember it -- see _API_KEY comment above. Also
+    treats a non-2xx response as a failure: httpx does not raise on
+    4xx/5xx by default, so without raise_for_status() a 401 from the
+    proxy's _check_auth would previously look identical to a real success
+    in this driver's own logs (the actual metaclaw_migration_20260817_181404
+    401s were only found by reading the proxy's log directly, not this
+    driver's).
     """
+    headers = {**headers, "Authorization": f"Bearer {_API_KEY}"} if _API_KEY else headers
     for attempt in range(retry + 1):
         try:
-            await client.post(PROXY_URL, json=payload, headers=headers)
+            response = await client.post(PROXY_URL, json=payload, headers=headers)
+            response.raise_for_status()
             return
         except Exception as e:
             if attempt < retry:

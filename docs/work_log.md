@@ -1713,28 +1713,36 @@
 - 核实官方 `benchmark/src/` 代码只算 Acc.（`report_cmd.py` 写进 `reports.md` 的 `Accuracy` 字段），从没算过 Compl.——全仓库搜 `completion` 关键词零命中，确认这是官方代码的真实缺口，不是我们漏看
 - 新建 [`scripts/metaclaw/compute_table1_scores.py`](openclaw-rl/scripts/metaclaw/compute_table1_scores.py)：读 `metaclaw-bench run` 输出目录下所有 `scoring.json`，聚合官方 `scoring_cmd.py` 已经算好的 `score`/`question_type` 字段，一次性输出 Acc. 和 Compl. 两个数，不重新跑推理、不重新实现打分逻辑。用合成数据验证过计算逻辑（3 条样本手算 Acc.=50%/Compl.=50%，脚本输出一致）
 - 完整"如何给任意一个 checkpoint 打分"三步法（起独立 SGLang 推理服务 → 配置 `openclaw.json` 环境变量指向它 → 跑官方 `metaclaw-bench run` → 用新脚本读 Compl.）已写入 `metaclaw_migration_plan.md`，含 base 模型和训练中 `torch_dist` checkpoint 两种 `MODEL_PATH` 填法（后者需先用 `convert_torch_dist_to_hf.py` 转换）、公平对比要用同一套系统级补丁的提醒
+- **复盘第一次真实训练（`metaclaw_migration_20260817_181404`）：表面正常关闭，实际零有效样本**。CLI 提供详细日志诊断后逐条代码级核实（不直接采信）：346 次 `openclaw agent` 全部因 `GatewayCredentialsRequiredError` 失败。
+  - **根因 1（主因）**：MetaClaw 官方 `_start_work_gateway`/`_run_openclaw_agent`（被我们直接 import、非自己代码）从不设置 `OPENCLAW_GATEWAY_TOKEN`，网关和 agent 客户端是两个独立子进程，网关自动生成的 runtime token 没有共享渠道。用 `git grep` 核实本地 `openclaw` 仓库两个版本标签：`GatewayCredentialsRequiredError` 在 `march_2026_3_8` 零命中、`may_2026_5_11` 大量命中——确认是三月之后才加入的强制鉴权，命中 CLAUDE.md"版本漂移"判断框架。**修复**：driver 启动时生成一个 `OPENCLAW_GATEWAY_TOKEN` 写回 `os.environ`，两个官方函数都用 `{**os.environ,...}` 建子进程环境，设一次自动共享，不改官方代码
+  - **根因 2（次因，401，此前被静默吞掉）**：driver 自己直接 POST verdict/close 到训练代理，从没带 `Authorization` 头；代理 `_check_auth`（`openclaw_opd_api_server.py`）只要 `SGLANG_API_KEY` 有值就要求这个头，没带就 401——而 `_post_with_retry` 从没检查响应状态码，401 被当"成功"处理，driver 日志里完全看不出来。**修复**：`_post_with_retry` 统一补 `Authorization: Bearer {SGLANG_API_KEY}` + `response.raise_for_status()`，启动脚本新增把 `SGLANG_API_KEY` 传给 driver 进程
+  - 两处修复均用合成数据做过功能测试（伪造 httpx client 验证 headers/状态码分支），真实网关/代理上未跑过
+→ 详见 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)"训练故障复盘与修复：metaclaw_migration_20260817_181404"
 
-**关键决策：** 无新架构决策，纯打分方法落地记录，为训练前 baseline 和训练后效果对比铺路
+**关键决策：** 两个真实 bug 均已定位到代码级根因并修复（不是靠猜测绕过），下一次训练提交后才能确认是否真的解决——`agent_succeeded=True` 开始出现、checkpoint 目录开始创建是最直接的验证信号
 
 **产出：**
 - `scripts/metaclaw/compute_table1_scores.py`（新建，合成数据验证过，真实数据未跑过）
-- `docs/metaclaw_migration_plan.md`：["如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）"](openclaw-rl/docs/metaclaw_migration_plan.md) 一节，Acc./Compl. 定义 + 完整命令
+- `docs/metaclaw_migration_plan.md`：["如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）"](openclaw-rl/docs/metaclaw_migration_plan.md) 一节 + "训练故障复盘与修复"一节
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`OPENCLAW_GATEWAY_TOKEN` 自动生成共享、`_post_with_retry` 补 `Authorization` 头 + `raise_for_status()`
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：新增把 `SGLANG_API_KEY` 传给 driver 进程
 
 ### 当前状态（2026-08-18）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17（第一次真实训练已提交，等待结果），另加：[x] 任意 checkpoint 打 Acc./Compl. 分数的可复用方法 + 脚本已就绪（`compute_table1_scores.py`），可以直接用于训练前 baseline 和训练后对比。
+**MetaClaw 迁移**：同 08-17，另加：[x] 任意 checkpoint 打 Acc./Compl. 分数的可复用方法 + 脚本已就绪（`compute_table1_scores.py`）；[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复（合成数据验证，真实环境未验证）。
 
 ### 已知限制 / 未解决
-同 08-17，未变，另加：`compute_table1_scores.py` 只用合成数据验证过计算逻辑，还没在真实 `metaclaw-bench run` 输出上跑过一次；Compl. 官方代码原生不支持，完全依赖这个新脚本补。
+同 08-17，未变，另加：`compute_table1_scores.py` 只用合成数据验证过计算逻辑，还没在真实 `metaclaw-bench run` 输出上跑过一次；Compl. 官方代码原生不支持，完全依赖这个新脚本补；**两处网关鉴权修复尚未在真实训练中验证**，如果修复不完整或还有第三个未发现的问题，下一次训练仍可能零样本。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：查看已提交训练的结果（同 08-17）；**用新方法打一次训练前 baseline**（base Qwen3-4B 的 Acc./Compl.），作为训练后对比基准
+2. **MetaClaw 迁移**：**重新提交训练，验证网关鉴权两处修复是否真的解决零样本问题**（重点看 `agent_succeeded=True` 是否开始出现、checkpoint 目录是否开始创建）；确认后再用新方法打一次训练前 baseline（base Qwen3-4B 的 Acc./Compl.）
 3. 其余同 08-17
 
 ### 未验证
+- [ ] **网关 token 共享 + verdict/close 鉴权头两处修复在真实训练中的效果**（只做过合成数据功能测试）
 - [ ] `compute_table1_scores.py` 在真实 `metaclaw-bench run` 输出上的实际运行结果（只验证过合成数据）
 - 其余同 08-17（见上）
 
