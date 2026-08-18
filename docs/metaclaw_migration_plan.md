@@ -144,6 +144,48 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 2. **过程指标**：逐日准确率曲线（3 日滚动平均，对照论文 Figure 2 的画法），看有没有出现"前几天攒信号、之后明显提升"的结构性拐点。
 3. **训练健康度指标**：沿用这次会话验证过的一套（A/B/D 触发频率、`+1`/`-1` 分布、batch 组成、是否出现类似"170852 vs 160713"那种概率性成功/失败的现象）。
 
+### 如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）
+
+不管是训练前的 base 模型，还是训练中途/训练完的任意一个 checkpoint，打分方法都是同一套——MetaClaw 官方 CLI 自带"推理→打分→出报告"一条龙命令，不需要自己写评测代码。三步：
+
+**1. 起一个纯推理用的 SGLang 服务，指向要打分的那份权重**
+
+不走训练那套代理（不需要 OPD/combine_select、不需要 `rl-training-headers` 插件，那些是训练奖励机制专用的，纯打分不需要）。复用现成的独立 SGLang 启动脚本 `scripts/launch_simulator.sh`（本来给外部 Simulator 用，参数是通用的）：
+
+```bash
+MODEL_PATH=<要打分的权重路径，HF 格式> \
+PORT=30002 \
+MODEL_NAME=qwen3-4b \
+SGLANG_API_KEY=openclaw-rl-key \
+bash /dfs/data/openclaw-rl-project/OpenClaw-RL/scripts/launch_simulator.sh
+```
+
+（端口用不同于训练自己占用的 30000 的值，比如 30002，避免冲突。）
+
+**`MODEL_PATH` 怎么填，分两种情况**：
+- **打分 base 模型**（训练前基线）：直接填 HF 格式的原始路径，比如 `/dfs/data/models/Qwen/Qwen3-4B-Thinking-2507`，不需要转换。
+- **打分训练中途/训练完的 checkpoint**：`SAVE_CKPT` 存的是 Megatron `torch_dist` 格式，SGLang 读不了，要先转成 HF 格式——`OpenClaw-RL-official/slime/tools/convert_torch_dist_to_hf.py`（跟准备 base 模型时用的 `convert_hf_to_torch_dist.py` 是反方向的配对工具），转换完的 HF 路径才能填进 `MODEL_PATH`。
+
+**2. 把 openclaw.json 的环境变量指向这个服务**
+
+```bash
+export BENCHMARK_BASE_URL="http://127.0.0.1:30002/v1"
+export BENCHMARK_API_KEY="openclaw-rl-key"
+export BENCHMARK_MODEL="qwen3-4b"
+```
+
+**3. 跑官方的完整评测流水线**
+
+```bash
+cd /dfs/data/openclaw-rl-project/MetaClaw-official/benchmark && python -m src.cli run -i data/metaclaw-bench/all_tests.json -o <这次打分结果的输出目录，建议按 checkpoint 名字区分>
+```
+
+跑完看输出目录下的 `reports.md`，里面是整体准确率——每次要对比不同 checkpoint 的分数，就把 `-o` 换成不同目录、重复这三步即可。
+
+**两点每次都要留意**：
+- **公平对比要用同一套系统级补丁**：训练前后两次评测如果 OpenClaw 行为不一样（比如中途才部署了那 5 个版本漂移补丁），分数差异就说不清是训练效果还是补丁效果。这几个补丁是系统级部署、不是每次训练重新装，一般装过一次就一直生效，正常不需要重复操作，但换机器/换环境时要记得先确认装没装。
+- **GPU 资源**：这个 SGLang 服务需要占一张卡，如果训练正占满全部 GPU，需要找一张空闲卡或者等训练间隙——但打分的是某一份固定权重，什么时候打分不影响分数本身，只是资源调度问题。
+
 ### 已知风险 / 限制（如实列出，展示时需要一并说明）
 
 - Qwen3-4B 在文件操作/JSON 结构化/shell 脚本这类任务上的底子未知，跟 GSM8K 数学题是完全不同的能力域，训练效果存在不确定性。
