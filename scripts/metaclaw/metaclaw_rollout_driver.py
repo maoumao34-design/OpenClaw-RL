@@ -27,6 +27,15 @@ Architecture summary (see the migration doc for the "why"):
     turn. Intermediate tool-call turns within the round are judged
     independently by a new task-agnostic step judge (also added by that
     patch), not by this driver.
+  - Acc./Compl. (paper Table 1's metrics) are computed LIVE as this run
+    progresses, matching MetaClaw-official's own rl_run.py methodology
+    (verified via direct read: it runs `metaclaw-bench run --scene-per-train
+    N` as a single pass, training and scoring the same data together, no
+    held-out set) -- NOT via a separate before/after clean-checkpoint eval.
+    See docs/metaclaw_migration_plan.md "训练/评测数据重叠" for the full
+    reasoning. This is why day-level resume (METACLAW_PROGRESS_DIR) exists:
+    under this design a crash-restart-from-day01 would corrupt the
+    aggregate, not just waste compute.
 
 Requires:
   - METACLAW_ROOT: path to the MetaClaw-official checkout.
@@ -96,6 +105,7 @@ from src.infer.infer_cmd import (  # noqa: E402
 )
 from src.infer.prompts import with_feedback  # noqa: E402
 from src.infer.query_reader import get_default_query_reader  # noqa: E402
+from src.scoring.scoring_cmd import _score_file_check, _score_multi_choice  # noqa: E402
 from src.utils import get_project_root, resolve_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -156,19 +166,121 @@ if not os.environ.get("OPENCLAW_GATEWAY_TOKEN"):
 AGENT_RETRY = int(os.environ.get("METACLAW_AGENT_RETRY", "0"))
 VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 
-# No day/round-level resume support (deliberate, 2026-08-17 decision -- see
-# docs/metaclaw_migration_plan.md). A day-granularity marker-based version
-# was implemented and then removed: MetaClaw-Bench's own per-round
-# `existing_inline_score` resume (infer_cmd.py) turns out to have the same
-# workspace-vs-recorded-feedback inconsistency risk this project first tried
-# to avoid by using day granularity instead -- and separately, the training
-# checkpoint's own save cadence is not synchronized with rollout-driver
-# progress at all (a "day done" marker doesn't mean that day's samples are
-# in a saved checkpoint yet). Given one full day01->day30 pass is bounded in
-# wall-clock time, a crash just means restarting the whole run from day01
-# with a fresh base checkpoint -- this trivially avoids every consistency
-# risk discussed (workspace reuse, checkpoint/day desync, cross-round
-# contamination) since there is no partial state to keep consistent at all.
+# Day-level resume, take 2 (2026-08-18 -- supersedes the 2026-08-17 "no
+# resume, full restart" decision recorded in metaclaw_migration_plan.md).
+# The design changed because the SCORING design changed: this driver now
+# reports its own Acc./Compl. aggregate computed LIVE from this same run's
+# actual responses (matching MetaClaw-official's own rl_run.py methodology
+# -- verified via direct read: it runs `metaclaw-bench run --scene-per-train
+# N` as ONE pass, so a Table-1-style number is a running aggregate over
+# responses generated at whatever training progress existed when each day
+# ran, not a separate before/after clean-checkpoint eval). Under that
+# design, "restart from day01 on crash" would corrupt the final aggregate
+# (days already scored would be scored AGAIN, using different -- more
+# trained -- weights, double-counted or inconsistent with what actually
+# happened) rather than just wasting compute, so resume is no longer
+# optional.
+#
+# Two of the three original objections to day-level resume no longer apply:
+#   - Workspace consistency: confirmed via _copy_workspace_for_test
+#     (infer_cmd.py:162-193) that every day's workspace is rebuilt from
+#     workspace_src FRESH regardless of day -- days never inherit each
+#     other's file state (matches the already-verified "no cross-day
+#     persistence" finding). Skipping day N's re-execution on resume does
+#     not leave any missing file-state behind for day N+1, because day N+1
+#     never depended on day N's actual workspace effects in the first place.
+#   - Checkpoint/day desync: training-side --load auto-resume already
+#     exists (run_openclaw_topk_select_modelfactory.sh) and is unaffected
+#     by this. The remaining risk is narrower than before: if the crash
+#     happens between "day N's verdict was POSTed to the proxy" and "that
+#     sample's gradient update got saved to a checkpoint", resuming from an
+#     older checkpoint means day N's specific training contribution is
+#     lost -- but day N's RECORDED SCORE (persisted below, independent of
+#     training checkpoints) remains a truthful record of what the model
+#     actually produced at that point, so the final aggregate stays
+#     correct even though the weight trajectory has a small gap. This is
+#     accepted, not solved -- same category of trade-off as the paper's own
+#     live single-pass method, which never claims a clean weight/day
+#     invariant either.
+#
+# Set METACLAW_PROGRESS_DIR to enable: each day's per-round scores are
+# written to <dir>/<test_id>.json immediately after that day finishes. On
+# startup, any day whose file already exists is skipped entirely (no
+# openclaw agent call, no verdict submission -- just reload its persisted
+# scores for the final aggregate). Unset (default) disables persistence,
+# matching prior behavior exactly (every crash is a full day01 restart).
+PROGRESS_DIR_RAW = os.environ.get("METACLAW_PROGRESS_DIR", "")
+PROGRESS_DIR = Path(PROGRESS_DIR_RAW) if PROGRESS_DIR_RAW else None
+if PROGRESS_DIR is not None:
+    PROGRESS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _day_progress_path(test_id: str) -> Path:
+    assert PROGRESS_DIR is not None
+    return PROGRESS_DIR / f"{test_id}.json"
+
+
+def _load_day_progress(test_id: str) -> list[dict[str, Any]] | None:
+    """Return the day's persisted round scores if already completed, else None."""
+    if PROGRESS_DIR is None:
+        return None
+    path = _day_progress_path(test_id)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(
+            "[MetaClawRollout] progress file %s unreadable (%s), re-running day %s",
+            path, e, test_id,
+        )
+        return None
+
+
+def _save_day_progress(test_id: str, round_scores: list[dict[str, Any]]) -> None:
+    if PROGRESS_DIR is None:
+        return
+    _day_progress_path(test_id).write_text(
+        json.dumps(round_scores, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _score_round_official(round_record: dict[str, Any], answer_text: str,
+                           inline_score: dict[str, Any]) -> dict[str, Any]:
+    """Compute the OFFICIAL scoring.json-equivalent score for one round.
+
+    Reuses scoring_cmd.py's own scorers directly (same functions
+    `metaclaw-bench scoring` calls) rather than approximating with the
+    binary inline_score["passed"] used for training reward -- multi_choice
+    gets real partial credit (1-(fp+fn)/n), matching what a real
+    `metaclaw-bench run` on this same data would have produced, so the
+    aggregate this driver reports is genuinely comparable to Table 1's
+    Acc./Compl., not a simplified stand-in.
+    """
+    question_type = round_record.get("type", "multi_choice")
+    if question_type == "file_check":
+        scored = _score_file_check({"inline_score": inline_score})
+    else:
+        eval_cfg = round_record.get("eval", {})
+        scored = _score_multi_choice(
+            answer_text,
+            eval_cfg.get("answer", ""),
+            len(eval_cfg.get("options", {})),
+        )
+    return {"question_type": question_type, "score": scored["score"]}
+
+
+def _aggregate_acc_compl(all_round_scores: list[dict[str, Any]]) -> tuple[float, float | None]:
+    """Acc./Compl. over every round score collected so far -- see
+    compute_table1_scores.py for the same definitions applied to an offline
+    `metaclaw-bench run` output instead of this driver's own live run.
+    """
+    if not all_round_scores:
+        return 0.0, None
+    acc = sum(r["score"] for r in all_round_scores) / len(all_round_scores)
+    file_check_scores = [r["score"] for r in all_round_scores if r["question_type"] == "file_check"]
+    compl = sum(file_check_scores) / len(file_check_scores) if file_check_scores else None
+    return acc, compl
 
 
 async def _post_with_retry(
@@ -343,7 +455,7 @@ async def _run_round(
     gateway_port: int,
     round_timeout: float | None,
     retry: int = 0,
-) -> tuple[dict[str, Any], bool]:
+) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
     """Run one round via the real `openclaw agent` CLI.
 
     Mirrors src.infer.infer_cmd._run_group's per-round logic (agent
@@ -356,15 +468,20 @@ async def _run_round(
     AGENT_RETRY module constant for why this defaults to 0 (matching
     MetaClaw-official's own default) rather than being enabled unconditionally.
 
-    Returns (inline_score, agent_succeeded). agent_succeeded=False means the
-    CLI call itself failed on every attempt (gateway hiccup, subprocess
-    crash/timeout) -- NOT that the model attempted the task and got it
-    wrong. The caller MUST NOT submit inline_score as a real training
-    verdict in that case (see _send_session_close_only and its call site) --
-    _compute_inline_score is still called here (mirroring MetaClaw-official's
-    own infer_cmd.py, which does the same on agent failure) purely for
-    logging visibility, its result is not a trustworthy training signal when
-    agent_succeeded=False.
+    Returns (inline_score, agent_succeeded, official_score).
+    agent_succeeded=False means the CLI call itself failed on every attempt
+    (gateway hiccup, subprocess crash/timeout) -- NOT that the model
+    attempted the task and got it wrong. The caller MUST NOT submit
+    inline_score as a real training verdict in that case (see
+    _send_session_close_only and its call site) -- _compute_inline_score is
+    still called here (mirroring MetaClaw-official's own infer_cmd.py, which
+    does the same on agent failure) purely for logging visibility, its
+    result is not a trustworthy training signal when agent_succeeded=False.
+    official_score is None in that same case (an infra failure is not a
+    genuine task attempt, so it must not silently count as a 0 in the
+    Acc./Compl. aggregate any more than it counts as a real training
+    verdict) -- otherwise it's the scoring_cmd.py-equivalent continuous
+    score used for that aggregate.
     """
     rc, stdout, stderr = -1, "", ""
     for attempt in range(retry + 1):
@@ -404,7 +521,11 @@ async def _run_round(
         f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
         session_id, round_record["id"], passed, agent_succeeded,
     )
-    return inline_score, agent_succeeded
+    official_score = (
+        _score_round_official(round_record, answer_text, inline_score)
+        if agent_succeeded else None
+    )
+    return inline_score, agent_succeeded, official_score
 
 
 async def run_day(
@@ -412,7 +533,14 @@ async def run_day(
     all_tests: dict[str, Any],
     project_root: Path,
     retry: int = 0,
-) -> None:
+) -> list[dict[str, Any]]:
+    """Run one day and return its round-level official scores (see
+    _score_round_official) for the caller to fold into the final
+    Acc./Compl. aggregate. Persists them to METACLAW_PROGRESS_DIR (if set)
+    only after the whole day completes without raising -- a mid-day crash
+    must not leave a partial/misleading progress file that a resumed run
+    would treat as "day done".
+    """
     test_id = test["id"]
     agent_id = test["agent"]
     eval_name = test["eval"]
@@ -463,6 +591,7 @@ async def run_day(
     query_reader = get_default_query_reader()
     groups = query_reader.read_queries(eval_dir, eval_name)
 
+    day_round_scores: list[dict[str, Any]] = []
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             for group in groups:
@@ -482,7 +611,7 @@ async def run_day(
                         if feedback_text else question_text
                     )
 
-                    inline_score, agent_succeeded = await _run_round(
+                    inline_score, agent_succeeded, official_score = await _run_round(
                         session_id=session_id,
                         round_record=round_record,
                         query=query,
@@ -494,6 +623,8 @@ async def run_day(
                         round_timeout=None,
                         retry=retry,
                     )
+                    if official_score is not None:
+                        day_round_scores.append(official_score)
 
                     is_last_round = idx == len(rounds) - 1
 
@@ -526,7 +657,11 @@ async def run_day(
             gateway_proc.terminate()
             await gateway_proc.wait()
 
+    # Only reached if the day completed without raising -- see docstring on
+    # why this must not happen inside `finally`.
+    _save_day_progress(test_id, day_round_scores)
     logger.info(f"{_GREEN}[MetaClawRollout] day=%s done{_RESET}", test_id)
+    return day_round_scores
 
 
 async def main() -> None:
@@ -552,18 +687,46 @@ async def main() -> None:
 
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
-        f"strict order, agent_retry=%d, verdict_retry=%d{_RESET}",
-        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY,
+        f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s{_RESET}",
+        len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR,
     )
 
-    # concurrency=1, strict day01 -> day30 order, no resume -- always starts
-    # from day01 (see module-level note above on why crash recovery is a
-    # full restart, not a resume). This is the property that preserves the
-    # "online update while running through the day-stream" design, mirroring
-    # how MetaClaw's own harness forces workers=1 whenever scene_per_train
-    # is set.
+    # concurrency=1, strict day01 -> day30 order. If METACLAW_PROGRESS_DIR is
+    # set, a day already completed by a prior (crashed) run is skipped
+    # entirely -- no re-execution, no re-submission to the training proxy --
+    # and its persisted scores are reused for the final aggregate as-is (see
+    # module-level comment above on why this is now safe and necessary).
+    # Unset (default): every day always runs fresh, matching prior behavior.
+    all_round_scores: list[dict[str, Any]] = []
     for test in test_list:
-        await run_day(test, all_tests, project_root, retry=AGENT_RETRY)
+        test_id = test["id"]
+        resumed = _load_day_progress(test_id)
+        if resumed is not None:
+            logger.info(
+                f"{_YELLOW}[MetaClawRollout] day=%s already completed (resume), "
+                f"skipping -- reusing %d persisted round score(s){_RESET}",
+                test_id, len(resumed),
+            )
+            all_round_scores.extend(resumed)
+            continue
+        day_scores = await run_day(test, all_tests, project_root, retry=AGENT_RETRY)
+        all_round_scores.extend(day_scores)
+
+    acc, compl = _aggregate_acc_compl(all_round_scores)
+    compl_str = f"{compl:.1%}" if compl is not None else "n/a (no file_check rounds)"
+    logger.info(
+        f"{_GREEN}[MetaClawRollout] run complete. %d day(s), %d scored round(s). "
+        f"Acc.=%.1f%% Compl.=%s{_RESET}",
+        len(test_list), len(all_round_scores), acc * 100, compl_str,
+    )
+    if PROGRESS_DIR is not None:
+        (PROGRESS_DIR / "final_scores.json").write_text(
+            json.dumps(
+                {"acc": acc, "compl": compl, "num_rounds": len(all_round_scores)},
+                ensure_ascii=False, indent=2,
+            ),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

@@ -99,13 +99,22 @@ METACLAW_ALL_TESTS_JSON=${METACLAW_ALL_TESTS_JSON:-${METACLAW_ROOT}/benchmark/da
 BENCHMARK_MODEL=${BENCHMARK_MODEL:-qwen3-4b}
 BENCHMARK_WORKSPACE_DIR=${BENCHMARK_WORKSPACE_DIR:-${METACLAW_ROOT}/benchmark/data/metaclaw-bench/workspaces/shared}
 
-# 不做断点续跑（2026-08-17 决定，见 docs/metaclaw_migration_plan.md）：
-# 最初做过一版按天粒度的续跑标记，后来发现 checkpoint 存盘节奏（按训练
-# 步数）跟 rollout driver 的天数进度完全不同步——"标记这天完成"不代表
-# 这天的样本已经真的进了某个存盘的 checkpoint，进程崩溃后重启会静默丢失
-# 一段训练贡献且没有办法发现。一遍 30 天训练总耗时有限，崩溃后直接从
-# day01 用干净的 base checkpoint 完整重跑，比维护一套不完全可靠的断点
-# 续跑机制更简单也更安全，不会有任何"部分完成状态对不对得上"的风险。
+# 断点续跑（2026-08-18 决定，取代 08-17"不做断点续跑"——设计改成跟
+# MetaClaw 官方 rl_run.py 一样边训练边算分之后，Table 1 式的 Acc./Compl.
+# 数字变成了这一趟运行本身的实时累积结果，"崩溃后从 day01 重跑"会导致
+# 已经算过分的天被用不同（更新过的）权重重新生成一次答案，污染最终聚合
+# 分数——不再只是浪费算力，必须要有断点续跑。训练侧 checkpoint 本来就有
+# --load 自动续训（见 run_openclaw_topk_select_modelfactory.sh），这里
+# 只需要让"这天已经打过分"这件事本身也能跨进程重启保留下来。
+#
+# 留空（默认）＝不开启，每次都从 day01 全新跑，跟旧行为一致。
+# 要用断点续跑：第一次提交训练时就设一个固定的 METACLAW_PROGRESS_DIR
+# （不要用默认的按时间戳生成的 LOGS_DIR，那个每次重新生成都不一样）；
+# 崩溃后重新提交这个脚本时，用同一个 METACLAW_PROGRESS_DIR 再跑一次即可
+# ——已经完成的天会被自动跳过（不重新调用 openclaw agent、不重新提交
+# verdict），只用它们已经存好的分数参与最终 Acc./Compl. 聚合；没跑完的
+# 天照常继续跑。详见 docs/metaclaw_migration_plan.md。
+METACLAW_PROGRESS_DIR=${METACLAW_PROGRESS_DIR:-}
 
 # 可选的鲁棒性开关，默认 0（不重试，跟 MetaClaw 官方 infer_cmd.py 的
 # retry=0 默认值一致，见 docs/metaclaw_migration_plan.md 查证记录四）。
@@ -342,6 +351,7 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_MAX_DAYS="${METACLAW_MAX_DAYS}" \
   METACLAW_AGENT_RETRY="${METACLAW_AGENT_RETRY}" \
   METACLAW_VERDICT_RETRY="${METACLAW_VERDICT_RETRY}" \
+  METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
   BENCHMARK_API_KEY="${SGLANG_API_KEY}" \
   BENCHMARK_MODEL="${BENCHMARK_MODEL}" \

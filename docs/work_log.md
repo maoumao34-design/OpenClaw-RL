@@ -1718,31 +1718,38 @@
   - **根因 2（次因，401，此前被静默吞掉）**：driver 自己直接 POST verdict/close 到训练代理，从没带 `Authorization` 头；代理 `_check_auth`（`openclaw_opd_api_server.py`）只要 `SGLANG_API_KEY` 有值就要求这个头，没带就 401——而 `_post_with_retry` 从没检查响应状态码，401 被当"成功"处理，driver 日志里完全看不出来。**修复**：`_post_with_retry` 统一补 `Authorization: Bearer {SGLANG_API_KEY}` + `response.raise_for_status()`，启动脚本新增把 `SGLANG_API_KEY` 传给 driver 进程
   - 两处修复均用合成数据做过功能测试（伪造 httpx client 验证 headers/状态码分支），真实网关/代理上未跑过
 → 详见 [`metaclaw_migration_plan.md`](openclaw-rl/docs/metaclaw_migration_plan.md)"训练故障复盘与修复：metaclaw_migration_20260817_181404"
+- **发现并解决训练/评测数据重叠（leakage）问题——同时改变了 Acc./Compl. 数字的产生方式和 checkpoint 的用途**。用户发现训练用的 30 天数据和打分用的是同一份，追问论文怎么处理。直接读官方 `benchmark/scripts/rl_run.py`（Table 1 "MetaClaw (Full)" 那一档的真实产出脚本）核实：**论文自己是边训练边算分、同一趟跑完，没有 held-out 测试集，也完全没讨论这个问题**（`run scene-per-train 5` 单趟命令，training 和 scoring 共享同一份数据和同一次推理）。
+  - **设计改动**：`metaclaw_rollout_driver.py` 现在训练过程中直接用官方 `scoring_cmd.py` 的打分函数（`_score_multi_choice`/`_score_file_check`，非简化版，multi_choice 有真实部分正确分）给每轮实时算分，跑完聚合成 Acc./Compl.，这才是跟论文方法学对得上的数字。之前那套"独立 SGLang + `metaclaw-bench run`"打分法保留作为论文没做过的、更干净的补充手段，不再是主产出
+  - **连带改动：checkpoint 角色从"最终模型"变成"崩溃后能重新训练的续跑点"**——训练和打分共用一趟运行后，"崩溃从 day01 重跑"会让已算过分的天用不同权重重新生成答案、污染最终聚合分数，不再只是浪费算力。撤回 08-17"不做断点续跑"的决定，重新加回按天粒度的进度持久化（`METACLAW_PROGRESS_DIR`）：跑完一天且无异常才落盘，启动时跳过已完成的天（不重跑 agent、不重新提交 verdict），复用其分数参与聚合
+  - 重新核查了之前否决按天续跑的两条理由：**都不再成立**——workspace 一致性核实每天都从 `workspace_src` 全新拷贝、从不继承前一天效果（跨天本来就无状态），跳过重跑不会丢失任何文件状态；checkpoint/天数不同步的训练侧 `--load` 自动续训已存在（早前修复），剩下风险变窄为"某天分数已记但训练贡献可能因崩溃丢失"，接受为已知权衡，不影响聚合分数本身的真实性
+  - 用合成数据做了两层功能测试：`_score_round_official` 对 multi_choice 算出真实部分正确分（不是二元）；`main()` 级别集成测试模拟"day01 已完成"场景，确认正确跳过、正确聚合。真实崩溃/重启场景未验证
+→ 详见 `metaclaw_migration_plan.md`"训练/评测数据重叠：论文自己怎么做的，我们的设计改动"
 
-**关键决策：** 两个真实 bug 均已定位到代码级根因并修复（不是靠猜测绕过），下一次训练提交后才能确认是否真的解决——`agent_succeeded=True` 开始出现、checkpoint 目录开始创建是最直接的验证信号
+**关键决策：** 两个真实 bug（网关鉴权）均已定位到代码级根因并修复；Acc./Compl. 的产生方式和 checkpoint 的用途都发生了实质性改动，改成跟论文 Table 1（Full 档）方法学一致——下一次训练提交后才能同时验证这三处改动
 
 **产出：**
 - `scripts/metaclaw/compute_table1_scores.py`（新建，合成数据验证过，真实数据未跑过）
-- `docs/metaclaw_migration_plan.md`：["如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）"](openclaw-rl/docs/metaclaw_migration_plan.md) 一节 + "训练故障复盘与修复"一节
-- `scripts/metaclaw/metaclaw_rollout_driver.py`：`OPENCLAW_GATEWAY_TOKEN` 自动生成共享、`_post_with_retry` 补 `Authorization` 头 + `raise_for_status()`
-- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：新增把 `SGLANG_API_KEY` 传给 driver 进程
+- `docs/metaclaw_migration_plan.md`：["如何给任意一个 checkpoint 打分"](openclaw-rl/docs/metaclaw_migration_plan.md) + "训练故障复盘与修复" + "训练/评测数据重叠"三节
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：网关鉴权两处修复；新增 `_score_round_official`/`_aggregate_acc_compl`（官方打分函数直接复用）、`METACLAW_PROGRESS_DIR` 按天进度持久化 + 断点续跑跳过逻辑
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：新增 `SGLANG_API_KEY`、`METACLAW_PROGRESS_DIR` 传给 driver 进程
 
 ### 当前状态（2026-08-18）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17，另加：[x] 任意 checkpoint 打 Acc./Compl. 分数的可复用方法 + 脚本已就绪（`compute_table1_scores.py`）；[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复（合成数据验证，真实环境未验证）。
+**MetaClaw 迁移**：同 08-17，另加：[x] 任意 checkpoint 打 Acc./Compl. 分数的可复用方法 + 脚本已就绪（`compute_table1_scores.py`）；[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐）+ 按天断点续跑（均合成数据验证，真实环境未验证）。
 
 ### 已知限制 / 未解决
-同 08-17，未变，另加：`compute_table1_scores.py` 只用合成数据验证过计算逻辑，还没在真实 `metaclaw-bench run` 输出上跑过一次；Compl. 官方代码原生不支持，完全依赖这个新脚本补；**两处网关鉴权修复尚未在真实训练中验证**，如果修复不完整或还有第三个未发现的问题，下一次训练仍可能零样本。
+同 08-17，未变，另加：`compute_table1_scores.py` 只用合成数据验证过计算逻辑，还没在真实 `metaclaw-bench run` 输出上跑过一次；Compl. 官方代码原生不支持，完全依赖这个新脚本补；**两处网关鉴权修复 + 边训练边算分改动 + 按天断点续跑，均未在真实训练中验证**，下一次训练需要同时确认这三处。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练，验证网关鉴权两处修复是否真的解决零样本问题**（重点看 `agent_succeeded=True` 是否开始出现、checkpoint 目录是否开始创建）；确认后再用新方法打一次训练前 baseline（base Qwen3-4B 的 Acc./Compl.）
+2. **MetaClaw 迁移**：**重新提交训练**，重点验证：`agent_succeeded=True` 是否开始出现（网关鉴权修复）、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合是否正常输出、`METACLAW_PROGRESS_DIR` 断点续跑（可以故意中断一次验证跳过逻辑）
 3. 其余同 08-17
 
 ### 未验证
 - [ ] **网关 token 共享 + verdict/close 鉴权头两处修复在真实训练中的效果**（只做过合成数据功能测试）
+- [ ] **边训练边算分（`_score_round_official`）+ 按天断点续跑在真实训练/真实崩溃场景下的效果**（只做过合成数据功能测试）
 - [ ] `compute_table1_scores.py` 在真实 `metaclaw-bench run` 输出上的实际运行结果（只验证过合成数据）
 - 其余同 08-17（见上）
 

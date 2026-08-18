@@ -140,9 +140,37 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 ### 验收方案
 
-1. **主指标**：Qwen3-4B 在 MetaClaw-Bench Part I（30 天，file-check 完成率 + 整体准确率）训练前 vs 训练后的对比。
+1. **主指标**：Acc./Compl.，跟论文 Table 1 方法学对齐——**训练本身这一趟运行的实时聚合分数**，不是训练前/训练后两次独立评测的对比（原因和设计见下方"训练/评测数据重叠"一节）。
 2. **过程指标**：逐日准确率曲线（3 日滚动平均，对照论文 Figure 2 的画法），看有没有出现"前几天攒信号、之后明显提升"的结构性拐点。
 3. **训练健康度指标**：沿用这次会话验证过的一套（A/B/D 触发频率、`+1`/`-1` 分布、batch 组成、是否出现类似"170852 vs 160713"那种概率性成功/失败的现象）。
+
+### 训练/评测数据重叠：论文自己怎么做的，我们的设计改动（2026-08-18）
+
+**发现的问题**：训练用的 30 天数据（`all_tests.json`）跟"如何给任意一个 checkpoint 打分"一节里打分用的是同一份数据——训练前后分别独立评测这套方法，如果训练和评测数据完全重叠，训练后分数的提升说不清是真的学会了泛化能力还是记住了这些具体题目。
+
+**查证论文自己怎么处理**：直接读了 MetaClaw 官方 `benchmark/scripts/rl_run.py`（Table 1 里 "MetaClaw (Full)" 这一档——skills + RL——的真实产出脚本），结论：**论文自己是边训练边算分，同一趟跑完，没有单独的 held-out 测试集，也完全没讨论这个 leakage 问题**（论文原文只提了"这是作者编写的模拟基准，绝对数值可能不直接迁移到生产场景"，这是在说仿真真实性，不是在说训练测试集重叠）。
+
+关键代码（`rl_run.py` 259-268 行）：
+```python
+run_cmd = [
+    cfg.BENCH_BIN, "run",
+    "-i", cfg.BENCH_INPUT,      # all_tests_metaclaw.json，跟评测同一份 30 天数据
+    "-o", cfg.BENCH_OUTPUT,
+    "-w", "1", "-n", str(cfg.BENCH_COUNT),
+    "--scene-per-train", str(cfg.SCENE_PER_TRAIN),   # =5，每完成 5 天触发一次 RL 训练
+]
+```
+`metaclaw-bench run` 本身就是"推理→打分→出报告"一条龙命令；`rl_run.py` 只是在外面套了一层代理，代理每完成 5 个 scene 触发一次训练权重更新——**代理返回给 agent 的每个真实回复，就是当时那一刻的权重生成的，`metaclaw-bench run` 自己的推理→打分流程照常跑，Table 1 的 Full 这行数字就是这一趟 30 天全部打分的聚合**，前几天用没怎么训练过的权重、后面天数用训练过几轮的权重，混在一起算平均分。论文原文（Section 4.1.1）另有一句可查证的话："MetaClaw (Full): the full pipeline combining skill-driven fast adaptation with opportunistic policy optimization via RL **(5-day training run)**"——RL 训练只在 30 天里的 5 天内触发，但具体是哪 5 天、跟评测窗口的精确关系，论文原文没有交代清楚。
+
+**设计改动（这次落地）**：把我们的迁移训练也改成跟论文一样——`metaclaw_rollout_driver.py` 现在在训练过程中直接用官方 `scoring_cmd.py` 的打分函数（`_score_multi_choice`/`_score_file_check`，跟 `metaclaw-bench scoring` 用的是同一段代码，不是简化版，multi_choice 有真实的部分正确分）给每一轮实时算分，全程跑完后聚合成 Acc./Compl. 输出——这才是跟论文 Table 1 方法学真正对得上的数字。之前"如何给任意一个 checkpoint 打分"那一节（起独立 SGLang 服务 + `metaclaw-bench run`）**仍然保留，作为一个论文没有做过的、更干净的补充手段**（训练前打一次干净 baseline、训练完打一次干净的冻结 checkpoint 分数），但不再是这次迁移的主要产出数字。
+
+**连带的架构改动：checkpoint 的角色变了**。训练和打分现在共用同一趟运行，"崩溃后从 day01 完整重跑"会导致已经算过分的天用不同（更新过的）权重重新生成一次答案，污染最终聚合分数——不再只是浪费算力，是会算出错误结果。所以撤回了 08-17"不做断点续跑"的决定，重新加回按天粒度的进度持久化：
+- `metaclaw_rollout_driver.py` 新增 `METACLAW_PROGRESS_DIR`：设置后，每天跑完（且没有中途异常）就把这天的逐轮 official score 写入 `<dir>/<test_id>.json`；驱动启动时先检查每天是否已有进度文件，有就整天跳过（不重新调用 `openclaw agent`、不重新提交 verdict），直接复用已存的分数参与最终聚合；全部跑完后聚合出的 Acc./Compl. 写入 `<dir>/final_scores.json`。
+- 重新评估了之前否决按天续跑的两条理由，发现**都不再成立**：
+  1. **workspace 一致性**：直接读 `_copy_workspace_for_test`（`infer_cmd.py:162-193`）确认每天的 workspace 都是从 `workspace_src` 全新拷贝，从不继承前一天的实际文件效果（跟已查证的"跨天无状态持久化"结论一致）——跳过某天的重新执行，不会让后面天数缺少任何文件状态，因为后面天数本来就不依赖前一天的真实文件效果。
+  2. **checkpoint/天数进度不同步**：训练侧 `--load` 自动续训已经存在（`run_openclaw_topk_select_modelfactory.sh` 的既有修复），不受这次改动影响。剩下的风险变窄了：如果崩溃发生在"某天的 verdict 已经 POST 给代理"和"这个样本的梯度更新真正存进某个 checkpoint"之间，重启后从更早的 checkpoint 继续训练，那天的训练贡献会丢——但那天的**打分记录**（独立于训练 checkpoint 持久化）依然是模型当时真实产出的如实记录，最终聚合分数不会因此出错，只是权重轨迹有一小段缺口。这是被接受、不是被解决的权衡，跟论文自己的单趟边训边评方法本来就不承诺"最终模型跟每一天严格对应"是同一类取舍。
+- 启动脚本新增 `METACLAW_PROGRESS_DIR`（默认空=不开启，行为不变）；要用断点续跑，第一次提交训练时就固定这个目录（不要用默认按时间戳生成的 `LOGS_DIR`），崩溃后用同一个目录重新提交同一个脚本即可自动跳过已完成的天。
+- 两处改动均用合成数据做过功能测试：`_score_round_official` 对 multi_choice 部分正确的题目算出了正确的部分分（不是二元 0/1）；`main()` 级别的集成测试模拟"day01 已完成"场景，确认 day01 被正确跳过、day02 起正常继续跑、最终聚合分数正确包含了 day01 复用的分数。真实训练环境（真实崩溃/重启场景）尚未验证。
 
 ### 如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）
 
