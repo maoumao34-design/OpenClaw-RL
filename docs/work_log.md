@@ -1749,12 +1749,14 @@
   - **明确建议：这一轮训练直接停掉，不要用它的 `METACLAW_PROGRESS_DIR` 做 resume**（里面全是空天，没有真实进度可续），开新目录、用修好 context 的脚本从 day01 完整重跑
   - CLI 同时发现请求里没有 `[RL-TRAINING-META]` 标记——暂缓排查（现在所有请求都还没走到"模型真正生成"就先溢出失败了，没法判断插件是否生效），等 context 修好、真的有请求跑通后是下一个要核实的问题：如果标记确实缺失，`_METACLAW_SESSION_RE` 整套确定性 reward/步骤判官分派可能从一开始就没生效
 → 详见 `metaclaw_migration_plan.md`"训练故障复盘与修复（二）：metaclaw_migration_20260818_*，context overflow"
+- **补上跟 Personal Agent Track 对齐的人类可读训练转录**。用户反馈之前 driver 日志只有 `passed=%s agent_succeeded=%s` 结构化摘要，看不到实际问答内容，没法像 Personal Agent Track 的 `simulation.log`（`student_chat.py` 打印每轮完整对话）那样手动通读找规律——agent 查结构化字段容易漏掉的模式，人工看原始转录才看得出来。在 `_run_round` 里加了同款风格的 `print()`（天级别标题、每轮完整 `>> Query -> OpenClaw`/`<< OpenClaw -> Query` 原文不截断、verdict、OPD hint），不需要新日志文件或环境变量——`metaclaw_rollout.log` 本来就是 driver 整个进程的 stdout 重定向，只是之前没打印过这些内容。用合成数据验证过完整一轮的打印格式（mock 掉 `_run_openclaw_agent`，跑真实 `_run_round`），真实训练环境未验证
+→ 详见 `metaclaw_migration_plan.md`"训练过程可读性：对齐 Personal Agent Track 的 simulation.log"
 
 ### 当前状态（2026-08-18）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复（均合成数据验证/直接在官方脚本上验证 sed 效果，真实环境未验证）。**已经拿到一份真实的训练前基线报告**（`run_20260818_101454`，346 题，Acc.=5.7%/Compl.=0.0%，`passed` 指标 30 天全为 0）——已定位一个大概率成因：`rl-training-headers` 插件往系统提示词注入的 `[RL-TRAINING-META]` 标记只有训练代理才会剥除，基线直连 SGLang 没剥，模型看到了训练时不会看到的内容；重跑基线前需要先 `openclaw plugins disable rl-training-headers`。
+**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复；[x] 训练日志补上跟 Personal Agent Track `simulation.log` 同等详细程度的人类可读转录（均合成数据验证/直接在官方脚本上验证 sed 效果，真实环境未验证）。**已经拿到一份真实的训练前基线报告**（`run_20260818_101454`，346 题，Acc.=5.7%/Compl.=0.0%，`passed` 指标 30 天全为 0）——已定位一个大概率成因：`rl-training-headers` 插件往系统提示词注入的 `[RL-TRAINING-META]` 标记只有训练代理才会剥除，基线直连 SGLang 没剥，模型看到了训练时不会看到的内容；重跑基线前需要先 `openclaw plugins disable rl-training-headers`。
 
 ### 已知限制 / 未解决
 同 08-17，未变，另加：**两处网关鉴权修复 + 边训练边算分改动 + 手动断点续跑 + report 格式对齐/自动落盘 + context overflow 修复，均未在真实训练中验证**；训练前基线报告的 `Compl.=0.0%` 大概率跟 `rl-training-headers` 标记污染有关，但没有重跑验证过，不能 100% 排除还有其他因素；`[RL-TRAINING-META]` 标记在真实训练请求里是否真的存在，尚未验证（两次真实训练都还没有请求真正跑通过）。

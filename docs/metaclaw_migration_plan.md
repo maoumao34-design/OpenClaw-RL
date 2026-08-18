@@ -252,6 +252,20 @@ CLI 观察到每天结束时 30000 端口的 close/verdict POST 返回 401。核
 
 **尚未验证/暂缓的问题**：CLI 同时发现这次失败的请求里没有出现 `[RL-TRAINING-META]` 标记（rl-training-headers 插件本该无条件注入的那个）。这条先不查——现在所有请求都还没走到"模型真正生成"这一步就先因为溢出失败了，没法判断是插件真的没生效、还是取样/日志位置没截到这段内容。等 context 修好、真的有请求能跑通之后，这是下一个要核实的问题：如果连这个标记都没有，`_METACLAW_SESSION_RE` 整套确定性 reward/步骤判官分派机制可能从一开始就没生效，训练可能一直在往 Personal Agent Track 的原逻辑上回退而不自知。
 
+### 训练过程可读性：对齐 Personal Agent Track 的 simulation.log（2026-08-18）
+
+用户反馈：之前 driver 日志只有 `passed=%s agent_succeeded=%s` 这类结构化一行摘要，看不到实际问了什么、模型答了什么、判官给了什么反馈——Personal Agent Track 的 `train_separate_student.sh` 有专门的 `simulation.log`（`student_chat.py` 直接 `print()` 每一轮 `>> Student -> OpenClaw:`/`<< OpenClaw -> Student:` 完整对话文本），用户需要能手动通读这种原始转录，才能看出 agent 容易漏掉的规律（不是结构化字段能覆盖的那种模式）。
+
+**实现**：在 `_run_round`（生成每一轮实际内容的地方）里加了跟 `student_chat.py` 同样风格的 `print()`（不是 `logger`，保持跟已有 `simulation.log` 一致的朴素输出、不带日志级别噪音）：
+- `run_day` 开头打印天级别的分隔标题（`# Day dayXX (session: metaclaw-dayXX)`）。
+- 每轮打印完整的 `>> Query -> OpenClaw`（含拼接进去的上一轮反馈文字）和 `<< OpenClaw -> Query`（`openclaw agent` 的完整原始 stdout，不截断——即使这段包含模型的工具调用轨迹而不只是最终答案，这段原始轨迹往往正是人能看出问题、结构化字段看不出来的地方）。
+- 每轮打印 verdict（`passed`/`agent_succeeded`/官方连续分数）。
+- 如果失败且生成了 OPD hint，打印这段 hint 文本（会被喂进下一轮反馈）。
+
+不需要额外的日志文件或环境变量——这些 `print()` 输出的去向和 Personal Agent Track 的 `simulation.log` 走的是同一个机制：启动脚本本来就把 driver 整个进程的 stdout/stderr 重定向进 `metaclaw_rollout.log`（`run_metaclaw_migration_modelfactory.sh` 第 3 步），只是之前 driver 自己没打印过这些内容。`tail -f metaclaw_rollout.log` 现在就能看到跟 `simulation.log` 同等详细程度的转录。
+
+用合成数据验证过完整一轮的打印格式（mock `_run_openclaw_agent` 返回固定内容，跑真实的 `_run_round`），确认 query/answer/verdict 都正确显示、格式跟预期一致。真实训练环境的日志量/可读性尚未验证。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

@@ -710,13 +710,35 @@ async def _run_round(
 
     inline_score = _compute_inline_score(round_record, answer_text, workspace_path)
     passed = inline_score.get("passed", False)
-    logger.info(
-        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
-        session_id, round_record["id"], passed, agent_succeeded,
-    )
     official_score = (
         _score_round_official(test_id, group_id, round_record, answer_text, inline_score)
         if agent_succeeded else None
+    )
+
+    # Human-readable transcript (2026-08-18) -- mirrors openclaw-test's
+    # student_chat.py print style (`>>`/`<<` turn markers, full untruncated
+    # text) so a person tailing metaclaw_rollout.log can eyeball actual
+    # question/answer/verdict content directly, the same way Personal Agent
+    # Track's simulation.log already works -- this is deliberately plain
+    # print(), not logger, to match that existing convention and stay easy
+    # to read without log-level noise. Full stdout is printed even though it
+    # may include the model's raw tool-call trace, not just the final answer
+    # -- that raw trace is often exactly where a human spots a pattern an
+    # agent parsing structured fields alone would miss.
+    print(f"\n  {'-' * 56}")
+    print(f"  round={round_record['id']}  session={session_id}  agent={test_id}")
+    print(f"  {'-' * 56}")
+    print(f"  >> Query -> OpenClaw:\n{query}\n")
+    if agent_succeeded:
+        print(f"  << OpenClaw -> Query:\n{answer_text}\n")
+    else:
+        print(f"  << OpenClaw -> Query: AGENT FAILED (rc={rc})\n{stderr[:2000]}\n")
+    score_str = f"{official_score['score']:.3f}" if official_score is not None else "N/A (infra failure)"
+    print(f"  verdict: passed={passed}  agent_succeeded={agent_succeeded}  official_score={score_str}")
+
+    logger.info(
+        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
+        session_id, round_record["id"], passed, agent_succeeded,
     )
     return inline_score, agent_succeeded, official_score
 
@@ -743,6 +765,10 @@ async def run_day(
     # matching MetaClaw-official's own _run_group (all of a day's rounds
     # share one session transcript).
     session_id = f"{_SESSION_ID_PREFIX}{test_id}"
+
+    print(f"\n{'#' * 60}")
+    print(f"# Day {test_id}  (session: {session_id})")
+    print(f"{'#' * 60}")
 
     workspace_src = resolve_path(
         all_tests["workspace_src"].replace("${METACLAW_ROOT}", str(project_root))
@@ -827,6 +853,8 @@ async def run_day(
                         passed = inline_score.get("passed", False)
                         eval_score = 1.0 if passed else -1.0
                         hint = "" if passed else _build_opd_hint(round_record, inline_score)
+                        if hint:
+                            print(f"  OPD hint (goes into next round's feedback):\n{hint}\n")
                         await _send_verdict_turn(
                             client, session_id, eval_score, hint,
                             session_done=is_last_round, retry=VERDICT_RETRY,
