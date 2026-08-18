@@ -1704,7 +1704,43 @@
 - `docs/reproduction_guide.md`/`scripts/train_separate_student.sh`/`scripts/train_with_services.sh`：仓库路径大小写修正
 - `docs/metaclaw_migration_plan.md`：三方对照表、查证记录（四）、训练起点/checkpoint 策略/断点续跑决策/OpenClaw 版本核查全部记录
 
-### 当前状态（2026-08-17）
+## 2026-08-18
+
+**目标：** 补齐"给任意一个 checkpoint 打 Table 1 分数（Acc./Compl.）"的可复用方法记录，让 workspace 内的 agent（modelfactory 上跑训练/打分的 CLI agent）能直接照着做，不用每次重新问怎么打分
+
+**完成内容：**
+- 核实论文 Table 1 两个指标的准确定义：**Acc.** = 全部题目（`multi_choice`+`file_check` 混在一起）平均分（"mean per-question accuracy"）；**Compl.** = 仅 `file_check` 子集单独的通过率（"file-check completion rate"）。核实 Table 1 就是这两个指标按 Part I/Part II 分别报一遍，一共 4 列，AutoResearchClaw（论文另一张 Table 2）是完全独立的评测，跟这两个数字无关
+- 核实官方 `benchmark/src/` 代码只算 Acc.（`report_cmd.py` 写进 `reports.md` 的 `Accuracy` 字段），从没算过 Compl.——全仓库搜 `completion` 关键词零命中，确认这是官方代码的真实缺口，不是我们漏看
+- 新建 [`scripts/metaclaw/compute_table1_scores.py`](openclaw-rl/scripts/metaclaw/compute_table1_scores.py)：读 `metaclaw-bench run` 输出目录下所有 `scoring.json`，聚合官方 `scoring_cmd.py` 已经算好的 `score`/`question_type` 字段，一次性输出 Acc. 和 Compl. 两个数，不重新跑推理、不重新实现打分逻辑。用合成数据验证过计算逻辑（3 条样本手算 Acc.=50%/Compl.=50%，脚本输出一致）
+- 完整"如何给任意一个 checkpoint 打分"三步法（起独立 SGLang 推理服务 → 配置 `openclaw.json` 环境变量指向它 → 跑官方 `metaclaw-bench run` → 用新脚本读 Compl.）已写入 `metaclaw_migration_plan.md`，含 base 模型和训练中 `torch_dist` checkpoint 两种 `MODEL_PATH` 填法（后者需先用 `convert_torch_dist_to_hf.py` 转换）、公平对比要用同一套系统级补丁的提醒
+
+**关键决策：** 无新架构决策，纯打分方法落地记录，为训练前 baseline 和训练后效果对比铺路
+
+**产出：**
+- `scripts/metaclaw/compute_table1_scores.py`（新建，合成数据验证过，真实数据未跑过）
+- `docs/metaclaw_migration_plan.md`：["如何给任意一个 checkpoint 打分（可复用方法，2026-08-18）"](openclaw-rl/docs/metaclaw_migration_plan.md) 一节，Acc./Compl. 定义 + 完整命令
+
+### 当前状态（2026-08-18）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
+**MetaClaw 迁移**：同 08-17（第一次真实训练已提交，等待结果），另加：[x] 任意 checkpoint 打 Acc./Compl. 分数的可复用方法 + 脚本已就绪（`compute_table1_scores.py`），可以直接用于训练前 baseline 和训练后对比。
+
+### 已知限制 / 未解决
+同 08-17，未变，另加：`compute_table1_scores.py` 只用合成数据验证过计算逻辑，还没在真实 `metaclaw-bench run` 输出上跑过一次；Compl. 官方代码原生不支持，完全依赖这个新脚本补。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：查看已提交训练的结果（同 08-17）；**用新方法打一次训练前 baseline**（base Qwen3-4B 的 Acc./Compl.），作为训练后对比基准
+3. 其余同 08-17
+
+### 未验证
+- [ ] `compute_table1_scores.py` 在真实 `metaclaw-bench run` 输出上的实际运行结果（只验证过合成数据）
+- 其余同 08-17（见上）
+
+---
+
+## 历史状态（2026-08-17，已被 8/18 结果取代）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
