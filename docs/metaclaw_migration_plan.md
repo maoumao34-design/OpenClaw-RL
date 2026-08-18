@@ -236,6 +236,22 @@ CLI 观察到每天结束时 30000 端口的 close/verdict POST 返回 401。核
 
 **验证方式**：两处修复均用合成数据做过功能测试（伪造 httpx client 直接检查生成的 `os.environ["OPENCLAW_GATEWAY_TOKEN"]`、检查 `_post_with_retry` 实际发出的 headers 里 `Authorization` 值正确、伪造一个真实 401 `httpx.Response` 确认现在会触发警告日志而不是静默"成功"），未在真实网关/代理上跑过——下一次训练提交后才能确认这两个根因是否真的被修复到位（比如 `agent_succeeded=True` 是否开始出现、checkpoint 目录是否开始创建）。
 
+### 训练故障复盘与修复（二）：metaclaw_migration_20260818_*，context overflow（2026-08-18）
+
+上一轮网关鉴权修复后重新提交的训练，卡在了另一个真实问题上：**day01 起就大面积 context overflow，全程零训练样本。**
+
+**现象**：`openclaw agent` 请求 16661 输入 + 30313 `max_tokens` = 46974 token，超过训练 SGLang 引擎的官方默认 `--sglang-context-length 32768`。SGLang 回 400 context overflow，代理转成 500，driver 记 `agent_succeeded=False`（正确地没有提交假训练信号，这部分行为符合预期）；连续失败触发 router 熔断，之后全部变成 503 no_available_workers。`agent_succeeded=True` 恒为 0，`day01.json`～`day04.json` 全是空 `[]`（`METACLAW_PROGRESS_DIR` 正确记录了实际发生的情况——空文件本身不是 bug，见下面 resume 修复）。
+
+**根因**：32768 是官方 `run_qwen3_4b_openclaw_topk_select.sh` 里 `CONTEXT_LENGTH`/`--rollout-max-context-len`/`--sglang-context-length` 三处硬编码的值——这是论文针对 **Personal Agent Track**（GSM8K 风格、对话短）调优的数字，不是通用默认值（对比确认：OpenClaw-RL 自己的 `toolcall-rl` 4B 训练脚本用的是 `--rollout-max-context-len 16384`，比 32768 还小，说明 32768 在 OpenClaw-RL 自己的赛道里已经算大配置，不是任何"安全余量"）。MetaClaw 的系统提示词（工具 schema + skills + memory + 当天任务文件）比 GSM8K 对话重得多——**查了 MetaClaw 自己的官方配置模板 `openclaw_cfg/openclaw.json`/`metaclaw.json`（我们直接复用、没改过的那份），明确声明 `"contextWindow": 50000, "maxTokens": 50000`**，不是我们瞎猜的数字，是论文作者自己给这套基准配的值。之前跑通的基线评测用的是临时起的 65536 上下文 SGLang，凑巧覆盖了 50000，才没暴露这个问题。
+
+**修复**（`scripts/run_openclaw_topk_select_modelfactory.sh`，`METACLAW_MIGRATION_PROFILE=1` 分支新增三条 sed）：把 `CONTEXT_LENGTH`/`--rollout-max-context-len`/`--sglang-context-length` 从 32768 统一改到 **65536**（用户决定：MetaClaw 官方声明的下限是 50000，但训练过程中会话内容会累积增长，比声明值再多留一点余量，65536 也是恰好跑通过的基线用过的值）。`--max-tokens-per-gpu 32768`（训练侧单 GPU 显存预算）不动——跟 sglang context 是否溢出无关，沿用同一脚本 `SMOKE_PROFILE` 分支的既有结论（是否需要一起调大待真实训练报错验证，不提前假设）。用 sed 直接在真实官方脚本上跑过一遍确认三处都改对、`--max-tokens-per-gpu` 确认没被误改。
+
+**连带修复：resume 会把"零样本天"误判成"已完成"**。设计 `METACLAW_PROGRESS_DIR`/`METACLAW_RESUME` 时没考虑到"一天里所有轮次都因基础设施故障失败"这种情况——`run_day` 不会因此抛异常，所以空列表 `[]` 照样会被持久化成"这天跑完了"。如果之后误开 `METACLAW_RESUME=1` 指向这次的进度目录，day01～day04 会被当成已完成直接跳过，永远没机会用修好的 context 重跑。**修复**：`main()` 里判断"要不要跳过"的条件从 `if resumed is not None` 改成 `if resumed:`——`None`（文件不存在）和 `[]`（文件存在但是空）都是 falsy，同一个判断就能把两种"这天其实没有真正完成"的情况都正确导向重跑；同时空列表文件本身依然保留（诊断价值：能看出"这天真的跑过但一个样本都没产生"，不是"从没跑到过"），只是不再被当作"已完成"处理。
+
+**明确建议**：**这一轮训练（`metaclaw_migration_20260818_*`）直接停掉，不要用它产生的 `METACLAW_PROGRESS_DIR` 做 resume**——里面全是空天，没有任何真实进度可续，重开一个新的 `METACLAW_PROGRESS_DIR`、用修好 context 的脚本从 day01 完整重跑。
+
+**尚未验证/暂缓的问题**：CLI 同时发现这次失败的请求里没有出现 `[RL-TRAINING-META]` 标记（rl-training-headers 插件本该无条件注入的那个）。这条先不查——现在所有请求都还没走到"模型真正生成"这一步就先因为溢出失败了，没法判断是插件真的没生效、还是取样/日志位置没截到这段内容。等 context 修好、真的有请求能跑通之后，这是下一个要核实的问题：如果连这个标记都没有，`_METACLAW_SESSION_RE` 整套确定性 reward/步骤判官分派机制可能从一开始就没生效，训练可能一直在往 Personal Agent Track 的原逻辑上回退而不自知。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

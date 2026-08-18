@@ -256,9 +256,12 @@ def _day_progress_path(test_id: str) -> Path:
 
 
 def _load_day_progress(test_id: str) -> list[dict[str, Any]] | None:
-    """Return the day's persisted round scores if RESUME is on and the day
-    was already completed by a prior run, else None (always None when
-    RESUME is off, even if a progress file happens to exist)."""
+    """Return the day's persisted round scores (from the file, verbatim --
+    may be `[]` if every round that day failed at the infra level) if
+    RESUME is on and a progress file exists, else None. Always None when
+    RESUME is off, even if a progress file happens to exist. Does NOT
+    itself decide whether an empty list counts as "done" -- see the
+    `if resumed:` (not `is not None`) check at the call site in main()."""
     if not RESUME or PROGRESS_DIR is None:
         return None
     path = _day_progress_path(test_id)
@@ -896,7 +899,17 @@ async def main() -> None:
     for test in test_list:
         test_id = test["id"]
         resumed = _load_day_progress(test_id)
-        if resumed is not None:
+        # Deliberately `if resumed:` not `if resumed is not None:` -- a day
+        # where every round failed at the infrastructure level (e.g. the
+        # 2026-08-18 context-overflow incident) still completes run_day()
+        # without raising, so it gets persisted as test_id.json containing
+        # `[]`. An empty list is a real, useful diagnostic record ("this day
+        # was attempted and produced zero samples"), but it must NOT count
+        # as "done" for resume purposes -- there is nothing to reuse, and
+        # skipping it would silently give up retrying that day forever. `[]`
+        # and `None` are both falsy, so this one check correctly retries
+        # both "file doesn't exist" and "file exists but is empty".
+        if resumed:
             logger.info(
                 f"{_YELLOW}[MetaClawRollout] day=%s already completed (resume), "
                 f"skipping -- reusing %d persisted round score(s){_RESET}",

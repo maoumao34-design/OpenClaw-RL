@@ -91,8 +91,30 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
     # 几个也不要少于 5 个，估算本身不准，实际数字要等真实训练跑一次才知
     # 道，见 docs/metaclaw_migration_plan.md）。只改这一处，并行度/
     # batch-size/上下文窗口等其余参数不动，跟 8GPU 正式训练配置一致。
+    # 2026-08-18：真实训练 metaclaw_migration_20260818_* 在 day01 就大面积
+    # context overflow——openclaw agent 请求 16661 输入 + 30313 max_tokens =
+    # 46974 token，超过官方默认 32768，代理转 500，driver 记
+    # agent_succeeded=False，连续失败触发 router 熔断，后续全 503，全程零
+    # 训练样本。根因：官方默认 32768 是 Personal Agent Track（GSM8K 风格，
+    # 短对话）专属的调优值（对比 OpenClaw-RL 自己的 toolcall-rl 4B 脚本用
+    # 的还更小，--rollout-max-context-len 16384，说明 32768 在 OpenClaw-RL
+    # 自己的赛道里已经算大的），MetaClaw 的系统提示词（工具 schema + skills
+    # + memory + 当天任务文件）比这重得多——MetaClaw 官方 openclaw_cfg/
+    # openclaw.json 自己就声明 "contextWindow": 50000, "maxTokens": 50000，
+    # 不是我们瞎猜的数字。改到 65536（用户决定，训练过程中还有额外累积的
+    # 会话内容，比 50000 再多留一点余量）。CONTEXT_LENGTH（喂给 sglang
+    # 启动本身）、--rollout-max-context-len（slime 侧 rollout 有效性判断）、
+    # --sglang-context-length（sglang rollout 引擎实际配置）三处是同一个
+    # "这个引擎能吃多少 token" 概念的三处体现，必须一起改，改漏一处就会
+    # 出现"sglang 能接但 slime 认为超限"或反过来的新不一致。
+    # --max-tokens-per-gpu 32768 不动——这是训练侧单 GPU 显存预算，跟
+    # sglang context 是否溢出无关（同上面 SMOKE_PROFILE 分支的既有结论：
+    # 是否需要一起调大待真实训练报错验证，不提前假设）。
     sed -i \
         -e 's/--save-interval 100/--save-interval 10/' \
+        -e 's/export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="65536"/' \
+        -e 's/--rollout-max-context-len 32768/--rollout-max-context-len 65536/' \
+        -e 's/--sglang-context-length 32768/--sglang-context-length 65536/' \
         "${PATCHED}"
 fi
 
