@@ -1754,25 +1754,24 @@
 - **对齐基线跑完，定版为本次迁移唯一采信的训练前基线**（`run_20260818_141305`，30 天/346 题，6 补丁+关 `rl-training-headers` 对齐后）：**Acc.=8.1%（Correct=28.0），Compl.=0.0%（0/224 file_check）**。跟上次不对齐基线（Acc.=5.7%）对比，验证了两件事：(1) `rl-training-headers` 标记污染是真实存在的，Acc. 提升全部来自 multi_choice（满分 12→18、部分正确 19→23）；(2) **`Compl.=0.0%` 两次完全一样，不是标记污染，是 4B 模型在 file_check 类任务上的真实基线能力上限**——之前"大概率是污染导致"的怀疑被证伪。之后训练成果（driver 自己输出的 `report.json`/`report.md`）都跟这份基线对比
   - 记录了一条操作提醒（非分析结论）：这次基线打分用的独立 SGLang（4B，:30002）和关闭状态的 `rl-training-headers` 插件目前仍是这个状态，**下次提交训练前必须重新 `openclaw plugins enable rl-training-headers`**（训练走 30000 代理，代理依赖这个标记做 session 分派，忘记开等于重蹈这次迁移最早发现的那个问题）
 → 详见 `metaclaw_migration_plan.md`"基线结果（用于后续对比，2026-08-18 定版）"
+- **第三次真实训练已提交，等待次日结果**：`rl-training-headers` 重新 enable，开新的 `METACLAW_PROGRESS_DIR`，用今天这一整套修复（context 32768→65536、resume 空天误判漏洞、report 格式对齐官方+自动落盘、人类可读转录）从 day01 完整重新提交。今天两次真实训练分别卡在网关鉴权和 context overflow，这次是第一次有机会真正跑出训练样本——重点看今天的修复是不是都生效了。
 
 ### 当前状态（2026-08-18）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复；[x] 训练日志补上跟 Personal Agent Track `simulation.log` 同等详细程度的人类可读转录；[x] **训练前基线已定版**（对齐基线，Acc.=8.1%/Compl.=0.0%，`run_20260818_141305`，后续训练成果对比这份数据）。
+**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复；[x] 训练日志补上跟 Personal Agent Track `simulation.log` 同等详细程度的人类可读转录；[x] **训练前基线已定版**（对齐基线，Acc.=8.1%/Compl.=0.0%，`run_20260818_141305`，后续训练成果对比这份数据）。**第三次真实训练已提交，等待次日结果**。
 
 ### 已知限制 / 未解决
-同 08-17，未变，另加：**网关鉴权修复 + 边训练边算分改动 + 手动断点续跑 + report 格式对齐/自动落盘 + context overflow 修复，均未在真实训练中验证**；`[RL-TRAINING-META]` 标记在真实训练请求里是否真的存在，尚未验证（两次真实训练都还没有请求真正跑通过）；下次提交训练前需要手动重新 enable `rl-training-headers` 插件（当前是关闭状态，基线打分用的）。
+同 08-17，未变，另加：**网关鉴权修复 + 边训练边算分改动 + 手动断点续跑 + report 格式对齐/自动落盘 + context overflow 修复，均未在真实训练中验证**（今天两次真实训练都还没有请求真正跑通过——先卡在网关鉴权、后卡在 context overflow——第三次是第一次有机会真正检验这些修复）；`[RL-TRAINING-META]` 标记在真实训练请求里是否真的存在，尚未验证。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新 enable `rl-training-headers` 插件后，开新的 `METACLAW_PROGRESS_DIR`、用修好 context 的脚本重新从 day01 完整提交训练**（上一轮已停，`METACLAW_PROGRESS_DIR` 里全是空天不能续），重点验证：`agent_succeeded=True` 是否开始出现、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合和 `report.md` 是否正常输出、**真实请求里是否出现 `[RL-TRAINING-META]` 标记**（决定确定性 reward/步骤判官分派是否真的生效）、训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有提升；建议故意中断一次后手动加 `METACLAW_RESUME=1` 验证跳过逻辑
+2. **MetaClaw 迁移**：**查看第三次训练的真实结果**——重点确认：`agent_succeeded=True` 是否开始出现（网关鉴权+context 两处修复是否真的生效）、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合和 `report.md` 是否正常输出且格式跟基线一致、**真实请求里是否出现 `[RL-TRAINING-META]` 标记**（决定确定性 reward/步骤判官分派是否真的生效）、训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有提升；若训练过程中中断过，检查 `METACLAW_RESUME=1` 续跑（含空天重跑）是否按预期工作
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **网关 token 共享 + verdict/close 鉴权头两处修复在真实训练中的效果**（只做过合成数据功能测试）
-- [ ] **边训练边算分（`_score_round_official`）+ 手动断点续跑（含空天修复）+ report 格式对齐/自动落盘 + context overflow 修复，在真实训练场景下的效果**（只做过合成数据功能测试/直接 sed 验证）
-- [ ] 真实训练请求里 `[RL-TRAINING-META]` 标记是否存在（决定 `_METACLAW_SESSION_RE` 分派机制是否真的生效，还是一直在往 Personal Agent Track 原逻辑回退而不自知）
+- [ ] **本次已提交训练（第三次）的真实结果**（网关鉴权+context overflow 两处修复是否真的解决了零样本问题、`[RL-TRAINING-META]` 标记是否真的存在、resume/report 格式是否按预期工作）
 - [ ] 训练成果相对基线（Acc.=8.1%/Compl.=0.0%）有没有真实提升
 - 其余同 08-17（见上）
 
