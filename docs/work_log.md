@@ -1727,12 +1727,15 @@
 - **用户纠正两点，当场改掉**：(1) 断点续跑不能做成"设了目录就自动跳过"，必须手动触发，否则正常训练可能因为凑巧复用了旧目录而意外漏跑某些天——拆成两个独立开关：`METACLAW_PROGRESS_DIR`（只负责落盘，不改变行为）+ `METACLAW_RESUME=1`（唯一真正触发跳过的开关，必须手动显式设置，且必须搭配 `METACLAW_PROGRESS_DIR` 否则报错）。(2) 之前提出的"独立 SGLang + `metaclaw-bench run`"打分法（保留作为"更干净的补充手段"）是错误判断——那个方法打分用的还是同一份 30 天训练数据，并不比实时聚合更干净，只是把重叠往后挪了一步。**已撤回并删除** `compute_table1_scores.py`（`launch_simulator.sh` 是 Personal Agent Track 通用脚本，不受影响，保留）。用户同时确认：训练跑完保存的最终 checkpoint 仍然保留作为最终结果的一部分，这个不需要额外代码，Megatron `--save`/`--load` 本来就会存
   - 三个开关行为均用合成数据验证：`METACLAW_RESUME` 不设时即使进度文件存在也正确忽略；设为 1 时正确加载并跳过；设为 1 但没设 `METACLAW_PROGRESS_DIR` 时正确报错拒绝启动
 → 详见 `metaclaw_migration_plan.md`"已废弃：独立 SGLang + `metaclaw-bench run` 打分法"
+- **训练 report 补齐成跟官方 `report.md`/`report.json` 同款格式**。用户拿到基线评测的 `report.md` 后追问训练是否也这样输出，查证发现官方训练脚本 `rl_run.py` 本身就是调 `metaclaw-bench run --scene-per-train`——跟纯基线评测走的是同一条 `infer→scoring→report` 流水线，官方两者格式本来就一致；我们自己的 driver 因为用的是 slime+Megatron 的 Hybrid RL、架构上没法塞进这条流水线，所以之前只输出简化版 `final_scores.json`。把 `report_cmd.py::run_report`/`_render_markdown` 的聚合和渲染逻辑原样搬进 driver（`_build_report`/`_render_report_markdown`，改成读内存里的 round 记录而不是扫描 `scoring.json` 文件），训练完输出**同名同结构**的 `report.json`/`report.md`（取代原来的 `final_scores.json`），可以直接跟基线报告并排对比。`_score_round_official` 返回结构同步对齐官方 `_score_one` 字段（`test_id`/`group_id`/`round_id`/`metrics`）。Token Usage 字段保留但恒为 0（driver 不落 `llm_log` 结构化文件，如实标注不是缺陷）；Compl. 不是官方 schema 概念，没塞进 `report.json`，改在 `report.md` 末尾单独加一行
+  - 用合成数据验证：两天混合 multi_choice+file_check 记录，聚合数字跟手算一致；渲染出的表格列名/顺序/`-`占位跟用户贴的真实基线报告样例逐列对得上
+→ 详见 `metaclaw_migration_plan.md`"训练 report 跟官方 `report.md`/`report.json` 对齐"
 
-**关键决策：** 两个真实 bug（网关鉴权）均已定位到代码级根因并修复；Acc./Compl. 的产生方式和 checkpoint 的用途都发生了实质性改动，改成跟论文 Table 1（Full 档）方法学一致；断点续跑改成手动触发、废弃了一个错误的补充打分法——下一次训练提交后才能同时验证这几处改动
+**关键决策：** 两个真实 bug（网关鉴权）均已定位到代码级根因并修复；Acc./Compl. 的产生方式和 checkpoint 的用途都发生了实质性改动，改成跟论文 Table 1（Full 档）方法学一致；断点续跑改成手动触发、废弃了一个错误的补充打分法；训练 report 格式补齐到跟官方基线评测一致——下一次训练提交后才能同时验证这几处改动
 
 **产出：**
-- `docs/metaclaw_migration_plan.md`："训练故障复盘与修复" + "训练/评测数据重叠" + "已废弃：独立 SGLang + `metaclaw-bench run` 打分法"三节
-- `scripts/metaclaw/metaclaw_rollout_driver.py`：网关鉴权两处修复；新增 `_score_round_official`/`_aggregate_acc_compl`（官方打分函数直接复用）、`METACLAW_PROGRESS_DIR`（落盘）+ `METACLAW_RESUME`（手动触发跳过，两个独立开关）
+- `docs/metaclaw_migration_plan.md`："训练故障复盘与修复" + "训练/评测数据重叠" + "已废弃：独立 SGLang + `metaclaw-bench run` 打分法" + "训练 report 跟官方对齐"四节
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：网关鉴权两处修复；新增 `_score_round_official`（对齐官方字段）/`_aggregate_acc_compl`/`_build_report`/`_render_report_markdown`（官方 report_cmd.py 逻辑搬入）；`METACLAW_PROGRESS_DIR`（落盘）+ `METACLAW_RESUME`（手动触发跳过，两个独立开关）；输出 `report.json`/`report.md` 取代 `final_scores.json`
 - `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：新增 `SGLANG_API_KEY`、`METACLAW_PROGRESS_DIR`、`METACLAW_RESUME` 传给 driver 进程
 - `scripts/metaclaw/compute_table1_scores.py`：已删除（错误的补充打分法，同一份数据重复使用）
 
@@ -1740,19 +1743,20 @@
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`）（均合成数据验证，真实环境未验证）。
+**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`）；[x] 训练 report 格式对齐官方 `report.json`/`report.md`（均合成数据验证，真实环境未验证）。**已经拿到一份真实的训练前基线报告**（`run_20260818_101454`，346 题，Acc.=5.7%/Compl.=0.0%，`passed` 指标 30 天全为 0，怀疑链路问题，待抽查 `infer_result.json` 核实）。
 
 ### 已知限制 / 未解决
-同 08-17，未变，另加：**两处网关鉴权修复 + 边训练边算分改动 + 手动断点续跑，均未在真实训练中验证**，下一次训练需要同时确认这几处。
+同 08-17，未变，另加：**两处网关鉴权修复 + 边训练边算分改动 + 手动断点续跑 + report 格式对齐，均未在真实训练中验证**；训练前基线报告的 `Compl.=0.0%`（224 题 file_check 全部失败）是否是链路问题还是真实基线，未核实。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练**，重点验证：`agent_succeeded=True` 是否开始出现（网关鉴权修复）、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合是否正常输出；建议正式跑时就设好 `METACLAW_PROGRESS_DIR`（不开 `METACLAW_RESUME`），故意中断一次后手动加 `METACLAW_RESUME=1` 验证跳过逻辑
+2. **MetaClaw 迁移**：**重新提交训练**，重点验证：`agent_succeeded=True` 是否开始出现（网关鉴权修复）、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合和 `report.md` 是否正常输出、格式是否真的跟基线报告一致；建议正式跑时就设好 `METACLAW_PROGRESS_DIR`（不开 `METACLAW_RESUME`），故意中断一次后手动加 `METACLAW_RESUME=1` 验证跳过逻辑；抽查基线报告里几道 file_check 题的 `infer_result.json`，确认 `Compl.=0.0%` 是真实基线还是链路问题
 3. 其余同 08-17
 
 ### 未验证
 - [ ] **网关 token 共享 + verdict/close 鉴权头两处修复在真实训练中的效果**（只做过合成数据功能测试）
-- [ ] **边训练边算分（`_score_round_official`）+ 手动断点续跑在真实训练/真实崩溃场景下的效果**（只做过合成数据功能测试）
+- [ ] **边训练边算分（`_score_round_official`）+ 手动断点续跑 + report 格式对齐，在真实训练/真实崩溃场景下的效果**（只做过合成数据功能测试）
+- [ ] 训练前基线报告 `Compl.=0.0%`（224 道 file_check 全部失败）是真实基线还是链路问题
 - 其余同 08-17（见上）
 
 ---

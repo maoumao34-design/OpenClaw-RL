@@ -267,9 +267,9 @@ def _save_day_progress(test_id: str, round_scores: list[dict[str, Any]]) -> None
     )
 
 
-def _score_round_official(round_record: dict[str, Any], answer_text: str,
-                           inline_score: dict[str, Any]) -> dict[str, Any]:
-    """Compute the OFFICIAL scoring.json-equivalent score for one round.
+def _score_round_official(test_id: str, group_id: str, round_record: dict[str, Any],
+                           answer_text: str, inline_score: dict[str, Any]) -> dict[str, Any]:
+    """Compute the OFFICIAL scoring.json-equivalent record for one round.
 
     Reuses scoring_cmd.py's own scorers directly (same functions
     `metaclaw-bench scoring` calls) rather than approximating with the
@@ -278,6 +278,13 @@ def _score_round_official(round_record: dict[str, Any], answer_text: str,
     `metaclaw-bench run` on this same data would have produced, so the
     aggregate this driver reports is genuinely comparable to Table 1's
     Acc./Compl., not a simplified stand-in.
+
+    Return shape deliberately mirrors scoring_cmd.py::_score_one's record
+    (test_id/group_id/round_id/question_type/score/metrics) minus
+    extracted_answer/correct_answer (report_cmd.py never reads those two) --
+    see _build_report/_render_report_markdown below, which are report_cmd.py's
+    aggregation and rendering logic ported to work off this list directly
+    instead of scanning scoring.json files off disk.
     """
     question_type = round_record.get("type", "multi_choice")
     if question_type == "file_check":
@@ -289,7 +296,14 @@ def _score_round_official(round_record: dict[str, Any], answer_text: str,
             eval_cfg.get("answer", ""),
             len(eval_cfg.get("options", {})),
         )
-    return {"question_type": question_type, "score": scored["score"]}
+    return {
+        "test_id": test_id,
+        "group_id": group_id,
+        "round_id": round_record.get("id", "unknown"),
+        "question_type": question_type,
+        "score": scored["score"],
+        "metrics": scored.get("metrics", {}),
+    }
 
 
 def _aggregate_acc_compl(all_round_scores: list[dict[str, Any]]) -> tuple[float, float | None]:
@@ -308,6 +322,138 @@ def _aggregate_acc_compl(all_round_scores: list[dict[str, Any]]) -> tuple[float,
     file_check_scores = [r["score"] for r in all_round_scores if r["question_type"] == "file_check"]
     compl = sum(file_check_scores) / len(file_check_scores) if file_check_scores else None
     return acc, compl
+
+
+_EMPTY_TOKENS = {"input": 0, "output": 0, "cache_read": 0, "total_input": 0}
+
+
+def _build_report(all_round_scores: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a report.json-equivalent structure from this run's own round
+    records -- same shape report_cmd.py::run_report produces (summary +
+    by_task, with per-task accuracy and averaged metrics), so this driver's
+    output is directly comparable to a `metaclaw-bench run` baseline's
+    report.json, side by side.
+
+    Token usage is always zero here (not a bug to "fix" -- see
+    _render_report_markdown): this driver never captures OpenClaw's
+    llm_log/usage data (_run_openclaw_agent only returns raw stdout text),
+    unlike the official infer_result.json pipeline report_cmd.py reads from.
+    Left in the same shape rather than omitted so the two reports line up
+    field-for-field.
+    """
+    by_task: dict[str, dict[str, Any]] = {}
+    for record in all_round_scores:
+        test_id = record["test_id"]
+        task = by_task.setdefault(test_id, {
+            "accuracy": 0.0,
+            "tokens": {"agent": dict(_EMPTY_TOKENS), "compaction": dict(_EMPTY_TOKENS)},
+            "questions": [],
+            "metrics": {},
+        })
+        task["questions"].append({
+            "group_id": record["group_id"],
+            "round_id": record["round_id"],
+            "score": record["score"],
+            "tokens": {"agent": dict(_EMPTY_TOKENS)},
+            "metrics": record["metrics"],
+        })
+        for key, value in record["metrics"].items():
+            task["metrics"][key] = task["metrics"].get(key, 0.0) + value
+
+    summary_metrics: dict[str, float] = {}
+    total_questions = 0
+    total_correct = 0.0
+    for task in by_task.values():
+        questions = task["questions"]
+        n = len(questions)
+        correct = sum(q["score"] for q in questions)
+        task["accuracy"] = correct / n if n else 0.0
+        for key in task["metrics"]:
+            task["metrics"][key] /= n
+        for key, value in task["metrics"].items():
+            summary_metrics[key] = summary_metrics.get(key, 0.0) + value * n
+        total_questions += n
+        total_correct += correct
+
+    if total_questions > 0:
+        for key in summary_metrics:
+            summary_metrics[key] /= total_questions
+
+    return {
+        "summary": {
+            "total_questions": total_questions,
+            "correct": total_correct,
+            "accuracy": total_correct / total_questions if total_questions else 0.0,
+            "tokens": {"agent": dict(_EMPTY_TOKENS), "compaction": dict(_EMPTY_TOKENS)},
+            "metrics": summary_metrics,
+        },
+        "by_task": by_task,
+    }
+
+
+def _render_report_markdown(report: dict[str, Any]) -> str:
+    """Same table layout as report_cmd.py::_render_markdown, so a training
+    run's report.md and a `metaclaw-bench run` baseline's report.md can be
+    read side by side without translating formats.
+
+    Token Usage section is kept (always 0) rather than dropped, for the same
+    field-alignment reason as _build_report -- and per docs/metaclaw_migration_plan.md,
+    the baseline's own 0/0 token usage turned out to be a metaclaw report_cmd.py
+    log-format mismatch, not a signal either report actually tracks reliably.
+    """
+    lines = ["# Benchmark Report (metaclaw_rollout_driver.py live run)", ""]
+    summary = report["summary"]
+    tokens = summary.get("tokens", {})
+    agent_tok = tokens.get("agent", {})
+    comp_tok = tokens.get("compaction", {})
+    lines += [
+        "## Summary",
+        "",
+        f"- **Total questions**: {summary['total_questions']}",
+        f"- **Correct**: {summary['correct']:.1f}",
+        f"- **Accuracy**: {summary['accuracy']:.1%}",
+        "",
+        "### Token Usage",
+        "",
+        "(not tracked by this driver -- always 0, see function docstring)",
+        "",
+        "| Type | Total Input | Output |",
+        "|------|-------------|--------|",
+        f"| agent | {agent_tok.get('total_input', 0):,} | {agent_tok.get('output', 0):,} |",
+        f"| compaction | {comp_tok.get('total_input', 0):,} | {comp_tok.get('output', 0):,} |",
+    ]
+
+    metrics = summary.get("metrics", {})
+    if metrics:
+        lines += ["", "### Metrics (Average)", ""]
+        for key in sorted(metrics.keys()):
+            lines.append(f"- **{key}**: {metrics[key]:.4f}")
+
+    lines += ["", "## By Task", ""]
+
+    all_metric_keys: set[str] = set()
+    for task_data in report["by_task"].values():
+        all_metric_keys.update(task_data.get("metrics", {}).keys())
+
+    header = "| Task | Questions | Correct | Accuracy |"
+    separator = "|------|-----------|---------|----------|"
+    for key in sorted(all_metric_keys):
+        header += f" {key} |"
+        separator += "------|"
+    lines.append(header)
+    lines.append(separator)
+
+    for task_id, task_data in sorted(report["by_task"].items()):
+        q_count = len(task_data.get("questions", []))
+        correct = sum(q["score"] for q in task_data.get("questions", []))
+        acc = task_data["accuracy"]
+        row = f"| {task_id} | {q_count} | {correct:.1f} | {acc:.1%} |"
+        task_metrics = task_data.get("metrics", {})
+        for key in sorted(all_metric_keys):
+            row += f" {task_metrics[key]:.4f} |" if key in task_metrics else " - |"
+        lines.append(row)
+
+    return "\n".join(lines) + "\n"
 
 
 async def _post_with_retry(
@@ -473,6 +619,8 @@ def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) 
 
 async def _run_round(
     session_id: str,
+    test_id: str,
+    group_id: str,
     round_record: dict[str, Any],
     query: str,
     openclaw_config_path: Path,
@@ -549,7 +697,7 @@ async def _run_round(
         session_id, round_record["id"], passed, agent_succeeded,
     )
     official_score = (
-        _score_round_official(round_record, answer_text, inline_score)
+        _score_round_official(test_id, group_id, round_record, answer_text, inline_score)
         if agent_succeeded else None
     )
     return inline_score, agent_succeeded, official_score
@@ -640,6 +788,8 @@ async def run_day(
 
                     inline_score, agent_succeeded, official_score = await _run_round(
                         session_id=session_id,
+                        test_id=test_id,
+                        group_id=group.get("id", "unknown"),
                         round_record=round_record,
                         query=query,
                         openclaw_config_path=openclaw_json_path,
@@ -747,13 +897,27 @@ async def main() -> None:
         f"Acc.=%.1f%% Compl.=%s{_RESET}",
         len(test_list), len(all_round_scores), acc * 100, compl_str,
     )
+
+    # report.json/report.md -- same filenames and shape as report_cmd.py's
+    # own output (see _build_report/_render_report_markdown), so this run's
+    # results can be read side by side with a `metaclaw-bench run` baseline
+    # without translating formats. Compl. has no equivalent field in the
+    # official report (it's specific to this migration's Table 1 mapping,
+    # not something report_cmd.py itself computes -- see
+    # docs/metaclaw_migration_plan.md), so it's logged above and appended as
+    # an extra line in report.md rather than invented as a fake report.json
+    # field that would not match the official schema.
+    report = _build_report(all_round_scores)
+    md = _render_report_markdown(report) + f"\n**Compl. (file_check only)**: {compl_str}\n"
+    print("\n" + md)
     if PROGRESS_DIR is not None:
-        (PROGRESS_DIR / "final_scores.json").write_text(
-            json.dumps(
-                {"acc": acc, "compl": compl, "num_rounds": len(all_round_scores)},
-                ensure_ascii=False, indent=2,
-            ),
-            encoding="utf-8",
+        (PROGRESS_DIR / "report.json").write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+        (PROGRESS_DIR / "report.md").write_text(md, encoding="utf-8")
+        logger.info(
+            f"{_GREEN}[MetaClawRollout] report written: %s{_RESET}",
+            PROGRESS_DIR / "report.json",
         )
 
 

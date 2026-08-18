@@ -168,12 +168,24 @@ run_cmd = [
 - `metaclaw_rollout_driver.py` 把"落盘进度"和"读进度并跳过"拆成两个独立开关：
   - `METACLAW_PROGRESS_DIR`：设置后，每天跑完（且没有中途异常）就把这天的逐轮 official score 写入 `<dir>/<test_id>.json`——纯记录动作，不改变这次跑的任何行为，正常训练也建议一直设着，方便万一真崩溃了有数据可续。
   - `METACLAW_RESUME=1`：**唯一**真正触发"跳过已完成的天"的开关，必须手动显式设置，且必须同时设了 `METACLAW_PROGRESS_DIR`（否则直接报错拒绝启动）。不设（默认）＝无论 `METACLAW_PROGRESS_DIR` 里有没有旧文件，永远从 day01 完整重新跑，正常训练不会因为凑巧复用了一个已有旧文件的目录就意外跳过某些天。
-  - 全部跑完后聚合出的 Acc./Compl. 写入 `<dir>/final_scores.json`。
+  - 全部跑完后生成 `<dir>/report.json`/`<dir>/report.md`（见下方"跟官方 report.md 对齐"一节）。
 - 重新评估了之前否决按天续跑的两条理由，发现**都不再成立**：
   1. **workspace 一致性**：直接读 `_copy_workspace_for_test`（`infer_cmd.py:162-193`）确认每天的 workspace 都是从 `workspace_src` 全新拷贝，从不继承前一天的实际文件效果（跟已查证的"跨天无状态持久化"结论一致）——跳过某天的重新执行，不会让后面天数缺少任何文件状态，因为后面天数本来就不依赖前一天的真实文件效果。
   2. **checkpoint/天数进度不同步**：训练侧 `--load` 自动续训已经存在（`run_openclaw_topk_select_modelfactory.sh` 的既有修复），不受这次改动影响。剩下的风险变窄了：如果崩溃发生在"某天的 verdict 已经 POST 给代理"和"这个样本的梯度更新真正存进某个 checkpoint"之间，重启后从更早的 checkpoint 继续训练，那天的训练贡献会丢——但那天的**打分记录**（独立于训练 checkpoint 持久化）依然是模型当时真实产出的如实记录，最终聚合分数不会因此出错，只是权重轨迹有一小段缺口。这是被接受、不是被解决的权衡，跟论文自己的单趟边训边评方法本来就不承诺"最终模型跟每一天严格对应"是同一类取舍。
 - 启动脚本新增 `METACLAW_PROGRESS_DIR`/`METACLAW_RESUME`（均默认空/0＝不开启，行为不变）；要续跑，第一次提交训练时就固定一个 `METACLAW_PROGRESS_DIR`（不要用默认按时间戳生成的 `LOGS_DIR`），崩溃后手动加上 `METACLAW_RESUME=1`、指向同一个目录重新提交这个脚本，才会跳过已完成的天。
 - 三处改动均用合成数据做过功能测试：`_score_round_official` 对 multi_choice 部分正确的题目算出了正确的部分分（不是二元 0/1）；`main()` 级别的集成测试模拟"day01 已完成"场景，确认 `METACLAW_RESUME=1` 时 day01 被正确跳过、`METACLAW_RESUME` 不设时即使进度文件存在也正确忽略、`METACLAW_RESUME=1` 但没设 `METACLAW_PROGRESS_DIR` 时正确报错拒绝启动。真实训练环境（真实崩溃/重启场景）尚未验证。
+
+### 训练 report 跟官方 `report.md`/`report.json` 对齐（2026-08-18）
+
+**为什么之前不一样**：官方训练脚本 `rl_run.py` 内部就是调 `metaclaw-bench run --scene-per-train N`——跟纯基线评测走的是同一个 `metaclaw-bench run` 命令，只是多一个触发训练的 flag，所以官方训练和基线评测产出的 report 格式本来就是一致的（`infer_cmd.py`→`scoring_cmd.py`→`report_cmd.py` 一条龙）。**我们自己的 `metaclaw_rollout_driver.py` 没走这条流水线**——用的是自己的 Hybrid RL（GRPO+OPD topk-select，跑在 slime+Megatron 上），架构上没法塞进"一个同步 CLI 命令里顺便调训练"这个模型，所以之前只输出一个简化的 `final_scores.json`，没有跟官方对齐格式。用户指出这个不一致后，把 `report_cmd.py::run_report`/`_render_markdown` 的聚合与渲染逻辑原样搬过来（新增 `_build_report`/`_render_report_markdown`），改成读这次跑的内存里的 round 记录而不是扫描 `scoring.json` 文件，输出**同样文件名、同样结构**的 `report.json`/`report.md`——训练完和基线评测的报告可以直接放在一起对照看，不用换算格式。
+
+`_score_round_official` 的返回结构也同步改成对齐官方 `scoring_cmd.py::_score_one` 的字段（`test_id`/`group_id`/`round_id`/`question_type`/`score`/`metrics`），不再只留 `question_type`/`score` 两个字段——`metrics`（`exact_match`/`f1`/`iou`/`precision`/`recall`/`passed` 等）本来就是 `_score_multi_choice`/`_score_file_check` 算出来的，之前只是没保留。
+
+两点跟官方 report 的已知差异，如实标注在输出里，不是缺陷：
+- **Token Usage 恒为 0**：官方 `report_cmd.py` 读的是 `infer_result.json` 里 `llm_log.messages[].usage`，我们的 driver 从来不落这种结构化文件（`_run_openclaw_agent` 只拿到原始 stdout 文本），所以这块数据我们确实没有——保留这个字段位置（都填 0）是为了跟官方 report 字段对齐、方便并排对比，不是伪造数据。（顺带一提，训练前基线那份报告的 Token Usage 也是 0/0——查过 `_extract_agent_tokens` 代码，那是 MetaClaw 自己的日志格式没读到 usage 字段导致的统计口径问题，不代表推理没有真的发生。）
+- **`report.json` 没有 Compl. 字段**：Compl.（仅 file_check 通过率）是本项目为了对应论文 Table 1 才额外算的量，不是 `report_cmd.py` 本身的概念，所以没有塞进 `report.json`（保持跟官方 schema 完全一致），而是在 `report.md` 末尾单独加一行、日志里也打出来。
+
+用合成数据验证过：两天的 multi_choice + file_check 混合记录，`_build_report` 算出的 summary/by_task 聚合数字和官方 `report_cmd.py::run_report` 手算结果一致；`_render_report_markdown` 渲染出的表格格式（列名、顺序、`-`占位）跟真实基线报告贴出来的样例逐列对得上。真实训练环境的 report 内容尚未验证。
 
 ### 已废弃：独立 SGLang + `metaclaw-bench run` 打分法（2026-08-18 提出，同日撤回）
 
