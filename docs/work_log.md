@@ -1755,24 +1755,27 @@
   - 记录了一条操作提醒（非分析结论）：这次基线打分用的独立 SGLang（4B，:30002）和关闭状态的 `rl-training-headers` 插件目前仍是这个状态，**下次提交训练前必须重新 `openclaw plugins enable rl-training-headers`**（训练走 30000 代理，代理依赖这个标记做 session 分派，忘记开等于重蹈这次迁移最早发现的那个问题）
 → 详见 `metaclaw_migration_plan.md`"基线结果（用于后续对比，2026-08-18 定版）"
 - **第三次真实训练已提交，等待次日结果**：`rl-training-headers` 重新 enable，开新的 `METACLAW_PROGRESS_DIR`，用今天这一整套修复（context 32768→65536、resume 空天误判漏洞、report 格式对齐官方+自动落盘、人类可读转录）从 day01 完整重新提交。今天两次真实训练分别卡在网关鉴权和 context overflow，这次是第一次有机会真正跑出训练样本——重点看今天的修复是不是都生效了。
+- **提交后发现新问题并当场修复：人类可读转录在真实训练里不是实时可见的**。CLI 反馈 `metaclaw_rollout.log` 里只有 `logger.info` 摘要，没有当天早些时候加的 `>> Query -> OpenClaw` 转录。诊断：Python `stdout` 重定向到文件（启动脚本的 `> metaclaw_rollout.log 2>&1 &`）会从行缓冲切换成全块缓冲（4-8KB 才刷新），`logging` 默认走 `stderr` 不受影响，所以只有摘要行实时可见，`print()` 内容已经执行、只是堵在缓冲区里没写进文件。**修复**：`if __name__ == "__main__":` 里加 `sys.stdout.reconfigure(line_buffering=True)`。用真实子进程+重定向到文件的方式复现过问题（不加这行时子进程没退出前文件读不到内容）、验证过修复有效（加了这行后子进程没退出前就能读到内容）——修复前后各测一遍，不是单纯读代码猜的。**这次已提交的训练跑的是旧代码，这个修复要等下一次重新提交才会生效**；这次先靠 `logger.info` 摘要判断训练是否正常——已确认 `day01` 出现过 `agent_succeeded=True`/`passed=True`，训练链路本身是通的，只是详细转录这次看不到实时更新
+→ 详见 `metaclaw_migration_plan.md`"训练过程可读性"补充修复部分
 
 ### 当前状态（2026-08-18）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。
-**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复；[x] 训练日志补上跟 Personal Agent Track `simulation.log` 同等详细程度的人类可读转录；[x] **训练前基线已定版**（对齐基线，Acc.=8.1%/Compl.=0.0%，`run_20260818_141305`，后续训练成果对比这份数据）。**第三次真实训练已提交，等待次日结果**。
+**MetaClaw 迁移**：同 08-17，另加：[x] 第一次真实训练零样本问题的两个根因（网关 token 未共享、verdict/close 提交 401 被静默吞掉）已定位并修复；[x] Acc./Compl. 改成边训练边算分（跟论文 Full 档方法学对齐，唯一产出方式）；[x] 按天断点续跑，手动触发（`METACLAW_RESUME=1` + `METACLAW_PROGRESS_DIR`），修复空天误判"已完成"的漏洞；[x] 训练 report 格式对齐官方 `report.json`/`report.md`，且默认自动落盘（`METACLAW_REPORT_DIR`，跟续跑开关解耦）；[x] **第二次真实训练零样本问题**（context overflow，32768→65536）已定位并修复；[x] 训练日志补上跟 Personal Agent Track `simulation.log` 同等详细程度的人类可读转录，并修复了转录不实时可见的缓冲问题；[x] **训练前基线已定版**（对齐基线，Acc.=8.1%/Compl.=0.0%，`run_20260818_141305`，后续训练成果对比这份数据）。**第三次真实训练已提交并确认训练链路本身走通**（`day01` 已出现 `agent_succeeded=True`/`passed=True`），等待次日完整结果；转录缓冲修复要等下次重新提交才生效。
 
 ### 已知限制 / 未解决
-同 08-17，未变，另加：**网关鉴权修复 + 边训练边算分改动 + 手动断点续跑 + report 格式对齐/自动落盘 + context overflow 修复，均未在真实训练中验证**（今天两次真实训练都还没有请求真正跑通过——先卡在网关鉴权、后卡在 context overflow——第三次是第一次有机会真正检验这些修复）；`[RL-TRAINING-META]` 标记在真实训练请求里是否真的存在，尚未验证。
+同 08-17，未变，另加：**边训练边算分改动 + 手动断点续跑 + report 格式对齐/自动落盘 + context overflow 修复，尚未看到完整真实训练结果**（链路本身已确认走通，`agent_succeeded=True` 已出现，但完整 30 天跑完后的 report/Acc.-Compl. 数字还没看到）；`[RL-TRAINING-META]` 标记在真实训练请求里是否真的存在，尚未验证；转录缓冲修复这次没生效（旧代码在跑），下次重新提交才能看到实时转录。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**查看第三次训练的真实结果**——重点确认：`agent_succeeded=True` 是否开始出现（网关鉴权+context 两处修复是否真的生效）、checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合和 `report.md` 是否正常输出且格式跟基线一致、**真实请求里是否出现 `[RL-TRAINING-META]` 标记**（决定确定性 reward/步骤判官分派是否真的生效）、训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有提升；若训练过程中中断过，检查 `METACLAW_RESUME=1` 续跑（含空天重跑）是否按预期工作
+2. **MetaClaw 迁移**：**查看第三次训练的完整结果**——重点确认：checkpoint 目录是否开始创建、driver 日志里 Acc./Compl. 实时聚合和 `report.md` 是否正常输出且格式跟基线一致、**真实请求里是否出现 `[RL-TRAINING-META]` 标记**（决定确定性 reward/步骤判官分派是否真的生效）、训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有提升；若训练过程中中断过，检查 `METACLAW_RESUME=1` 续跑（含空天重跑）是否按预期工作；下次重新提交训练时确认转录缓冲修复生效（`tail -f` 能实时看到 `>> Query -> OpenClaw`）
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **本次已提交训练（第三次）的真实结果**（网关鉴权+context overflow 两处修复是否真的解决了零样本问题、`[RL-TRAINING-META]` 标记是否真的存在、resume/report 格式是否按预期工作）
+- [ ] **本次已提交训练（第三次）的完整结果**（30 天跑完后的 report/Acc.-Compl. 数字、`[RL-TRAINING-META]` 标记是否真的存在、resume/report 格式是否按预期工作）
 - [ ] 训练成果相对基线（Acc.=8.1%/Compl.=0.0%）有没有真实提升
+- [ ] 转录缓冲修复在下一次训练里是否真的解决了实时可见问题
 - 其余同 08-17（见上）
 
 ---

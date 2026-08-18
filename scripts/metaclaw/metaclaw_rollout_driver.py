@@ -986,5 +986,15 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # 2026-08-18: stdout switches from line-buffered to fully block-buffered
+    # (4-8KB) the moment it's not a tty -- exactly what the launch script's
+    # `> metaclaw_rollout.log 2>&1 &` redirect does. logging's default
+    # handler writes to stderr, which stays unbuffered regardless, so only
+    # the terse logger.info lines showed up in real time while the detailed
+    # print() transcripts (added this same day for readability) sat in the
+    # buffer, invisible to `tail -f` until it happened to fill or the
+    # process exited. Force line buffering so both streams behave the same
+    # way once redirected to a file.
+    sys.stdout.reconfigure(line_buffering=True)
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
