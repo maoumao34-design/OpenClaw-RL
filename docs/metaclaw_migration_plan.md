@@ -140,7 +140,7 @@ MetaClaw 本质上也是一种 tool-call 场景（agent 靠 `run_command` 工具
 
 ### 验收方案
 
-1. **主指标**：Acc./Compl.，跟论文 Table 1 方法学对齐——**训练本身这一趟运行的实时聚合分数**，不是训练前/训练后两次独立评测的对比（原因和设计见下方"训练/评测数据重叠"一节）。
+1. **主指标**：Acc./Compl.，跟论文 Table 1 方法学对齐——**训练本身这一趟运行的实时聚合分数**，不是训练前/训练后两次独立评测的对比（原因和设计见下方"训练/评测数据重叠"一节）。跟训练前基线（见下方"基线结果"一节，Acc.=8.1%/Compl.=0.0%）对比，判断训练有没有让这两个数字比基线好。
 2. **过程指标**：逐日准确率曲线（3 日滚动平均，对照论文 Figure 2 的画法），看有没有出现"前几天攒信号、之后明显提升"的结构性拐点。
 3. **训练健康度指标**：沿用这次会话验证过的一套（A/B/D 触发频率、`+1`/`-1` 分布、batch 组成、是否出现类似"170852 vs 160713"那种概率性成功/失败的现象）。
 
@@ -198,7 +198,28 @@ run_cmd = [
 
 曾经想过"起独立 SGLang 服务 + 跑官方 `metaclaw-bench run`"给任意 checkpoint（包括训练前 base、训练后 checkpoint）单独打分，作为跟下面"边训练边算分"方法并存的补充手段。**用户指出这是错误做法后撤回**：这个方法打分用的 `all_tests.json` 跟训练用的是同一份 30 天数据，训练后的 checkpoint 拿这份数据打分，分数提升说不清是泛化能力还是记住了具体题目——挪到"训练完再单独测"并不能解决训练测试集重叠问题，只是把重叠发生的时间往后挪了一步，并没有比下面的实时聚合方法更干净，之前"更干净的补充手段"这个说法是错误判断。相应的 `scripts/metaclaw/compute_table1_scores.py` 已删除（`scripts/launch_simulator.sh` 本身是 Personal Agent Track 外部 Simulator 用的通用脚本，不受影响，未删除）。
 
-Acc./Compl. 现在**唯一**的产生方式见下方"训练/评测数据重叠"一节——`metaclaw_rollout_driver.py` 自己在训练过程中实时算分聚合。**训练跑完保存的最终 checkpoint 仍然保留，作为最终交付结果的一部分**（跟 Acc./Compl. 数字本身是否"干净"无关，checkpoint 本身没有被拿去跟同一份数据重新对比评分的问题）——这部分不需要额外代码，Megatron `--save`/`--load` 机制本来就会持续存盘。
+Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐的产生方式见下方"训练/评测数据重叠"一节——`metaclaw_rollout_driver.py` 自己在训练过程中实时算分聚合。**训练跑完保存的最终 checkpoint 仍然保留，作为最终交付结果的一部分**（跟 Acc./Compl. 数字本身是否"干净"无关，checkpoint 本身没有被拿去跟同一份数据重新对比评分的问题）——这部分不需要额外代码，Megatron `--save`/`--load` 机制本来就会持续存盘。
+
+**这条"撤回"不等于禁止再用 `metaclaw-bench run` 打训练前基线分**——被撤回的具体做法是"训练后再用同一套方法给 checkpoint 单独打分、拿来跟基线对比"，那才是训练测试集重叠的地方（checkpoint 已经在这份数据上训练过）。**训练前**（模型完全没见过这份数据）用这个方法打一次性的基线分，不存在这个问题，是干净的 zero-shot 测量，跟论文自己 Table 1 的"Baseline"那一行是同一类东西——下面"基线结果"一节记录的就是这样打出来的一次性基线，仅此一次，不会在训练后重复用同一方法再打一次跟它对比。
+
+### 基线结果（用于后续对比，2026-08-18 定版）
+
+**这是本次 MetaClaw 迁移唯一采信的训练前基线，后续训练成果（`metaclaw_rollout_driver.py` 输出的 `report.json`/`report.md`）都应该跟这份数据对比。**
+
+打分条件（"对齐基线"，第二次跑，取代第一次不对齐的版本）：
+- 6 个系统级补丁全部按训练时的实际状态部署：`sglang execution-bias`/`embedded-agent overflow-recovery`/`system-prompt output-directives`/`cli-compaction`/`silent-reply-policy` 五个版本漂移补丁**开启**；`rl-training-headers` 插件**关闭**（原因见"已知风险/限制"——这个插件注入的 `[RL-TRAINING-META]` 标记只有训练代理会剥除，基线直连 SGLang 没有剥除环节，开着会让模型看到训练时看不到的内容）。
+- 独立 SGLang 服务（4B，端口 30002）+ 官方 `metaclaw-bench run` 走完整 `infer→scoring→report` 流水线，30 天全量、346 题。
+
+结果（目录 `/dfs/data/openclaw-rl-project/metaclaw-baseline-eval-aligned/run_20260818_141305/`）：
+
+| 指标 | 对齐基线（采信） | 不对齐（作废，仅供参考） |
+|------|:---:|:---:|
+| Acc. | **8.1%**（Correct=28.0/346） | 5.7% |
+| Compl.（224 道 file_check） | **0.0%**（0/224，全部 `score=0`/`passed=0`） | 0.0% |
+
+**关键结论：给 6 个补丁对齐没有把 Compl. 从 0 拉起来，也证实了之前"`Compl.=0.0%` 可能是 `rl-training-headers` 标记污染"这个怀疑是错的——4B 模型在 MetaClaw 的 file_check 类任务上一题都做不对，是真实的基线能力上限，不是链路/污染问题。** Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23），这部分才是真的被 header 污染拖累过的——这也印证了之前查证 `rl-training-headers` 会往系统提示词注入无关内容这个判断本身是对的，只是它的影响范围止步于 multi_choice，没有波及 file_check（file_check 靠的是能不能正确操作文件，多一行系统提示词噪音显然不是 4B 模型在这类任务上一题不中的原因）。
+
+**当前机器状态提醒（操作性，非分析结论）**：这次基线打分用的独立 SGLang（4B，:30002）打分后仍在运行，`rl-training-headers` 插件仍是关闭状态——**下一次提交训练前必须重新 `openclaw plugins enable rl-training-headers`**（训练走 30000 端口代理，代理依赖这个插件注入的标记做 session 分派，关着的话又会静默回退到 Personal Agent Track 原逻辑，重蹈这次迁移最早发现的那个问题）。是否需要先停掉这个独立 SGLang 服务、以及下一趟 8 卡训练什么时候提交，由用户决定。
 
 ### 已知风险 / 限制（如实列出，展示时需要一并说明）
 
@@ -207,7 +228,7 @@ Acc./Compl. 现在**唯一**的产生方式见下方"训练/评测数据重叠"�
 - `file_check` 题的 OPD hint 改用 checker stdout 而不是静态 `feedback.incorrect`（见下方查证记录第 1 条）——这条修正逻辑已经想清楚，但**实际接入代码、实测蒸馏效果是否真的比静态文字更好，还没做**。
 - 按天顺序、concurrency=1 串行喂数据这个设计，跟现有 Megatron/slime 的 batch 收集逻辑（`_drain_output_queue` 等）配合是否顺畅、吞吐是否够用，还没有实测验证（架构上确认可行，性能上未知）。
 - 跨天没有任何文件/session 状态持久化（见下方查证记录第 3 条）——每天的"记忆"完全依赖模型权重本身的更新，如果某天的训练没有真正让权重产生可观测变化，后续天数就学不到前面天数的教训，这是一个比"batch 组成随机性影响训练成功率"（本项目在 separate 阶段反复验证过的现象）更敏感的失败模式，需要在正式跑之前想清楚怎么监控。
-- **`rl-training-headers` 插件对训练/基线两条链路的实际效果不对称，直接影响可比性**（2026-08-18 发现）：这个插件的注入是无条件的——只要启用，每次 `before_prompt_build` 都往系统提示词末尾追加 `[RL-TRAINING-META] session_id=... turn_type=...`（见上"启动脚本必须复用的现有依赖"一节）。这条标记只有**训练代理**（30000 端口，`openclaw_opd_api_server.py::_strip_rl_meta_from_messages`）才会在转发给 SGLang 之前剥掉——训练时模型看到的是干净提示词。但如果基线评测走的是"直连 SGLang"（不经过训练代理，比如已废弃的独立打分法当时用的那种链路），这条标记不会被剥，模型会看到训练时从没见过的这行怪异后缀，可能是干扰输出格式的一个真实原因（不确定，未验证，仅是合理怀疑）。**已有的一份训练前基线报告（`run_20260818_101454`）大概率受此影响，`Compl.=0.0%` 有可能部分归因于此**。要拿干净基线，重跑前应 `openclaw plugins disable rl-training-headers`（比想办法接入剥除逻辑更简单）。
+- **`rl-training-headers` 插件对训练/基线两条链路的实际效果不对称**（2026-08-18 发现，同日用对齐基线验证过实际影响范围）：这个插件的注入是无条件的——只要启用，每次 `before_prompt_build` 都往系统提示词末尾追加 `[RL-TRAINING-META] session_id=... turn_type=...`（见上"启动脚本必须复用的现有依赖"一节）。这条标记只有**训练代理**（30000 端口，`openclaw_opd_api_server.py::_strip_rl_meta_from_messages`）才会在转发给 SGLang 之前剥掉——训练时模型看到的是干净提示词。基线评测走的是"直连 SGLang"，不经过训练代理，这条标记不会被剥，模型会看到训练时从没见过的这行后缀。**用关掉插件的"对齐基线"重跑验证过实际影响范围**：Acc. 从 5.7%→8.1%，提升全部来自 multi_choice（满分 12→18、部分正确 19→23）——说明这条标记确实污染过 multi_choice 的输出；但 **`Compl.=0.0%` 两次结果完全一样，没有被这条标记影响，是文件操作类任务的真实基线能力上限，不是链路污染**（完整数据见下方"基线结果"一节）。结论：这个不对称是真实存在的，但只影响 multi_choice 类型的评测/训练，不影响 file_check——重跑基线或做任何直连 SGLang 的评测前仍然应该 `openclaw plugins disable rl-training-headers`，但不要因为这条风险去怀疑 file_check 相关的数字。
 
 ### 训练故障复盘与修复：metaclaw_migration_20260817_181404（2026-08-18）
 
