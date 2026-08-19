@@ -1795,24 +1795,29 @@
 - **发现并修复一个独立的问题：默认提交训练会静默加载上一次的（可能训坏的）权重**。用户追问"权重续训"跟"按天续跑"是不是两套机制，CLI 核对 `run_openclaw_topk_select_modelfactory.sh` 确认：`--load "${SAVE_CKPT}"` 是无条件加的（更早为 Personal Agent Track 真实崩溃续训加的），`run_metaclaw_migration_modelfactory.sh` 里 `SAVE_CKPT` 默认值原来是固定路径（不带时间戳）——只要上次训练在这个目录存过 checkpoint，下次提交训练**即使完全不碰 `METACLAW_PROGRESS_DIR`/`METACLAW_RESUME`** 也会静默加载那份权重继续训，不是从干净 base 开始，跟"实验阶段每次都要重新开始跑"这个明确要求直接冲突。之前"训练侧 checkpoint 本来就有 `--load` 自动续训，不受这次改动影响"这个判断没有意识到这正是问题所在
   - **修复**：`SAVE_CKPT` 默认值改成带时间戳（跟 `LOGS_DIR` 共用脚本开头统一生成的 `RUN_TIMESTAMP`）——不显式设置就天然是新目录，`--load` 自动回退到干净预训练权重；旧 checkpoint 不删，留在各自时间戳目录下，需要接着训某次跑出来的权重仍可以手动指定 `SAVE_CKPT`。用 bash 验证过默认解析和显式覆盖两种情况都符合预期
 → 详见 `metaclaw_migration_plan.md`"修复：默认提交训练会静默加载上一次的（可能训坏的）权重"
+- **发现并修复第三个独立问题：训练暂停期间的 503 被当成基础设施失败，整段天数被空转吃掉**。用上面两个修复后重新提交的 `metaclaw_migration_20260819_132608` 从 `day06` 起大段"没答题"，CLI 沿时间线核对 `submission paused`、权重同步和 rollout 失败，定位到跟前一天那两个 bug不是同一类——训练信号是干净的，是 slime 攒满一个 batch（16 条）后 `pause_submission()`（真实观测一次完整暂停窗口 4 分 20 秒，含 66.5 秒 `save_model`）期间，代理对所有请求直接 503（`submission_enabled` 检查在最前面），OpenClaw 自己不重试，`rc=1` 退出，driver 原来的 `AGENT_RETRY` 循环两次尝试之间没有任何等待，扛不住几分钟的暂停，一次暂停窗口就能连续吃掉后面好几天
+  - CLI 用真实日志核实：日志里其实有三类失败——503（还没开始处理就拒绝，能靠等）、timeout（已经生成很久才死，不该跟 503 用同一套长等待，风险是把真实的 GPU 争用问题也拖成空转）、generate-fail（`rc==0`，已在前一次修复里确认走正常打分通道）——不能一概而论
+  - **修复**：只针对 503 单独加一个独立、耐心的等待重试环，不消耗现有 `AGENT_RETRY`/`VERDICT_RETRY` 预算，其余失败类型（含 timeout）完全不受影响：`_run_round`（agent 子进程）用 `stderr` 文本匹配 `"503 status code"`（OpenClaw 自己 `FailoverError` 的确切文案）；`_post_with_retry`（verdict/close 提交）用 `httpx` 结构化 `response.status_code == 503`（更精确，httpx 自己的错误文案跟 OpenClaw 不是同一段文字）。15 秒重试间隔，900 秒（15 分钟）总预算，用 `time.monotonic()` 测墙钟时间（不是单纯累加 sleep，因为每次失败的进程启动本身也要 1-2 秒）
+  - 5 项合成数据回归测试全部通过（503-then-成功、503 耗尽预算后正确放弃、timeout 完全不进等待环——三点都覆盖了 `_run_round`/`_post_with_retry` 两条路径）。真实训练环境（真实的分钟级暂停窗口）尚未验证
+→ 详见 `metaclaw_migration_plan.md`"修复：训练暂停期间的 503 被当成基础设施失败，整段天数被空转吃掉"
 
 ### 当前状态（2026-08-19）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
 
 ### 已知限制 / 未解决
-同 08-18，未变，另加：**训练信号修复 + checkpoint 默认路径修复均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"。
+同 08-18，未变，另加：**训练信号修复 + checkpoint 默认路径修复 + 503 暂停重试修复均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净权重+干净信号下的真实效果
+2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部三处修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`、暂停窗口期间日志出现 503 pause-retry 等待记录而不是直接判定基础设施失败。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净权重+干净信号+完整天数下的真实效果
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **训练信号四处修复 + checkpoint 默认路径修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
-- [ ] 干净权重+干净信号下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
+- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
+- [ ] 干净权重+干净信号+完整天数下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
 - 其余同 08-18（见上）
 

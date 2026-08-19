@@ -359,6 +359,38 @@ CLI 核对 `run_openclaw_topk_select_modelfactory.sh` 发现一个跟今天训�
 
 **修复**：`SAVE_CKPT` 默认值改成带时间戳（跟 `LOGS_DIR` 共用同一个 `RUN_TIMESTAMP` 变量，脚本开头统一生成一次，方便按时间戳对应同一次训练）——不显式设置 `SAVE_CKPT` 提交训练，目录天然不存在，`--load` 自动回退到 `--ref-load` 干净权重，不需要手动删除旧目录或记住换路径。旧 checkpoint 不会被清掉，各自留在自己的时间戳目录下；需要的话仍然可以手动 `SAVE_CKPT=<旧路径>` 显式指定去接着训某一次跑出来的权重，只是不再是"什么都不设"时的默认行为。用 bash 单独验证过：默认解析出的 `SAVE_CKPT`/`LOGS_DIR` 用的是同一个时间戳；显式设置 `SAVE_CKPT` 时覆盖仍然生效，不受这次改动影响。
 
+### 修复：训练暂停期间的 503 被当成基础设施失败，整段天数被空转吃掉（2026-08-19）
+
+**现象**：`metaclaw_migration_20260819_132608`（换了新 `SAVE_CKPT`、修好训练信号污染之后提交的这次）从 `day06` 起，`Acc.` 不再是"答错了"的低分，而是大段"没答题"——CLI 沿时间线比对 `submission paused`、权重同步和 rollout 失败，定位到这不是训练信号问题（跟前一天那两个 bug 不是同一类），而是 **MetaClaw driver 和 slime 换权重时的暂停窗口在抢跑**。
+
+**根因（代码+真实日志核实）**：`openclaw_opd_api_server.py` 的 `submission_enabled` 检查在最前面（鉴权之后、真正处理请求之前）：
+
+```python
+if not owner.submission_enabled.is_set():
+    raise HTTPException(status_code=503, detail="submission paused for weight update")
+```
+
+slime 自己的 rollout 循环攒满一个训练 batch（16 条）就会 `pause_submission()`，直到这一步的 actor train + 存 checkpoint + `update_weights` 全部跑完才 resume——真实观测一次完整暂停窗口是 **4 分 20 秒**（含一次 66.5 秒的 `save_model`），不是瞬间的事。这个窗口内所有打到 30000 端口的请求，包括 `openclaw agent` 自己发的，全部立即收到 503。OpenClaw 自己对此没有退避重试，几乎立刻以 `FailoverError: 503 status code (no body)` 失败退出（`rc=1`）。driver 原来的 `AGENT_RETRY` 循环两次尝试之间**没有任何等待**，就算调大这个值也扛不住几分钟的暂停——一次暂停窗口就能把后面好几天的题目连续判成"基础设施失败"，日志显示 `day06` 整天、`day07` 全天、`day08` 前几题都被这样吃掉。**训练样本本身没有被污染**（暂停期间还在飞的那一轮会被 slime 自己标 `generated_while_paused` 丢弃，不会进 GRPO；503 也不会被当成 -1 提交）——纯粹是"天数被空转，Table 1 式的 30 天 Acc 不能用，前几天的信号还能看"。
+
+**跟前一天训练信号污染的区别**：那次是权重真的被 13-token 残片污染训坏；这次权重是干净的，只是"没来得及答题"。之所以这次才暴露：昨天的 stub 让训练很快出结果，暂停窗口短，driver 来不及扫过整天；这次 stub 修好之后暂停变长，这个原本就存在的设计漏洞才显现出来。
+
+**日志里其实有三类失败，不能一概而论**（这点由 CLI 用真实日志核实指出，避免"一律等待"误伤）：
+
+| 类型 | 例子 | 特征 | 能不能靠"等暂停结束"救 |
+|------|------|------|------|
+| 503 | `day06` 整天、`day07`、`day08` 开头 | 代理还没开始处理就直接拒绝，约 1-2 秒/题 | 能——这正是吃掉天数的原因 |
+| timeout | `day05 r4-r7/r13`："LLM request timed out" | 已经真实生成了很久才死 | 不一定——用同一套长等待去救，风险是把 GPU 争用/超长序列这类真实问题也一起拖成更长的空转 |
+| generate-fail | `day08 r11` 等 | `rc==0`，OpenClaw 自己的兜底文案 | 不该走这条——已经在前一次修复里确认走正常打分通道，不受这次改动影响 |
+
+**修复**：只针对 503 这一种失败模式加一个独立、耐心的等待重试环，其余失败模式（timeout、崩溃、别的 `FailoverError`）维持现在"立刻放弃、尊重 `AGENT_RETRY`/`VERDICT_RETRY`（默认 0，无等待）"的行为不变：
+
+- **`_run_round`**（`openclaw agent` 子进程调用）：每次失败先检查 `stderr` 里有没有 `"503 status code"` 这个特征串（OpenClaw 自己 `FailoverError` 的确切文案）。命中就进入独立等待环：`sleep METACLAW_PAUSE_RETRY_INTERVAL`（默认 15 秒）后重试同一轮，不计入 `AGENT_RETRY` 的次数预算；累计等待时间（用 `time.monotonic()` 测的墙钟时间，从第一次命中 503 算起，不是单纯把 sleep 加总——每次失败的 agent 启动本身也要 1-2 秒，这部分也要算进预算）超过 `METACLAW_PAUSE_RETRY_MAX_WAIT`（默认 900 秒＝15 分钟，比观测到的 4 分 20 秒留了将近 4 倍余量，考虑到序列更长、又可能撞上存盘会更久）才真正判定为基础设施失败。没命中 503 特征串的失败（timeout 等）完全不进这个等待环，直接走原来的 `AGENT_RETRY` 逻辑，不受影响。
+- **`_post_with_retry`**（verdict/close 提交）：同样的独立等待环，但检测方式更精确——这条路径直接用 `httpx`，503 会变成 `HTTPStatusError`，直接读 `e.response.status_code == 503` 判断，不用像 agent 侧那样匹配文本（那边文案是 `"503 Service Unavailable"`，跟 OpenClaw 自己的 `"503 status code"` 不是同一段文字，两边分开检测是对的，不能共用一个字符串常量）。等满预算仍然只是打 log、不向上抛异常（维持原有"记录后放行"的设计），但日志明确写成"pause-retry exhausted"，跟普通的"submission failed"分开，事后翻日志能一眼分清是哪种失败。close 提交如果撞上 503 也一样会进等待环——close 本身很便宜（不用重新生成任何内容），等的只是暂停结束，这么处理没问题。
+
+暂时不做的：给 `/healthz` 加字段暴露 `submission_enabled` 状态、让 driver 精确轮询"是否已恢复"（比字符串/状态码匹配更精确，但要多改一处代理代码）。这次 503 的成因单一（就是 `submission_enabled` 暂停），现有检测已经足够可靠，没有需要区分的"第二种 503"。如果以后真出现"等满 15 分钟仍然 503"的情况，再考虑加这一层。
+
+**验证方式**：新增 5 项合成数据回归测试，覆盖：`_run_round` 遇 503 重试后成功、遇 503 耗尽预算后正确放弃（用极短的等待参数验证墙钟计时逻辑本身是对的，不是靠真的等 15 分钟）、timeout 类失败完全不进等待环（零等待、只尝试一次，验证跟 503 处理是互斥的两条路径）；`_post_with_retry` 遇 503 重试后成功、遇 503 耗尽预算后正确放弃且不抛异常。全部通过，真实训练环境（真实的 4 分钟量级暂停窗口）尚未验证。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

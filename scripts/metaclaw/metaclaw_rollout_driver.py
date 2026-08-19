@@ -59,6 +59,7 @@ import logging
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -185,6 +186,54 @@ if not os.environ.get("OPENCLAW_GATEWAY_TOKEN"):
 # reading alone.
 AGENT_RETRY = int(os.environ.get("METACLAW_AGENT_RETRY", "0"))
 VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
+
+# 503-gated pause-retry (2026-08-19) -- NOT the same mechanism as
+# AGENT_RETRY/VERDICT_RETRY above, deliberately independent budget, always
+# on (no env var to disable -- unlike AGENT_RETRY there's no "maybe it
+# doesn't help" question here, a 503 from this proxy always specifically
+# means submission_enabled.is_set() is False, i.e. genuinely temporary).
+# Root cause (metaclaw_migration_20260819_132608, confirmed via direct
+# code read of openclaw_opd_api_server.py's submission_enabled check):
+# slime's own rollout loop calls pause_submission() the moment a training
+# batch fills up, and doesn't resume until actor train + checkpoint save +
+# update_weights finish (observed once: 4m20s, including a 66.5s
+# save_model) -- every request hitting the proxy during that window,
+# `openclaw agent`'s own included, gets an instant 503. With
+# AGENT_RETRY's default of 0 (and even a nonzero value, since that loop
+# has no sleep between attempts), a single pause window was silently
+# eating every remaining round for the rest of that day and several days
+# after it -- not a training-signal-corruption bug like the two fixed
+# 2026-08-19 (rollout/training data stayed clean), but a real-data-loss
+# one: the driver's own Acc./Compl. aggregate call these rounds "N/A
+# infra failure" when the truth is "never got a chance to answer".
+#
+# Gated specifically on the 503 signal, NOT applied to every kind of
+# failure -- confirmed via real log review that timeouts ("LLM request
+# timed out", already deep into a real generation attempt when they die)
+# are a genuinely different failure mode than 503 (proxy rejects before
+# doing any work at all) and must NOT get the same patient-wait treatment:
+# blindly waiting out a timeout the same way risks compounding a real
+# GPU-contention/long-sequence problem into an even longer stall, whereas
+# waiting out a 503 is cheap and its resolution is guaranteed (the pause
+# always lifts once the training step finishes). Non-503 failures
+# (timeout, crashes, any other error) get none of this -- they fall
+# straight through to the existing AGENT_RETRY/VERDICT_RETRY behavior,
+# unchanged.
+PAUSE_RETRY_INTERVAL_SECONDS = float(os.environ.get("METACLAW_PAUSE_RETRY_INTERVAL", "15"))
+PAUSE_RETRY_MAX_WAIT_SECONDS = float(os.environ.get("METACLAW_PAUSE_RETRY_MAX_WAIT", "900"))
+
+# OpenClaw's own FailoverError text when its configured model provider
+# (this proxy) returns 503 -- observed verbatim in real stderr:
+# "FailoverError: 503 status code (no body)". This is what _run_round
+# checks in the `openclaw agent` subprocess's stderr (we have no
+# structured HTTP visibility into that subprocess's own internal
+# requests, only its exit code/stdout/stderr). _post_with_retry does NOT
+# use this string -- it talks to the proxy directly via httpx and gets a
+# real status code (`e.response.status_code == 503`), which is more
+# precise than text-matching and catches this even if httpx's own
+# rendering of a 503 differs from OpenClaw's ("503 Service Unavailable"
+# vs OpenClaw's "503 status code" are not the same text).
+_AGENT_PAUSE_MARKER = "503 status code"
 
 # Day-level resume, take 2 (2026-08-18 -- supersedes the 2026-08-17 "no
 # resume, full restart" decision recorded in metaclaw_migration_plan.md).
@@ -516,24 +565,60 @@ async def _post_with_retry(
     in this driver's own logs (the actual metaclaw_migration_20260817_181404
     401s were only found by reading the proxy's log directly, not this
     driver's).
+
+    503 specifically (submission_enabled paused, see PAUSE_RETRY_* module
+    comment) gets its own patient wait-and-retry, independent of `retry` --
+    a verdict/close POST landing in a pause window is cheap to retry (no
+    generation involved, just waiting for the pause to lift), and losing it
+    silently would mean a round that genuinely got answered never actually
+    reaches the training queue. This still never raises to the caller on
+    final failure (existing behavior, log-and-move-on), it just tries
+    harder specifically for this one well-understood, always-temporary
+    failure mode before giving up.
     """
     headers = {**headers, "Authorization": f"Bearer {_API_KEY}"} if _API_KEY else headers
-    for attempt in range(retry + 1):
+    attempt = 0
+    pause_wait_start: float | None = None
+    while True:
         try:
             response = await client.post(PROXY_URL, json=payload, headers=headers)
             response.raise_for_status()
             return
         except Exception as e:
+            status_code = getattr(getattr(e, "response", None), "status_code", None)
+            if status_code == 503:
+                if pause_wait_start is None:
+                    pause_wait_start = time.monotonic()
+                elapsed = time.monotonic() - pause_wait_start
+                if elapsed < PAUSE_RETRY_MAX_WAIT_SECONDS:
+                    logger.warning(
+                        "[MetaClawRollout] session=%s %s 503 pause-retry "
+                        "elapsed=%.0fs/%.0fs, waiting %.0fs before retry",
+                        session_id, label, elapsed, PAUSE_RETRY_MAX_WAIT_SECONDS,
+                        PAUSE_RETRY_INTERVAL_SECONDS,
+                    )
+                    await asyncio.sleep(PAUSE_RETRY_INTERVAL_SECONDS)
+                    continue
+                logger.warning(
+                    "[MetaClawRollout] session=%s %s 503 pause-retry exhausted "
+                    "after %.0fs -- giving up (this is a pause-retry timeout, "
+                    "not a generic submission failure)",
+                    session_id, label, elapsed,
+                )
+                return
+
             if attempt < retry:
                 logger.warning(
                     "[MetaClawRollout] session=%s %s submission failed (attempt %d/%d), "
                     "retrying: %s", session_id, label, attempt + 1, retry, e,
                 )
-            else:
-                logger.warning(
-                    "[MetaClawRollout] session=%s %s submission failed (final attempt): %s",
-                    session_id, label, e,
-                )
+                attempt += 1
+                continue
+            logger.warning(
+                "[MetaClawRollout] session=%s %s submission failed (final attempt): %s",
+                session_id, label, e,
+            )
+            return
 
 
 async def _send_verdict_turn(
@@ -693,9 +778,13 @@ async def _run_round(
     resume-skip.
 
     retry mirrors infer_cmd.py's own `_run_question` retry loop exactly
-    (same `for attempt in range(retry + 1)` shape, same log style) -- see
-    AGENT_RETRY module constant for why this defaults to 0 (matching
-    MetaClaw-official's own default) rather than being enabled unconditionally.
+    (same shape, same log style) -- see AGENT_RETRY module constant for why
+    this defaults to 0 (matching MetaClaw-official's own default) rather
+    than being enabled unconditionally. A 503 from the proxy (submission
+    paused for a weight update -- see PAUSE_RETRY_* module comment) is
+    handled by a SEPARATE, independent wait-and-retry loop that never
+    consumes this `retry` budget -- only non-503 failures (timeout,
+    crashes, other errors) count against it, unchanged from before.
 
     Returns (inline_score, agent_succeeded, official_score).
     agent_succeeded=False means the CLI call itself failed on every attempt
@@ -713,7 +802,9 @@ async def _run_round(
     score used for that aggregate.
     """
     rc, stdout, stderr = -1, "", ""
-    for attempt in range(retry + 1):
+    attempt = 0
+    pause_wait_start: float | None = None
+    while True:
         rc, stdout, stderr = await _run_openclaw_agent(
             session_id=session_id,
             message=query,
@@ -725,20 +816,48 @@ async def _run_round(
         )
         if rc == 0:
             break
+
+        if _AGENT_PAUSE_MARKER in stderr:
+            if pause_wait_start is None:
+                pause_wait_start = time.monotonic()
+            elapsed = time.monotonic() - pause_wait_start
+            if elapsed < PAUSE_RETRY_MAX_WAIT_SECONDS:
+                logger.warning(
+                    "[MetaClawRollout] session=%s round=%s 503 pause-retry "
+                    "elapsed=%.0fs/%.0fs, waiting %.0fs before retry",
+                    session_id, round_record["id"], elapsed,
+                    PAUSE_RETRY_MAX_WAIT_SECONDS, PAUSE_RETRY_INTERVAL_SECONDS,
+                )
+                await asyncio.sleep(PAUSE_RETRY_INTERVAL_SECONDS)
+                continue
+            logger.warning(
+                "[MetaClawRollout] session=%s round=%s 503 pause-retry exhausted "
+                "after %.0fs -- treating as infrastructure failure (this is a "
+                "pause-retry timeout, not a generic agent failure)",
+                session_id, round_record["id"], elapsed,
+            )
+            break
+
         if attempt < retry:
             logger.warning(
                 "[MetaClawRollout] session=%s round=%s openclaw agent failed "
                 "(rc=%d), retry %d/%d: %s",
                 session_id, round_record["id"], rc, attempt + 1, retry, stderr[:500],
             )
+            attempt += 1
+            continue
+        break
 
     agent_succeeded = rc == 0
     if not agent_succeeded:
+        # Attempt count deliberately not stated here -- could be `retry + 1`
+        # (generic failure path) or many more (503 pause-retry loop, see the
+        # dedicated log line already emitted above for that case); this
+        # message is a summary, not a duplicate of that detail.
         logger.warning(
-            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d) "
-            "after %d attempt(s): %s "
+            "[MetaClawRollout] session=%s round=%s openclaw agent failed (rc=%d): %s "
             "-- treating as infrastructure failure, will NOT submit a training verdict",
-            session_id, round_record["id"], rc, retry + 1, stderr[:500],
+            session_id, round_record["id"], rc, stderr[:500],
         )
         answer_text = ""
     else:
