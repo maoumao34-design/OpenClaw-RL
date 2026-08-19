@@ -1815,26 +1815,35 @@
   - 跟 MetaClaw 官方评测代码"一天一个 session"是主动分歧，明确记账：官方确定性打分从不读 transcript，这次改动不影响打分口径
   - `py_compile` 通过。**真实训练环境完全未验证**——CLI 明确要求不热补正在跑的 `153518`/`173654`，这次改动落地后由用户决定何时提交新训练；如果跟 OPD hint 接线修复同一轮验证，Acc. 提升需要分开看归因（"选择题不再被 overflow 拖累" vs "OPD 让 file_check 真的变好"，是两件事）
 → 详见 `metaclaw_migration_plan.md`"改动：session 拆分——从'一天一个 session'改成'每题一个 session'"
+- **发现并修复第六个独立问题，也是迄今最大的一个：`openclaw agent` 子进程从未传 `--agent`，`write` 实际写进了 checker 看不到的默认 agent workspace**。CLI 排查 `Compl.` 为什么一直是 0 时发现，模型经常真的在写文件（session transcript 里有真实的 `Successfully wrote N bytes` 成功回执），但文件落在 `openclaw_state_.../workspace-main/day05/`，checker 读的是 `work/workspace_day05_.../day05/`——两个完全不同的目录，`stdout` 永远是 `FAIL: cannot read ...` 不是因为没写，是写到了别的地方
+  - 沿 OpenClaw CLI 自己的源码逐层追出根因：`MetaClaw-official/benchmark/src/infer/infer_cmd.py::_run_openclaw_agent` 有 `agent_id` 参数但从未拼进 `openclaw agent` 的命令行，它唯一的官方调用方 `_run_question` 也从未传——**这个缺口在 MetaClaw 官方代码本身，driver 是直接 import 复用的，缺口原样带进来**。不传 `--agent` 时，OpenClaw 自己的 session-key 解析其实内部算对过一次默认 agent id（`resolveDefaultAgentId`，只配一个 agent 时会返回 `metaclaw_agent`），但新 session-id 第一次出现、任何 store 都找不到匹配时，兜底分支用的是原始 `opts.agentId`（`undefined`）而不是那个已经算对的结果，`normalizeAgentId(undefined)` 硬编码回落成字面量 `"main"`——OpenClaw 自己 session-key 解析代码的一处真实不一致，CLI 用本机实际安装的 OpenClaw 编译产物核对过跟源码仓库对得上
+  - **"官方 Compl. 不为 0 应该做过调整吧"——查证结果：查不到确凿规避机制，如实记录不卡修复**。仓库里唯一显式传 `--agent` 的地方是另一条无关路径（`metaclaw/utils.py::run_turn`），`_register_session_in_json` 只在题目 `"update"` 字段下才触发、不是每题都走。真正原因不确定（候选：官方论文用的 OpenClaw CLI 版本更老、这段兜底当年行为不同；或官方外层脚本在别处传了等价参数），两条都没有确凿证据，留作开放问题
+  - **影响范围**：这个缺口从 driver 第一次跑起来那天就存在，**至今为止每一次 MetaClaw 迁移训练/基线的 `Compl.`＝0.0% 都可能主要是这个原因**，不是 checker 真没找到文件，是文件从一开始就没写到 checker 会看的地方。修完不会让 `Compl.` 直接变成论文级别数字——文件内容对不对、`generate-fail`、同天 session 污染这些问题都还在，只是不再被"写到隔壁目录"锁死成 0
+  - **修复**：给 `openclaw agent` 子进程调用显式加 `--agent {agent_id}`。没有采用"整份拷贝 `infer_cmd.py` 打补丁"（`prepare_patched_*.sh` 那套模式）——那套是给会被 slime/proxy 直接 import 的模块用的；这里训练路径只用到 `_run_openclaw_agent` 这一个函数，`_run_group`/`_run_question` 完全没被用到，为两个 argv 参数拷贝 1400 行文件过重。改法是在 `metaclaw_rollout_driver.py` 里本地复制这一个函数（~40 行，逐行对照官方版本，只加一行 `--agent`），不 import 官方版本、不碰 `MetaClaw-official/` 任何文件——跟这次迁移一贯处理官方代码缺口的方式一致（比如 `OPENCLAW_GATEWAY_TOKEN` 也是写进 driver 自己的环境变量）。`agent_id` 在本地版本里是必填参数（官方是 `str | None = None`），训练路径漏传应该直接报错，不能静默retreat回这个 bug
+  - **明确没做**：MetaClaw-Bench 自己的离线评测路径（`_run_question`/`_run_group`，不经过这个 driver）目前仍未修，这次完全没用到那条路径，等真用到再处理
+  - `py_compile` 通过，新增合成测试（mock 子进程调用）确认最终 argv 精确等于 `(..., "--session-id", <id>, "--agent", "metaclaw_agent", "--message", <msg>)`。**真实训练环境完全未验证**——下一轮需要确认真实 session key 变成 `agent:metaclaw_agent:explicit:...`、写入的文件出现在正确的 `workspace_{test_id}_*` 目录、checker stdout 不再清一色 `FAIL: cannot read`。同样不热补正在跑的 job
+→ 详见 `metaclaw_migration_plan.md`"修复：`openclaw agent` 从未传 `--agent`，`write` 实际写进了 checker 看不到的默认 agent workspace"
 
 ### 当前状态（2026-08-19）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）；[x] checker 算出的 OPD hint 被无条件丢弃的问题已修复（Layer 1 收窄 file_check 静态文案退路 + Layer 2 真正接回 `accepted=True` 材料化）；[x] session 从"一天一个"拆成"每题一个"，切断了同一天题目间的 context overflow 连坐，顺带结构性解决了 08-17 的"跨 round 污染"老问题。所有改动均合成数据/官方源文件/代码核实/bash 逻辑验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）；[x] checker 算出的 OPD hint 被无条件丢弃的问题已修复（Layer 1 收窄 file_check 静态文案退路 + Layer 2 真正接回 `accepted=True` 材料化）；[x] session 从"一天一个"拆成"每题一个"，切断了同一天题目间的 context overflow 连坐，顺带结构性解决了 08-17 的"跨 round 污染"老问题；[x] **`openclaw agent` 补上 `--agent`，`write` 不再写进 checker 看不到的默认 workspace（很可能是 Compl. 至今为 0 的主因）**。所有改动均合成数据/官方源文件/代码核实/bash 逻辑验证，真实训练未验证。
 
 ### 已知限制 / 未解决
-同 08-18，未变，另加：**五处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分）均完全未在真实训练中验证**（`py_compile`/回归测试/代码核实通过不代表真实代理/SGLang/Megatron/OpenClaw CLI 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518`/`173654` 已确认存在"越写越长、write 调用消失 + 同一天后续题目被拖垮"两层模式，前者（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这部分症状，不是回归。
+同 08-18，未变，另加：**六处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分 + `--agent` workspace 修复）均完全未在真实训练中验证**（`py_compile`/回归测试/代码核实通过不代表真实代理/SGLang/Megatron/OpenClaw CLI 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518`/`173654` 已确认存在"越写越长、write 调用消失 + 同一天后续题目被拖垮 + write 写错目录"三层模式，前两者剩下的成因（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这部分症状，不是回归；MetaClaw-Bench 自己的离线评测路径（`_run_question`/`_run_group`）仍未修 `--agent` 缺口，这次没用到那条路径。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练的时机由用户判断**（CLI 明确要求不要热补正在跑的 `153518`/`173654`）。提交时带上今天全部五处修复，不显式设置 `SAVE_CKPT`，按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、暂停窗口期间日志出现 503 pause-retry 等待记录、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`、`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备。如果 Acc. 有提升，要分开归因"选择题不再被 overflow 拖累"和"OPD 是否真的让 file_check 变好"
+2. **MetaClaw 迁移**：**重新提交训练的时机由用户判断**（CLI 明确要求不要热补正在跑的 `153518`/`173654`）。提交时带上今天全部六处修复，不显式设置 `SAVE_CKPT`，按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、暂停窗口期间日志出现 503 pause-retry 等待记录、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`、`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失、**真实 session key 是 `agent:metaclaw_agent:explicit:...`、写入文件出现在正确的 `workspace_{test_id}_*` 目录、checker stdout 不再清一色 `FAIL: cannot read`**。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线（这次 `Compl.` 是否终于脱离 0.0% 是最值得看的信号），同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备。如果 Acc. 有提升，要分开归因"选择题不再被 overflow 拖累"和"OPD 是否真的让 file_check 变好"
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复 + OPD hint 接线修复 + session 拆分在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
-- [ ] 干净权重+干净信号+完整天数+session 拆分下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
+- [ ] **六处修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题，尤其是 `--agent` 修复对 `Compl.` 的实际影响
+- [ ] 干净权重+干净信号+完整天数+session 拆分+正确 workspace 下训练结果跟基线（Acc.=8.1%/Compl.=0.0%，注意这个基线本身也可能受 `--agent` 缺口影响，需要重新评估是否也要用修复后的口径重新跑一次基线）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
 - [ ] "越写越长"模式剩下的两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
+- [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
 - 其余同 08-18（见上）
 
 ---

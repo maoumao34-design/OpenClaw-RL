@@ -446,6 +446,35 @@ slime 自己的 rollout 循环攒满一个训练 batch（16 条）就会 `pause_
 
 **验证方式**：`py_compile` 通过。**真实训练环境完全未验证**——CLI 明确要求不要热补正在跑的 `153518`/`173654`，这次改动落地后由用户决定何时提交新训练。下一轮训练需要确认：`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失（单题仍可能很长/仍可能 0 分，但不该再连坐后面的题）；如果这次跟 Layer 1/2（OPD hint 接线修复）同一轮训练一起验证，Acc. 提升需要分开看归因——"选择题不再被 overflow 拖累"和"OPD 让 file_check 真的变好"是两件不同的事，不能笼统算作同一个改动的效果。
 
+### 修复：`openclaw agent` 从未传 `--agent`，`write` 实际写进了 checker 看不到的默认 agent workspace（2026-08-19d）
+
+**背景**：CLI 排查 `Compl.` 为什么一直是 0 时发现，模型经常真的在写文件（session transcript 里能看到 `Successfully wrote N bytes to day05/xxx.json` 这类真实成功回执），但 checker 评测的目录里那些文件从来不存在，stdout 永远是 `FAIL: cannot read day05/xxx.json`。核对真实文件位置：写入的文件在 `openclaw_state_.../workspace-main/day05/`，checker 读的是 `work/workspace_day05_.../day05/`——两个完全不同的目录。`openclaw.json` 里 `metaclaw_agent.workspace` 确实已经被 `_patch_agent_workspace` 改成了后者，但 `openclaw agent` 子进程实际用的 session key 是 `agent:main:explicit:metaclaw-day05`——**跑的根本不是 `metaclaw_agent` 这个被 patch 过的 agent，是 OpenClaw 自带的默认 `main` agent**，它的 workspace 是一个完全独立的、写死在 OpenClaw CLI 自己代码里的默认目录，跟 `openclaw.json` 里配的任何东西无关。
+
+**根因（沿着 OpenClaw CLI 自己的源码逐层追出来的，不是猜）**：`MetaClaw-official/benchmark/src/infer/infer_cmd.py::_run_openclaw_agent` 构造 `openclaw agent --session-id <id> --message <text>` 子进程调用时，函数签名里有 `agent_id: str | None = None` 这个参数，但函数体从未把它拼进命令行；它唯一的官方调用方 `_run_question` 也从未把 `agent_id` 传给它——**这个缺口就存在于 MetaClaw 官方代码本身，我们的 driver 是直接 import 这个函数复用的，缺口原样带了进来**。
+
+不传 `--agent` 时，OpenClaw CLI 自己的 session-key 解析（`agentViaGatewayCommand` → `resolveSessionKeyForRequest`，`src/agents/command/session.ts`）内部其实**先算对了一次**：`defaultAgentId = normalizeAgentId(resolveDefaultAgentId(cfg))`——因为我们的 `openclaw.json` 只配了一个 agent（`metaclaw_agent`），`resolveDefaultAgentId` 会正确返回 `"metaclaw_agent"`。但这个正确结果没有被用上：新的 `--session-id` 第一次出现时，在所有 agent 的 session store 里都找不到匹配，代码落到一个兜底分支——
+
+```js
+if (requestedSessionId && !sessionKey) sessionKey = buildExplicitSessionIdSessionKey({
+    sessionId: requestedSessionId,
+    agentId: opts.agentId,   // 用的是原始参数（undefined），不是上面已经算对的 defaultAgentId
+});
+```
+
+`opts.agentId` 是 `undefined`（没传 `--agent`），`normalizeAgentId(undefined)` 硬编码返回字面量 `"main"`（`routing/session-key.ts`）——`defaultAgentId` 那次正确的计算结果被完全绕过。这是 OpenClaw 自己 session-key 解析代码里的一处真实不一致，不是 MetaClaw 或我们哪里少配置了什么。CLI 用本机实际安装的 OpenClaw 编译产物（`node_modules/openclaw/dist/session-*.js`）核对过这段逻辑，跟源码仓库对得上。
+
+**"官方 Compl. 不为 0，应该是做过调整的吧"——查证结果：查不到确凿的规避机制，如实记录，不卡修复**：搜了整个仓库唯一显式传 `--agent` 的地方是 `metaclaw/utils.py::run_turn(..., "--agent", "main")`，那是另一条独立的调用路径（跟 `infer_cmd.py` 这套 bench 评测/训练脚本无关），解释不了 bench 的 `Compl.`；`_register_session_in_json` 只在题目自带的 `"update"` 字段（`type: session, action: new`）下才会触发，不是每题都走，也不构成通用的规避机制。真正的原因目前不确定，候选是：官方论文用的 OpenClaw CLI 版本可能是更老的版本、这段兜底当年行为不同（跟 `CLAUDE.md` 记录的三月/五月版本不确定性是同一类问题，但这次可能是 OpenClaw 自身代码的真实版本差异，不是新功能有无的问题）；或者官方真正跑评测的外层脚本（不在这个文件里）在别处传了等价参数。**这两条都没有确凿证据，留作开放问题，不阻塞这次修复**——不管官方当年为什么侥幸没事，显式传 `--agent` 都是绕开这整条不确定性、直接给出正确结果的做法，不依赖猜中官方的具体机制。
+
+**影响范围**：这个缺口不是这次迁移新引入的，从 driver 第一次跑起来那天就存在，意味着**至今为止每一次 MetaClaw 迁移训练/基线跑的 `Compl.`＝0.0% 都可能主要是这个原因造成的，不是 checker 真的没找到文件，是文件从一开始就没写到 checker 会看的地方**。修完也不会让 `Compl.` 突然变成论文级别的数字——checker 能看见文件了，但文件内容本身对不对（比如日期是不是训练当天而不是三月的题面日期）、`generate-fail`、同一天 session 污染这些此前记录过的问题都还在，只是不再被"写到隔壁目录"这一条锁死成 0。
+
+**修复**：给 `openclaw agent` 子进程调用显式加 `--agent {agent_id}`。**没有采用"整份拷贝 `infer_cmd.py` 再打补丁"（`prepare_patched_*.sh` 那套给 `OpenClaw-RL-official` 文件用的模式）**——CLI 指出这次不适用同一模式：那套是给会被 slime/proxy 直接 import 的模块用的，只能靠拷贝改 `PYTHONPATH`；而这里训练路径只通过 driver 调用 `_run_openclaw_agent` 这一个函数，`_run_group`/`_run_question` 那套官方评测编排代码根本没被用到，为了两个 argv 参数去拷贝一份 1400 行的文件、还要伪造 `src/infer/` 包结构、改 `sys.path`，过重也容易和真正的官方模块混着加载。改法是**在 `metaclaw_rollout_driver.py` 里本地复制这一个函数**（~40 行，跟官方版本逐行一致，只加了一行 `"--agent", agent_id,`），不 import 官方版本，不碰 `MetaClaw-official/` 任何文件——这也是这次迁移一直以来对 MetaClaw 官方代码缺口的处理惯例（比如 `OPENCLAW_GATEWAY_TOKEN` 也是写进 driver 自己的 `os.environ`，没有改官方源码）。
+
+`agent_id` 在本地版本里是**必填参数**（官方签名是 `agent_id: str | None = None`，这里故意不给默认值）——训练路径上如果哪天不小心没传 `agent_id`，应该直接报错，而不是静默退回"不传 `--agent`"、重新掉进这个 bug。`run_day` 里 `agent_id = test["agent"]`（每天都是 `"metaclaw_agent"`）本来就已经喂给 `_patch_agent_workspace`/`_prepare_session`，这次只是把 `_run_round`/`_run_openclaw_agent` 也接上同一个变量，不是引入新概念。
+
+**明确没有做的**：MetaClaw-Bench 自己的离线评测路径（`infer_cmd.py::_run_question`/`_run_group`，用于比如训练前后单独跑一次 `metaclaw-bench run` 拿 Compl. 对比，不经过这个 driver）目前仍然没有这个修复——那条路径这次完全没用到，等真的需要用它的时候再单独处理，不在这次范围内提前修。
+
+**验证方式**：`py_compile` 通过。新增一个合成测试（mock `asyncio.create_subprocess_exec`，断言最终 argv 精确等于 `("openclaw", "agent", "--session-id", <id>, "--agent", "metaclaw_agent", "--message", <msg>)`）确认参数顺序和内容都对。**真实训练环境完全未验证**——下一轮训练需要确认：真实 session key 变成 `agent:metaclaw_agent:explicit:...`（不再是 `agent:main:explicit:...`）、`write` 之后的文件确实出现在 `workspace_{test_id}_*` 而不是 `workspace-main/`、checker `stdout` 不再是清一色的 `FAIL: cannot read ...`。这轮同样不热补正在跑的 job，何时提交新训练由用户决定。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

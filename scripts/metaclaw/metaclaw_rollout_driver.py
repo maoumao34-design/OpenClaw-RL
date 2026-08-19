@@ -111,7 +111,6 @@ from src.infer.infer_cmd import (  # noqa: E402
     _patch_agent_workspace,
     _prepare_session,
     _prepare_work_copy,
-    _run_openclaw_agent,
     _start_work_gateway,
     _wait_for_gateway,
 )
@@ -119,6 +118,94 @@ from src.infer.prompts import with_feedback  # noqa: E402
 from src.infer.query_reader import get_default_query_reader  # noqa: E402
 from src.scoring.scoring_cmd import _score_file_check, _score_multi_choice  # noqa: E402
 from src.utils import get_project_root, resolve_path  # noqa: E402
+
+
+async def _run_openclaw_agent(
+    session_id: str,
+    message: str,
+    openclaw_config_path: Path,
+    openclaw_state_dir: Path,
+    project_root: Path,
+    agent_id: str,
+    gateway_port: int | None = None,
+    timeout: float | None = None,
+) -> tuple[int, str, str]:
+    """Local copy of MetaClaw-official's own infer_cmd.py::_run_openclaw_agent
+    (2026-08-19d) -- NOT imported, because the official function silently
+    drops its own `agent_id` parameter: it never appends `--agent <id>` to
+    the `openclaw agent` subprocess argv, and its only caller in official
+    code (`_run_question`) never passes `agent_id` either. Confirmed (CLI,
+    cross-referenced against this machine's actual installed OpenClaw
+    build, `session-key-*.js`/`session-*.js` in node_modules) this is a
+    real gap in OpenClaw's own session-key resolution, not something
+    MetaClaw's harness compensates for elsewhere: without --agent,
+    `resolveSessionKeyForRequest` computes the CORRECT default agent id
+    internally (works when only one agent is configured, ours -- `agents.
+    list` has exactly one entry, `metaclaw_agent`) but then, when no
+    existing session-store entry matches the (new) --session-id, its
+    fallback path builds the session key from the RAW --agent value
+    instead of that already-correct default -- and an absent --agent
+    normalizes to the literal string "main", not our configured agent.
+    Every round's files were actually being written successfully, just
+    into `{state_dir}/workspace-main/` (OpenClaw's built-in default-agent
+    workspace) instead of the per-day workspace_copy the checker reads
+    from (`_patch_agent_workspace` only patches the `metaclaw_agent` entry
+    in openclaw.json) -- explaining why Compl. has been ~0.0% across every
+    MetaClaw migration run to date: the checker was never wrong about the
+    files not being where it looked, the files just were never being
+    written there in the first place. See docs/metaclaw_migration_plan.md
+    for the full trace.
+
+    Fix: pass --agent explicitly (agent_id has no default here, unlike the
+    official signature's `agent_id: str | None = None` -- a training run
+    silently falling back to no --agent, and therefore back to this exact
+    bug, is worse than a hard failure). `run_day` already threads
+    `test["agent"]` (== "metaclaw_agent" for every real day) through
+    `_patch_agent_workspace`/`_prepare_session`; this is the one remaining
+    call site that wasn't also given it.
+
+    Deliberately NOT a prepare_patched_*.sh-style patched copy of the whole
+    ~1400-line infer_cmd.py (this project's usual pattern for OpenClaw-RL-
+    official files that get imported by the slime/proxy process) -- this
+    driver only ever calls this one function from infer_cmd.py's training
+    path (_run_group/_run_question, the official eval-only orchestration,
+    are not used here at all), so a full patched-copy-plus-sys.path-
+    rewrite would be reproducing ~1400 lines of unrelated code to change
+    two argv entries. If MetaClaw-Bench's own OFFLINE eval path
+    (`infer_cmd.py::_run_question`/`_run_group`, used for e.g. before/after
+    Compl. comparisons outside this driver) is ever needed with a correct
+    --agent too, that is a separate, still-unaddressed gap -- fix it there
+    when/if that path is actually used, not preemptively here.
+    """
+    env = {
+        **os.environ,
+        "METACLAW_ROOT": str(project_root),
+        "OPENCLAW_CONFIG_PATH": str(openclaw_config_path),
+        "OPENCLAW_STATE_DIR": str(openclaw_state_dir),
+    }
+    if gateway_port is not None:
+        env["OPENCLAW_GATEWAY_PORT"] = str(gateway_port)
+    proc = await asyncio.create_subprocess_exec(
+        "openclaw", "agent",
+        "--session-id", session_id,
+        "--agent", agent_id,
+        "--message", message,
+        cwd=str(project_root),
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        return -1, "", f"Timeout after {timeout}s"
+    return proc.returncode, stdout_bytes.decode(), stderr_bytes.decode()
+
 
 # ---------------------------------------------------------------------------
 # Proxy wiring
@@ -785,6 +872,7 @@ async def _run_round(
     session_id: str,
     test_id: str,
     group_id: str,
+    agent_id: str,
     round_record: dict[str, Any],
     query: str,
     openclaw_config_path: Path,
@@ -836,6 +924,7 @@ async def _run_round(
             openclaw_config_path=openclaw_config_path,
             openclaw_state_dir=openclaw_state_dir,
             project_root=project_root,
+            agent_id=agent_id,
             gateway_port=gateway_port,
             timeout=round_timeout,
         )
@@ -1137,6 +1226,7 @@ async def run_day(
                         session_id=round_session_id,
                         test_id=test_id,
                         group_id=group.get("id", "unknown"),
+                        agent_id=agent_id,
                         round_record=round_record,
                         query=query,
                         openclaw_config_path=openclaw_json_path,
