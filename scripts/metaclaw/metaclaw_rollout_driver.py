@@ -136,6 +136,26 @@ _API_KEY = os.environ.get("SGLANG_API_KEY", "")
 # prepare_patched_openclaw_opd.sh's _METACLAW_SESSION_RE.
 _SESSION_ID_PREFIX = "metaclaw-"
 
+# OpenClaw's own embedded-agent-runner fallback text (src/agents/embedded-
+# agent-runner/run.ts and run/incomplete-turn.ts in the may_2026_5_11
+# snapshot) for "the CLI process technically exited rc=0 but the agent
+# itself never produced a usable turn". Detected here for TRANSCRIPT
+# VISIBILITY ONLY (2026-08-19) -- deliberately does NOT change
+# agent_succeeded, official_score, or verdict submission. An earlier
+# version of this fix routed detected turns through the agent_succeeded=False
+# infra-failure path, which was wrong (confirmed in review): that path
+# excludes the round from the Acc. denominator and skips verdict submission
+# entirely, letting the next round's step-judge score the leftover pending
+# turn instead of the checker -- semantically wrong for a genuine (if
+# unusable) task attempt. Once the verdict-signal-skip and verdict-early-
+# return fixes land, rc==0 + this fallback text flows through the ALREADY-
+# correct normal path on its own: _compute_inline_score naturally scores
+# empty/fallback content as failed, eval_score=-1.0 gets submitted as a
+# real verdict. This constant exists purely so a human scanning the
+# transcript can immediately tell "the agent gave up" apart from "the agent
+# tried and got the task wrong".
+_GENERATE_FAIL_MARKERS = ("Agent couldn't generate a response",)
+
 # Shared gateway auth token for MetaClaw's own _start_work_gateway /
 # _run_openclaw_agent (imported verbatim above, not our code). Verified
 # root cause of metaclaw_migration_20260817_181404's 100%-failure run
@@ -531,14 +551,30 @@ async def _send_verdict_turn(
     previous turn's next_state) -- no new admin endpoint needed. Our patched
     _opd_evaluate() (prepare_patched_openclaw_combine_select.sh) recognizes
     the metaclaw_verdict JSON and uses eval_score/hint directly instead of
-    calling any LLM judge. max_tokens is kept small since this call's own
-    completion is never read -- only its message content (used as
-    next_state) and headers matter.
+    calling any LLM judge.
 
-    Only call this when the round's `openclaw agent` CLI call actually
-    succeeded (rc == 0) -- see _send_session_close_only for the
-    infrastructure-failure case, and the comment at its call site in
-    run_day for why these must not be conflated.
+    max_tokens=0 (2026-08-19, was 8) is a dedicated signal, not just "keep it
+    small" -- the proxy's openclaw-rl-metaclaw-verdict-signal-skip patch
+    (prepare_patched_openclaw_opd.sh) checks for exactly this value and skips
+    calling SGLang entirely for this request. This exists because
+    X-Turn-Type: main has an unavoidable side effect beyond the one we want
+    (using this call's own messages[-1] as next_state for the PREVIOUS
+    pending turn): it ALSO unconditionally registers THIS call's own
+    generated completion as a new pending turn awaiting its own future
+    next_state. With any non-zero max_tokens the model still generates
+    something (confirmed via real Qwen3-4B-Thinking-2507 tokenizer testing
+    that even an empty assistant message produces non-empty response tokens
+    after chat-template diffing -- the Thinking template's `</think>` closing
+    tag and `<|im_end|>` turn marker are structural, not content-conditional,
+    so the proxy's own "empty response" skip check can never catch this no
+    matter how small max_tokens is), and that stray completion becomes a
+    real training sample once the next round's turn supplies it a next_state
+    -- confirmed as the actual mechanism behind
+    metaclaw_migration_20260818_182736's contamination (69/234 submitted RL
+    samples were response_len==13 stubs from exactly this path, scored +1 by
+    the step-judge with no idea it was looking at a throwaway artifact, not a
+    real intermediate tool-call turn). See docs/metaclaw_migration_plan.md
+    for the full investigation.
     """
     verdict_payload = json.dumps(
         {"metaclaw_verdict": True, "eval_score": eval_score, "hint": hint},
@@ -550,7 +586,7 @@ async def _send_verdict_turn(
             "model": _MODEL_ID,
             "messages": [{"role": "user", "content": verdict_payload}],
             "temperature": 0.0,
-            "max_tokens": 8,
+            "max_tokens": 0,
         },
         headers={
             "X-Session-Id": session_id,
@@ -730,6 +766,14 @@ async def _run_round(
     print(f"  {'-' * 56}")
     print(f"  >> Query -> OpenClaw:\n{query}\n")
     if agent_succeeded:
+        if any(marker in answer_text for marker in _GENERATE_FAIL_MARKERS):
+            # Plain ASCII, deliberately no emoji/unicode decoration -- a
+            # print() encoding crash here would take down the whole
+            # multi-hour training run over a cosmetic transcript annotation,
+            # not worth the risk on whatever locale/codepage the deployment
+            # terminal or log capture ends up using.
+            print(f"  [GENERATE-FAIL] fallback text detected (see module docstring "
+                  f"-- scored normally as a real failed attempt, not an infra failure)")
         print(f"  << OpenClaw -> Query:\n{answer_text}\n")
     else:
         print(f"  << OpenClaw -> Query: AGENT FAILED (rc={rc})\n{stderr[:2000]}\n")

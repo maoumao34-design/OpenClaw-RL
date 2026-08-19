@@ -1767,7 +1767,55 @@
 - **修复转录在终端看不到的问题**：`metaclaw_rollout.log` 文件里内容完整（30 个 `# Day`、346 条 `>> Query -> OpenClaw`，证实上一条 `line_buffering` 修复确实有效），但训练脚本自己的终端/job 输出里看不到——因为 driver 用的是纯重定向 `> log 2>&1`，只写文件；Personal Agent Track 的 `simulation_loop` 用的是 `tee -a`，文件和终端同时写。**修复**：改成进程替换 `> >(tee -a "$LOG") 2>&1`（不是直接 `| tee`——直接管道会导致 `$!` 拿到 `tee` 的 PID、后面 `kill "${DRIVER_PID}"` 清理逻辑杀错进程；进程替换保留 `$!` 仍是 driver 自己的 PID）。验证过三点：`$!` 确实还是 driver 自己的 PID、`kill "$DRIVER_PID"` 确实能正确杀掉真正的进程（30 秒 sleep 测试进程验证过）、日志文件内容没有因为改用 `tee` 而缺失
 → 详见 `metaclaw_migration_plan.md`"训练过程可读性"第三个补充修复部分
 
-### 当前状态（2026-08-18）
+## 2026-08-19
+
+**目标：** 分析 `metaclaw_migration_20260818_182736`（第一次真正产生训练样本的训练）"先好后差"塌陷模式的根因，修复训练信号污染
+
+**完成内容：**
+- **定位到根因：不是环境突然出问题，是从 step 0 起训练信号就在灌毒**。CLI 深挖训练日志和 wandb 曲线（`train_rollout_logprob_abs_diff` 从 step 0 的 3.86 掉到 step 9 的 0.23），确认两个真实 bug 叠加：
+  - **Bug A（checker 分数从没打到真实最后一轮）**：`_send_verdict_turn` 把 checker 判决当合成 `main` 轮次 POST 给代理，`_opd_evaluate()` 认出 checker 分（265 次 `deterministic-reward`），但代码继续往下掉进 PRM 分支共用的 `return`，那两处都引用只在 PRM 分支才会赋值的 `_skip_forced_negative_override`——265 次评估全部 `UnboundLocalError`，真正该吃 ±1 的最终轮被静默丢弃
+  - **Bug B（verdict 自己的生成残片反而进了 GRPO）**：`X-Turn-Type: main` 除了需要的"挂 next_state"效果外，还会无条件把这次调用自己的生成结果注册成新的待评估轮次；`max_tokens=8` 时 Qwen3-Thinking 把预算花在 thinking 上，留下 13-token 残片，被下一题内容挂上 next_state、被 step-judge 打分、当 RL-only 提交——234 条提交样本里 113 条（48%）是这类残片，69 条还拿到 +1。真实 checker 信号整晚没进优化器，GRPO 很快学会"少说话/空回复"，这才是 `day11` 后大面积塌陷的真正原因，之前"这次训练没被基础设施问题污染"的判断是错的，已在 `metaclaw_migration_plan.md` 里更正
+  - 方案制定经过三轮 CLI 交叉核实：第一版"`max_tokens` 调到 0、指望现有空响应检查接住"被 CLI 用真实 tokenizer 实测证伪（Thinking 模板即使空内容也会补 `</think>`/`<|im_end|>` 结构性 token，约 5 个，现有检查过滤不掉）；改成代理侧控制流直接短路，不依赖生成结果长什么样
+→ 详见 `metaclaw_migration_plan.md`"训练信号根因分析与修复：checker 分数丢失 + verdict 残片污染 GRPO"
+- **四处改动落地**：
+  1. `prepare_patched_openclaw_opd.sh` 新增 `openclaw-rl-metaclaw-verdict-signal-skip`：`_handle_request` 识别 `max_tokens==0` 信号，完全不调用 SGLang，只执行"挂 next_state"+ 完整 `session_done` 清理（含 `_seen_user_messages.pop`）
+  2. `prepare_patched_openclaw_combine_select.sh` 新增 `openclaw-rl-metaclaw-verdict-early-return`：`_metaclaw_verdict` 分支末尾显式 `return`（结构照抄 step-judge 分支），不再掉进会崩溃的共用出口——代价是原设计"长 hint 走 OPD"这条从没成功执行过的路径正式改成 RL-only，如实记在补丁注释里
+  3. 同一脚本，step-judge 分支新增 `openclaw-rl-metaclaw-step-judge-truncation-penalty`：补上跟现有 PRM 分支一致的 `is_truncated` 强制 -1（延续 08-06 已确定的策略，不是另选弱方案）
+  4. `metaclaw_rollout_driver.py`：`_send_verdict_turn` 的 `max_tokens` 8→0（`_send_session_close_only` 不动）；新增 generate-fail 兜底文案检测，**只做转录标注**，不改变 `agent_succeeded`/打分/verdict 逻辑（草稿曾想复用 infra 失败通道处理，被指出语义不对，已改正）
+  - 四处改动均用官方源文件跑过完整补丁链验证（`py_compile` 通过、代码位置正确），driver 侧新增端到端回归测试（mock agent 调用，确认普通轮次不受影响、verdict payload 正确变成 `max_tokens=0`、close payload 不变、generate-fail 检测只加标注）。**真实训练环境完全未验证**，冒烟清单见迁移文档
+→ 详见同一节
+
+**关键决策：** 这是本次迁移目前为止最严重的一处训练信号污染，两个 bug 叠加导致 234 条样本里近一半是被误标的垃圾残片，真实 checker 信号完全没进优化器——`metaclaw_migration_20260818_182736` 这个 checkpoint 不能代表训练方法的真实效果，之前"如实评估"里"数字接近基线"这个结论本身没错，但背后原因不是"方法效果不明显"，是"训练信号从一开始就没对"。下次训练才是第一次有条件看到干净信号下的真实效果
+
+**产出：**
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `openclaw-rl-metaclaw-verdict-signal-skip` 补丁
+- `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-metaclaw-verdict-early-return` + `openclaw-rl-metaclaw-step-judge-truncation-penalty` 两处补丁
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`_send_verdict_turn` max_tokens 改 0，新增 `_GENERATE_FAIL_MARKERS` 转录标注
+- `docs/metaclaw_migration_plan.md`：新增"训练信号根因分析与修复"一节，更正了上一节"没被基础设施问题污染"的错误判断
+
+### 当前状态（2026-08-19）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复，四处改动均合成数据/官方源文件验证，真实训练未验证。
+
+### 已知限制 / 未解决
+同 08-18，未变，另加：**四处训练信号修复完全未在真实训练中验证**（`py_compile`/回归测试通过不代表真实代理/SGLang 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为这两个 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**重新提交训练**（带上今天四处修复），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净信号下的真实效果
+3. 其余同 08-17
+
+### 未验证
+- [ ] **四处训练信号修复在真实训练中是否真的生效**（冒烟清单四条）——本次迁移当前最需要验证的问题
+- [ ] 干净信号下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
+- 其余同 08-18（见上）
+
+---
+
+## 历史状态（2026-08-18，已被 8/19 结果取代）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变——见下方"历史状态（2026-08-13）"完整列表）。

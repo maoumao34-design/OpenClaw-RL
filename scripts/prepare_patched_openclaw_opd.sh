@@ -906,6 +906,92 @@ session_done_cleanup_new = (
 )
 text = text.replace(session_done_cleanup_old, session_done_cleanup_new, 1)
 
+# ---------------------------------------------------------------------
+# 2026-08-19 补丁：openclaw-rl-metaclaw-verdict-signal-skip
+#
+# 背景：MetaClaw 迁移的 driver 用一个 X-Turn-Type: main 的合成 POST 把
+# checker 的确定性 verdict 挂给上一轮当 next_state（这一步的唯一目的，
+# 见 metaclaw_rollout_driver.py::_send_verdict_turn 的文档字符串）。但
+# turn_type=="main" 在这个函数里天然还有第二个、不需要的副作用：这次
+# POST 自己的生成结果也会被注册成一条新的待评估 pending turn（下面
+# `if turn_type == "main":` 分支的原有逻辑）。原来想靠"把 max_tokens
+# 调小/调到 0，让生成结果为空，指望现有的空响应检查接住"来避免这个
+# 副作用——用真实 Qwen3-4B-Thinking-2507 tokenizer 实测过，这个假设不
+# 成立：即使 assistant 消息 content/reasoning_content 都是空字符串，
+# Thinking 模板本身仍然会补上结构性的 `</think>` 闭合标签和 `<|im_end|>`
+# 轮次结束标记，这几个 token 不是空白，现有 `response_text.strip()`
+# 检查过滤不掉，那条早退分支永远不会命中（历史证据：2026-08-18
+# metaclaw_migration_20260818_182736 那次 max_tokens=8 时留下了
+# 13-token 的 thinking 残片；改小到 0 只会留下约 5-token 的模板闭合
+# 残片，Bug 换个形态但没堵住）。
+#
+# 真正的修法是控制流层面直接短路，不依赖生成结果长什么样：driver 把
+# `max_tokens: 0` 当一个专用信号（不会跟 OpenClaw 真实请求撞车——它
+# 自己配置的 maxTokens 是 50000），代理识别到这个信号后完全不调用
+# SGLang（连"0 会不会被 SGLang 拒绝"这个问题都不存在），只做这次调用
+# 唯一该做的事——给上一轮挂 next_state、触发它的评估——然后照抄当前
+# （含 openclaw-rl-duplicate-user-retry-penalty 补丁新增的
+# `_seen_user_messages.pop`）session_done 清理逻辑直接返回，全程不碰
+# apply_chat_template / _pending_turn_data / _turn_counts，第二个副
+# 作用从源头上就不会发生。
+#
+# 必须放在 messages 校验之后、forward_body 构造/SGLang POST 之前——
+# 再往前 messages 还没定义，没法执行"挂 next_state"这一步；这个信号
+# 分支本身要抢在真正调用 SGLang 之前拦下来，不能等生成完再补救。
+#
+# 这个补丁本身放在脚本末尾（`_seen_user_messages.pop` 那个 session_done
+# 清理补丁之后）执行，不是因为代码位置要在后面——它改的是函数最前面
+# messages 校验之后那一段。放在这里纯粹是为了避开一个字符串匹配冲突：
+# 这段新代码自己内部也要写一遍"照抄"的 session_done 清理逻辑（含
+# `_turn_counts.pop`），如果这个 text.replace() 在 session_done_cleanup_old
+# 那个 patch 之前执行，会让 `_turn_counts.pop(session_id, None)\n` 这行在
+# 全文里变成 2 处，导致后面那个 patch 的"必须只有 1 处"校验失败——放在
+# 它后面执行就不会有这个问题，纯粹是脚本内 patch 顺序的技术细节，不影响
+# 最终生成文件里两段代码的相对位置。
+# ---------------------------------------------------------------------
+metaclaw_verdict_skip_old = (
+    '        messages = body.get("messages")\n'
+    '        if not isinstance(messages, list) or not messages:\n'
+    '            raise HTTPException(status_code=400, detail="messages must be a non-empty list")\n'
+    '\n'
+    '        tools = body.get("tools")\n'
+)
+if metaclaw_verdict_skip_old not in text:
+    raise SystemExit(
+        "patch failed: expected messages-validation block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+metaclaw_verdict_skip_new = (
+    '        messages = body.get("messages")\n'
+    '        if not isinstance(messages, list) or not messages:\n'
+    '            raise HTTPException(status_code=400, detail="messages must be a non-empty list")\n'
+    '\n'
+    '        # --- openclaw-rl-metaclaw-verdict-signal-skip (temporary, safe to remove) ---\n'
+    '        if turn_type == "main" and body.get("max_tokens") == 0:\n'
+    '            logger.info(\n'
+    '                "[openclaw-rl-metaclaw-verdict-signal-skip] session=%s -> "\n'
+    '                "max_tokens=0 signal, skipping SGLang call entirely "\n'
+    '                "(no pending turn registered)",\n'
+    '                session_id,\n'
+    '            )\n'
+    '            _prev_turn_num = self._turn_counts.get(session_id, 0)\n'
+    '            if _prev_turn_num > 0 and messages:\n'
+    '                self._flush_pending_record(session_id, messages[-1])\n'
+    '                _prev_turn_data = self._pending_turn_data.get(session_id, {}).get(_prev_turn_num)\n'
+    '                if _prev_turn_data is not None:\n'
+    '                    self._fire_opd_task(session_id, _prev_turn_num, _prev_turn_data, messages[-1])\n'
+    '            if session_done:\n'
+    '                self._flush_pending_record(session_id, None)\n'
+    '                self._maybe_submit_ready_samples(session_id, force_drop_without_next_state=True)\n'
+    '                self._turn_counts.pop(session_id, None)\n'
+    '                self._seen_user_messages.pop(session_id, None)\n'
+    '                logger.info("[OpenClaw-OPD] session=%s done -> cleaned up", session_id)\n'
+    '            return {"response": {"choices": [], "session_id": session_id}}\n'
+    '\n'
+    '        tools = body.get("tools")\n'
+)
+text = text.replace(metaclaw_verdict_skip_old, metaclaw_verdict_skip_new, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched -> {dest_path}")

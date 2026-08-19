@@ -322,7 +322,34 @@ CLI 观察到每天结束时 30000 端口的 close/verdict POST 返回 401。核
 
 **如实评估，不回避**：数字跟冻结基线几乎一样，**不像训练方法已经拉开差距**。更值得注意的是逐日模式：`day01` 准确率还有 38%，`day11` 之后几乎全是 0——不是"训练完全没用、从头到尾都跟基线一样低"，而是**前几天表现明显更好、之后迅速塌陷到接近 0**，`Compl.` 则自始至终是 0，`file_check` 类任务完全没有被训出来。这个"先好后差"的模式本身就是一个需要解释的现象（可能是训练不稳定/灾难性遗忘，也可能是别的原因），不是简单的"方法无效"就能盖棺定论的，需要看训练过程中的具体样本（`metaclaw_rollout.log` 里的转录、`report.md` 的逐日明细）才能判断下一步该往哪个方向调整——这正是"人类可读转录"这个功能存在的意义，具体分析留给用户看原始转录后决定。
 
-**这次训练本身没有被基础设施问题污染**（不是"又没跑起来"），是目前为止唯一一次可以拿来真正讨论"方法本身效果如何"的数据；后续如果要继续调整训练方法（学习率、reward 设计、OPD hint 质量等），都应该以这次的逐日曲线和转录作为分析起点。
+**更正（同日，下一节）**：上面这句判断当时是错的——这次训练看起来没被"基础设施问题"污染，但被两个更隐蔽的训练信号 bug 污染了，"先好后差"这个模式本身就是被污染训坏的直接后果，不是需要另外解释的独立现象。详见下一节的根因分析和修复。
+
+### 训练信号根因分析与修复：checker 分数丢失 + verdict 残片污染 GRPO（2026-08-19）
+
+CLI 深挖 `metaclaw_migration_20260818_182736` 的训练日志和 wandb 曲线，定位到"先好后差"塌陷模式的真正根因——**不是环境突然出问题，是从 step 0 起训练信号就在灌毒，大约 9 步后策略学会了空回复/纯 thinking，`day11` 只是权重已经被拉歪之后的必然结果**。经逐条代码核实（不直接采信 CLI 的结论），确认是两个真实 bug 叠加：
+
+**Bug A：checker 分数从没打到真实最后一轮**——`_send_verdict_turn` 把 checker 判决当 `X-Turn-Type: main` 的合成轮次 POST 给代理，`_opd_evaluate()` 认出了 checker 分（日志里 265 次 `deterministic-reward`），但代码会继续往下掉进 PRM 分支共用的 `return` 语句，那两处 `return` 都引用 `_skip_forced_negative_override`——这个变量只在 `_metaclaw_verdict is None` 的 PRM 分支里才会被赋值，MetaClaw verdict 分支从来没赋值过就被读取，Python 必然 `UnboundLocalError`。265 次 checker 评估全部在这一步炸掉，真正该吃 ±1 的最终轮被静默丢弃。
+
+**Bug B：verdict 自己的生成残片反而进了 GRPO**——`X-Turn-Type: main` 除了"把这次消息内容挂给上一轮当 next_state"这个需要的效果之外，还有一个无法避免的副作用：这次调用自己的生成结果也会被无条件注册成一条新的待评估轮次。`max_tokens=8` 时 Qwen3-4B-Thinking 把预算花在 thinking 上，留下 13-token 残片；这条残片后续被下一题的内容挂上 next_state、被 step-judge 打分、当 RL-only 提交——`metaclaw_migration_20260818_182736` 里 234 条提交样本中 113 条（48%）是 `response_len==13` 且 `prompt_len<200` 的残片，其中 69 条还拿到了 +1。真实 checker 信号整晚没进优化器，batch 里从第一步起就混着这类被误标的残片，GRPO 很快学会"少说话/空回复"，这才是 `day11` 后大面积 `generate-fail`/Acc. 塌陷的真正原因。
+
+**方案制定过程（三轮 CLI 交叉核实，纠正了两版方案）**：
+1. 第一版方案想用"把 `max_tokens` 调到 0、指望现有空响应检查接住"来堵 Bug B——CLI 用真实 Qwen3-4B-Thinking-2507 tokenizer 实测证伪：即使 assistant 消息完全为空，Thinking 模板本身仍会补上结构性的 `</think>` 闭合标签和 `<|im_end|>` 轮次结束标记（约 5 个 token），现有 `response_text.strip()` 检查过滤不掉这几个 token，这条早退分支永远不会命中——换个更短的残片，问题没堵住。
+2. 改成代理侧控制流直接短路：driver 把 `max_tokens: 0` 当专用信号，代理识别到这个信号后**完全不调用 SGLang**，只做该做的事（挂 next_state、触发上一轮评估），然后照抄 `session_done` 清理逻辑直接返回——不依赖生成结果长什么样，也不依赖 SGLang 怎么解释 `max_tokens=0`。
+
+**最终实现（四处改动，均已用合成数据/真实模板文件验证，未在真实训练中跑过）**：
+1. **`scripts/prepare_patched_openclaw_opd.sh`** 新增 `openclaw-rl-metaclaw-verdict-signal-skip` 补丁：`_handle_request` 在 messages 校验之后、构造 `forward_body`/POST SGLang 之前，检查 `turn_type=="main" and body.get("max_tokens")==0`，命中就跳过 SGLang 调用，只执行"挂 next_state"逻辑 + 完整的 `session_done` 清理（含 `_seen_user_messages.pop`，跟当前实际清理逻辑逐行对齐）后直接返回。用真实官方文件跑过一遍完整补丁链，`py_compile` 通过，生成代码位置正确（插在 messages 校验和 `forward_body` 构造之间）。
+2. **`scripts/prepare_patched_openclaw_combine_select.sh`** 新增 `openclaw-rl-metaclaw-verdict-early-return` 补丁：`_metaclaw_verdict is not None` 分支末尾加显式 `return`（结构照抄旁边 `metaclaw_round_mode`/step-judge 分支：`accepted: False`，`eval_score` 直接用 checker 分），不再往下掉进会崩溃的共用 PRM 出口。**代价（如实记录）**：原设计里"长 hint 走 OPD+RL"这条路径（`votes` 列表构造那段）因为这次改动被放弃，改成明确的 RL-only——但那条路径从 UnboundLocalError 出现以来就没有成功执行过一次，这不是削弱已经生效的功能，是把"从没跑通的死代码"正式确认为"这轮不做"。以后要恢复 OPD 处理，应显式设 `_skip_forced_negative_override = False` 再继续往下走，不能直接撤销这个 `return`。
+3. 同一个补丁脚本，`metaclaw_round_mode`（step-judge）分支新增 `openclaw-rl-metaclaw-step-judge-truncation-penalty`：`eval_score = _prm_eval_majority_vote(_step_raw)` 之后检查 `turn_data.get("is_truncated")`，命中强制 `eval_score = -1.0`——跟现有 PRM 分支的 `openclaw-rl-truncation-penalty`（2026-08-06 已确定的"强制 -1、不丢样本"策略）保持一致，不是另选一个更弱的方案（core 补丁 1 从源头消灭 verdict 残片后，这条主要用于兜住其他真实中间轮次的截断，是加固不是主防线）。
+4. **`scripts/metaclaw/metaclaw_rollout_driver.py`**：`_send_verdict_turn` 的 `max_tokens` 从 8 改成 0（`_send_session_close_only` 保持 8 不变，本来就是 `X-Turn-Type: side`，走不到新补丁分支）；`_run_round` 新增 `_GENERATE_FAIL_MARKERS` 检测 OpenClaw 自己的"⚠️ Agent couldn't generate a response"兜底文案，**只用于转录标注可见性**，不改变 `agent_succeeded`/打分/verdict 提交的任何逻辑——第 1、2 条修好后，`rc==0` + 兜底文案会自然地被 `_compute_inline_score`/`_score_round_official` 打出真实的低分/失败结果，走正常的 `eval_score=-1.0` verdict 提交通道，不需要新的分类逻辑（早期草稿曾想复用 `agent_succeeded=False` 的基础设施失败通道处理这种情况，被指出是错的：那个通道会把这道题从 Acc. 分母里排除、且不提交 verdict 改由下一轮 step-judge 打分，语义上不对——generate-fail 是"模型没给出可用回复"，不是"网关挂了"）。
+
+**验证方式**：四处改动都用官方源文件跑过完整补丁链验证（`py_compile` 通过、生成代码位置正确），driver 侧新增了一次端到端回归测试（mock `_run_openclaw_agent`，确认普通轮次打分不受影响、verdict payload 正确变成 `max_tokens=0`、close payload 保持 `max_tokens=8` 不变、generate-fail 检测只加转录标注不改变 `agent_succeeded`/`official_score`）。**真实训练环境完全未验证**——下一次训练需要按冒烟清单逐项确认：
+
+1. 代理日志里出现 `openclaw-rl-metaclaw-verdict-signal-skip` 专用日志；verdict 之后**没有**新的 `MAIN ... response_tokens=5`（或 13）
+2. `deterministic-reward` 后面是长 `prompt_len` 的正常 RL 提交，不再是 `response_len=13` 这种残片
+3. `UnboundLocalError` 次数为 0
+4. `_send_session_close_only` 对应的请求仍然是 `X-Turn-Type: side`
+
+缺任何一条就应该停下来，不要继续训练。
 
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
