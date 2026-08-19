@@ -377,7 +377,7 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   BENCHMARK_WORKSPACE_DIR="${BENCHMARK_WORKSPACE_DIR}" \
   SGLANG_API_KEY="${SGLANG_API_KEY}" \
   python "${SCRIPTS_DIR}/metaclaw_rollout_driver.py" \
-  > "${LOGS_DIR}/metaclaw_rollout.log" 2>&1 &
+  > >(tee -a "${LOGS_DIR}/metaclaw_rollout.log") 2>&1 &
 DRIVER_PID=$!
 
 echo ""
@@ -385,7 +385,7 @@ echo "所有服务已启动，训练进行中..."
 echo "  日志目录:         ${LOGS_DIR}/"
 echo "  METACLAW_ROOT:    ${METACLAW_ROOT}"
 echo "  训练日志:         tail -f ${LOGS_DIR}/training.log"
-echo "  rollout driver:   tail -f ${LOGS_DIR}/metaclaw_rollout.log"
+echo "  rollout driver:   ${LOGS_DIR}/metaclaw_rollout.log（同时也直接打在本终端/job 输出里，跟 Personal Agent Track 的 simulation.log 一样用 tee，不用单独开一个终端 tail -f 才能看）"
 echo "  Ray dashboard:    http://127.0.0.1:8265"
 
 wait "${DRIVER_PID}" 2>/dev/null || true
