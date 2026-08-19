@@ -1806,26 +1806,35 @@
   - `py_compile` + 完整补丁链对真实官方源文件生成输出验证通过，人工核对生成代码的分支结构正确。**真实训练环境完全未验证**——下一轮需要在日志里确认出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1` 这行，不能只有 `submitted RL sample`
   - **明确没有一起做**：CLI 同一轮诊断还指出"越写越长"另有两个更致命的独立成因——下一轮 `_build_feedback_text` 静态反馈文案本身可能文不对题（跟这次的 verdict hint 是完全不同的代码路径）、中间轮次 step-judge 对"没有实际调用 write/edit 的长分析"经常打 +1（75-100% 命中率）。这两处都只有诊断没有方案，决定不跟这次两层改动捆在一起，等下一轮训练数据出来分别单独设计
 → 详见 `metaclaw_migration_plan.md`"修复：checker 算出的 OPD hint 被无条件丢弃，file_check/多选题 verdict 轮次从未真正走过 OPD 蒸馏"
+- **发现并修复第五个独立问题：session 拆分——从"一天一个 session"改成"每题一个 session"**。CLI 继续排查上面第 (1)(2) 点"越写越长"的另外两个成因时，挖出第三个、对 Acc. 影响最直接的独立问题：`153518`/`173654` 两次训练日志显示 `day01-06` 选择题正确率稳定在 85-97%（权重没训坏），但从 `day07` 起，一旦某道 file_check 题写崩（`day07 r5` 约 1.7 万字），**同一天后面所有题目**（含本来答得好的选择题）一起 Context overflow——`day08`/`day09`/`day10` 同一模式反复出现。根因是这次迁移一直对齐 MetaClaw 官方评测代码"一天一个 session"（`_run_group` 的设计），导致某题写崩的长文原样累积进当天后续所有题目的上下文
+  - 读代码核实（不是猜）：`_prepare_session` 只是 touch 一个 `.jsonl` transcript 文件，跟 workspace/gateway 无关；day 级资源（workspace/gateway/plugins allowlist）都不依赖 session_id；proxy 侧 `_pending_turn_data`/`_prm_tasks` 按 session_id 分桶，新 session 天然是白纸；`[Previous Feedback]` 靠纯文本拼接不靠共享历史，不受影响；MetaClaw 自己的训练侧代码（`openclaw_env_rollout.py`）跟这次迁移的 day/round/feedback 结构本来就没对齐过，不存在"按题拆 session 会破坏跟官方训练方法一致性"的顾虑
+  - CLI 额外核实三件事：全部 30 天 346 题的 `round_record["id"]` 扫描（清一色 `r1`...`r15`，字符安全，每天恰好 1 个 group）；`openclaw agent --session-id` 真隔离（官方文档+代码解析确认，`sessions_*` 调用在真实日志里 0 次，无记忆类插件）；overflow 真实模式不止 day07（day08/09/10 同一模式，均由真实日志核对）
+  - **修复**：只改 `metaclaw_rollout_driver.py`——day 级 `session_id`/`_prepare_session` 删除，round 循环内部现算 `round_session_id = f"metaclaw-{test_id}-{group_id}-{round_id}"`（`{group_id}-` 真实数据里冗余但保留作防御）；`_run_round`/`_send_verdict_turn`/`_send_session_close_only` 三处统一用这个新 id；`session_done`/`_send_session_close_only` 都从"只有当天最后一题才收尾"改成**每题无条件收尾**——不这样做的话非最后一题失败的挂起轮次会卡在一个再也不会收到消息的 session 里，永远等不到清理
+  - **连带效果**：顺手结构性解决了 08-17 记录的"跨 round 污染"老问题（挂起轮次被下一个 round 误判成 next_state）——每个 round 现在是独立 session 且每次都无条件 `session_done`，那个 bug 的前提不再成立，不需要再单独判断触发频率或设计修复，08-17 那条"待观察"记录已关闭
+  - **预期效果**（如实记录）：会让 day07-10 那种"选择题被前面题目长文拖垮"的模式基本消失，Acc. 里选择题部分能重新反映真实能力；不会让 `Compl.` 变好——单题依然可能写崩/打 0 分，这只是不再连坐，"file_check 学不会写文件"仍要靠 OPD/奖励设计解决
+  - 跟 MetaClaw 官方评测代码"一天一个 session"是主动分歧，明确记账：官方确定性打分从不读 transcript，这次改动不影响打分口径
+  - `py_compile` 通过。**真实训练环境完全未验证**——CLI 明确要求不热补正在跑的 `153518`/`173654`，这次改动落地后由用户决定何时提交新训练；如果跟 OPD hint 接线修复同一轮验证，Acc. 提升需要分开看归因（"选择题不再被 overflow 拖累" vs "OPD 让 file_check 真的变好"，是两件事）
+→ 详见 `metaclaw_migration_plan.md`"改动：session 拆分——从'一天一个 session'改成'每题一个 session'"
 
 ### 当前状态（2026-08-19）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）；[x] checker 算出的 OPD hint 被无条件丢弃的问题已修复（Layer 1 收窄 file_check 静态文案退路 + Layer 2 真正接回 `accepted=True` 材料化）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）；[x] checker 算出的 OPD hint 被无条件丢弃的问题已修复（Layer 1 收窄 file_check 静态文案退路 + Layer 2 真正接回 `accepted=True` 材料化）；[x] session 从"一天一个"拆成"每题一个"，切断了同一天题目间的 context overflow 连坐，顺带结构性解决了 08-17 的"跨 round 污染"老问题。所有改动均合成数据/官方源文件/代码核实/bash 逻辑验证，真实训练未验证。
 
 ### 已知限制 / 未解决
-同 08-18，未变，另加：**四处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线）均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518` 这次训练已确认存在"越写越长、write 调用消失"的模式，CLI 诊断出的另外两个成因（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这个模式的部分症状，不是回归。
+同 08-18，未变，另加：**五处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分）均完全未在真实训练中验证**（`py_compile`/回归测试/代码核实通过不代表真实代理/SGLang/Megatron/OpenClaw CLI 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518`/`173654` 已确认存在"越写越长、write 调用消失 + 同一天后续题目被拖垮"两层模式，前者（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这部分症状，不是回归。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部四处修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`、暂停窗口期间日志出现 503 pause-retry 等待记录而不是直接判定基础设施失败、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备
+2. **MetaClaw 迁移**：**重新提交训练的时机由用户判断**（CLI 明确要求不要热补正在跑的 `153518`/`173654`）。提交时带上今天全部五处修复，不显式设置 `SAVE_CKPT`，按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、暂停窗口期间日志出现 503 pause-retry 等待记录、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`、`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备。如果 Acc. 有提升，要分开归因"选择题不再被 overflow 拖累"和"OPD 是否真的让 file_check 变好"
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复 + OPD hint 接线修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
-- [ ] 干净权重+干净信号+完整天数下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
+- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复 + OPD hint 接线修复 + session 拆分在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
+- [ ] 干净权重+干净信号+完整天数+session 拆分下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
-- [ ] "越写越长"模式的另外两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
+- [ ] "越写越长"模式剩下的两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
 - 其余同 08-18（见上）
 
 ---

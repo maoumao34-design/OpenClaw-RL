@@ -12,12 +12,23 @@ Architecture summary (see the migration doc for the "why"):
     MetaClaw's own benchmark harness), NOT a self-controlled generation
     loop -- preserves the real OpenClaw "coding" tool profile MetaClaw-Bench
     tasks are authored against.
-  - Each day is ONE proxy session, session_id = f"metaclaw-{test_id}"
+  - Each ROUND is its own proxy session (2026-08-19c; was one session per
+    day before this), session_id = f"metaclaw-{test_id}-{group_id}-{round_id}"
     (the "metaclaw-" prefix is load-bearing: prepare_patched_openclaw_opd.sh
     pattern-matches it via _METACLAW_SESSION_RE to flag every turn in the
     session as MetaClaw round mode -- intermediate tool-call turns cannot
     carry a custom body field of their own, since OpenClaw's internal HTTP
-    client constructs those requests, not this driver).
+    client constructs those requests, not this driver). Deliberately
+    diverges from MetaClaw-official's own eval harness (_run_group shares
+    one session across a whole day) -- switched to per-round sessions
+    because sharing one transcript let an early round's overlong response
+    balloon the context for every later round that day, dragging down
+    otherwise-fine rounds (including multi_choice) via context overflow.
+    The day's WORKSPACE (files an agent actually writes) is untouched by
+    this -- only the raw chat transcript is no longer shared across rounds;
+    cross-round continuity is still carried explicitly via the
+    [Previous Feedback] text. See docs/metaclaw_migration_plan.md for the
+    full writeup.
   - After each round finishes, the round's deterministic checker/multi-choice
     result (via the official _compute_inline_score/_build_feedback_text) is
     submitted to the proxy as a synthetic "next turn" message containing a
@@ -686,11 +697,16 @@ async def _send_verdict_turn(
 async def _send_session_close_only(
     client: httpx.AsyncClient, session_id: str, retry: int = 0,
 ) -> None:
-    """Close the day's session WITHOUT submitting a verdict for the pending turn.
+    """Close the round's session WITHOUT submitting a verdict for the pending turn.
 
     Used when the round's `openclaw agent` CLI call itself failed (rc != 0 --
-    gateway hiccup, subprocess crash/timeout, not a genuine task attempt) and
-    this was the day's last round. Mirrors OpenClaw-RL's own General Agent
+    gateway hiccup, subprocess crash/timeout, not a genuine task attempt).
+    Called unconditionally for every failed round (2026-08-19c, was only for
+    the day's last round back when a whole day was one session) -- with one
+    session per round, there is no longer a "next round in the same session"
+    to leave the pending turn for; skipping this close would strand it in
+    the proxy's per-session state forever instead of getting force-dropped.
+    Mirrors OpenClaw-RL's own General Agent
     tracks (toolcall-rl/swe-rl): both explicitly set ``Sample.Status.ABORTED``
     and return BEFORE the sample reaches reward_func/normal submission when
     generation/execution infrastructure fails mid-attempt, so the failure
@@ -989,15 +1005,9 @@ async def run_day(
     test_id = test["id"]
     agent_id = test["agent"]
     eval_name = test["eval"]
-    # Load-bearing: NOT test["session"] verbatim -- must start with
-    # _SESSION_ID_PREFIX so the proxy's _METACLAW_SESSION_RE recognizes
-    # every turn in this day as MetaClaw round mode. One session per day,
-    # matching MetaClaw-official's own _run_group (all of a day's rounds
-    # share one session transcript).
-    session_id = f"{_SESSION_ID_PREFIX}{test_id}"
 
     print(f"\n{'#' * 60}")
-    print(f"# Day {test_id}  (session: {session_id})")
+    print(f"# Day {test_id}")
     print(f"{'#' * 60}")
 
     workspace_src = resolve_path(
@@ -1036,8 +1046,6 @@ async def run_day(
             await gateway_proc.wait()
         raise RuntimeError(f"[{test_id}] gateway on port {gateway_port} never became ready")
 
-    _prepare_session(work_openclaw_state_dir, agent_id, session_id)
-
     query_reader = get_default_query_reader()
     groups = query_reader.read_queries(eval_dir, eval_name)
 
@@ -1050,6 +1058,70 @@ async def run_day(
                 prev_round_record: dict | None = None
 
                 for idx, round_record in enumerate(rounds):
+                    # One session PER ROUND (2026-08-19c), not one session
+                    # per day. Was: session_id = f"{_SESSION_ID_PREFIX}{test_id}"
+                    # shared across every round in the day, matching
+                    # MetaClaw-official's own _run_group. Changed because that
+                    # sharing is exactly what let one file_check round's very
+                    # long response (transcript growth confirmed via
+                    # metaclaw_migration_20260819_153518/173654 logs -- CLI
+                    # cross-check: day07 r5 alone ~17k chars) balloon the SAME
+                    # session's context for every later round THAT DAY,
+                    # including unrelated multi_choice rounds that were
+                    # otherwise answered fine (day01-06 MC steady at
+                    # 85-97%) -- once a day's transcript got long enough,
+                    # everything after it, file_check and multi_choice alike,
+                    # died to context overflow / empty responses (day07 r6
+                    # onward, day08 r10 onward, day09 r8 onward, day10 r10
+                    # onward, all confirmed via real log review). Per-round
+                    # session_id gives each round a fresh, empty transcript
+                    # (_prepare_session just touches a new .jsonl -- verified
+                    # via direct read of MetaClaw-official's infer_cmd.py,
+                    # no other persistence mechanism exists) while leaving the
+                    # day's WORKSPACE untouched (same workspace_copy/
+                    # gateway_port/openclaw_json_path for the whole day,
+                    # unchanged below) -- a later round can still see files an
+                    # earlier round actually wrote, it just no longer inherits
+                    # the earlier round's raw chat transcript. Cross-round
+                    # continuity for "what went wrong last time" is carried by
+                    # the explicit [Previous Feedback] text (query/
+                    # with_feedback below, unaffected by this change), not by
+                    # shared conversation history. This does NOT fix a
+                    # file_check round writing an overlong response or
+                    # scoring 0 -- only stops that from dragging down every
+                    # later round in the same day. A deliberate divergence
+                    # from MetaClaw-official's own eval harness (_run_group
+                    # shares one session across a day) -- acceptable because
+                    # MetaClaw's own scorer never reads the transcript, and
+                    # this migration was never aligned with MetaClaw's own
+                    # training-mode code (openclaw_env_rollout.py) either,
+                    # which uses a completely different one-session-per-task
+                    # model with no day/round/feedback structure at all (see
+                    # docs/metaclaw_migration_plan.md "三方对照"). The
+                    # "{group_id}-" component is redundant in every real
+                    # all_tests.json (group["id"] always == test_id for
+                    # QuestionsJsonQueryReader-format data, confirmed via a
+                    # full 346-round scan across all 30 days' questions.json,
+                    # all round ids are plain r1..r15, alphanumeric only) but
+                    # kept anyway as a defensive guard against
+                    # EvalFlowQueryReader's legacy format, which CAN produce
+                    # multiple groups per day -- costs nothing, protects
+                    # against an assumption this code does not actually rely
+                    # on holding forever. Also structurally closes the
+                    # previously-deferred "跨 round 污染" risk (see
+                    # docs/metaclaw_migration_plan.md 下一步工程任务 第 1 项):
+                    # that bug required a crashed round's orphaned pending
+                    # turn to be picked up by the SAME session's next message;
+                    # with every round now its own session (and session_done
+                    # sent unconditionally below, not just on the day's last
+                    # round), there is no longer a "same session" for a later
+                    # round to leak into.
+                    round_session_id = (
+                        f"{_SESSION_ID_PREFIX}{test_id}-{group.get('id', 'unknown')}-"
+                        f"{round_record['id']}"
+                    )
+                    _prepare_session(work_openclaw_state_dir, agent_id, round_session_id)
+
                     question_text = round_record["question"]
                     feedback_text: str | None = None
                     if prev_inline_score is not None and prev_round_record is not None:
@@ -1062,7 +1134,7 @@ async def run_day(
                     )
 
                     inline_score, agent_succeeded, official_score = await _run_round(
-                        session_id=session_id,
+                        session_id=round_session_id,
                         test_id=test_id,
                         group_id=group.get("id", "unknown"),
                         round_record=round_record,
@@ -1078,31 +1150,41 @@ async def run_day(
                     if official_score is not None:
                         day_round_scores.append(official_score)
 
-                    is_last_round = idx == len(rounds) - 1
-
                     if agent_succeeded:
                         passed = inline_score.get("passed", False)
                         eval_score = 1.0 if passed else -1.0
                         hint = "" if passed else _build_opd_hint(round_record, inline_score)
                         if hint:
                             print(f"  OPD hint (goes into next round's feedback):\n{hint}\n")
+                        # session_done=True unconditionally (2026-08-19c) --
+                        # was `session_done=is_last_round` back when a whole
+                        # day was one session. Every round is now its own
+                        # complete session, so every round's verdict must
+                        # close it (same reasoning as _send_session_close_only
+                        # below), not just the day's last round.
                         await _send_verdict_turn(
-                            client, session_id, eval_score, hint,
-                            session_done=is_last_round, retry=VERDICT_RETRY,
+                            client, round_session_id, eval_score, hint,
+                            session_done=True, retry=VERDICT_RETRY,
                         )
                     else:
                         # Infrastructure failure, not a real task attempt -- do NOT
                         # submit a verdict (would fabricate a false -1 training
                         # signal). Mirrors toolcall-rl/swe-rl's Sample.Status.ABORTED
                         # early-return; see _send_session_close_only's docstring.
-                        # Only need to actually talk to the proxy if this was the
-                        # day's last round (otherwise the round's turn, if any was
-                        # even submitted, simply stays pending and gets picked up
-                        # normally by whatever comes next).
-                        if is_last_round:
-                            await _send_session_close_only(
-                                client, session_id, retry=VERDICT_RETRY,
-                            )
+                        # Unconditional (2026-08-19c), not `if is_last_round:` --
+                        # under one-session-per-day, a non-last-round failure's
+                        # orphaned pending turn was left to be picked up by the
+                        # same session's next real message (the very "跨 round
+                        # 污染" mechanism this change also closes off). Under
+                        # one-session-per-round there is no longer a "next
+                        # message in the same session" ever coming -- skipping
+                        # this close would leave that pending turn stuck in the
+                        # proxy's per-session state forever instead of being
+                        # force-dropped, which is strictly worse than the old
+                        # behavior, not just a no-op.
+                        await _send_session_close_only(
+                            client, round_session_id, retry=VERDICT_RETRY,
+                        )
 
                     prev_inline_score = inline_score
                     prev_round_record = round_record

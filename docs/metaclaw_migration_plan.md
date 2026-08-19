@@ -411,6 +411,41 @@ slime 自己的 rollout 循环攒满一个训练 batch（16 条）就会 `pause_
 
 **明确没有一起做的**：CLI 同一轮诊断还指出"越写越长"这个模式另有两个更致命的独立成因——(1) 下一轮 `_build_feedback_text` 返回的静态反馈文案本身可能文不对题（跟这次改的 verdict hint 是两套完全不同的代码路径，`_build_feedback_text` 影响的是下一题看到的 `[Previous Feedback]`，不是训练用的 teacher 信号）；(2) 中间轮次的 step-judge 对"没有实际调用 write/edit 的长分析"经常打 +1（`20260819_153518` 数据：45 次里 39 次，约 75-100%），相当于在奖励"堆字数而不落盘"这个行为。这两处都还没有设计成方案，只有诊断，跟这次两层改动不是同一严谨程度，决定不捆在一起改——先看这次 OPD 接线修复单独生效的效果，同时用下一轮训练的干净数据验证 CLI 这两个新假设，再分别单独设计方案。
 
+### 改动：session 拆分——从"一天一个 session"改成"每题一个 session"，切断把整天拖垮的上下文堆积（2026-08-19c）
+
+**背景**：CLI 排查"OPD 接线修复也救不了"的那部分越写越长问题时（见上一节"明确没有一起做的"第 (1)(2) 点），继续深挖出第三个独立成因，且是三个里对 Acc. 影响最直接的一个：`metaclaw_migration_20260819_153518`/`173654` 两次训练日志显示，`day01-06` 选择题正确率一直稳定在 85-97%（跟基线同一档，权重没训坏），但从 `day07` 起，一旦某道 `file_check` 题写出一篇几千到近两万字的长文（`day07 r5` 约 1.7 万字），**同一天后面所有题目**（不管是 `file_check` 还是本来答得好好的选择题）就会一起开始 Context overflow/空回复——`day07 r6` 起、`day08 r10` 起、`day09 r8` 起、`day10 r10` 起，均由 CLI 核对真实日志确认是同一个模式：选择题不是训坏了，是被同一天前面题目的长文本拖进了 overflow。
+
+**根因**：这次迁移的设计一直是"一天一个 proxy session"（`session_id = f"metaclaw-{test_id}"`，`run_day` 里对全天所有 round 只调用一次 `_prepare_session`），刻意对齐 MetaClaw 官方自己的评测代码 `infer_cmd.py::_run_group`（`original_session_id` 对一天里所有 round 复用同一个值）。这意味着当天所有 round 的完整对话历史（包括某道题写崩的一万多字）会原样累积进同一份 transcript，作为下一题 `openclaw agent --session-id` 调用的上下文——一天前几题写崩，后面所有题目（不管类型）陪葬。
+
+**读代码确认的关键事实**（不是假设，逐条核实过）：
+1. `_prepare_session`（`MetaClaw-official/benchmark/src/infer/infer_cmd.py:423`）只是在 `work_openclaw_state_dir/agents/{agent_id}/sessions/{session_id}.jsonl` touch 一个文件（不存在才建）——换一个新 `session_id` 就是换一份全新空 transcript，纯文件级操作，跟 workspace/gateway 完全无关。
+2. `run_day` 里 workspace（`_prepare_work_copy`/`_copy_workspace_for_test`/`_patch_agent_workspace`/`_ensure_plugins_allowlisted`）和 gateway（`_start_work_gateway`/`gateway_port`）全部是 day 级资源，一个参数都不依赖 session_id，天然可以在"当天 workspace 不变"的前提下单独拆分 session。
+3. `openclaw_opd_api_server.py::_maybe_submit_ready_samples` 里 `_pending_turn_data`/`_prm_tasks` 是按 `session_id` 分桶的字典——新 session_id 对代理来说天然是一张白纸，proxy 侧不需要任何改动。
+4. `[Previous Feedback]`（`_build_feedback_text`/`with_feedback`）是纯文本拼接，靠 `prev_inline_score`/`prev_round_record` 传递，不依赖共享对话历史——"跨题知道上一题哪里错了"这条路径本来就不靠 session 共享维持，不受这次改动影响。
+5. MetaClaw 官方"训练模式"代码（`metaclaw/openclaw_env_rollout.py::run_task_episode`）用的是完全不同的模型：`session_id = f"env-{task_id}-{uuid4}"`，每个 task 独立 session，自己直接控制生成循环、走 shell 命令，根本没有 `day/group/round/[Previous Feedback]/checker` 这套结构——这次迁移本来就没有对齐这份代码（"三方对照"表已记录），所以"要不要按题拆 session"这件事上不存在 MetaClaw 训练侧的先例可以参照，是这次迁移自己的架构决定，不是照抄谁。
+
+**CLI 额外核实的三件事**（读真实数据/官方源码，不是猜）：
+1. **全部 30 天 346 道题的 `round_record["id"]` 扫描**：清一色 `r1`...`r15`，纯字母数字，没有空格/斜杠这类不安全字符；`preference_tags` 只在 `all_tests.json` 的 day 级出现，round 级没有；每天恰好 1 个 group，且 `group["id"] == test_id`（跟 `day07/questions.json` 单独核实的结果一致）。
+2. **`openclaw agent --session-id` 是不是真隔离**：OpenClaw 官方文档确认换 id 就是换会话；CLI 把 id 解析成 `agent:{agentId}:explicit:{sessionId}`，transcript 路径正是 `_prepare_session` touch 的那个 `.jsonl`；`20260819_153518` 训练本身已经反向证明了这条 jsonl 就是在涨的那份上下文（同一天越问越长直到 overflow）。残留风险很小且不是 blocker：OpenClaw 的 `tools.sessions.visibility` 理论上允许 `sessions_list` 读到同 agent 目录下其它 session 的 jsonl，但 `153518` 这次训练实测工具只有 `read`/`write`/`edit`，`sessions_*` 调用 0 次；训练侧 plugins allowlist 只有 `rl-training-headers`，没有任何记忆类插件。
+3. **overflow 真实模式不只 day07 一个案例**：`day07`（r5 写崩→r6 起全 overflow，含 2 道选择题）、`day08`（r1-7 已经很长，r8-9 generate-fail，r10 起 overflow，含末尾选择题）、`day09`（r1-3 超长→r5 generate-fail→r8 起 overflow，含 r10 选择题）、`day10`（r4-5 约 2 万字→r6 generate-fail→r10 起 overflow，含 2 道选择题）——模式一致：前面几道写崩的 `file_check` 把 transcript 撑满，后面不论题型一起死。
+
+**修复（只改 `metaclaw_rollout_driver.py`，不碰 proxy 补丁/workspace/gateway 逻辑）**：
+- day 级的 `session_id = f"{_SESSION_ID_PREFIX}{test_id}"` 和它对应的单次 `_prepare_session(...)` 调用整个删除，改成 round 循环内部为每道题现算：`round_session_id = f"{_SESSION_ID_PREFIX}{test_id}-{group.get('id','unknown')}-{round_record['id']}"`，紧接着调用 `_prepare_session(work_openclaw_state_dir, agent_id, round_session_id)`。`{group_id}-` 这段在真实数据里是冗余的（`group["id"]` 恒等于 `test_id`），但保留作为对 `EvalFlowQueryReader` legacy 格式（理论上一天可以有多个 group）的防御，成本为零。
+- `_run_round`/`_send_verdict_turn`/`_send_session_close_only` 三处全部改用同一个 `round_session_id`，不再是共享的 day 级 `session_id`。
+- `_send_verdict_turn` 的 `session_done` 从 `is_last_round`（只有当天最后一题才收尾）改成**每题无条件 `True`**——每题现在都是完整独立的 session，必须每次收尾，不能只等到当天最后一题。
+- `agent_succeeded=False` 分支的 `_send_session_close_only` 同理，从 `if is_last_round:` 改成**每次失败都无条件调用**——不这样做的话，非当天最后一题的失败会把挂起轮次留在一个再也不会收到任何后续消息的 session 里，永远等不到清理，比原来的行为更糟（原来好歹能被当天下一题的 next_state 误判掉，现在的 session 拆分下这条误判路径也不存在了）。
+- `is_last_round` 这个局部变量随之整个删除（原来只在这两处用到）。
+
+**连带效果**：这个改动顺手把 08-17 记录的"跨 round 污染"这个此前搁置的老问题也一并结构性解决了（`docs/metaclaw_migration_plan.md`"下一步工程任务"第 1 项）——那个 bug 的前提是"崩溃 round 的挂起轮次被同一 session 的下一条消息误判成它的 next_state"，现在每个 round 都是独立 session、且每次都无条件发送 `session_done`，这个前提不再成立，不需要再单独设计修复。
+
+**预期效果（CLI 给出，如实记录，不夸大）**：
+- 会：`day07-10` 那种"选择题被同一天前面的长文拖垮"的模式应基本消失，Acc. 里的选择题部分能重新反映模型真实能力。
+- 不会：`Compl.` 不会因此变好——单题依然可能写出一万字、依然可能打 0 分，这个改动只是让它不再拖累同一天后面所有题目，"file_check 学不会写文件"这件事仍然要靠 OPD 蒸馏/奖励设计解决，是另一件事。
+
+**跟 MetaClaw 官方评测代码的分歧，明确记账**：MetaClaw 自己的 `_run_group` 是"一天一个 session"，这次改成"每题一个 session"是主动偏离——可以接受的理由是：MetaClaw 自己的确定性打分（`_compute_inline_score`）从不读 transcript，只读 workspace 文件/agent 最终回答，这次改动没有改变 checker 打分口径；而 MetaClaw 自己的训练侧代码（`openclaw_env_rollout.py`）本来就没有跟这次迁移的 day/round/feedback 结构对齐过，不存在"这次改动破坏了跟官方训练方法一致性"这层顾虑。这是训练 driver 自己的架构选择，不是无意识偏离。
+
+**验证方式**：`py_compile` 通过。**真实训练环境完全未验证**——CLI 明确要求不要热补正在跑的 `153518`/`173654`，这次改动落地后由用户决定何时提交新训练。下一轮训练需要确认：`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失（单题仍可能很长/仍可能 0 分，但不该再连坐后面的题）；如果这次跟 Layer 1/2（OPD hint 接线修复）同一轮训练一起验证，Acc. 提升需要分开看归因——"选择题不再被 overflow 拖累"和"OPD 让 file_check 真的变好"是两件不同的事，不能笼统算作同一个改动的效果。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：
@@ -465,6 +500,8 @@ slime 自己的 rollout 循环攒满一个训练 batch（16 条）就会 `pause_
 
 - **发现但未修复：跨 round 污染 bug（2026-08-17，需要真实数据才能判断值不值得精确修）**。`agent_succeeded=False` 时，driver 目前只处理了"这是当天最后一个 round"（发 `_send_session_close_only`）；如果失败发生在**不是最后一个 round 的中途**，且这个 round 崩溃前已经真实产生过至少一个轮次，代码现在什么都不做——那个轮次会一直"待评估"挂在代理里，下一个 round 开始后，它的第一个真实轮次一到，会被反应式机制误当成上一个失败 round 那个挂起轮次的 `next_state` 去评估，等于用完全不相关的下一个 round 内容判断上一个失败 round 的最后一步。不好简单补：直接照搬 `_send_session_close_only` 会带上 `X-Session-Done: true` 的副作用（`_turn_counts.pop(session_id, None)`），语义上是"这一整天结束了"，但这天后面还有别的 round 要继续跑，现在没有干净的区分手段。
   **要不要精确修，取决于这个失败模式在真实场景下有多常见**——只有 round "跑到一半才失败"（已经成功过几个工具调用之后才崩）才会触发，一上来就失败（比如网关连不上）不会留下挂起轮次。这个频率纯粹是实证问题，本地无法判断，需要看真实训练日志里 `agent_succeeded=False` 的那些 round 具体是在第几个工具调用之后失败的。**留到真实训练跑起来、观察这类日志之后再决定要不要修、怎么修**。
+
+  **已结构性解决，不再需要单独判断/修复（2026-08-19c）**：见"session 拆分——从'一天一个 session'改成'每题一个 session'"一节。那次改动是为了解决另一个问题（同一天后面题目被前面题目的长文本拖进 context overflow）而做的，但它顺带拆掉了这个 bug 的前提——每个 round 现在是独立的 proxy session，且 `_send_session_close_only`/`_send_verdict_turn` 的 `session_done` 都改成每题无条件发送，不再有"下一个 round 在同一个 session 里"这回事，"挂起轮次被下一个 round 的内容误当 next_state"这条路径不再存在，不需要再单独判断触发频率或设计修复。
 
 ### 三方对照：迁移方法各环节分别用的哪种方式，跟 MetaClaw 自己、OpenClaw-RL tool-call 的差异（2026-08-17）
 
