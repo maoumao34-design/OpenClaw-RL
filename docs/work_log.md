@@ -1792,24 +1792,27 @@
 - `scripts/prepare_patched_openclaw_combine_select.sh`：新增 `openclaw-rl-metaclaw-verdict-early-return` + `openclaw-rl-metaclaw-step-judge-truncation-penalty` 两处补丁
 - `scripts/metaclaw/metaclaw_rollout_driver.py`：`_send_verdict_turn` max_tokens 改 0，新增 `_GENERATE_FAIL_MARKERS` 转录标注
 - `docs/metaclaw_migration_plan.md`：新增"训练信号根因分析与修复"一节，更正了上一节"没被基础设施问题污染"的错误判断
+- **发现并修复一个独立的问题：默认提交训练会静默加载上一次的（可能训坏的）权重**。用户追问"权重续训"跟"按天续跑"是不是两套机制，CLI 核对 `run_openclaw_topk_select_modelfactory.sh` 确认：`--load "${SAVE_CKPT}"` 是无条件加的（更早为 Personal Agent Track 真实崩溃续训加的），`run_metaclaw_migration_modelfactory.sh` 里 `SAVE_CKPT` 默认值原来是固定路径（不带时间戳）——只要上次训练在这个目录存过 checkpoint，下次提交训练**即使完全不碰 `METACLAW_PROGRESS_DIR`/`METACLAW_RESUME`** 也会静默加载那份权重继续训，不是从干净 base 开始，跟"实验阶段每次都要重新开始跑"这个明确要求直接冲突。之前"训练侧 checkpoint 本来就有 `--load` 自动续训，不受这次改动影响"这个判断没有意识到这正是问题所在
+  - **修复**：`SAVE_CKPT` 默认值改成带时间戳（跟 `LOGS_DIR` 共用脚本开头统一生成的 `RUN_TIMESTAMP`）——不显式设置就天然是新目录，`--load` 自动回退到干净预训练权重；旧 checkpoint 不删，留在各自时间戳目录下，需要接着训某次跑出来的权重仍可以手动指定 `SAVE_CKPT`。用 bash 验证过默认解析和显式覆盖两种情况都符合预期
+→ 详见 `metaclaw_migration_plan.md`"修复：默认提交训练会静默加载上一次的（可能训坏的）权重"
 
 ### 当前状态（2026-08-19）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复，四处改动均合成数据/官方源文件验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
 
 ### 已知限制 / 未解决
-同 08-18，未变，另加：**四处训练信号修复完全未在真实训练中验证**（`py_compile`/回归测试通过不代表真实代理/SGLang 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为这两个 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"。
+同 08-18，未变，另加：**训练信号修复 + checkpoint 默认路径修复均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练**（带上今天四处修复），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净信号下的真实效果
+2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净权重+干净信号下的真实效果
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **四处训练信号修复在真实训练中是否真的生效**（冒烟清单四条）——本次迁移当前最需要验证的问题
-- [ ] 干净信号下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
+- [ ] **训练信号四处修复 + checkpoint 默认路径修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
+- [ ] 干净权重+干净信号下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
 - 其余同 08-18（见上）
 

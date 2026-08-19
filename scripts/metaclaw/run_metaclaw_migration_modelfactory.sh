@@ -49,6 +49,10 @@ OPENCLAW_RL_ROOT=$(cd "${SCRIPTS_DIR}/../.." && pwd)
 OPENCLAW_RL_GIT_SHA=$(cd "${OPENCLAW_RL_ROOT}" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 export OPENCLAW_RL_GIT_SHA
 
+# 本次提交的统一时间戳，SAVE_CKPT 和 LOGS_DIR 默认值共用同一个，方便按
+# 时间戳对上是同一次训练；见下面 SAVE_CKPT 定义处的说明。
+RUN_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
 # =====================================================================
 # 配置
 # =====================================================================
@@ -85,8 +89,26 @@ if [ -z "${OPENCLAW_GATEWAY_TOKEN:-}" ]; then
     exit 1
 fi
 
-# 独立 checkpoint 路径——不跟 Personal Agent Track 的 checkpoint 混用
-SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-metaclaw-migration}
+# 独立 checkpoint 路径——不跟 Personal Agent Track 的 checkpoint 混用。
+#
+# 2026-08-19 修复（真实发现，不是预防性改动）：CLI 核对 run_openclaw_
+# topk_select_modelfactory.sh 发现 --load "${SAVE_CKPT}" 是无条件加的
+# （Megatron 在这个目录不存在/没有 latest_checkpointed_iteration.txt 时
+# 才会回退到 --ref-load 用干净预训练权重，见该脚本顶部注释）——这跟"按
+# 天续跑"（METACLAW_PROGRESS_DIR/METACLAW_RESUME）完全是两回事、两个
+# 独立开关：不设 METACLAW_RESUME 只保证不会跳过已经打过分的天，**不保证
+# 训练权重是干净的**。之前这里用固定路径（不带时间戳）作为默认值，
+# 意味着只要上一次训练在这个目录存过 checkpoint（哪怕是训坏的），下一次
+# 提交训练——即使完全不碰任何续跑相关的环境变量——也会静默地把那份
+# 权重通过 --load 加载进来继续训，不是从干净的 base Qwen3-4B 开始，跟
+# 用户"实验阶段每次都要重新开始跑"这个要求直接冲突。
+#
+# 改成默认按时间戳生成唯一路径（跟 LOGS_DIR 共用同一个 RUN_TIMESTAMP，
+# 方便按时间戳对应同一次训练）：每次不显式设置 SAVE_CKPT 提交训练，
+# 目录天然不存在，--load 自动回退到 --ref-load 干净权重，不需要手动
+# 删除旧目录或记住换路径。旧 checkpoint 不会被清掉，各自留在自己的
+# 时间戳目录下，需要的话仍可以手动 SAVE_CKPT=<旧路径> 显式接着训。
+SAVE_CKPT=${SAVE_CKPT:-/dfs/data/openclaw-rl-project/checkpoints/qwen3-4b-openclaw-metaclaw-migration_${RUN_TIMESTAMP}}
 REPO_ROOT=${REPO_ROOT:-/dfs/data/openclaw-rl-project/OpenClaw-RL-official}
 
 # MetaClaw-official 检出路径（需要额外准备，不是 openclaw-rl 仓库自带的）
@@ -139,7 +161,7 @@ METACLAW_MAX_DAYS=${METACLAW_MAX_DAYS:-}
 CONDA_ENV=${CONDA_ENV:-/dfs/data/envs/openclaw-rl}
 CONDA_BASE=${CONDA_BASE:-/dfs/data/miniconda3}
 
-LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/metaclaw_migration_$(date +%Y%m%d_%H%M%S)}
+LOGS_DIR=${LOGS_DIR:-/dfs/data/openclaw-rl-project/logs/metaclaw_migration_${RUN_TIMESTAMP}}
 mkdir -p "${LOGS_DIR}"
 
 # report.json/report.md 落盘目录，跟上面断点续跑的 METACLAW_PROGRESS_DIR
