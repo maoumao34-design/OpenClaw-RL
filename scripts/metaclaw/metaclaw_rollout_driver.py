@@ -740,6 +740,15 @@ def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) 
     into inline_score by _compute_inline_score/_run_file_check -- dynamically
     accurate to the real failure, no extra checker execution needed).
 
+    If the checker produced neither stdout nor stderr (a silent failure --
+    e.g. a bare sys.exit(1) with no diagnostic print), there is no reliable
+    signal to build a hint from. Return "" rather than falling back to the
+    static feedback.incorrect text -- an empty hint correctly yields
+    RL-only training (checker eval_score still applies) instead of risking
+    an OPD hint that may not describe what actually happened. Confirmed
+    (2026-08-19, metaclaw_migration_20260819_153518 log cross-check) this
+    silent-failure case is rare: 1 of 55 failed file_check rounds.
+
     multi_choice has no such problem: _build_feedback_text's per-option text
     is already selected from the agent's actual wrong/missed options, so it
     is reused as-is here.
@@ -752,7 +761,7 @@ def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) 
             return stdout
         if stderr:
             return stderr
-        return _build_feedback_text(round_record, inline_score)
+        return ""
     return _build_feedback_text(round_record, inline_score)
 
 

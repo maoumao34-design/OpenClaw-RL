@@ -1800,25 +1800,32 @@
   - **修复**：只针对 503 单独加一个独立、耐心的等待重试环，不消耗现有 `AGENT_RETRY`/`VERDICT_RETRY` 预算，其余失败类型（含 timeout）完全不受影响：`_run_round`（agent 子进程）用 `stderr` 文本匹配 `"503 status code"`（OpenClaw 自己 `FailoverError` 的确切文案）；`_post_with_retry`（verdict/close 提交）用 `httpx` 结构化 `response.status_code == 503`（更精确，httpx 自己的错误文案跟 OpenClaw 不是同一段文字）。15 秒重试间隔，900 秒（15 分钟）总预算，用 `time.monotonic()` 测墙钟时间（不是单纯累加 sleep，因为每次失败的进程启动本身也要 1-2 秒）
   - 5 项合成数据回归测试全部通过（503-then-成功、503 耗尽预算后正确放弃、timeout 完全不进等待环——三点都覆盖了 `_run_round`/`_post_with_retry` 两条路径）。真实训练环境（真实的分钟级暂停窗口）尚未验证
 → 详见 `metaclaw_migration_plan.md`"修复：训练暂停期间的 503 被当成基础设施失败，整段天数被空转吃掉"
+- **发现并修复第四个独立问题：checker 算出的 OPD hint 被无条件丢弃，file_check/多选题 verdict 轮次从未真正走过 OPD 蒸馏**。CLI 对着 `metaclaw_migration_20260819_153518` 排查"越写越长、`write` 调用消失"这个模式，核对 driver 的判分和 hint 构造，发现上面第一条修复（`openclaw-rl-metaclaw-verdict-early-return`）为了堵 `UnboundLocalError` 崩溃，把返回值写死成 `accepted: False, hint: ""`——但 `_metaclaw_hint`（driver 侧 `_build_opd_hint` 算出的真实失败原因）当时已经算出来了，只打进日志没真正使用，OPD 蒸馏这条路径事实上从未生效过，一直只有 checker ±1 的 GRPO 信号
+  - 两处独立问题，分两层修，Layer 1 必须先于 Layer 2：**Layer 1**（`_build_opd_hint`，只影响 file_check）——checker 静默失败（stdout/stderr 都空）时原来退回题面写死的静态 `feedback.incorrect` 文案，可能文不对题（day01 r5 实锤：模型没碰某个 task，hint 却说该 task 的日期格式错了），改成直接返回 `""`，不再猜；CLI 用 `20260819_153518` 真实数据核对：约 55 道失败 file_check 里 48 道有真实 checker stdout、6 道是留在 stderr 的 traceback、只有 1 道落进"两边都空"这个分支，改动后覆盖率几乎不受影响。**Layer 2**（`prepare_patched_openclaw_combine_select.sh`，`_metaclaw_verdict` 分支）——`_metaclaw_hint` 非空且长度 > 10 时，照抄父类 `accepted=True` 材料化代码（`_append_hint_to_messages` → `_normalize_messages_for_template` → `apply_chat_template` → tokenizer 编码），真正返回 `accepted=True` 让 hint 进入 teacher 序列，`eval_score` 仍是 checker ±1；空 hint 维持 `accepted=False` 不变；材料化代码包了 try/except，模板/tokenizer 在 MetaClaw 消息结构上一旦报错就安全退回现有行为，不丢样本
+  - CLI 核实过一个容易想歪的点：官方原始调度确实是"没 hint 就整条丢弃"，但 MetaClaw 走的是 `Combine → Combine-Select` 链路，本项目早先给 Personal Agent Track 打的调度补丁本来就有"`accepted=False` 但 `eval_score` 有效就走纯 RL"这条路，这次改动不需要碰调度逻辑，只改 `_opd_evaluate` 返回值
+  - `py_compile` + 完整补丁链对真实官方源文件生成输出验证通过，人工核对生成代码的分支结构正确。**真实训练环境完全未验证**——下一轮需要在日志里确认出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1` 这行，不能只有 `submitted RL sample`
+  - **明确没有一起做**：CLI 同一轮诊断还指出"越写越长"另有两个更致命的独立成因——下一轮 `_build_feedback_text` 静态反馈文案本身可能文不对题（跟这次的 verdict hint 是完全不同的代码路径）、中间轮次 step-judge 对"没有实际调用 write/edit 的长分析"经常打 +1（75-100% 命中率）。这两处都只有诊断没有方案，决定不跟这次两层改动捆在一起，等下一轮训练数据出来分别单独设计
+→ 详见 `metaclaw_migration_plan.md`"修复：checker 算出的 OPD hint 被无条件丢弃，file_check/多选题 verdict 轮次从未真正走过 OPD 蒸馏"
 
 ### 当前状态（2026-08-19）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-18，另加：[x] `metaclaw_migration_20260818_182736`"先好后差"塌陷模式的根因（checker 分数丢失 + verdict 残片污染 GRPO）已定位并修复；[x] 默认提交训练会静默加载上次可能训坏的权重这个问题已修复（`SAVE_CKPT` 默认带时间戳）；[x] 训练暂停期间 503 把整段天数空转吃掉的问题已修复（503 专属耐心等待重试环，跟 timeout 等其它失败类型分开处理）；[x] checker 算出的 OPD hint 被无条件丢弃的问题已修复（Layer 1 收窄 file_check 静态文案退路 + Layer 2 真正接回 `accepted=True` 材料化）。所有改动均合成数据/官方源文件/bash 逻辑验证，真实训练未验证。
 
 ### 已知限制 / 未解决
-同 08-18，未变，另加：**训练信号修复 + checkpoint 默认路径修复 + 503 暂停重试修复均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看。
+同 08-18，未变，另加：**四处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线）均完全未在真实训练中验证**（`py_compile`/回归测试/bash 逻辑验证通过不代表真实代理/SGLang/Megatron 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518` 这次训练已确认存在"越写越长、write 调用消失"的模式，CLI 诊断出的另外两个成因（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这个模式的部分症状，不是回归。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部三处修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`、暂停窗口期间日志出现 503 pause-retry 等待记录而不是直接判定基础设施失败。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，才是第一次干净权重+干净信号+完整天数下的真实效果
+2. **MetaClaw 迁移**：**重新提交训练**（带上今天全部四处修复，不显式设置 `SAVE_CKPT`，确认用的是新的干净权重路径），按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、`_send_session_close_only` 仍是 `X-Turn-Type: side`、暂停窗口期间日志出现 503 pause-retry 等待记录而不是直接判定基础设施失败、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线，同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
+- [ ] **训练信号四处修复 + checkpoint 默认路径修复 + 503 暂停重试修复 + OPD hint 接线修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题
 - [ ] 干净权重+干净信号+完整天数下训练结果跟基线（Acc.=8.1%/Compl.=0.0%）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
+- [ ] "越写越长"模式的另外两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
 - 其余同 08-18（见上）
 
 ---

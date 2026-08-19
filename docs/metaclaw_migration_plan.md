@@ -391,6 +391,26 @@ slime 自己的 rollout 循环攒满一个训练 batch（16 条）就会 `pause_
 
 **验证方式**：新增 5 项合成数据回归测试，覆盖：`_run_round` 遇 503 重试后成功、遇 503 耗尽预算后正确放弃（用极短的等待参数验证墙钟计时逻辑本身是对的，不是靠真的等 15 分钟）、timeout 类失败完全不进等待环（零等待、只尝试一次，验证跟 503 处理是互斥的两条路径）；`_post_with_retry` 遇 503 重试后成功、遇 503 耗尽预算后正确放弃且不抛异常。全部通过，真实训练环境（真实的 4 分钟量级暂停窗口）尚未验证。
 
+### 修复：checker 算出的 OPD hint 被无条件丢弃，file_check/多选题 verdict 轮次从未真正走过 OPD 蒸馏（2026-08-19b）
+
+**背景**：CLI 对着 `metaclaw_migration_20260819_153518` 的日志排查"越写越长、`write` 调用消失"这个模式，核对 driver 里 `file_check` 的判分和 OPD hint 构造，发现上一条（"训练信号根因分析与修复"）里加的 `openclaw-rl-metaclaw-verdict-early-return` 有一个没写完的地方：那次修复的目的是堵住 `UnboundLocalError` 崩溃，返回值写成固定的 `accepted: False, hint: ""`，但 `_metaclaw_hint`（`_send_verdict_turn` 携带过来的、由 driver 侧 `_build_opd_hint` 算出的真实失败原因）在这之前已经算出来了，只打进日志的 `hint_len` 字段，从没真正被使用——多选题和 `file_check` 的 verdict 轮次自此只有 checker ±1 的 GRPO 信号，OPD hint 蒸馏这条路径实际上从未生效过。
+
+**两处独立问题，分两层修，且顺序不能反**（Layer 1 必须先于 Layer 2，否则会把不可信的 hint 也喂给 OPD，比现在什么都不做还糟）：
+
+**Layer 1（driver 侧，`_build_opd_hint`，只影响 `file_check`）**：原来 checker exit 1 且 stdout/stderr 都是空字符串时，退回题面写死的静态 `feedback.incorrect` 文案——函数自己的 docstring 早就写明白这条退路危险（"用静态文案当 hint，如果真实失败原因不是它描述的那种，会把蒸馏目标指向错误的纠正方向，主动污染训练"），但这条退路当时仍然保留着。`metaclaw_migration_20260819_153518` 的 day01 r5 就是实锤：`python -c` 找不到 T-405 静默失败（stdout/stderr 皆空），hint 变成"due_date 格式应该是 2026-03-18T18:00:00+08:00"，模型可能根本没碰这个 task。
+
+**修复**：stdout/stderr 都空时直接返回 `""`，不再退回静态文案。CLI 用 `20260819_153518` 这趟真实数据核对过覆盖率影响：约 55 道失败的 `file_check` 题里，48 道 checker 有 `FAIL: ...` 这类 stdout、6 道是 `python -c` 的 traceback（留在 stderr，改动前后都会被保留，不受影响）、只有 1 道（day01 r5）落进"两边都空"这个分支——改完之后"猜错"的口子基本堵上，代价很小（1/55 变成无 hint，GRPO 的 -1 照常打，只是不再有 OPD）。`_build_opd_hint` 的 `len(hint) <= 10` 材料化门槛（Layer 2 复用父类同一标准）也核对过不会误杀——这趟数据里最短的真实 hint 是 28 字符。
+
+**Layer 2（proxy 侧，`prepare_patched_openclaw_combine_select.sh`，`_metaclaw_verdict is not None` 分支）**：`_metaclaw_hint` 非空且长度 > 10 时，不再走固定的 `accepted: False` 返回，而是照抄父类 `OpenClaw-Combine-Select` 的 `accepted=True` 候选材料化代码——`_append_hint_to_messages(turn_data["messages"], _metaclaw_hint)` → `_normalize_messages_for_template` → `self.tokenizer.apply_chat_template(..., tools=turn_data.get("tools"))` → 拼接 `response_text` → tokenizer 编码成 `enhanced_ids`——返回 `accepted=True, teacher_tokens_candidates=[enhanced_ids], hints=[_metaclaw_hint]`，`eval_score` 仍然是 checker 的 ±1（不受影响，走的是 `OPD+RL` 而不是纯 `OPD`）。`_metaclaw_hint` 为空时（passed=True，或者 Layer 1 主动压掉了不可信的静态文案）维持原有 `accepted: False` 不变。中间轮次的 step-judge 分支（`metaclaw_round_mode`）不动——那条设计上没有具体纠正对象，继续 RL-only 是对的。
+
+这段材料化代码用 `try/except` 包住：`apply_chat_template`/tokenizer 这条路径此前从没有在 MetaClaw 的 tool 消息结构上真正跑出 `accepted=True` 过（一直是先崩溃、后来是固定 `accepted=False`），是没有历史数据验证过的新代码路径，一旦真的因为消息结构不兼容而抛异常，退回现有的安全 `accepted=False` 返回，不让整条样本因为模板报错而丢失（不是必须项，但成本低、能避免"模板一炸整条样本消失"这个新引入的风险）。
+
+**调度逻辑核实（CLI 提出，已核实不需要改动）**：官方原始 `openclaw_opd_api_server.py` 的 `_maybe_submit_ready_samples` 确实是"`accepted=False` 直接 `continue`，样本整条丢弃"（第 863-865 行），但 MetaClaw 走的是 `Combine → Combine-Select` 继承链，`openclaw_combine_api_server.py`（本项目早先给 Personal Agent Track 打的补丁，非本次新增）的调度是三路：`accepted 且有效 RL` 走 `OPD+RL`、`仅 accepted` 走纯 `OPD`、`仅有效 RL`（`accepted=False` 但 `eval_score` 非空）走 `_submit_rl_turn_sample`——这条 RL-only 路径本来就存在且一直在用（Personal Agent Track 的普通 PRM ±1 走的就是它），这次改动只碰 `_opd_evaluate` 的返回值，不涉及、也不需要碰这段调度代码。唯一真会导致整条样本丢失的地方是 `Combine` 里 `task.result()` 抛未捕获异常时的 `continue`（跟 `accepted` 是否为 `True/False` 无关）——这正是上面 try/except 防的那个场景。
+
+**验证方式**：`metaclaw_rollout_driver.py` 的 `_build_opd_hint` 改动通过 `py_compile` 验证。`prepare_patched_openclaw_combine_select.sh` 的改动跑了完整补丁链对真实官方 `openclaw_combine_select_api_server.py` 生成输出，`py_compile` 通过，人工读取生成代码确认缩进、`try/except/else`、`if _metaclaw_hint and len(...) > 10:` 分支结构、两个 `return` 的位置都正确。**真实训练环境完全未验证**——下一轮训练需要在日志里找一条 `FAIL: cannot read` 类和一条选择题错题，确认后面跟着 `[openclaw-rl-metaclaw-verdict-opd-hint] session=... accepted K_i=1 hint_len=...`（不能只有 `submitted RL sample` 那行），且没有因为 `apply_chat_template` 在 MetaClaw 的 tool 消息结构上出错而卡住；stdout 全空的 `file_check` 失败题应仍然只是 RL-only。
+
+**明确没有一起做的**：CLI 同一轮诊断还指出"越写越长"这个模式另有两个更致命的独立成因——(1) 下一轮 `_build_feedback_text` 返回的静态反馈文案本身可能文不对题（跟这次改的 verdict hint 是两套完全不同的代码路径，`_build_feedback_text` 影响的是下一题看到的 `[Previous Feedback]`，不是训练用的 teacher 信号）；(2) 中间轮次的 step-judge 对"没有实际调用 write/edit 的长分析"经常打 +1（`20260819_153518` 数据：45 次里 39 次，约 75-100%），相当于在奖励"堆字数而不落盘"这个行为。这两处都还没有设计成方案，只有诊断，跟这次两层改动不是同一严谨程度，决定不捆在一起改——先看这次 OPD 接线修复单独生效的效果，同时用下一轮训练的干净数据验证 CLI 这两个新假设，再分别单独设计方案。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：
