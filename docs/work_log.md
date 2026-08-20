@@ -1863,28 +1863,38 @@
 - `scripts/prepare_patched_openclaw_combine.sh`：新增 `openclaw-rl-metaclaw-train-until-day` 拦截补丁（`_maybe_submit_ready_samples`）
 - `docs/metaclaw_migration_plan.md`：新增"方案：可调 K 天训练窗口 + 冻结评测剩余天数"一节，含三轮 CLI 审阅过程和最终实现细节
 
+**完成内容（续，同一天）：**
+- **发现并修复第八个独立问题：day12-14 那种"超长 thinking 空转"老问题再次出现，根因是难度阶梯（P2 命名规范引入）+ 反复灌同一份刻板反馈**。CLI 排查 `metaclaw_migration_20260820_094611`（全量 30 天）时确认：day01-09 正常，day10-11 开始"只说不做"，day12-14 陷入 thinking 循环（7 万→22 万字，同一句"满足用户要求"复读几百到近两千次）——跟 Personal Agent Track 08-07~08-10 那次"超长 thinking 空转"是同一机制，换了个触发场景（P2 文件命名反复失败）
+  - 经过多轮 CLI 用真实数据核实（含专门验证"不能影响 P1 现在跑得不错的部分"这个约束），定稿并实现三处独立修复：
+  - **修复 1**：`_build_next_round_feedback`（新函数）给 file_check 失败的 next-round 反馈追加真实 checker stdout，带过滤——只在 stdout 以 `FAIL` 开头、不含 `Traceback` 时追加，否则整段跳过退回纯静态反馈（P1 用的 `check_iso8601` 约 1/4 失败是脚本自己崩了产出 Traceback，原样拼会更糊）
+  - **修复 2**：仅当 `round_record["eval"]["command"]` 命中 `check_filename.py --dir`（P2 宽松日期模式）时，追加"日期不用精确匹配"的说明；day11 起的精确 glob 模式完全不加（题面无专门字段区分，靠解析 command 判断，检测不到就不加，不猜）——确认 P1 的 35 道 file_check 全部走 `check_iso8601`，这条改动对 P1 结构性零影响
+  - **修复 3**：选择题格式失败（`_build_multi_choice_feedback` 返回官方常量 `FORMAT_ERROR`）时追加模型这次实际输出的原文片段，打破连续 20+ 次字节级相同反馈；一处改动同时覆盖 next-round 反馈和 OPD hint（两边调用同一个官方函数）；`094611` 数据里 P1 阶段格式失败 0 次，几乎不受影响
+  - **修复 4**：`is_invalid_tool_use`（含规则 5 复读检测，`N=12`，已用 P1 好样本/day12-14 坏样本两面校准过，无需重新调参）接线到 MetaClaw 的 `_metaclaw_verdict`/`metaclaw_round_mode` 两条打分分支——CLI 用真实 shadow 日志确认这个标记之前只在 Personal Agent Track 分支强制 -1，MetaClaw 两条路径 52 次命中、0 次真正生效，不是重做检测，是把已有信号接到之前漏掉的地方，跟 08-19 给 step-judge 补 `is_truncated` 覆盖是同一类缺口
+  - **验证**：`py_compile` 通过（driver + 三个代理补丁脚本对真实官方源文件完整跑通）；新增合成测试覆盖 `_filtered_checker_stdout`（干净/Traceback/非FAIL/超长四种情况）、`_is_dir_mode_filename_check`（`--dir`/精确glob/缺失三种情况）、`_build_next_round_feedback`（五种场景：宽松失败/精确失败/Traceback失败/通过/MC格式失败）全部符合预期；`is_invalid_tool_use` 接线位置人工核对（`_metaclaw_verdict` 分支在 hint 材料化前、`metaclaw_round_mode` 分支跟 `is_truncated` 并列）。**真实训练环境完全未验证**——不热改正在跑的训练
+→ 详见 `metaclaw_migration_plan.md`"方案：next-round 反馈 + FORMAT_ERROR + is_invalid_tool_use 三处修复"
+
 ### 当前状态（2026-08-20）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-19（六处修复：训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分 + `--agent` workspace 修复，已合入 `metaclaw_migration_20260820_*` 这条正在跑的训练，目前到 day12 效果不错），另加：[x] **`METACLAW_TRAIN_UNTIL_DAY` 可调训练窗口 + 冻结评测已实现**（driver + 2 处 proxy 补丁），`py_compile`/合成测试/完整补丁链验证通过，真实训练完全未验证，且明确不影响正在跑的 `day12` 这条训练。
+**MetaClaw 迁移**：同 08-19（六处修复：训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分 + `--agent` workspace 修复，已合入 `metaclaw_migration_20260820_*` 这条正在跑的训练，目前到 day12 效果不错），另加：[x] **`METACLAW_TRAIN_UNTIL_DAY` 可调训练窗口 + 冻结评测已实现**（driver + 2 处 proxy 补丁），[x] **day12-14 超长 thinking 空转的三处根因修复已实现**（next-round 反馈追加真实 stdout + 日期说明 + FORMAT_ERROR 原文片段 + `is_invalid_tool_use` 接线到 MetaClaw 两条打分分支）。以上两项均 `py_compile`/合成测试/完整补丁链验证通过，真实训练完全未验证，且明确不影响正在跑的 `day12` 这条训练。
 
 ### 已知限制 / 未解决
-同 08-19（历史状态），未变，另加：**`METACLAW_TRAIN_UNTIL_DAY` 功能完全未在真实训练中验证**——尤其是"未设置=行为完全一致"这个最关键的前提，只能靠代码结构上的门控条件（`TRAIN_UNTIL_DAY is not None`/`owner._metaclaw_training_frozen`）保证，没有做、也没法在本地做端到端的默认配置逐字节对比；dayK 尾部竞态（少量样本被连带丢弃）是已知、接受的设计，尚未在真实数据上观察过实际丢弃规模。
+同 08-19（历史状态），未变，另加：**`METACLAW_TRAIN_UNTIL_DAY` 功能和 thinking 空转三处修复均完全未在真实训练中验证**——尤其是"未设置=行为完全一致"这个最关键的前提，只能靠代码结构上的门控条件保证；dayK 尾部竞态（少量样本被连带丢弃）是已知、接受的设计，尚未在真实数据上观察过实际丢弃规模；thinking 空转修复只覆盖了这次诊断出的三个根因，没有解决"P2 阶段真实通过率能不能提高"这个更根本的能力问题，修复的目标是"不再灌刻板反馈导致空转"，不是"让模型学会命名规范"。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比**，确认这次改动在默认关闭状态下真的没有引入任何行为差异——这是这个新功能能不能信任的前提验证，优先于"用它做实际的短训练窗口实验"。同时继续观察 `metaclaw_migration_20260820_*`（六处修复已合入）跑完 30 天后的 Acc./Compl. 曲线，尤其是 `Compl.` 是否真的脱离了 0.0%（`--agent` 修复的预期效果）
-3. 确认默认配置对比通过后，可以考虑用 `METACLAW_TRAIN_UNTIL_DAY` 设一个具体 K，实际验证"早期正信号有用 vs 继续吃负分伤模型"这个假设
+2. **MetaClaw 迁移**：**用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比**，确认这两批改动在默认/未触发状态下真的没有引入任何行为差异——这是能不能信任这些改动的前提验证，优先于"用它们做实际实验"。同时继续观察 `metaclaw_migration_20260820_*`（六处修复已合入，不含本次这两批）跑完 30 天后的 Acc./Compl. 曲线，尤其是 `Compl.` 是否脱离 0.0%、day12+ 是否仍会陷入 thinking 空转（如果仍会，说明这批修复还没上这条训练，符合预期，不是修复无效）
+3. 确认默认配置对比通过后，可以考虑：用 `METACLAW_TRAIN_UNTIL_DAY` 设一个具体 K 做冻结实验；提交一轮带上 thinking 空转三处修复的新训练，观察 day12+ 是否还会崩盘
 4. 其余同 08-17
 
 ### 未验证
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
+- [ ] **thinking 空转三处修复上线后，day12+ 是否还会复现"越写越长/thinking 循环"**——核心验证点
 - [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%——`--agent` 修复的核心验证点
 - [ ] `METACLAW_TRAIN_UNTIL_DAY` 设置为具体 K 值时，冻结是否真的生效（`[metaclaw-freeze]` 日志、样本提交数骤降为 0）、dayK 尾部竞态实际丢弃规模
 - [ ] 干净权重+干净信号+完整天数+session 拆分+正确 workspace 下训练结果跟基线（Acc.=8.1%/Compl.=0.0%，这个基线本身也可能受 `--agent` 缺口影响，需要重新评估是否要用修复后的口径重新跑一次基线）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
-- [ ] "越写越长"模式剩下的两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
 - [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
 - 其余同 08-19（历史状态，见上）
 

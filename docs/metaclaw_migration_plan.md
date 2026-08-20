@@ -499,6 +499,28 @@ if (requestedSessionId && !sessionKey) sessionKey = buildExplicitSessionIdSessio
 
 **验证方式**：`py_compile` 通过；三个代理补丁脚本（`prepare_patched_openclaw_opd.sh`/`prepare_patched_openclaw_combine.sh`/`prepare_patched_openclaw_combine_select.sh`）依次跑完整补丁链，对真实官方源文件生成输出，全部 `py_compile` 通过，人工核对冻结检查在 `chat_completions` 里的位置确实在 `submission_enabled` 判断之前。新增合成测试覆盖：环境变量未设置/设为 `"0"`/设为 `"5"` 时 `TRAIN_UNTIL_DAY` 解析结果正确（`"0"` 不会被误判成"禁用"）；`is_frozen_day` 判断公式在多组 `(K, day_index)` 组合下结果正确；`_send_freeze_signal` 发出的请求 header/body 形状正确。**没有做端到端的"默认配置逐字节对比"合成测试**（`main()` 依赖真实 `openclaw agent`/代理/checker，本地无法完整跑通）——这个验证交给用户接下来另开的一次默认配置训练去跟当前 `day12` 这条正在跑的训练直接对比，代码层面能提供的保证是：新增的所有分支都由 `TRAIN_UNTIL_DAY is not None`（driver 侧）或 `owner._metaclaw_training_frozen`（代理侧，只有收到过冻结 header 才会变 `True`）这两个条件严格把门，未触发这两个条件时执行路径与改动前完全相同。**真实训练环境完全未验证**——不热改正在跑的 `day12` 这条训练，这次改动只影响未来新提交的训练任务。
 
+### 方案：next-round 反馈 + FORMAT_ERROR + is_invalid_tool_use 三处修复（2026-08-20b）
+
+**背景**：CLI 排查 `metaclaw_migration_20260820_094611`（全量 30 天训练）时发现"超长 thinking 空转"这个老问题在 day12-14 再次出现，且是**难度阶梯**触发的——day01-09 正常（thinking 5-9k 字），day10-11 先出现"只说不做、不调工具"，day12-14 才真正陷入 thinking 循环（7 万→22 万字，`finish_reason=length` 过半，字面上把"每个部分都满足用户要求"这类话复读几百到近两千次）。这条链路跟 Personal Agent Track 08-07~08-10 那次"超长 thinking 空转"是同一个机制（同一套刻板反馈反复灌 → 模型放弃用工具 → thinking 里空转），只是换了个触发场景：P2 阶段引入的文件命名规范题反复失败，同一份高度雷同的静态反馈（21 种骨架，18/39 同句式）逐天再灌一遍。
+
+这次讨论经过多轮 CLI 用真实数据核实（含专门确认"改动不能影响 P1 阶段现在跑得不错的部分"这个约束），最终定稿三处独立修复，均已实现：
+
+**修复 1：next-round 反馈追加真实 checker stdout（file_check 失败）**——`_build_feedback_text`（MetaClaw 官方函数，next-round 反馈和 `_build_opd_hint` 的训练 hint 都调用它）对 file_check 只读题面写死的 `feedback.incorrect`，从不读 checker 真实 stdout。新增 `metaclaw_rollout_driver.py::_build_next_round_feedback`，在官方函数返回值基础上追加真实 stdout（复用 `inline_score`，不用额外跑 checker）。**不是无条件追加**——CLI 用真实数据核实过：P1 用的 `check_iso8601.py`/内联 ISO 检查大多数失败时 stdout 很干净（`FAIL: field: value`），值得追加；但约 1/4 是检查脚本自己崩了产出 Python Traceback，原样拼进去只会更糊。`_filtered_checker_stdout` 只在 stdout 以 `FAIL` 开头、不含 `Traceback` 时才追加，否则整段跳过、退回纯静态反馈——采用 CLI 提供的两个选项里更简单的那个（跳过，不做"salvage 最后一行异常"）。
+
+**修复 2：`check_filename.py --dir` 模式追加"日期不用精确匹配"的说明**——CLI 发现一个独立的真实缺口：`check_filename.py` 的 `--dir` 模式（P2，day06-10 用）只校验"任意 8 位日期+snake_case"，不要求日期等于场景虚构日期，但静态反馈的例子文件名（如 `20260327_...`）会让模型误以为必须精确匹配。**这条不能全局套用**——day11 起换成 `glob('dayXX/20260330_*.md')` 这类精确日期匹配，例子日期在那边确实必须精确，生搬硬套会教错。题面数据没有专门字段区分"宽松/精确"两种模式，只能靠解析 `round_record["eval"]["command"]`（`_is_dir_mode_filename_check`：含 `check_filename.py` 且含 `--dir` 才判定为宽松模式），检测不到就完全不加这条说明，不猜。CLI 确认 day01-05（P1）的 35 道 file_check 全部是 `check_iso8601`/内联检查，`check_filename.py`/`--dir` 零命中——这条改动对 P1 结构性零影响。
+
+**修复 3：选择题 `FORMAT_ERROR` 追加原文片段**——CLI 发现 `_build_multi_choice_feedback` 格式解析失败（抽不到 `\bbox`）时，逐字返回 `prompts.py` 里的常量 `FORMAT_ERROR`，`094611` 训练里这条反馈在 day10-14 崩盘段连续出现 22 次，且 `_build_opd_hint` 对选择题也复用同一个函数，训练侧 hint 里同样重复。**这不是"无条件拼接的 bug"，是"格式失败这个条件反复触发导致的真实逐字复读"**——修法不是改官方函数（`_build_feedback_text`/`_build_multi_choice_feedback` 是 MetaClaw 官方代码，逻辑本身没错，只是文案固定），是在 driver 侧包一层：拿到返回值后判断是否等于 `prompts.py` 里 import 进来的 `FORMAT_ERROR` 常量（不在自己代码里抄字符串，避免以后官方改文案对不上），命中就追加模型这次实际输出的一小段原文，让反馈不再字节级相同。**一处改动同时覆盖 next-round 反馈和 OPD hint 两个使用点**，因为两边调用的是同一个官方函数。
+
+**修复 4：`is_invalid_tool_use` 接线到 MetaClaw 的两条打分路径**——`_max_sentence_copies(reasoning) >= 12` 这套复读检测（规则 5，2026-08-07 为 Personal Agent Track 加的）已经在跑，`turn_data["is_invalid_tool_use"]` 对每个真实生成轮次都会算，但**强制 `eval_score` 覆盖成 -1 这个动作，只挂在 Personal Agent Track 的 PRM 分支**（`eval_score = _prm_eval_majority_vote(eval_raw)` 那一行之后），MetaClaw 的 `_metaclaw_verdict is not None`（checker ±1）和 `metaclaw_round_mode`（step-judge）两条路径都提前 `return`，从没读过这个标记。CLI 用 `094611` 真实 shadow 日志确认：52 次 `is_invalid_tool_use=True`，`[openclaw-rl-invalid-tool-use-penalty]` 强制 -1 触发 0 次——不是"规则 5 已经处理过 MetaClaw 的样本"，是"判了但没接到 MetaClaw 的 reward 管线上"。**修复不是重做检测**，是在 `prepare_patched_openclaw_combine_select.sh` 的两条分支里各加一次读取：`_metaclaw_verdict` 分支里，`eval_score = float(...)` 之后、OPD hint 材料化之前加 `if turn_data.get("is_invalid_tool_use"): eval_score = -1.0`（覆盖后的分数会同时用于 `accepted=True`/`accepted=False` 两种返回）；`metaclaw_round_mode` 分支里，跟现有的 `is_truncated` 强制 -1 并列加一条独立判断（两者都命中也没关系，各自打日志，最终都是 -1）。**明确不做**：`is_repeat_thinking_violation` 那条给 OPD hint 追加"别复读"提示的机制——那是 Personal Agent Track 判官投票路径专属的，MetaClaw 两条路径都没有对应的 LLM 判官投票环节，没有插入点，这次只做核心的强制 -1 接线。
+
+**关于"改动不能影响 P1"这个约束，逐条核实过（不是假设）**：
+- 修复 1：会碰到 P1（P1 的 file_check 通过率只有 45.7%，超过一半的失败题会触发这条追加），但改动性质是纯信息追加、不碰 `eval_score`/训练信号，风险可控——已确认 P1 用的 ISO checker 大多数失败 stdout 干净，追加是净收益，含 Traceback 的约 1/4 已被过滤规则挡住。
+- 修复 2：结构性零命中 P1（P1 没有 `check_filename.py --dir` 题）。
+- 修复 3：`094611` 这趟数据里 P1 阶段 MC 格式失败 0 次，几乎碰不到；即使碰到也只是让文字不再字节级重复，不改变判分。
+- 修复 4：不是新增检测，是复用已经在跑、已经用真实数据两面校准过的规则 5（P1 良好样本最高复读 7 次，day12-14 坏样本最低 351 次，`N=12` 阈值两边都有数量级余量，直接沿用，不用重新调参）——P1 现在良好的样本本来就远低于这个阈值，不会被误伤。
+
+**验证方式**：`py_compile` 通过（driver + 三个代理补丁脚本对真实官方源文件跑完整补丁链，全部编译通过）。新增合成测试覆盖：`_filtered_checker_stdout` 对干净/Traceback/非 FAIL 前缀/超长四种情况分别处理正确；`_is_dir_mode_filename_check` 对 `--dir`/精确 glob/缺失字段三种情况判断正确；`_build_next_round_feedback` 对"file_check 失败+宽松模式"“file_check 失败+精确模式（不加日期说明）"“file_check 失败+Traceback（跳过 stdout）"“file_check 通过（完全不增强）"“MC FORMAT_ERROR（追加原文片段）"五种场景验证输出内容符合预期；`is_invalid_tool_use` 接线用真实源码人工核对了插入位置（`_metaclaw_verdict` 分支：`eval_score` 赋值之后、hint 材料化之前；`metaclaw_round_mode` 分支：跟 `is_truncated` 并列，日志格式对齐 PA/truncation 同款 `overriding X -> -1.0`）。**真实训练环境完全未验证**——不热改正在跑的训练，下一轮训练需要确认：next-round 反馈里出现真实 checker stdout（干净情况）、`--dir` 模式题面出现日期说明、精确 glob 模式题面不出现、连续 MC 格式失败反馈不再字节级相同、`[openclaw-rl-metaclaw-invalid-tool-use-penalty]` 日志在命中复读等无效模式时正确触发。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

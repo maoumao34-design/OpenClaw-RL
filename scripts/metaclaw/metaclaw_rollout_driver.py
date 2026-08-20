@@ -114,7 +114,7 @@ from src.infer.infer_cmd import (  # noqa: E402
     _start_work_gateway,
     _wait_for_gateway,
 )
-from src.infer.prompts import with_feedback  # noqa: E402
+from src.infer.prompts import FORMAT_ERROR, with_feedback  # noqa: E402
 from src.infer.query_reader import get_default_query_reader  # noqa: E402
 from src.scoring.scoring_cmd import _score_file_check, _score_multi_choice  # noqa: E402
 from src.utils import get_project_root, resolve_path  # noqa: E402
@@ -915,6 +915,106 @@ def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) 
     return _build_feedback_text(round_record, inline_score)
 
 
+# Sanity cap so an otherwise-clean FAIL line doesn't turn the next-round
+# feedback into an essay -- checker stdout is meant to add a short, concrete
+# progress signal, not replace the static feedback text.
+_FC_STDOUT_MAX_LEN = 200
+
+
+def _filtered_checker_stdout(inline_score: dict[str, Any]) -> str:
+    """Return a short, appendable line from a FAILED file_check round's real
+    checker stdout -- "" if the stdout isn't in clean enough shape to append.
+
+    Deliberately NOT "append raw stdout unconditionally" (2026-08-20, CLI
+    real-data cross-check of metaclaw_migration_20260820_122808): most
+    file_check checkers (check_iso8601.py and friends, used by P1/day01-05)
+    print a clean, specific `FAIL: field: value` line on failure -- genuinely
+    more concrete than the static feedback.incorrect text and worth adding.
+    But ~1/4 of real P1 failures instead have the checker script itself
+    crash (a bare `python -c` snippet with no exception handling), producing
+    a raw Python Traceback -- appending THAT verbatim would make the
+    next-round feedback less clear, not more. Skip entirely (fall back to
+    the static-only feedback, unchanged from before this function existed)
+    on anything containing "Traceback" or not starting with "FAIL" --
+    intentionally the simpler of the two options CLI offered (the other
+    being "salvage just the last exception line"), since a wrong guess at
+    what counts as a usable salvage is worse than adding nothing this round.
+    """
+    stdout = (inline_score.get("stdout") or "").strip()
+    if not stdout or "Traceback" in stdout or not stdout.startswith("FAIL"):
+        return ""
+    if len(stdout) > _FC_STDOUT_MAX_LEN:
+        stdout = stdout[:_FC_STDOUT_MAX_LEN].rstrip() + "..."
+    return stdout
+
+
+# check_filename.py's lenient --dir mode only checks "some 8-digit date +
+# snake_case" (any date passes), but the static feedback.incorrect text
+# always shows the fictional scenario's specific date as an example -- which
+# reads as "must match this exact date". Appending this note only when we
+# can positively confirm --dir mode (see _is_dir_mode_filename_check) --
+# from day11 onward the checker switches to an exact glob on the scenario
+# date (e.g. glob('day11/20260330_*.md')), where that date genuinely DOES
+# matter and generalizing it away would teach the wrong thing.
+_FC_DIR_MODE_NOTE = (
+    " (Note: any valid 8-digit date + snake_case filename satisfies this "
+    "check -- the exact date shown above is only an example, not a literal "
+    "requirement.)"
+)
+
+
+def _is_dir_mode_filename_check(round_record: dict[str, Any]) -> bool:
+    """True iff this round's checker is check_filename.py's lenient --dir
+    mode, as opposed to an exact-date glob check. There is no dedicated
+    mode/checker-type field in the question data (confirmed 2026-08-20, CLI
+    cross-check across all 30 days' questions.json) -- detected from
+    round_record["eval"]["command"] instead, the only place this
+    distinction is actually recoverable."""
+    command = round_record.get("eval", {}).get("command", "")
+    return "check_filename.py" in command and "--dir" in command
+
+
+def _build_next_round_feedback(
+    round_record: dict[str, Any], inline_score: dict[str, Any], answer_text: str,
+) -> str:
+    """Wraps MetaClaw-official's own _build_feedback_text with narrowly-scoped,
+    additive-only augmentations -- never replaces or removes the official
+    static text, each gated so it can only ever fire on an actual FAILURE (a
+    round that already produced non-empty static feedback), matching the
+    real-data investigation in docs/metaclaw_migration_plan.md ("方案：
+    next-round 反馈 + FORMAT_ERROR + is_invalid_tool_use", 2026-08-20).
+
+    Three independent pieces, safe to reason about separately:
+    - multi_choice format failures (feedback text == FORMAT_ERROR, the
+      literal constant from prompts.py) get a snippet of the model's own
+      actual failed response appended, so 20+ consecutive format failures
+      (confirmed in real day10-14 collapse data) no longer produce
+      byte-identical feedback every single time.
+    - file_check failures get the checker's real stdout appended, if (and
+      only if) it looks clean (see _filtered_checker_stdout).
+    - file_check failures ALSO get a date-genericization note appended, if
+      (and only if) this round's checker is confirmed to be check_filename.py
+      --dir mode (see _is_dir_mode_filename_check) -- never applied to the
+      exact-date glob checks used from day11 onward.
+    """
+    text = _build_feedback_text(round_record, inline_score)
+    if not text:
+        return text
+
+    if text == FORMAT_ERROR and answer_text.strip():
+        snippet = answer_text.strip()[:120]
+        text = f"{text} (your previous response: {snippet!r})"
+
+    if round_record.get("type") == "file_check" and not inline_score.get("passed", False):
+        stdout_line = _filtered_checker_stdout(inline_score)
+        if stdout_line:
+            text = f"{text}\n{stdout_line}"
+        if _is_dir_mode_filename_check(round_record):
+            text = f"{text}{_FC_DIR_MODE_NOTE}"
+
+    return text
+
+
 async def _run_round(
     session_id: str,
     test_id: str,
@@ -929,7 +1029,7 @@ async def _run_round(
     gateway_port: int,
     round_timeout: float | None,
     retry: int = 0,
-) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
+) -> tuple[dict[str, Any], bool, dict[str, Any] | None, str]:
     """Run one round via the real `openclaw agent` CLI.
 
     Mirrors src.infer.infer_cmd._run_group's per-round logic (agent
@@ -946,7 +1046,11 @@ async def _run_round(
     consumes this `retry` budget -- only non-503 failures (timeout,
     crashes, other errors) count against it, unchanged from before.
 
-    Returns (inline_score, agent_succeeded, official_score).
+    Returns (inline_score, agent_succeeded, official_score, answer_text).
+    answer_text (2026-08-20) is this round's own raw model output ("" when
+    agent_succeeded=False) -- the caller needs it for the NEXT round's
+    feedback text (see _build_next_round_feedback's FORMAT_ERROR handling),
+    not for anything about THIS round.
     agent_succeeded=False means the CLI call itself failed on every attempt
     (gateway hiccup, subprocess crash/timeout) -- NOT that the model
     attempted the task and got it wrong. The caller MUST NOT submit
@@ -1064,7 +1168,7 @@ async def _run_round(
         f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
         session_id, round_record["id"], passed, agent_succeeded,
     )
-    return inline_score, agent_succeeded, official_score
+    return inline_score, agent_succeeded, official_score, answer_text
 
 
 _REQUIRED_PLUGINS = ("rl-training-headers",)
@@ -1192,6 +1296,7 @@ async def run_day(
                 rounds = group.get("rounds", [])
                 prev_inline_score: dict | None = None
                 prev_round_record: dict | None = None
+                prev_answer_text: str = ""
 
                 for idx, round_record in enumerate(rounds):
                     # One session PER ROUND (2026-08-19c), not one session
@@ -1261,7 +1366,9 @@ async def run_day(
                     question_text = round_record["question"]
                     feedback_text: str | None = None
                     if prev_inline_score is not None and prev_round_record is not None:
-                        candidate = _build_feedback_text(prev_round_record, prev_inline_score)
+                        candidate = _build_next_round_feedback(
+                            prev_round_record, prev_inline_score, prev_answer_text,
+                        )
                         if candidate:
                             feedback_text = candidate
                     query = (
@@ -1269,7 +1376,7 @@ async def run_day(
                         if feedback_text else question_text
                     )
 
-                    inline_score, agent_succeeded, official_score = await _run_round(
+                    inline_score, agent_succeeded, official_score, answer_text = await _run_round(
                         session_id=round_session_id,
                         test_id=test_id,
                         group_id=group.get("id", "unknown"),
@@ -1325,6 +1432,7 @@ async def run_day(
 
                     prev_inline_score = inline_score
                     prev_round_record = round_record
+                    prev_answer_text = answer_text
     finally:
         if gateway_proc.returncode is None:
             gateway_proc.terminate()
