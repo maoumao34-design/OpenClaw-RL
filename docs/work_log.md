@@ -1824,7 +1824,7 @@
   - `py_compile` 通过，新增合成测试（mock 子进程调用）确认最终 argv 精确等于 `(..., "--session-id", <id>, "--agent", "metaclaw_agent", "--message", <msg>)`。**真实训练环境完全未验证**——下一轮需要确认真实 session key 变成 `agent:metaclaw_agent:explicit:...`、写入的文件出现在正确的 `workspace_{test_id}_*` 目录、checker stdout 不再清一色 `FAIL: cannot read`。同样不热补正在跑的 job
 → 详见 `metaclaw_migration_plan.md`"修复：`openclaw agent` 从未传 `--agent`，`write` 实际写进了 checker 看不到的默认 agent workspace"
 
-### 当前状态（2026-08-19）
+### 历史状态（2026-08-19，已被 8/20 结果取代）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
@@ -1833,18 +1833,60 @@
 ### 已知限制 / 未解决
 同 08-18，未变，另加：**六处修复（训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分 + `--agent` workspace 修复）均完全未在真实训练中验证**（`py_compile`/回归测试/代码核实通过不代表真实代理/SGLang/Megatron/OpenClaw CLI 链路行为符合预期）；`metaclaw_migration_20260818_182736` 的 checkpoint 因为训练信号 bug 不能代表训练方法真实效果，之前基于它做的"数字接近基线"讨论仍然是真实观察到的现象，但不能归因于"方法本身效果不明显"；`metaclaw_migration_20260819_132608` 的 Acc./Compl. 曲线因为 503 把大段天数空转吃掉，同样不能当成 Table 1 式的完整 30 天真实效果看；`metaclaw_migration_20260819_153518`/`173654` 已确认存在"越写越长、write 调用消失 + 同一天后续题目被拖垮 + write 写错目录"三层模式，前两者剩下的成因（下一轮静态反馈文案文不对题、step-judge 对空谈长分析打 +1）尚未设计修复方案，下一轮训练大概率仍会复现这部分症状，不是回归；MetaClaw-Bench 自己的离线评测路径（`_run_question`/`_run_group`）仍未修 `--agent` 缺口，这次没用到那条路径。
 
-### 下一步
+### 下一步（8/19 视角，已被 8/20 更新）
 1. **OpenClaw-RL 复现**：同 08-17
 2. **MetaClaw 迁移**：**重新提交训练的时机由用户判断**（CLI 明确要求不要热补正在跑的 `153518`/`173654`）。提交时带上今天全部六处修复，不显式设置 `SAVE_CKPT`，按迁移文档的冒烟清单逐项确认：`openclaw-rl-metaclaw-verdict-signal-skip` 专用日志出现、verdict 之后没有新的短 response 残片、`deterministic-reward` 后面是长 prompt 的正常提交、`UnboundLocalError` 次数为 0、暂停窗口期间日志出现 503 pause-retry 等待记录、失败题日志里出现 `[openclaw-rl-metaclaw-verdict-opd-hint] ... accepted K_i=1`、`day07-10` 这类"从某题起到收工全是 Context overflow"的模式基本消失、**真实 session key 是 `agent:metaclaw_agent:explicit:...`、写入文件出现在正确的 `workspace_{test_id}_*` 目录、checker stdout 不再清一色 `FAIL: cannot read`**。缺任何一条就停，不要继续训练；全部确认后再看这次训练的逐日 Acc./Compl. 曲线（这次 `Compl.` 是否终于脱离 0.0% 是最值得看的信号），同时用干净数据验证 CLI 提出的"静态反馈文案文不对题"/"step-judge 奖励空谈"这两个新假设，为下一步单独设计方案做准备。如果 Acc. 有提升，要分开归因"选择题不再被 overflow 拖累"和"OPD 是否真的让 file_check 变好"
 3. 其余同 08-17
 
+（事后来看，08-19 提到的这六处修复到 08-20 已经真的提交跑了一轮——`metaclaw_migration_20260820_*`，跑到 day12 效果不错，本文档下一节记录后续。）
+
+---
+
+## 2026-08-20
+
+**目标：** 设计并实现"可调 K 天训练窗口 + 冻结评测剩余天数"（`METACLAW_TRAIN_UNTIL_DAY`）这个**额外、纯附加**的能力——用户和 CLI 之前讨论过，边训边考的混合 Acc./Compl. 没法直接回答"训练到底有没有提高能力"，需要一种方式能"训 K 天、冻结权重、继续跑完剩余天数"，拿冻结段的干净数字跟训练前对比。**硬性前提**：这次改动落地时，`metaclaw_migration_20260820_*` 那条训练已经跑到 day12、效果不错，这次改动完全不能影响这条正在跑的训练——默认（不设置开关）必须和当前这条训练逐字节一致，这是能不能合入的前提，不是"尽量做到"。
+
+**完成内容：**
+- 方案经过三轮 CLI 交叉审阅才定稿：第一轮 CLI 确认方向可行，指出"未设置=零触碰"要用"环境变量是否存在"而不是数字哨兵、冻结检查必须放在 proxy 分发点（driver 不改 `_run_round`）、每天都发信号（防漏发）；第二轮 CLI 核对代码后指出四处必须改准的地方——冻结信号必须绕开 `submission_enabled` 的 503（否则控制面消息本身会被暂停窗口卡住）、标志位在 OPD 但拦截必须打在 combine 的 `_maybe_submit_ready_samples`（不能只改 OPD/combine-select，会"写了标志没人读"）、dayK 尾部竞态接受不做 drain、报告只在设了 K 时才拆分；第三轮 CLI 用真实日志（`logs/metaclaw_migration_20260820_094611/...`）指出第一版方案把冻结识别写进 `_handle_request` 是错的——真实代码里 `submission_enabled` 的 503 检查在 `chat_completions` 路由函数里、`_handle_request` 之前就已经发生，冻结识别必须打在 `chat_completions` 本身，鉴权之后、503 检查之前
+- **driver 侧**（`metaclaw_rollout_driver.py`）：新增 `METACLAW_TRAIN_UNTIL_DAY`（`int | None`，未设置即 `None`，`"0"` 合法且不等于禁用）；新增 `_send_freeze_signal`（复用 `_post_with_retry`，专用 header `X-Metaclaw-Freeze-Training: true`，占位 body）；`main()` 天数循环用 1-based `day_index` 判断 `is_frozen_day`，冻结的每一天调用 `run_day` 前都发一次冻结信号（不是只发一次）；`run_day`/`_run_round`/`_send_verdict_turn` 一行未改。同时把每天的 `official_score` 分流进 `train_round_scores`/`frozen_round_scores` 两个桶
+- **proxy 侧，两处**：①`prepare_patched_openclaw_opd.sh`——`chat_completions` 路由新增 header 参数 `x_metaclaw_freeze_training`，在 `_check_auth` 之后、`submission_enabled` 503 检查之前识别并置位 `owner._metaclaw_training_frozen = True`、立即返回（不解析 body）；`__init__` 里显式初始化 `self._metaclaw_training_frozen = False`。②`prepare_patched_openclaw_combine.sh`——`_maybe_submit_ready_samples` 里、`skip_forced_negative_override` 之后、`eval_score` 赋值之前，加 `if getattr(self, "_metaclaw_training_frozen", False): ...continue`，跟现有 `is_aborted`/`generated_while_paused`/`is_duplicate_user_retry` 是同一个拦截模式的延伸，同时挡住 OPD 和 RL-only 两条提交路径。`openclaw_combine_select_api_server.py` 不需要改动
+- dayK 尾部异步样本竞态：采纳"接受，写清楚"这个选项（CLI 认同），不做等待清空/session_id 解析，失败模式是"dayK 尾部少丢几个样本"不是"训错"
+- 报告：只有设置了 `METACLAW_TRAIN_UNTIL_DAY` 才会在 `report.json` 新增 `metaclaw_train_until_day`/`metaclaw_train_window`/`metaclaw_frozen_window` 三个字段，`report.md` 新增 Train/Frozen 对照表并标注"Train window 只是过程监控，Frozen window 才是回答训练有没有用的数字"；未设置时字段集合不变
+- **验证**：三个代理补丁脚本依次跑通完整补丁链，对真实官方源文件生成输出全部 `py_compile` 通过，人工核对冻结检查在 `chat_completions` 里确实排在 `submission_enabled` 之前；新增合成测试覆盖环境变量未设置/`"0"`/`"5"` 时 `TRAIN_UNTIL_DAY` 解析正确、`is_frozen_day` 公式在多组输入下结果正确、`_send_freeze_signal` 的 header/body 形状正确。**没有做也做不到端到端"默认配置逐字节对比"的本地合成测试**——`main()` 依赖真实 `openclaw agent`/代理/checker，验证交给用户接下来另开一次默认配置训练、跟当前 `day12` 这条正在跑的训练直接对比
+→ 详见 `metaclaw_migration_plan.md`"方案：可调 K 天训练窗口 + 冻结评测剩余天数"
+
+**关键决策：** 这是一个额外能力，不是对现有训练逻辑的修改或替代——`metaclaw_migration_20260820_*` 这条正在跑的训练（day12，效果不错）不受这次改动影响，也不会被热改。用户明确表示会先跑一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前这条对比，验证"改了代码但没打开开关"这件事本身没有引入行为差异，然后才会决定要不要用这个开关做实际的短训练窗口实验。
+
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：新增 `TRAIN_UNTIL_DAY` 常量、`_send_freeze_signal`、`main()` 天数循环/报告section 改动
+- `scripts/prepare_patched_openclaw_opd.sh`：新增 `openclaw-rl-metaclaw-train-until-day` 补丁（`__init__` 标志位 + `chat_completions` 冻结识别）
+- `scripts/prepare_patched_openclaw_combine.sh`：新增 `openclaw-rl-metaclaw-train-until-day` 拦截补丁（`_maybe_submit_ready_samples`）
+- `docs/metaclaw_migration_plan.md`：新增"方案：可调 K 天训练窗口 + 冻结评测剩余天数"一节，含三轮 CLI 审阅过程和最终实现细节
+
+### 当前状态（2026-08-20）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-19（六处修复：训练信号 + checkpoint 默认路径 + 503 暂停重试 + OPD hint 接线 + session 拆分 + `--agent` workspace 修复，已合入 `metaclaw_migration_20260820_*` 这条正在跑的训练，目前到 day12 效果不错），另加：[x] **`METACLAW_TRAIN_UNTIL_DAY` 可调训练窗口 + 冻结评测已实现**（driver + 2 处 proxy 补丁），`py_compile`/合成测试/完整补丁链验证通过，真实训练完全未验证，且明确不影响正在跑的 `day12` 这条训练。
+
+### 已知限制 / 未解决
+同 08-19（历史状态），未变，另加：**`METACLAW_TRAIN_UNTIL_DAY` 功能完全未在真实训练中验证**——尤其是"未设置=行为完全一致"这个最关键的前提，只能靠代码结构上的门控条件（`TRAIN_UNTIL_DAY is not None`/`owner._metaclaw_training_frozen`）保证，没有做、也没法在本地做端到端的默认配置逐字节对比；dayK 尾部竞态（少量样本被连带丢弃）是已知、接受的设计，尚未在真实数据上观察过实际丢弃规模。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比**，确认这次改动在默认关闭状态下真的没有引入任何行为差异——这是这个新功能能不能信任的前提验证，优先于"用它做实际的短训练窗口实验"。同时继续观察 `metaclaw_migration_20260820_*`（六处修复已合入）跑完 30 天后的 Acc./Compl. 曲线，尤其是 `Compl.` 是否真的脱离了 0.0%（`--agent` 修复的预期效果）
+3. 确认默认配置对比通过后，可以考虑用 `METACLAW_TRAIN_UNTIL_DAY` 设一个具体 K，实际验证"早期正信号有用 vs 继续吃负分伤模型"这个假设
+4. 其余同 08-17
+
 ### 未验证
-- [ ] **六处修复在真实训练中是否真的生效**——本次迁移当前最需要验证的问题，尤其是 `--agent` 修复对 `Compl.` 的实际影响
-- [ ] 干净权重+干净信号+完整天数+session 拆分+正确 workspace 下训练结果跟基线（Acc.=8.1%/Compl.=0.0%，注意这个基线本身也可能受 `--agent` 缺口影响，需要重新评估是否也要用修复后的口径重新跑一次基线）对比有没有真实提升
+- [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
+- [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%——`--agent` 修复的核心验证点
+- [ ] `METACLAW_TRAIN_UNTIL_DAY` 设置为具体 K 值时，冻结是否真的生效（`[metaclaw-freeze]` 日志、样本提交数骤降为 0）、dayK 尾部竞态实际丢弃规模
+- [ ] 干净权重+干净信号+完整天数+session 拆分+正确 workspace 下训练结果跟基线（Acc.=8.1%/Compl.=0.0%，这个基线本身也可能受 `--agent` 缺口影响，需要重新评估是否要用修复后的口径重新跑一次基线）对比有没有真实提升
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
 - [ ] "越写越长"模式剩下的两个成因（下一轮静态反馈文案文不对题、step-judge 奖励空谈长分析）——已诊断，方案待设计
 - [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
-- 其余同 08-18（见上）
+- 其余同 08-19（历史状态，见上）
 
 ---
 

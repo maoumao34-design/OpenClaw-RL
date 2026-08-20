@@ -475,6 +475,30 @@ if (requestedSessionId && !sessionKey) sessionKey = buildExplicitSessionIdSessio
 
 **验证方式**：`py_compile` 通过。新增一个合成测试（mock `asyncio.create_subprocess_exec`，断言最终 argv 精确等于 `("openclaw", "agent", "--session-id", <id>, "--agent", "metaclaw_agent", "--message", <msg>)`）确认参数顺序和内容都对。**真实训练环境完全未验证**——下一轮训练需要确认：真实 session key 变成 `agent:metaclaw_agent:explicit:...`（不再是 `agent:main:explicit:...`）、`write` 之后的文件确实出现在 `workspace_{test_id}_*` 而不是 `workspace-main/`、checker `stdout` 不再是清一色的 `FAIL: cannot read ...`。这轮同样不热补正在跑的 job，何时提交新训练由用户决定。
 
+### 方案：可调 K 天训练窗口 + 冻结评测剩余天数（2026-08-20）
+
+**背景与定位——这是一个额外的、纯附加的能力，不是对现有训练逻辑的修改**。用户提出这个需求时，`metaclaw_migration_20260820_*` 这轮训练已经跑到 day12、效果不错（Acc./Compl. 趋势正常），这次改动**完全不能影响这条正在跑的训练**——默认（不设置开关）情况下必须和现在这条正在跑的训练行为逐字节一致，这是本次改动能不能合入的硬性前提，不是"尽量做到"。用户明确会在改完之后另开一次默认配置的训练，跟当前这条正在跑的训练做直接对比，验证"改了代码但没打开开关"这件事本身没有引入任何行为差异。
+
+**动机**：论文 Full 档"边训边考"方法学下，Acc./Compl. 是一个混合了训练全程不同权重状态的滚动平均数——前几天接近 base，后几天用的是训到一半的权重，一个数字里混了多种能力水平，没法直接回答"训练到底有没有提高能力"。CLI 提出的方案：把 30 天拆成两段，前 K 天正常训练+边跑边考，dayK+1 起权重冻结、但继续用同一套 harness 真实跑完剩余天数——冻结段的 Acc./Compl. 才是能跟"训练前"直接对比的干净数字。
+
+**核心设计前提（已用真实代码核实，不是假设）**：这次迁移的 Acc./Compl. 计算完全在 `_run_round` 本地完成（`_compute_inline_score`/`_score_round_official`），跟这个回合的对话样本有没有被提交去训练完全无关。这意味着"冻结训练但继续跑完 30 天"不需要另起一套评测哈内斯——`run_day`/`_run_round`/`_send_verdict_turn` 全部保持不变，唯一需要变化的是**代理侧收到 verdict 之后要不要把这个样本放进训练队列**。
+
+**开关**：`METACLAW_TRAIN_UNTIL_DAY`。**未设置（默认）＝完全不启用**——`TRAIN_UNTIL_DAY: int | None = int(...) if 非空 else None`，用"环境变量是否非空"本身做开关，不是拿一个很大的数字当默认值假装禁用。天数用 `test_list` 的 1-based 下标（`day_index = idx + 1`），不解析 `test_id` 字符串，跟已有的 `METACLAW_MAX_DAYS` 是同一个"数第几个 test"的思路，两者正交。K=0 合法（day1 起就冻结，等价于用这套 harness 跑一次纯 base 模型的 30 天评测）。
+
+**driver 侧改动**：`main()` 的天数循环里，`day_index > TRAIN_UNTIL_DAY` 的每一天，在调用 `run_day(...)` 之前都发一次冻结信号（新增 `_send_freeze_signal`，复用 `_post_with_retry`）——不是只在跨过阈值那一刻发一次，是每个冻结天都发，防止某一次网络调用失败导致后面整段静默没冻结成功（幂等，代理侧重复设置 `True` 没有副作用）。`run_day`/`_run_round`/`_send_verdict_turn`/`_send_session_close_only` 一行都没有改。
+
+**代理侧改动，两处，位置是这次实现的关键**：
+
+1. **冻结信号识别位置：`prepare_patched_openclaw_opd.sh` 打在 `chat_completions` 这个 FastAPI 路由函数本身，不是 `_handle_request`**——第一版方案写的是"`_handle_request` 里：鉴权 → `submission_enabled` → …"，跟真实代码顺序不符，被 CLI 用真实日志（`logs/metaclaw_migration_20260820_094611/patched-openclaw-opd/openclaw_opd_api_server.py` 601-609 行）指出来：`submission_enabled` 的 503 检查发生在 `chat_completions` 路由函数里，在调用 `_handle_request` **之前**，如果把冻结识别塞进 `_handle_request`，冻结信号本身在 dayK 末尾撞上权重同步暂停窗口时仍然会先吃一次 503，等于这处修正没真正落地。正确位置是 `chat_completions` 里 `await owner._check_auth(authorization)` 之后、`if not owner.submission_enabled.is_set():` 之前——识别到专用 header `X-Metaclaw-Freeze-Training: true` 就置位 `owner._metaclaw_training_frozen = True` 并立刻返回，完全绕开这道 503 闸（这是一条控制面消息，不是训练数据提交，不该被"训练暂停中"卡住）。新增的路由参数 `x_metaclaw_freeze_training: str | None = Header(default=None)` 跟现有 `x_session_id`/`x_turn_type`/`x_session_done` 是同一种 FastAPI 参数写法。这个早退发生在 `await request.json()` 之前，driver 侧发送的 body 可以是任意占位内容（实现用的是 `{}`），不需要伪装成真实 chat-completions 形状。`self._metaclaw_training_frozen` 在 `__init__` 里显式初始化成 `False`（挂在 `self._thread`/`self.app = self._build_app()` 之间）。
+
+2. **实际拦截点：`prepare_patched_openclaw_combine.sh` 的 `_maybe_submit_ready_samples`，不是 OPD 自己、也不是 combine-select**——这是这个文件本来就存在的理由（见该文件顶部注释）：真实训练 import 的是 `OpenClawCombineSelectAPIServer`，继承自 `OpenClawCombineAPIServer`，只覆写 `_opd_evaluate()`，不覆写 `_maybe_submit_ready_samples()`——这个函数才是唯一真正调用 `_submit_turn_sample`/`_submit_rl_turn_sample` 的地方，同时覆盖 OPD 和 RL-only 两条提交路径。标志位加在 `openclaw-rl-skip-forced-negative-override` 那个既有拦截点之后、`eval_score = opd_result.get("eval_score")` 之前，跟现有 `is_aborted`/`generated_while_paused`/`is_duplicate_user_retry`/`skip_forced_negative_override` 是同一个拦截模式的延伸：`if getattr(self, "_metaclaw_training_frozen", False): ...continue`（`getattr` 兜底是双保险，即使哪天 `__init__` 的初始化因为某种原因没跑到，也不会因为属性不存在而报错）。`openclaw_combine_select_api_server.py` **不需要改动**——冻结检查在比 `_opd_evaluate` 更下游的分发层，`_opd_evaluate` 算出什么结果都会被同一道闸拦住。
+
+**dayK 尾部竞态：接受，不做 drain，写清楚**。`run_day(dayK)` 返回时，代理里可能还有几个还没 `done()` 的 step-judge 异步任务；dayK+1 一发冻结信号，这几个本该算进 Train window 的样本可能被连带丢弃。跟 CLI 讨论后采纳"接受，文档写清楚"这个选项，不做等待清空、也不做按 session_id 解析"这题属于哪天"这类更精确但更重的方案——失败模式是"dayK 尾部少丢几个样本"，不是"训错"，影响面有限且早就在设计阶段就明确过。
+
+**报告拆分，仅在设置了 `METACLAW_TRAIN_UNTIL_DAY` 时才出现**：`main()` 循环时把每天的 `official_score` 同时归入 `train_round_scores`/`frozen_round_scores` 两个桶（按 `is_frozen_day` 分流，`resume` 命中的天也一样归桶，résumé 和冻结是两个独立维度）。`report.json` 只有在 `TRAIN_UNTIL_DAY is not None` 时才新增 `metaclaw_train_until_day`/`metaclaw_train_window`/`metaclaw_frozen_window` 三个字段（各自复用 `_build_report`），**未设置时 `report.json`/`report.md` 的既有字段一个都不变**——这条本身也是"未设置=完全一致"这个前提的一部分，不能只验证训练行为一致、报告格式却悄悄多了字段。`report.md` 额外追加一段 Train/Frozen 对照表，明确标注"Train window 只是过程监控，Frozen window 才是回答'训练有没有用'的数字"。
+
+**验证方式**：`py_compile` 通过；三个代理补丁脚本（`prepare_patched_openclaw_opd.sh`/`prepare_patched_openclaw_combine.sh`/`prepare_patched_openclaw_combine_select.sh`）依次跑完整补丁链，对真实官方源文件生成输出，全部 `py_compile` 通过，人工核对冻结检查在 `chat_completions` 里的位置确实在 `submission_enabled` 判断之前。新增合成测试覆盖：环境变量未设置/设为 `"0"`/设为 `"5"` 时 `TRAIN_UNTIL_DAY` 解析结果正确（`"0"` 不会被误判成"禁用"）；`is_frozen_day` 判断公式在多组 `(K, day_index)` 组合下结果正确；`_send_freeze_signal` 发出的请求 header/body 形状正确。**没有做端到端的"默认配置逐字节对比"合成测试**（`main()` 依赖真实 `openclaw agent`/代理/checker，本地无法完整跑通）——这个验证交给用户接下来另开的一次默认配置训练去跟当前 `day12` 这条正在跑的训练直接对比，代码层面能提供的保证是：新增的所有分支都由 `TRAIN_UNTIL_DAY is not None`（driver 侧）或 `owner._metaclaw_training_frozen`（代理侧，只有收到过冻结 header 才会变 `True`）这两个条件严格把门，未触发这两个条件时执行路径与改动前完全相同。**真实训练环境完全未验证**——不热改正在跑的 `day12` 这条训练，这次改动只影响未来新提交的训练任务。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

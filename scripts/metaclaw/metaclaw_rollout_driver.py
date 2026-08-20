@@ -285,6 +285,25 @@ if not os.environ.get("OPENCLAW_GATEWAY_TOKEN"):
 AGENT_RETRY = int(os.environ.get("METACLAW_AGENT_RETRY", "0"))
 VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 
+# Adjustable training window (2026-08-20) -- see docs/metaclaw_migration_plan.md
+# "方案：可调 K 天训练窗口 + 冻结评测剩余天数". Unset (default, empty string) means
+# disabled: train every day, exactly matching prior behavior -- this is a
+# genuine absence of the feature (day_index > TRAIN_UNTIL_DAY can never be
+# true when TRAIN_UNTIL_DAY is None), not "set K to a large number". Set to
+# an integer K (1-based index into test_list; K=0 is valid -- freezes before
+# day 1, i.e. a pure base-model pass through this same 30-day harness) to
+# train through day K and freeze from day K+1 onward: no further samples
+# reach the training queue (see _send_freeze_signal below and the
+# openclaw-rl-metaclaw-train-until-day patches in prepare_patched_openclaw_
+# opd.sh/prepare_patched_openclaw_combine.sh), but the remaining days still
+# run for real (agent + checker), producing a complete Acc./Compl. report --
+# just against a fixed checkpoint instead of a rolling one. A day already
+# completed by a prior crashed run (METACLAW_RESUME) is bucketed by this
+# same day_index regardless of whether IT was trained originally --
+# resume/freeze are orthogonal.
+_TRAIN_UNTIL_DAY_RAW = os.environ.get("METACLAW_TRAIN_UNTIL_DAY", "")
+TRAIN_UNTIL_DAY: int | None = int(_TRAIN_UNTIL_DAY_RAW) if _TRAIN_UNTIL_DAY_RAW.strip() else None
+
 # 503-gated pause-retry (2026-08-19) -- NOT the same mechanism as
 # AGENT_RETRY/VERDICT_RETRY above, deliberately independent budget, always
 # on (no env var to disable -- unlike AGENT_RETRY there's no "maybe it
@@ -717,6 +736,34 @@ async def _post_with_retry(
                 session_id, label, e,
             )
             return
+
+
+async def _send_freeze_signal(client: httpx.AsyncClient, retry: int) -> None:
+    """POST the training-freeze signal for METACLAW_TRAIN_UNTIL_DAY (see that
+    module constant's comment).
+
+    Recognized by prepare_patched_openclaw_opd.sh's chat_completions patch
+    BEFORE the submission_enabled 503 gate -- unlike every other call this
+    driver makes, this one is safe to send even during a slime pause window,
+    since it is a control-plane message, not a training-data submission. The
+    proxy sets a persistent flag and returns immediately without ever calling
+    `await request.json()`, so the body here is a genuine placeholder (never
+    parsed) rather than something that has to mimic a real chat-completions
+    shape.
+
+    Called once per frozen day (not just once when the threshold is first
+    crossed, see main()) -- idempotent on the proxy side (re-setting an
+    already-True flag is a no-op), but resending guards against this one
+    call itself failing silently and leaving the rest of the run un-frozen
+    with no other signal that it happened.
+    """
+    await _post_with_retry(
+        client, "metaclaw-freeze-signal",
+        payload={},
+        headers={"X-Metaclaw-Freeze-Training": "true"},
+        retry=retry,
+        label="freeze-signal",
+    )
 
 
 async def _send_verdict_turn(
@@ -1314,9 +1361,9 @@ async def main() -> None:
     logger.info(
         f"{_YELLOW}[MetaClawRollout] %d day(s) loaded from %s, concurrency=1, "
         f"strict order, agent_retry=%d, verdict_retry=%d, progress_dir=%s, resume=%s, "
-        f"report_dir=%s{_RESET}",
+        f"report_dir=%s, train_until_day=%s{_RESET}",
         len(test_list), all_tests_path, AGENT_RETRY, VERDICT_RETRY, PROGRESS_DIR, RESUME,
-        REPORT_DIR,
+        REPORT_DIR, TRAIN_UNTIL_DAY if TRAIN_UNTIL_DAY is not None else "disabled",
     )
 
     # concurrency=1, strict day01 -> day30 order. If METACLAW_RESUME=1 (see
@@ -1327,8 +1374,16 @@ async def main() -> None:
     # runs fresh, unconditionally, matching prior behavior exactly --
     # normal training is never at risk of accidentally skipping a day.
     all_round_scores: list[dict[str, Any]] = []
-    for test in test_list:
+    # Only ever populated when TRAIN_UNTIL_DAY is set -- see the reporting
+    # section below, which only reads/prints these (and only adds the extra
+    # report.json keys) in that same case, so leaving them empty when the
+    # feature is off has no observable effect.
+    train_round_scores: list[dict[str, Any]] = []
+    frozen_round_scores: list[dict[str, Any]] = []
+    for day_index, test in enumerate(test_list, start=1):
         test_id = test["id"]
+        is_frozen_day = TRAIN_UNTIL_DAY is not None and day_index > TRAIN_UNTIL_DAY
+        bucket = frozen_round_scores if is_frozen_day else train_round_scores
         resumed = _load_day_progress(test_id)
         # Deliberately `if resumed:` not `if resumed is not None:` -- a day
         # where every round failed at the infrastructure level (e.g. the
@@ -1347,9 +1402,16 @@ async def main() -> None:
                 test_id, len(resumed),
             )
             all_round_scores.extend(resumed)
+            bucket.extend(resumed)
             continue
+        if is_frozen_day:
+            # Sent every frozen day (not just once when the threshold is
+            # first crossed) -- see _send_freeze_signal's docstring for why.
+            async with httpx.AsyncClient(timeout=120.0) as freeze_client:
+                await _send_freeze_signal(freeze_client, retry=VERDICT_RETRY)
         day_scores = await run_day(test, all_tests, project_root, retry=AGENT_RETRY)
         all_round_scores.extend(day_scores)
+        bucket.extend(day_scores)
 
     acc, compl = _aggregate_acc_compl(all_round_scores)
     compl_str = f"{compl:.1%}" if compl is not None else "n/a (no file_check rounds)"
@@ -1370,6 +1432,52 @@ async def main() -> None:
     # field that would not match the official schema.
     report = _build_report(all_round_scores)
     md = _render_report_markdown(report) + f"\n**Compl. (file_check only)**: {compl_str}\n"
+
+    # Train/Frozen window split (2026-08-20) -- ONLY added when
+    # METACLAW_TRAIN_UNTIL_DAY is set. When it is not, `report` keeps
+    # exactly the same top-level keys as before this feature existed --
+    # this `if` is the one place that has to hold for "unset = unchanged
+    # report format" to actually be true, not just "unset = unchanged
+    # training behavior". Namespaced under metaclaw_* keys rather than
+    # touching report's existing fields, so a report.json from a run that
+    # DOES use this feature still compares field-for-field against a
+    # `metaclaw-bench run` baseline's report.json for everything except
+    # these new keys (see _build_report's own docstring for why that
+    # alignment matters).
+    if TRAIN_UNTIL_DAY is not None:
+        train_acc, train_compl = _aggregate_acc_compl(train_round_scores)
+        frozen_acc, frozen_compl = _aggregate_acc_compl(frozen_round_scores)
+        train_compl_str = f"{train_compl:.1%}" if train_compl is not None else "n/a"
+        frozen_compl_str = f"{frozen_compl:.1%}" if frozen_compl is not None else "n/a"
+        logger.info(
+            f"{_GREEN}[MetaClawRollout] TRAIN_UNTIL_DAY=%d -- "
+            f"Train window (day1-%d, %d round(s), rolling weights): "
+            f"Acc.=%.1f%% Compl.=%s | "
+            f"Frozen window (day%d-%d, %d round(s), fixed checkpoint): "
+            f"Acc.=%.1f%% Compl.=%s{_RESET}",
+            TRAIN_UNTIL_DAY, TRAIN_UNTIL_DAY, len(train_round_scores),
+            train_acc * 100, train_compl_str,
+            TRAIN_UNTIL_DAY + 1, len(test_list), len(frozen_round_scores),
+            frozen_acc * 100, frozen_compl_str,
+        )
+        report["metaclaw_train_until_day"] = TRAIN_UNTIL_DAY
+        report["metaclaw_train_window"] = _build_report(train_round_scores)
+        report["metaclaw_frozen_window"] = _build_report(frozen_round_scores)
+        md += (
+            f"\n## Train / Frozen window split (METACLAW_TRAIN_UNTIL_DAY={TRAIN_UNTIL_DAY})\n\n"
+            f"**Train window is process-monitoring only** (rolling weights while "
+            f"training -- same caveat as the blended full-run number above). "
+            f"**Frozen window is the number that answers \"did training help\"** "
+            f"(fixed checkpoint from day {TRAIN_UNTIL_DAY}, no further weight "
+            f"updates from day {TRAIN_UNTIL_DAY + 1} onward).\n\n"
+            f"| Window | Days | Rounds | Acc. | Compl. |\n"
+            f"|---|---|---|---|---|\n"
+            f"| Train (rolling weights) | day1-{TRAIN_UNTIL_DAY} | "
+            f"{len(train_round_scores)} | {train_acc * 100:.1f}% | {train_compl_str} |\n"
+            f"| Frozen (fixed checkpoint) | day{TRAIN_UNTIL_DAY + 1}-{len(test_list)} | "
+            f"{len(frozen_round_scores)} | {frozen_acc * 100:.1f}% | {frozen_compl_str} |\n"
+        )
+
     print("\n" + md)
     if REPORT_DIR is not None:
         (REPORT_DIR / "report.json").write_text(

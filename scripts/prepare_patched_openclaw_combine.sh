@@ -212,9 +212,75 @@ skip_forced_neg_new = (
 )
 text = text.replace(skip_forced_neg_old, skip_forced_neg_new, 1)
 
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-train-until-day (temporary, safe to remove) -- see
+# docs/metaclaw_migration_plan.md "方案：可调 K 天训练窗口 + 冻结评测剩余天数".
+# This is the ONE enforcement point for the freeze flag set by
+# prepare_patched_openclaw_opd.sh's chat_completions patch
+# (self._metaclaw_training_frozen). Placed here, not in openclaw_opd_api_
+# server.py or openclaw_combine_select_api_server.py, for the same reason
+# this whole file exists (see this script's top-of-file comment): actual
+# training imports OpenClawCombineSelectAPIServer, which subclasses this
+# class and overrides _opd_evaluate() but NOT _maybe_submit_ready_samples()
+# -- this is the ONLY place that actually calls _submit_turn_sample/
+# _submit_rl_turn_sample, for BOTH the OPD and RL-only paths. Setting the
+# flag anywhere else without also gating here would repeat the exact
+# "flag written, nobody reads it" mistake this file was created to avoid.
+#
+# Deliberately a SEPARATE check from skip_forced_negative_override above
+# (not merged into it) -- this one is a global switch unrelated to any
+# per-turn eval_score override, and unlike the is_aborted/generated_while_
+# paused/is_duplicate_user_retry check further up (which reads per-turn
+# `td` flags), this reads process-wide server state, so it belongs at this
+# late, unconditional gate rather than the earlier per-turn one.
+#
+# NOT retroactive: turns already in `pending`/`prm_tasks` for THIS session
+# when the flag flips mid-day are not force-dropped by this check alone --
+# they still get evaluated and hit this same gate when their own task
+# completes, at which point they ARE dropped (frozen is checked before
+# either submit call, not just for turns arriving after the flag flips).
+# The remaining edge case (a handful of dayK's own trailing async step-
+# judge tasks resolving after the freeze signal for dayK+1 has already
+# been sent) is a known, accepted small-scale race -- see the migration
+# doc's "dayK 尾部竞态" section: it can only ever DROP a few of dayK's own
+# tail samples, never misattribute or corrupt data across the day
+# boundary, and is documented rather than engineered away.
+# ---------------------------------------------------------------------
+train_until_day_gate_old = (
+    '            # --- openclaw-rl-skip-forced-negative-override (temporary, safe to remove) ---\n'
+    '            if opd_result.get("skip_forced_negative_override"):\n'
+    '                continue\n'
+    '\n'
+    '            eval_score = opd_result.get("eval_score")\n'
+)
+if text.count(train_until_day_gate_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the "
+        f"skip_forced_negative_override + eval_score assignment block in "
+        f"{src_path}, found {text.count(train_until_day_gate_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+train_until_day_gate_new = (
+    '            # --- openclaw-rl-skip-forced-negative-override (temporary, safe to remove) ---\n'
+    '            if opd_result.get("skip_forced_negative_override"):\n'
+    '                continue\n'
+    '\n'
+    '            # --- openclaw-rl-metaclaw-train-until-day (temporary, safe to remove) ---\n'
+    '            if getattr(self, "_metaclaw_training_frozen", False):\n'
+    '                logger.info(\n'
+    '                    "[metaclaw-freeze] session=%s turn=%d dropped (training frozen) "\n'
+    '                    "-- not submitted to OPD or RL",\n'
+    '                    session_id, turn_num,\n'
+    '                )\n'
+    '                continue\n'
+    '\n'
+    '            eval_score = opd_result.get("eval_score")\n'
+)
+text = text.replace(train_until_day_gate_old, train_until_day_gate_new, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
-print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override turns, gates both OPD and RL submission paths) -> {dest_path}")
+print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override/metaclaw_training_frozen turns, gates both OPD and RL submission paths) -> {dest_path}")
 PY
 
 echo "已生成 openclaw_combine_api_server.py 补丁: ${DEST_DIR}/openclaw_combine_api_server.py（_maybe_submit_ready_samples 拦截 is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override，OPD+RL 两条提交路径一起挡住，见 docs/issues_log.md 2026-08-13 条目）"

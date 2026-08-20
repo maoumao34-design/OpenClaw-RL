@@ -992,6 +992,105 @@ metaclaw_verdict_skip_new = (
 )
 text = text.replace(metaclaw_verdict_skip_old, metaclaw_verdict_skip_new, 1)
 
+# ---------------------------------------------------------------------------
+# openclaw-rl-metaclaw-train-until-day (temporary, safe to remove) -- see
+# docs/metaclaw_migration_plan.md "方案：可调 K 天训练窗口 + 冻结评测剩余天数"
+# for the full design. Two independent patches:
+#   1. __init__: self._metaclaw_training_frozen = False -- the flag itself,
+#      defaulting to False so a process that never receives the freeze
+#      signal below behaves identically to before this patch existed.
+#   2. chat_completions route: recognize a dedicated X-Metaclaw-Freeze-
+#      Training header BEFORE the submission_enabled 503 gate (not inside
+#      _handle_request, which the route only reaches AFTER that gate) --
+#      this is a control-plane signal from the rollout driver, not a
+#      training-data submission, and must not be blockable by slime's
+#      pause-for-weight-update window. Sets the flag and returns
+#      immediately, never touching body/session_id/turn_type machinery.
+# The actual enforcement (dropping samples instead of submitting them once
+# frozen) lives in openclaw_combine_api_server.py's _maybe_submit_ready_samples
+# override (prepare_patched_openclaw_combine.sh), not here -- this file only
+# owns the flag and how it gets set.
+# ---------------------------------------------------------------------------
+train_until_day_init_old = (
+    '        self._server: uvicorn.Server | None = None\n'
+    '        self._thread: threading.Thread | None = None\n'
+    '        self.app = self._build_app()\n'
+)
+if train_until_day_init_old not in text:
+    raise SystemExit(
+        "patch failed: expected __init__ tail block not found "
+        "in openclaw_opd_api_server.py (official file may have changed upstream -- update this patch)"
+    )
+train_until_day_init_new = (
+    '        self._server: uvicorn.Server | None = None\n'
+    '        self._thread: threading.Thread | None = None\n'
+    '\n'
+    '        # --- openclaw-rl-metaclaw-train-until-day (temporary, safe to remove) ---\n'
+    '        # Default False: unless the rollout driver explicitly sends the freeze\n'
+    '        # signal below (only happens when METACLAW_TRAIN_UNTIL_DAY is set), this\n'
+    '        # is never touched and behaves exactly as if this patch did not exist.\n'
+    '        self._metaclaw_training_frozen = False\n'
+    '\n'
+    '        self.app = self._build_app()\n'
+)
+text = text.replace(train_until_day_init_old, train_until_day_init_new, 1)
+
+chat_completions_freeze_old = (
+    '        @app.post("/v1/chat/completions")\n'
+    '        async def chat_completions(\n'
+    '            request: Request,\n'
+    '            authorization: str | None = Header(default=None),\n'
+    '            x_session_id: str | None = Header(default=None),\n'
+    '            x_turn_type: str | None = Header(default=None),\n'
+    '            x_session_done: str | None = Header(default=None),\n'
+    '        ):\n'
+    '            owner: OpenClawOPDAPIServer = request.app.state.owner\n'
+    '            await owner._check_auth(authorization)\n'
+    '            if not owner.submission_enabled.is_set():\n'
+    '                raise HTTPException(status_code=503, detail="submission paused for weight update")\n'
+)
+if text.count(chat_completions_freeze_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the chat_completions "
+        f"auth/submission_enabled block in {src_path}, found "
+        f"{text.count(chat_completions_freeze_old)} (official file may have "
+        "changed upstream -- update this patch)"
+    )
+chat_completions_freeze_new = (
+    '        @app.post("/v1/chat/completions")\n'
+    '        async def chat_completions(\n'
+    '            request: Request,\n'
+    '            authorization: str | None = Header(default=None),\n'
+    '            x_session_id: str | None = Header(default=None),\n'
+    '            x_turn_type: str | None = Header(default=None),\n'
+    '            x_session_done: str | None = Header(default=None),\n'
+    '            x_metaclaw_freeze_training: str | None = Header(default=None),\n'
+    '        ):\n'
+    '            owner: OpenClawOPDAPIServer = request.app.state.owner\n'
+    '            await owner._check_auth(authorization)\n'
+    '\n'
+    '            # --- openclaw-rl-metaclaw-train-until-day (temporary, safe to\n'
+    '            # remove) --- Deliberately BEFORE the submission_enabled 503 gate:\n'
+    '            # this is a control-plane message from the rollout driver (see\n'
+    '            # metaclaw_rollout_driver.py::_send_freeze_signal), not a training\n'
+    '            # sample, and must not be blockable by slime pausing submission for\n'
+    '            # a weight-update window -- a driver that only ever hits 503 here\n'
+    '            # would never manage to actually freeze training. Never parses\n'
+    '            # `body` (frozen and unfrozen requests alike can send an empty\n'
+    '            # placeholder payload; the header alone decides).\n'
+    '            if (\n'
+    '                x_metaclaw_freeze_training\n'
+    '                and x_metaclaw_freeze_training.strip().lower() in ("1", "true", "yes", "on")\n'
+    '            ):\n'
+    '                owner._metaclaw_training_frozen = True\n'
+    '                logger.info("[metaclaw-freeze] training_frozen=True (signal received)")\n'
+    '                return JSONResponse(content={"status": "frozen"})\n'
+    '\n'
+    '            if not owner.submission_enabled.is_set():\n'
+    '                raise HTTPException(status_code=503, detail="submission paused for weight update")\n'
+)
+text = text.replace(chat_completions_freeze_old, chat_completions_freeze_new, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched -> {dest_path}")
