@@ -1926,7 +1926,33 @@
 - `docs/metaclaw_migration_plan.md`：新增 08-20 版基线记录（取代 08-18 版）、K=6 里程碑记录（含出分口径更正）、"方案：可调 K 天训练窗口"动机段落两次改正
 - `C:\Users\maozh2\.claude\projects\D--MAO-Claude\memory\feedback_workaround_framing.md`（新建，通用记忆，非项目文档）
 
-**完成内容（续，同一天）：**
+### 历史状态（2026-08-21，已被 8/25 结果取代）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-20（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复均已实现，已合入 `metaclaw_migration_20260820_*` 这条正在跑的训练），另加：[x] **训练前基线已用 `--agent` 修复后的 harness 重新定版**（Acc.=17.8%/Compl.=0.0%，seed 465485731，取代旧的 8.1% 版本）；[x] **里程碑：`K=6` 冻结实验第一次拿到可信的正面训练效果**（主结果=全程 live 聚合 Acc.=37.3%/Compl.=13.9%，相对基线 +19.5pt/+13.9pt，`Compl.` 首次非零；用的是 `0882f69`，不含 thinking 空转修复）；[x] `METACLAW_TRAIN_UNTIL_DAY` 的设计动机表述两次被用户纠正后已改正，明确其"临时工具，非永久方法学"的定位。基线和 K=6 实验都是真实跑通的结果，不是待验证项；文档表述纠正不涉及代码改动。
+
+### 已知限制 / 未解决
+同 08-20（历史状态），未变，另加：**K=6 实验的正面结果不能代表 thinking 空转问题已解决**——冻结窗口没崩，结构性原因是 day6 后没再继续训练，不是修复生效；也没有用官方独立 bench 重新核实过这个冻结 checkpoint，严格 apples-to-apples 对比还没做。新基线确认了 file_check（`Compl.=0.0%`）是真实能力上限，不是链路问题——thinking 空转三处修复即使完全生效，也只是"不再空转"，不代表 file_check 通过率会提高，这是两件不同的事。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比，确认这两批改动在默认/未触发状态下真的没有引入任何行为差异
+3. 其余同 08-17
+
+### 未验证（截至 08-21 末，见 08-25 条目最新结果）
+- [ ] `METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致
+- [ ] thinking 空转三处修复上线后，训练继续超过 day6/day12 是否还会复现"越写越长/thinking 循环"
+- [ ] K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实
+- 其余同 08-20（历史状态，见上）
+
+---
+
+## 2026-08-25
+
+**目标：** 排查 K=6 实验里 3 题未计分的根因，修复发现的新问题（暂停窗口砍断在飞生成时被误判成 timeout、没吃到 08-19 的 503 耐心等待逻辑）。
+
+**完成内容：**
 - **发现并修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503，漏出 08-19 那次修复的覆盖范围**。K=6 冻结实验里未计分的 3 题（`day03/r11`/`day05/r13`/`day06/r4`）查出同一个根因：不是"新请求撞上已暂停的 503"，是**暂停发生那一刻这道题的生成正在飞、被 SGLang `pause_generation` 中途砍断**——代理侧 `is_aborted`/`degraded-turn-drop` 正确丢弃了这个残缺样本（训练信号没被污染），但 OpenClaw 网关把这次中断报给 driver 的方式是 `GatewayClientRequestError: FailoverError: LLM request timed out`，不是 `"503 status code"`，08-19 那次修复的 `_AGENT_PAUSE_MARKER` 只认后者，这次匹配不上，`AGENT_RETRY=0` 直接判 infra failure，题目从聚合里被剔除
   - 跟 08-19 的关系是"同一诱因换了表现形态"，不是推翻——CLI 当时明确把 timeout 排除在耐心等待之外，理由是"timeout 通常是模型真的在深度生成中挂了，跟一上来就被拒的 503 不一样，盲目等可能拖长真实的 GPU 争用问题"。这次核实：至少这一句特定的 OpenClaw 文案，在能查到的样本里 100% 是暂停窗口导致的——K=6 这 3 题全部对齐，回溯扫描全部历史 migration run 找到 28 次真正的 `openclaw agent failed + LLM request timed out`，**28/28 对齐、零反例**
   - **修复**：`_AGENT_PAUSE_MARKER`（单字符串）扩成 `_AGENT_PAUSE_MARKERS`（元组，加入 `"LLM request timed out"`），命中任意一个都进现有耐心等待重试环，完全复用现有的 `PAUSE_RETRY_INTERVAL_SECONDS`/`PAUSE_RETRY_MAX_WAIT_SECONDS` 预算，不新增参数；日志措辞从"503 pause-retry"改成"pause-retry (matched %r)"带上具体命中哪个 marker
@@ -1935,18 +1961,22 @@
   - **验证**：`py_compile` 通过，新增合成测试覆盖三种场景（timeout 一次后成功重试、持续 timeout 耗尽预算判失败、跟暂停无关的普通失败零等待立刻判失败）全部符合预期。**真实训练环境完全未验证**——不热改正在跑的训练
 → 详见 `metaclaw_migration_plan.md`"修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503"
 
-### 当前状态（2026-08-21）
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`_AGENT_PAUSE_MARKER`→`_AGENT_PAUSE_MARKERS`，`_run_round` 匹配逻辑、日志措辞改动
+- `docs/metaclaw_migration_plan.md`：新增"修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503"一节
+
+### 当前状态（2026-08-25）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-20（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复均已实现，已合入 `metaclaw_migration_20260820_*` 这条正在跑的训练），另加：[x] **训练前基线已用 `--agent` 修复后的 harness 重新定版**（Acc.=17.8%/Compl.=0.0%，seed 465485731，取代旧的 8.1% 版本）；[x] **里程碑：`K=6` 冻结实验第一次拿到可信的正面训练效果**（主结果=全程 live 聚合 Acc.=37.3%/Compl.=13.9%，相对基线 +19.5pt/+13.9pt，`Compl.` 首次非零；用的是 `0882f69`，不含 thinking 空转修复）；[x] `METACLAW_TRAIN_UNTIL_DAY` 的设计动机表述两次被用户纠正后已改正，明确其"临时工具，非永久方法学"的定位；[x] **暂停窗口砍断在飞生成、误判成 timeout 而不是 503 的问题已修复**（`_AGENT_PAUSE_MARKERS` 扩展，28/28 历史数据零反例支持），预期能挽回 K=6 实验里丢掉的那类样本。基线和 K=6 实验都是真实跑通的结果，不是待验证项；两处文档表述纠正不涉及代码改动；pause-marker 修复涉及代码改动，已 `py_compile`+合成测试验证，真实训练未验证。
+**MetaClaw 迁移**：同 08-21（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复 + 新基线 + K=6 里程碑均已就绪），另加：[x] **暂停窗口砍断在飞生成、误判成 timeout 而不是 503 的问题已修复**（`_AGENT_PAUSE_MARKERS` 扩展，28/28 历史数据零反例支持），预期能挽回 K=6 实验里丢掉的那类样本。`py_compile`+合成测试验证通过，真实训练完全未验证，不影响正在跑的 `day12` 这条训练。
 
 ### 已知限制 / 未解决
-同 08-20（历史状态），未变，另加：**K=6 实验的正面结果不能代表 thinking 空转问题已解决**——冻结窗口没崩，结构性原因是 day6 后没再继续训练，不是修复生效；也没有用官方独立 bench 重新核实过这个冻结 checkpoint，严格 apples-to-apples 对比还没做。新基线确认了 file_check（`Compl.=0.0%`）是真实能力上限，不是链路问题——thinking 空转三处修复即使完全生效，也只是"不再空转"，不代表 file_check 通过率会提高，这是两件不同的事。**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。
+同 08-21（历史状态），未变，另加：**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比**，确认这两批改动在默认/未触发状态下真的没有引入任何行为差异——这是能不能信任这些改动的前提验证，优先于"用它们做实际实验"。同时继续观察 `metaclaw_migration_20260820_*`（六处修复已合入，不含本次这几批）跑完 30 天后的 Acc./Compl. 曲线，用**新基线（17.8%/0.0%）**而不是旧基线（8.1%）做对比，尤其看 `Compl.` 是否脱离 0.0%、day12+ 是否仍会陷入 thinking 空转（如果仍会，说明这批修复还没上这条训练，符合预期，不是修复无效）
+2. **MetaClaw 迁移**：**用户先另开一次默认配置（不设置 `METACLAW_TRAIN_UNTIL_DAY`）的训练，跟当前 `day12` 这条正在跑的训练直接对比**，确认这几批改动在默认/未触发状态下真的没有引入任何行为差异——这是能不能信任这些改动的前提验证，优先于"用它们做实际实验"。同时继续观察 `metaclaw_migration_20260820_*`（六处修复已合入，不含本次这几批）跑完 30 天后的 Acc./Compl. 曲线，用**新基线（17.8%/0.0%）**而不是旧基线（8.1%）做对比，尤其看 `Compl.` 是否脱离 0.0%、day12+ 是否仍会陷入 thinking 空转（如果仍会，说明这批修复还没上这条训练，符合预期，不是修复无效）
 3. 确认默认配置对比通过后：**（a）最优先——提交一轮带上 thinking 空转三处修复 + `_AGENT_PAUSE_MARKERS` 扩展、训练继续超过 day6/day12 的新训练，观察 day12+ 是否还会崩盘、之前那类丢样本是否被挽回**——这是验证这几处修复是否真的有效的唯一方式，也是朝"训练能稳定跑满完整 30 天、直接跟基线做论文原生对比"这个最终目标迈的关键一步；（b）考虑用官方独立 `metaclaw-bench run` 重新评一次 K=6 冻结实验的 checkpoint，做严格 apples-to-apples 核实
 4. 其余同 08-17
 

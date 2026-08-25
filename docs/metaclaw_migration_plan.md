@@ -684,7 +684,7 @@ CLI 当时提出的具体方案（把 30 天拆成两段，前 K 天正常训练
 
 **这次实验本身是一个阶段性的中间结果，不是最终形态**：只训了 6 天就冻结，是因为训练还没法稳定跑满完整 30 天不崩（`094611` 那次全量训练在 day12+ 就撞上了 thinking 空转塌陷）——**这次迁移最终要拿到的，是训练稳定跑完整 30 天之后，"训练前全程混合基线"vs"训练后全程混合数字"这一组直接对比**，不需要任何冻结/分段技巧，这才是跟论文方法学完全一致的最终验证方式。当 thinking 空转三处修复（`455a54f`）验证生效、训练能稳定撑过 day12 及以后，下一步就该直接跑一次真正完整的 30 天训练，用这组"全程 vs 全程"的对比作为最终结论，而不是继续依赖 `METACLAW_TRAIN_UNTIL_DAY` 这个临时工具。
 
-### 修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503，漏出 08-19 那次修复的覆盖范围（2026-08-21）
+### 修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503，漏出 08-19 那次修复的覆盖范围（2026-08-25）
 
 **背景**：K=6 冻结实验里未计分的 3 题（`day03/r11`/`day05/r13`/`day06/r4`）查出了同一个根因，但表现形态是新的——不是"新请求撞上已经暂停的 503"，是**暂停发生的那一刻，这道题的生成正在飞，被 SGLang 的 `pause_generation` 中途砍断**。以 `day05/r13` 为例，同一秒内依次发生：`drained 16 groups`→`submission paused`→这道题的 MAIN 轮次 `finish_reason=abort`→代理侧 `[openclaw-rl-degraded-turn-drop] ... is_aborted` 正确丢弃这个残缺样本（训练信号没被污染，这部分工作正常）→`Timer update_weights start`。但 OpenClaw 网关把这次中断报给 driver 的方式是 `GatewayClientRequestError: FailoverError: LLM request timed out`，不是 `"503 status code"`——`_run_round` 的 `_AGENT_PAUSE_MARKER` 只认后者，这次匹配不上，直接落进"`AGENT_RETRY=0`、立刻判 infra failure"这条路径，题目从 346 里被剔除，不进 Acc./Compl. 聚合。
 
