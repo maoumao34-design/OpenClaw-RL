@@ -324,33 +324,53 @@ TRAIN_UNTIL_DAY: int | None = int(_TRAIN_UNTIL_DAY_RAW) if _TRAIN_UNTIL_DAY_RAW.
 # one: the driver's own Acc./Compl. aggregate call these rounds "N/A
 # infra failure" when the truth is "never got a chance to answer".
 #
-# Gated specifically on the 503 signal, NOT applied to every kind of
-# failure -- confirmed via real log review that timeouts ("LLM request
-# timed out", already deep into a real generation attempt when they die)
-# are a genuinely different failure mode than 503 (proxy rejects before
-# doing any work at all) and must NOT get the same patient-wait treatment:
-# blindly waiting out a timeout the same way risks compounding a real
-# GPU-contention/long-sequence problem into an even longer stall, whereas
-# waiting out a 503 is cheap and its resolution is guaranteed (the pause
-# always lifts once the training step finishes). Non-503 failures
-# (timeout, crashes, any other error) get none of this -- they fall
-# straight through to the existing AGENT_RETRY/VERDICT_RETRY behavior,
-# unchanged.
+# Gated specifically on signals confirmed to mean "submission is paused for
+# a weight update", NOT applied to every kind of failure. Originally (2026-
+# 08-19) this was just the literal 503 -- timeouts were deliberately
+# excluded, reasoning that a timeout means the request was already deep
+# into a real generation attempt when it died, a genuinely different
+# failure mode than a 503 (proxy rejects before doing any work at all), and
+# that blindly waiting out a timeout the same way risks compounding a real
+# GPU-contention/long-sequence problem into an even longer stall.
+#
+# Narrowed, not reversed (2026-08-21): real log review (3 lost rounds in
+# the K=6 run -- day03/r11, day05/r13, day06/r4 -- plus a retroactive scan
+# of every prior migration run, 28/28 real occurrences, 0 counterexamples)
+# confirmed that OpenClaw's own gateway timeout message specifically
+# ("GatewayClientRequestError: FailoverError: LLM request timed out") is,
+# at least in every observed case, itself a symptom of the SAME pause
+# window: SGLang's pause_generation aborts whatever was in-flight the
+# moment submission_enabled clears, and OpenClaw's gateway reports that as
+# a timeout rather than a clean 503 (the connection was live and got cut,
+# not rejected up front) -- confirmed via _run_round's own is_aborted/
+# degraded-turn-drop handling firing in the proxy log at the exact same
+# second. This is NOT a blanket "treat all timeouts as safe to wait
+# out" reversal -- only this specific, stable OpenClaw error string is
+# added to the marker set; a driver-side asyncio timeout (round_timeout
+# actually set to a real value, currently always None -- see
+# _run_openclaw_agent's own "Timeout after {timeout}s" fallback, deliberately
+# NOT added here) would still fall straight through to plain
+# AGENT_RETRY/VERDICT_RETRY behavior, unchanged, since that failure mode
+# has no comparable real-data evidence tying it to a pause window.
 PAUSE_RETRY_INTERVAL_SECONDS = float(os.environ.get("METACLAW_PAUSE_RETRY_INTERVAL", "15"))
 PAUSE_RETRY_MAX_WAIT_SECONDS = float(os.environ.get("METACLAW_PAUSE_RETRY_MAX_WAIT", "900"))
 
-# OpenClaw's own FailoverError text when its configured model provider
-# (this proxy) returns 503 -- observed verbatim in real stderr:
-# "FailoverError: 503 status code (no body)". This is what _run_round
-# checks in the `openclaw agent` subprocess's stderr (we have no
-# structured HTTP visibility into that subprocess's own internal
-# requests, only its exit code/stdout/stderr). _post_with_retry does NOT
-# use this string -- it talks to the proxy directly via httpx and gets a
-# real status code (`e.response.status_code == 503`), which is more
-# precise than text-matching and catches this even if httpx's own
-# rendering of a 503 differs from OpenClaw's ("503 Service Unavailable"
-# vs OpenClaw's "503 status code" are not the same text).
-_AGENT_PAUSE_MARKER = "503 status code"
+# OpenClaw's own FailoverError text for the two confirmed pause-window
+# symptoms -- observed verbatim in real stderr:
+#   "FailoverError: 503 status code (no body)" (rejected before any work)
+#   "FailoverError: LLM request timed out" (in-flight generation aborted
+#   mid-stream when the pause window opened -- added 2026-08-21, see above)
+# This is what _run_round checks in the `openclaw agent` subprocess's
+# stderr (we have no structured HTTP visibility into that subprocess's own
+# internal requests, only its exit code/stdout/stderr). _post_with_retry
+# does NOT use these strings -- it talks to the proxy directly via httpx
+# and gets a real status code (`e.response.status_code == 503`), which is
+# more precise than text-matching and catches a 503 even if httpx's own
+# rendering of it differs from OpenClaw's ("503 Service Unavailable" vs
+# OpenClaw's "503 status code" are not the same text); the timeout-abort
+# symptom has no analogous httpx-visible signal on the verdict/close side,
+# since that path was never the one whose in-flight generation got cut.
+_AGENT_PAUSE_MARKERS = ("503 status code", "LLM request timed out")
 
 # Day-level resume, take 2 (2026-08-18 -- supersedes the 2026-08-17 "no
 # resume, full restart" decision recorded in metaclaw_migration_plan.md).
@@ -1082,24 +1102,27 @@ async def _run_round(
         if rc == 0:
             break
 
-        if _AGENT_PAUSE_MARKER in stderr:
+        _matched_pause_marker = next(
+            (m for m in _AGENT_PAUSE_MARKERS if m in stderr), None
+        )
+        if _matched_pause_marker is not None:
             if pause_wait_start is None:
                 pause_wait_start = time.monotonic()
             elapsed = time.monotonic() - pause_wait_start
             if elapsed < PAUSE_RETRY_MAX_WAIT_SECONDS:
                 logger.warning(
-                    "[MetaClawRollout] session=%s round=%s 503 pause-retry "
-                    "elapsed=%.0fs/%.0fs, waiting %.0fs before retry",
-                    session_id, round_record["id"], elapsed,
+                    "[MetaClawRollout] session=%s round=%s pause-retry "
+                    "(matched %r) elapsed=%.0fs/%.0fs, waiting %.0fs before retry",
+                    session_id, round_record["id"], _matched_pause_marker, elapsed,
                     PAUSE_RETRY_MAX_WAIT_SECONDS, PAUSE_RETRY_INTERVAL_SECONDS,
                 )
                 await asyncio.sleep(PAUSE_RETRY_INTERVAL_SECONDS)
                 continue
             logger.warning(
-                "[MetaClawRollout] session=%s round=%s 503 pause-retry exhausted "
-                "after %.0fs -- treating as infrastructure failure (this is a "
-                "pause-retry timeout, not a generic agent failure)",
-                session_id, round_record["id"], elapsed,
+                "[MetaClawRollout] session=%s round=%s pause-retry (matched %r) "
+                "exhausted after %.0fs -- treating as infrastructure failure "
+                "(this is a pause-retry timeout, not a generic agent failure)",
+                session_id, round_record["id"], _matched_pause_marker, elapsed,
             )
             break
 

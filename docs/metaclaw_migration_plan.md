@@ -684,6 +684,24 @@ CLI 当时提出的具体方案（把 30 天拆成两段，前 K 天正常训练
 
 **这次实验本身是一个阶段性的中间结果，不是最终形态**：只训了 6 天就冻结，是因为训练还没法稳定跑满完整 30 天不崩（`094611` 那次全量训练在 day12+ 就撞上了 thinking 空转塌陷）——**这次迁移最终要拿到的，是训练稳定跑完整 30 天之后，"训练前全程混合基线"vs"训练后全程混合数字"这一组直接对比**，不需要任何冻结/分段技巧，这才是跟论文方法学完全一致的最终验证方式。当 thinking 空转三处修复（`455a54f`）验证生效、训练能稳定撑过 day12 及以后，下一步就该直接跑一次真正完整的 30 天训练，用这组"全程 vs 全程"的对比作为最终结论，而不是继续依赖 `METACLAW_TRAIN_UNTIL_DAY` 这个临时工具。
 
+### 修复：暂停窗口把正在飞的生成砍断后，OpenClaw 报的是 timeout 不是 503，漏出 08-19 那次修复的覆盖范围（2026-08-21）
+
+**背景**：K=6 冻结实验里未计分的 3 题（`day03/r11`/`day05/r13`/`day06/r4`）查出了同一个根因，但表现形态是新的——不是"新请求撞上已经暂停的 503"，是**暂停发生的那一刻，这道题的生成正在飞，被 SGLang 的 `pause_generation` 中途砍断**。以 `day05/r13` 为例，同一秒内依次发生：`drained 16 groups`→`submission paused`→这道题的 MAIN 轮次 `finish_reason=abort`→代理侧 `[openclaw-rl-degraded-turn-drop] ... is_aborted` 正确丢弃这个残缺样本（训练信号没被污染，这部分工作正常）→`Timer update_weights start`。但 OpenClaw 网关把这次中断报给 driver 的方式是 `GatewayClientRequestError: FailoverError: LLM request timed out`，不是 `"503 status code"`——`_run_round` 的 `_AGENT_PAUSE_MARKER` 只认后者，这次匹配不上，直接落进"`AGENT_RETRY=0`、立刻判 infra failure"这条路径，题目从 346 里被剔除，不进 Acc./Compl. 聚合。
+
+**跟 08-19 那次 503 修复的关系，不是新问题、是同一诱因换了个表现形态**：08-19 那次修复时，CLI 用真实日志分析后明确把 timeout 排除在耐心等待之外——理由是"timeout 通常发生在已经深度生成中才挂，跟 503（一上来就被拒）性质不同，盲目等可能把真实的 GPU 争用问题拖得更长"。这次的数据核实了一件事：**至少这一句特定的 OpenClaw 网关文案（`"LLM request timed out"`），在已核实的样本里全部是暂停窗口导致的，不是"模型真的卡住了"**——`_run_round` 传的 `round_timeout=None`，driver 自己的 `asyncio.wait_for` 永不超时，日志里这句话 100% 是 `openclaw agent` 子进程自己打到 stderr、然后以非零码退出的，机制上跟 `"503 status code"` 完全一样（都是读子进程 stderr 里 OpenClaw 自己的固定错误文案）。
+
+**真实数据核实（CLI，两轮）**：
+1. K=6 这次：3/3 与暂停窗口在同一秒对齐。
+2. 全部历史 migration run 回溯扫描：28 次真正的 `openclaw agent failed` + `LLM request timed out`（排除 transcript 里偶然出现同文案但不是失败原因的噪声），**28/28 都能对上 `pause`/`update_weights`/`finish_reason=abort`**，零反例；`094611` day12-14 那批裸的 `LLM request timed out` 字符串没有伴随 `openclaw agent failed`，是转录噪声，不会误触发这条新规则（按"只在 agent 真失败的 stderr 上匹配"这条既有原则，这些噪声天然被排除）。
+
+**修复**：`_AGENT_PAUSE_MARKER`（单个字符串）扩成 `_AGENT_PAUSE_MARKERS = ("503 status code", "LLM request timed out")`（元组），`_run_round` 里的判断从 `if _AGENT_PAUSE_MARKER in stderr:` 改成 `any(marker in stderr for marker in _AGENT_PAUSE_MARKERS)` 命中任意一个都进现有那套耐心等待重试环——**完全复用现有的 `PAUSE_RETRY_INTERVAL_SECONDS`/`PAUSE_RETRY_MAX_WAIT_SECONDS` 预算，不新增参数**。日志里把"503 pause-retry"这个措辞改成"pause-retry (matched %r)"，带上具体命中的是哪个 marker，避免以后翻日志时被"503"这个字面词误导。
+
+**08-19 的顾虑是收窄，不是整段收回**：只加了这一句特定、稳定的 OpenClaw 错误文案进 marker 集合，不是"以后所有 timeout 都当 503 处理"——如果 `round_timeout` 将来真的被设成一个具体数值、driver 自己的 `asyncio.wait_for` 触发了它自己的 `"Timeout after {timeout}s"` 兜底，那种超时跟暂停窗口无关，仍然应该立刻判失败，不进这套等待环，这个边界这次没有改变。
+
+**Plan B（proxy `/healthz` 暴露 `submission_enabled` 状态、driver 精确轮询）暂不做**：08-19 设计 503 处理时就提过这个更精确但更重的方案，当时因为"没有需要区分的第二种情况"搁置；这次虽然确认了第二种触发文案，但 28/28 历史数据零反例，说明现有"文案匹配"这个粗粒度手段已经足够可靠，不需要马上上更重的精确判断机制——如果以后真出现"timeout 明显跟暂停无关却被这条新规则误当成安全等待"的反例，再考虑把 Plan B 捡回来。
+
+**验证方式**：`py_compile` 通过。新增合成测试（mock `_run_openclaw_agent` 返回序列）覆盖三种场景：`"LLM request timed out"` 一次后成功→正确走耐心等待环后重试成功；持续 `"LLM request timed out"`→正确耗尽预算后判 `agent_succeeded=False`；跟暂停无关的普通失败文本→完全不进等待环、立刻按 `AGENT_RETRY=0` 判失败（零等待，确认没有被新 marker 误伤）。三个场景全部符合预期。**真实训练环境完全未验证**——不热改正在跑的训练，下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"这行，且这类原本会丢的题目能重试成功进入 Acc./Compl. 聚合。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：
