@@ -1971,6 +1971,32 @@
 - **发现（用户，已用真实代码+真实题面核实）：`check_filename.py --dir --min-count` 是累计跨轮次计数，一旦落后就结构性补不回来——正确的做法也会被判负分**。读了 `check_filename.py` 全文和真实 `day06/questions.json` 的 `eval.command` 序列（`r1` 默认 min-count=1、`r2` 改成 2、`r4`→3、`r7`→4、`r9`→5，逐题递增），确认：checker 每次现场数当天共享目录里有多少个合规文件，跟 `min_count` 比大小，不是只看这一轮新写的文件对不对。题干只要求每轮写 1 个新文件，min-count 的设计假设"每题都写对、累计数正好跟上"——**一旦某道题落后（比如文件名不合规），后面每题只让新写 1 个，永远追不平，即使某一轮自己写得完全正确，checker 依然会判 -1**。**这现在是"越写越长/thinking 空转"这整条链路的真正解释，不是一个平行的独立根因**——模型确实在往正确方向靠近，但因为当天更早的题目已经欠账，怎么改都还是 -1，持续收到这种"看似纠偏、实际拧不动"的负反馈才是把模型逼向空转的机制
 → 详见 `metaclaw_migration_plan.md`"查证记录：`094611`'超长 thinking 空转'复现的时间线"+"重大发现：`check_filename.py --dir --min-count` 是累计跨轮次计数"
 
+**完成内容（续二，同一天）——分阶段核查 day01-30 全部检查方式，发现第二类更严重的累计问题：**
+- 用户要求核查 day15 及之后是否每 5 天一个阶段、用不同检查方式——读了全部 30 天 `questions.json` 的 `eval.command` 加 `eval/scripts/` 下全部 5 个 checker 脚本源码（`check_filename.py`/`check_iso8601.py`/`check_metadata.py`/`check_backup.py`/`check_done_log.py`），确认**不是同一种检查方式**，分六个阶段：day01-05 单文件内容检查（`check_iso8601.py`，无累计问题）；day06-10 `check_filename.py --dir --min-count`（已知累计缺陷）；day11-15 题面自带 `python -c` 手写 `len(glob(...))>=N`（结构同 day06-10，只是没有 `--dir` 这种干净 CLI flag，且常 `&&` 接一个对选中文件的 `check_metadata.py`）；day16-20 新引入 `check_backup.py`（单文件、无累计问题）与 `--dir --min-count` 混用；day21-25 新引入 `check_done_log.py --min-entries`（**更严重的累计问题**，见下）；day26-30 前几阶段的检查方式全部混用。
+- **新发现：`check_done_log.py --min-entries` 不是"数量不够就 FAIL"，是每次调用都把 `done.log` 从头到尾整份重新逐行校验格式**——只要曾经有一轮往里面写错过一行（哪怕很多轮之前），之后所有轮次不管新写的行多规范，永远判 FAIL，是**永久性**损坏，比 `--dir --min-count` 的"门槛追不上"更彻底（后者理论上门槛不再涨还有机会追平，这个只要历史里有一行格式错就再也过不去）。`check_backup.py`/`check_metadata.py`/`check_iso8601.py` 三个逐个核实过，均为单文件校验，本身没有累计问题，但常被 `&&` 接在有累计问题的检查后面，一旦前面短路 FAIL，后面这几个原本没问题的检查根本没机会跑。
+- **修复方向讨论收敛（仍未实现，未交 CLI review）**：核心是"round 开始前/结束后 diff"——文件累计类（day06-23 部分题目）diff 文件集合、找出这一轮新写的文件，单独跑跟 day01-05 单文件模式同口径的命名+扩展名判定；日志行累计类（day21-30）diff 日志行、只对新追加的行单独校验格式，不看历史行。两类都只改"训练用 `eval_score` 怎么算"，官方 Acc./Compl. 继续用 checker 原始口径不动，保住跟论文可比性。反馈文案（`_build_opd_hint`/`_build_next_round_feedback`）要同步改，现在这两类失败反馈都只有聚合数字（"found 3, need 5"），从不像单文件模式那样指出"这一轮新写的文件/日志行具体哪里错"，需要用同一次 diff 顺带给出具体诊断，避免奖励判断和反馈文字互相打架。明确否决了两个替代方案：让 agent 回头补写早前欠账的文件（改变题面指令）、driver 判负后自己塞一个"正确"文件把计数补平（伪造 workspace 状态，比现状更失真）。
+→ 详见 `metaclaw_migration_plan.md`"补充查证：day01-30 全部检查方式分阶段核查，发现第二类更严重的累计问题（`check_done_log.py`）+ 修复方向讨论"
+
+**完成内容（续三，同一天）——把修复方向落成具体设计，写入文档待 CLI review：**
+- 新增"方案：round 开始前/结束后 diff 判定训练奖励 + 复用同一次 diff 生成具体反馈"一节：文件累计类（day06-23）用"round 前后扫目录取差集"判定这一轮是否新增合规文件，`--dir` 模式复用参数解析、glob 模式直接对解析出的字面量表达式跑 `glob.glob()`；日志行累计类（day21-30）用同样的 diff 原理对 `done.log` 只校验新追加的行，不重新校验历史行；`&&` 复合命令拆开分段独立判定，累计段用新逻辑、其余段（backup/metadata/iso8601）照官方逻辑单独跑，不再依赖短路。同一次 diff 顺带给出具体反馈文案（区分"没写新文件"/"写了但命名不对"/"命名对但扩展名不对"），不再是笼统的聚合数字。只改训练用 `eval_score`，官方 Acc./Compl. 口径不动。
+- 明确列了 4 个未细化、留给 CLI 的问题：glob 表达式解析在全部 30 天真实数据上是否稳定；拆分 `&&` 后多出的 subprocess 调用对耗时的影响；`done.log` 非纯追加场景（真实数据里有没有出现过）；训练侧接线点（`_metaclaw_verdict`/`metaclaw_round_mode` 分支）怎么改，这次讨论完全没涉及
+→ 详见 `metaclaw_migration_plan.md`"方案：round 开始前/结束后 diff 判定训练奖励 + 复用同一次 diff 生成具体反馈"
+
+**完成内容（续四，同一天）——CLI 两轮真实数据核对，方案定稿为 v2，Phase 1 确认可进入实现：**
+- **第一轮核对**：CLI 用 30 天真实 `questions.json` + 现有 driver 代码做只读核对，方向确认可行，但指出 v1 的 4 类边界问题——(1) glob 段不能一律走"抠 glob+PATTERN diff"，实际有存在性检查（27 题）、内容校验（2 题，需 fallback）、过滤式 glob（1 题，需 fallback）、双 glob 双阈值（1 题，需两组独立 diff）四种子类型；(2) `--dir` 范围写窄了，实际 70 题（day16-23 还有 33 题），不应按 day 段划分应按 `eval.command` 特征分类；(3) 训练判 pass 时反馈也要跟着切，不能只改 `eval_score`/OPD hint 漏掉 `_build_next_round_feedback`；(4) `done.log` 非追加场景兜底策略合理但需 runtime 监控。同时确认了接线点比预想简单——`prepare_patched_openclaw_combine_select.sh` 不用改，只需改 driver 主循环（约 1420 行）三行。
+- **据此修订为 v2**：新增 relax-only 安全约束（`seg_training_pass = seg_official_pass or seg_round_local_pass`，diff 只能把官方判负翻成正，不能反过来，防止在存在性检查题上比官方更严）；按 `eval.command` 特征分 8 类（A1/A2/A3/B/C1/C2/C3/D），C1/C2/C3 明确 fallback 官方或留到 Phase 2；引入统一 `training_passed` 驱动 `eval_score`/OPD hint/next-round 反馈三处。
+- **第二轮核对**：CLI 确认 relax-only 逻辑正确、正好堵住 A3 假阴性；分类表与 30 天数据一致；累计段也跑一遍官方命令的额外开销经全量 398 段扫描确认安全（无写操作迹象）；额外钉了一句此前模糊的实现约定——失败文案以 diff 诊断为主，官方静态聚合文案只能是次要补充，不能盖过具体诊断。**结论：Phase 1（A1/A2/A3/B/D + relax-only + 三处接线）可以进入实现**，C1/C2/C3 fallback 官方。
+- 已把 v2 定稿写入 `metaclaw_migration_plan.md`，取代 v1 那一节
+→ 详见 `metaclaw_migration_plan.md`"方案 v2：round 前后 diff 判定训练奖励"
+
+**完成内容（续五，同一天）——CLI 最终确认 Phase 1 可以实现，已实现并本地验证：**
+- CLI 最终确认：v2 方向、relax-only、按 command 分类、A1/A2/A3/B/D 范围、`training_passed` 三处共用、只改 driver、官方 Acc./Compl. 不动全部对症；只强调实现时记住两点——重跑 `seg_official_pass` 时整段原样 shell、不拆 `$(...)`；`training_passed=False` 时失败文案以 diff 诊断为主，不再主推官方聚合 `found K < N`。这两点在实现中都落实了。
+- **已实现**（`scripts/metaclaw/metaclaw_rollout_driver.py`）：`_split_command_segments`/`_classify_segment`（分类）、`_snapshot_segment`/`_prepare_before_snapshots`（before/after 快照）、`_diagnose_file_segment`/`_diagnose_log_segment`（具体反馈诊断）、`_rerun_segment_official`（segment 级独立重跑）、`_compute_training_verdict`（relax-only 汇总）；`_run_round`/`_build_next_round_feedback`/`run_day` 主循环三处接线全部改成消费 `training_passed`/`training_hint`；`combine_select` 补丁按 CLI 确认未改动。
+- **实现中发现并修复一个 v2 设计没预料到的分类 bug**：`check_metadata.py $(python -c "...glob.glob(...)...")` 这种"用 glob 选目标文件、本身是内容检查"的写法，最初被误分类成 A2A3——已加前置守卫（段内出现 `check_metadata.py`/`check_backup.py`/`check_iso8601.py` 直接判 OFFICIAL）修复。
+- **验证**：`py_compile` 通过；单元级合成测试（tmp workspace）覆盖净增升级、无新文件/命名错误的具体诊断、官方已过不碰 diff、复合命令部分净增仍判负、`done.log` 历史改写正确退化并打日志，全部通过；**全量 30 天真实数据分类扫描**（不是单个样例）得到 A1=70、A2A3=75（=CLI 报告的 48+27）、B=75 段，**跟 CLI 两轮真实数据核对报告的数字完全一致**。
+- **仍未验证**：真实训练环境下的实际效果（day12+ 是否还复现 `094611` 崩溃模式）、`done.log` 非追加场景真实触发率（监控日志已埋点）、`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响
+→ 详见 `metaclaw_migration_plan.md`"Phase 1 已实现"一节
+
 ### 当前状态（2026-08-25）
 
 ### 已就绪
@@ -1978,16 +2004,18 @@
 **MetaClaw 迁移**：同 08-21（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复 + 新基线 + K=6 里程碑均已就绪），另加：[x] **暂停窗口砍断在飞生成、误判成 timeout 而不是 503 的问题已修复**（`_AGENT_PAUSE_MARKERS` 扩展，28/28 历史数据零反例支持），预期能挽回 K=6 实验里丢掉的那类样本；[x] **"超长 thinking 空转"复现的真正机制已定位（经过一次自我纠正）**——最初以为是"中段 step-judge 跟最终结果脱钩"，已撤回；真正原因是 `check_filename.py --dir --min-count` 累计计数缺陷：这一轮即使做对了，也可能因为当天更早题目的欠账被 checker 判 -1，持续的"看似纠偏、实际拧不动"负反馈才是把模型逼向空转的机制，需要下一步单独讨论怎么修。`py_compile`+合成测试验证通过（pause-marker），真实训练完全未验证，不影响正在跑的 `day12` 这条训练。
 
 ### 已知限制 / 未解决
-同 08-21（历史状态），未变，另加：**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。**`check_filename` 累计计数缺陷只是诊断/发现，完全没有修复方案，更没有实现**——`455a54f` 那三处修复（next-round 反馈+`is_invalid_tool_use` 接线）不解决这条新根因，下一轮训练如果还是崩，符合预期，不代表之前的诊断错了。
+同 08-21（历史状态），未变，另加：**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。**累计跨轮次计数缺陷的 diff-based 修复（Phase 1）已实现并通过本地验证（py_compile+合成测试+全量 30 天真实数据分类扫描），但完全没有在真实训练环境跑过**——`day12`+ 是否真的不再复现 `094611` 的 thinking 空转崩溃模式，仍需下一轮训练验证，本地验证只能确认代码逻辑本身没错。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**先跟用户和 CLI 讨论 `check_filename.py --dir --min-count` 累计计数缺陷该怎么修**，这是比"提交下一轮训练"更优先的事——不确认清楚就提交训练，很可能重复 `094611`/`day12-14` 的崩溃模式，浪费一次训练资源。用户另开默认配置训练对比 `TRAIN_UNTIL_DAY` 行为一致性的任务仍然有效，可以并行推进
+2. **MetaClaw 迁移**：**diff-based 修复（Phase 1）已实现并本地验证通过，下一步是提交一轮真实训练验证**——继续跑到 day12+ 看是否还复现 `094611` 崩溃模式，同时观察 `done.log` 非追加监控日志是否触发。用户另开默认配置训练对比 `TRAIN_UNTIL_DAY` 行为一致性的任务仍然有效，可以并行推进
 3. 其余同 08-17
 
 ### 未验证
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
-- [ ] **`check_filename.py --dir --min-count` 累计计数缺陷该怎么修**——方案未讨论，是当前最优先的开放问题
+- [ ] **diff-based 修复（Phase 1）在真实训练环境下的实际效果**——继续跑到 day12+ 是否还复现 `094611` 的 thinking 空转崩溃模式，是这次修复要解决的核心问题，本地验证无法回答
+- [ ] **`done.log` 非追加场景真实触发率**——监控日志已埋点（`_compute_training_verdict` 里 `logger.warning`），只能等真实训练跑起来后观察
+- [ ] **`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响**——本地未测过实际耗时，CLI 判断"可忽略"是基于全量 398 段无写操作迹象的静态扫描，不是真实计时
 - [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**——下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"且题目最终计分成功
 - [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前的 Frozen 窗口评测走的是训练自己的 harness，跟官方 bench 不完全同构
 - [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%、Acc. 相对**新基线（17.8%）**有没有提升——`--agent` 修复的核心验证点，注意不要再拿旧的 8.1% 做对比

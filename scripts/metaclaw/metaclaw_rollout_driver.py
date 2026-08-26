@@ -65,10 +65,13 @@ Requires:
 from __future__ import annotations
 
 import asyncio
+import glob
 import json
 import logging
 import os
+import re
 import secrets
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -1016,8 +1019,33 @@ def _build_next_round_feedback(
       (and only if) this round's checker is confirmed to be check_filename.py
       --dir mode (see _is_dir_mode_filename_check) -- never applied to the
       exact-date glob checks used from day11 onward.
+
+    2026-08-25 (see docs/metaclaw_migration_plan.md "方案 v2: round 前后
+    diff 判定训练奖励", CLI review): `_compute_training_verdict` may have
+    already upgraded this round to `inline_score["training_passed"]=True`
+    despite the official checker's raw `passed=False` -- a historical-deficit
+    false negative (an earlier round in the same day fell behind a
+    cumulative min-count/min-entries threshold), not a real mistake THIS
+    round made. This function must treat that the same as a genuine pass --
+    otherwise eval_score/OPD would say "fine" while the very next round's
+    visible [Previous Feedback] still says "FAIL: expected >= N, found K",
+    splitting the two signals apart (exactly the gap CLI's review caught).
+    Building `feedback_score` as a shallow copy with `passed` forced True
+    keeps this consistent with however a genuine pass is normally worded
+    (`feedback.correct`, often empty) instead of hardcoding "" here.
+
+    When training_passed is still False, the diff-based diagnostic
+    (`inline_score["training_hint"]`, if any) takes priority over the
+    official checker stdout -- CLI's explicit call: the round-local
+    diagnosis must lead, the official aggregate "found K, need N" line is at
+    most a secondary fallback now, not the primary failure text.
     """
-    text = _build_feedback_text(round_record, inline_score)
+    training_passed = inline_score.get("training_passed", inline_score.get("passed", False))
+    feedback_score = inline_score
+    if training_passed and not inline_score.get("passed", False):
+        feedback_score = {**inline_score, "passed": True}
+
+    text = _build_feedback_text(round_record, feedback_score)
     if not text:
         return text
 
@@ -1025,14 +1053,357 @@ def _build_next_round_feedback(
         snippet = answer_text.strip()[:120]
         text = f"{text} (your previous response: {snippet!r})"
 
-    if round_record.get("type") == "file_check" and not inline_score.get("passed", False):
-        stdout_line = _filtered_checker_stdout(inline_score)
-        if stdout_line:
-            text = f"{text}\n{stdout_line}"
+    if round_record.get("type") == "file_check" and not training_passed:
+        training_hint = inline_score.get("training_hint", "")
+        if training_hint:
+            text = f"{text}\n{training_hint}"
+        else:
+            stdout_line = _filtered_checker_stdout(inline_score)
+            if stdout_line:
+                text = f"{text}\n{stdout_line}"
         if _is_dir_mode_filename_check(round_record):
             text = f"{text}{_FC_DIR_MODE_NOTE}"
 
     return text
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 fix: round-local training verdict via before/after diff (2026-08-25)
+# -- see docs/metaclaw_migration_plan.md "方案 v2: round 前后 diff 判定训练
+# 奖励" for the full design + CLI's two rounds of real-data review.
+#
+# Problem this solves: several file_check checkers (check_filename.py --dir,
+# a handful of hand-written `python -c` glob-count snippets, and
+# check_done_log.py --min-entries) score CUMULATIVE state across the whole
+# day/log, not just this round's own contribution. A round that does exactly
+# what its own question asks can still get eval_score=-1 because an EARLIER
+# round in the same day fell behind -- the deficit is structurally
+# unrecoverable under normal one-artifact-per-round agent behavior (see
+# docs/metaclaw_migration_plan.md's "重大发现" section for the original
+# check_filename.py --dir discovery and its day01-30 generalization).
+#
+# Fix: for these specific checker shapes, additionally judge "did THIS round
+# make its own correct incremental contribution" via a before/after diff, and
+# combine it with the official verdict RELAX-ONLY (`official_pass or
+# round_local_pass`) so a diff-parsing bug can only ever fail to fix the
+# connat, never invent a new false negative. Official Acc./Compl.
+# (_score_round_official) is completely unaffected -- this only changes what
+# feeds eval_score / OPD hint / next-round feedback.
+#
+# Scope (Phase 1, per CLI's 30-day real-data classification):
+#   A1     -- check_filename.py --dir [--min-count N]         (70 rounds)
+#   A2/A3  -- hand-written `len(glob(...))>=N` / `if glob(...)` (48+27 rounds)
+#   B      -- check_done_log.py --min-entries                  (46 rounds/75 segs)
+# Explicitly NOT covered in Phase 1 (falls back to the segment's own official
+# exit code, unchanged behavior) -- CLI confirmed these need different
+# handling or are rare enough not to be worth it yet:
+#   - glob + content/ISO validation in the same python -c snippet (2 rounds,
+#     e.g. day09/r3, day10/r6)
+#   - filtered glob, e.g. `[f for f in glob.glob(...) if 'adr' in f]`
+#     (1 round, day11/r6)
+#   - two independent globs with two thresholds (1 round, day26/r8 -- Phase 2)
+#   - check_backup.py / check_metadata.py / check_iso8601.py segments
+#     (~120 segments) -- these are already round-local by design, no fix
+#     needed; still re-executed standalone (see _rerun_segment_official) so
+#     `&&` short-circuiting from an earlier failed segment doesn't hide
+#     their own real exit code.
+# ---------------------------------------------------------------------------
+
+# Mirrors check_filename.py::PATTERN (MetaClaw-Bench eval/scripts/
+# check_filename.py) verbatim -- a stable single-line regex, not imported
+# because that script is invoked as a subprocess via eval.command, never as
+# a library. Same "local copy of a small stable regex" risk class already
+# accepted for _run_openclaw_agent's local copy of infer_cmd.py's function.
+_FC_PATTERN = re.compile(r'^\d{8}_[a-z][a-z0-9_]*\.[a-z0-9]+$')
+
+# Mirrors check_done_log.py::LINE_PATTERN verbatim, same rationale as above.
+_DL_LINE_PATTERN = re.compile(
+    r'^\[DONE\] (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?\+08:00) \| ([^\|]+) \| (.+)$'
+)
+
+_GLOB_LITERAL_RE = re.compile(r"glob\.glob\('([^']+)'\)")
+_GLOB_FILTER_RE = re.compile(r"\[[^\]]*for\s+\w+\s+in\s+glob\.glob\([^\]]*\bif\b")
+
+
+def _split_command_segments(command: str) -> list[str]:
+    """Split an eval.command string on ' && ' into independently-runnable
+    segments. CLI confirmed (30-day real-data scan, 0 counterexamples) no
+    embedded `python -c` string in this dataset contains a literal '&&' of
+    its own, so this naive split is safe for the current data -- not a
+    guarantee for hypothetical future question data."""
+    return [seg.strip() for seg in command.split(" && ") if seg.strip()]
+
+
+def _classify_segment(segment: str) -> tuple[str, dict[str, Any]]:
+    """Classify one eval.command segment for the round-local diff fix.
+
+    Returns (category, params). category is one of:
+      "A1"       -- check_filename.py --dir mode
+      "A2A3"     -- a single, unfiltered, count-or-existence-only glob check
+      "B"        -- check_done_log.py --min-entries
+      "OFFICIAL" -- everything else (backup/metadata/iso8601, multi-glob,
+                    content-checking glob snippets, filtered glob, or
+                    anything this parser can't confidently recognize) --
+                    re-executed standalone, judged by its own exit code,
+                    never diffed. Falling into this bucket is always safe
+                    (relax-only), it just means this segment's cumulative-
+                    count connat (if any) doesn't get resolved this round.
+    """
+    if "check_filename.py" in segment and "--dir" in segment:
+        dir_m = re.search(r'--dir\s+(\S+)', segment)
+        ext_m = re.search(r'--ext\s+(\S+)', segment)
+        if dir_m and ext_m:
+            return "A1", {"dir": dir_m.group(1).rstrip("/"), "ext": ext_m.group(1)}
+        return "OFFICIAL", {}
+
+    if "check_done_log.py" in segment:
+        log_m = re.search(r'check_done_log\.py\s+(\S+\.log)', segment)
+        if log_m:
+            prefix_m = re.search(r'--task-prefix\s+(\S+)', segment)
+            return "B", {
+                "logfile": log_m.group(1),
+                "task_prefix": prefix_m.group(1) if prefix_m else None,
+            }
+        return "OFFICIAL", {}
+
+    # Must come BEFORE the glob check below: day11+ often invokes
+    # check_metadata.py with a `$(python -c "...glob.glob(...)...")` subshell
+    # argument selecting WHICH file to check -- that glob call is picking a
+    # target file for a content check, not counting/existence-checking
+    # anything itself, so this must classify as OFFICIAL (re-run whole,
+    # judged by its own exit code) even though the substring "glob.glob("
+    # is present somewhere in the segment. Caught by a real test case
+    # (day11's `check_metadata.py $(python -c "...glob.glob(...)...")`
+    # segment) that the naive glob-substring check below misclassified as
+    # A2A3 before this guard was added.
+    if "check_metadata.py" in segment or "check_backup.py" in segment or "check_iso8601.py" in segment:
+        return "OFFICIAL", {}
+
+    if "glob.glob(" in segment:
+        glob_calls = _GLOB_LITERAL_RE.findall(segment)
+        if len(glob_calls) != 1:
+            return "OFFICIAL", {}  # 0 (unparseable) or 2+ (e.g. day26/r8) -- Phase 2/fallback
+        if re.search(r'json\.load\(|\.read\(\)', segment):
+            return "OFFICIAL", {}  # content check embedded (e.g. day09/r3, day10/r6) -- fallback
+        if _GLOB_FILTER_RE.search(segment):
+            return "OFFICIAL", {}  # filtered glob (e.g. day11/r6) -- fallback
+        return "A2A3", {"glob_expr": glob_calls[0]}
+
+    return "OFFICIAL", {}
+
+
+def _list_matching_files(directory: Path, ext: str | None) -> set[str]:
+    """Read-only directory scan mirroring check_filename.py::check_dir's
+    matching logic. ext=None skips the extension filter."""
+    if not directory.is_dir():
+        return set()
+    names = os.listdir(directory)
+    if ext is not None:
+        ext_lower = ext.lstrip(".").lower()
+        return {
+            f for f in names
+            if _FC_PATTERN.match(f) and f.rsplit(".", 1)[-1].lower() == ext_lower
+        }
+    return {f for f in names if _FC_PATTERN.match(f)}
+
+
+def _read_log_lines(path: Path) -> list[str]:
+    """Mirrors check_done_log.py's own line-reading logic exactly (drop
+    blank lines, strip trailing newline)."""
+    if not path.exists():
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [line.rstrip("\n") for line in f if line.strip()]
+
+
+def _snapshot_segment(category: str, params: dict[str, Any], workspace_path: Path) -> Any:
+    """Read-only snapshot taken once before the round's agent call and once
+    after -- the diff between the two is this round's own contribution.
+    Only called for "A1"/"A2A3"/"B" (never "OFFICIAL", which has no diff)."""
+    if category == "A1":
+        directory = workspace_path / params["dir"]
+        return {
+            "compliant": _list_matching_files(directory, params["ext"]),
+            "all": set(os.listdir(directory)) if directory.is_dir() else set(),
+        }
+    if category == "A2A3":
+        glob_expr = params["glob_expr"]
+        directory = workspace_path / (os.path.dirname(glob_expr) or ".")
+        return {
+            "compliant": set(glob.glob(str(workspace_path / glob_expr))),
+            "all": set(os.listdir(directory)) if directory.is_dir() else set(),
+        }
+    if category == "B":
+        return _read_log_lines(workspace_path / params["logfile"])
+    return None
+
+
+def _prepare_before_snapshots(
+    round_record: dict[str, Any], workspace_path: Path,
+) -> list[tuple[str, tuple[str, dict[str, Any]], Any]] | None:
+    """Classify this round's eval.command into segments and snapshot
+    whatever each diff-capable segment needs, BEFORE the round's agent call
+    runs. Returns None for non-file_check rounds (multi_choice never uses
+    this mechanism -- its official `passed` is used as-is, unconditionally).
+    Always computed for file_check rounds regardless of how the round turns
+    out -- cheap (os.listdir/glob/read lines, no subprocess), the expensive
+    per-segment official reruns only happen later if the round actually
+    needs them (see _compute_training_verdict)."""
+    if round_record.get("type") != "file_check":
+        return None
+    command = round_record.get("eval", {}).get("command", "")
+    if not command:
+        return None
+    result = []
+    for segment_text in _split_command_segments(command):
+        category, params = _classify_segment(segment_text)
+        before = _snapshot_segment(category, params, workspace_path) if category != "OFFICIAL" else None
+        result.append((segment_text, (category, params), before))
+    return result
+
+
+def _diagnose_file_segment(before_all: set[str], after_all: set[str], ext: str | None) -> str:
+    """Best-effort, check_filename.py::check_file()-style specific diagnostic
+    for why this round produced no new compliant file -- used instead of the
+    aggregate "found K, need N" message, which never explains what was wrong
+    with what the agent actually wrote this round."""
+    new_any = after_all - before_all
+    if not new_any:
+        return "no new file was created in this round"
+    candidate = sorted(new_any)[0]
+    if not _FC_PATTERN.match(candidate):
+        return f"'{candidate}' does not match YYYYMMDD_snake_case.ext pattern"
+    if ext is not None and candidate.rsplit(".", 1)[-1].lower() != ext.lstrip(".").lower():
+        got_ext = candidate.rsplit(".", 1)[-1] if "." in candidate else ""
+        return (
+            f"'{candidate}' matches the naming pattern but has extension "
+            f".{got_ext}, expected .{ext.lstrip('.')}"
+        )
+    return f"'{candidate}' was created but was not counted (unexpected)"
+
+
+def _diagnose_log_segment(new_lines: list[str], task_prefix: str | None) -> str:
+    """Same idea as _diagnose_file_segment but for check_done_log.py --
+    reports which of the newly-appended lines (not historical ones) failed
+    and why, instead of the aggregate entry count."""
+    if not new_lines:
+        return "no new entry was appended to done.log this round"
+    for line in new_lines:
+        m = _DL_LINE_PATTERN.match(line)
+        if not m:
+            return f"your new done.log entry does not match format: {line!r}"
+        if len(m.group(4).strip()) > 80:
+            return f"your new done.log entry's summary exceeds 80 chars: {line!r}"
+    if task_prefix:
+        last_task_id = _DL_LINE_PATTERN.match(new_lines[-1]).group(3).strip()
+        if not last_task_id.startswith(task_prefix):
+            return (
+                f"your new done.log entry's task id {last_task_id!r} does not "
+                f"start with {task_prefix!r}"
+            )
+    return ""  # only reached if this is called when nothing was actually wrong
+
+
+def _check_new_log_lines(new_lines: list[str], task_prefix: str | None) -> bool:
+    if not new_lines:
+        return False
+    for line in new_lines:
+        m = _DL_LINE_PATTERN.match(line)
+        if not m or len(m.group(4).strip()) > 80:
+            return False
+    if task_prefix:
+        last_task_id = _DL_LINE_PATTERN.match(new_lines[-1]).group(3).strip()
+        if not last_task_id.startswith(task_prefix):
+            return False
+    return True
+
+
+def _rerun_segment_official(segment_text: str, workspace_path: Path, timeout: float = 30.0) -> bool:
+    """Re-execute one `&&`-segment in isolation (own subprocess, same
+    shell=True/cwd semantics as MetaClaw-official's own _run_file_check) so
+    its exit code reflects ITS OWN outcome, not whatever the original
+    whole-command short-circuit happened to report. CLI confirmed (398-
+    segment scan across all 30 days) no write-like calls in any observed
+    segment (5 official check_*.py scripts are all read-only `open`; no
+    embedded python -c snippet does write/a/w/unlink), so re-running a
+    segment here has no side effects on top of what the original run
+    already did."""
+    try:
+        proc = subprocess.run(
+            segment_text, shell=True, cwd=str(workspace_path),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _compute_training_verdict(
+    round_record: dict[str, Any],
+    inline_score: dict[str, Any],
+    before_snapshots: list[tuple[str, tuple[str, dict[str, Any]], Any]] | None,
+    workspace_path: Path,
+) -> tuple[bool, str]:
+    """Return (training_passed, diagnostic_hint) for one round.
+
+    Relax-only: this can only turn an official FAIL into a training PASS,
+    never the reverse. If the official chain already passed, or this round
+    isn't classifiable file_check (multi_choice, or an empty/unparseable
+    command), training_passed is just an alias of the official `passed` and
+    no diff logic runs at all -- the (cheap) before_snapshots computed for a
+    round that turns out to officially pass are simply unused.
+    """
+    official_passed = inline_score.get("passed", False)
+    if official_passed or not before_snapshots:
+        return official_passed, ""
+
+    seg_passes: list[bool] = []
+    diag_parts: list[str] = []
+    for segment_text, seg_info, before in before_snapshots:
+        category, params = seg_info
+        seg_official_pass = _rerun_segment_official(segment_text, workspace_path)
+
+        if category == "OFFICIAL" or before is None:
+            seg_passes.append(seg_official_pass)
+            continue
+
+        seg_round_local_pass = False
+        seg_diag = ""
+        if category in ("A1", "A2A3"):
+            after = _snapshot_segment(category, params, workspace_path)
+            new_compliant = after["compliant"] - before["compliant"]
+            seg_round_local_pass = bool(new_compliant)
+            if not seg_round_local_pass:
+                ext = params.get("ext")  # A1 has it, A2A3 doesn't
+                seg_diag = _diagnose_file_segment(before["all"], after["all"], ext)
+        elif category == "B":
+            after = _read_log_lines(workspace_path / params["logfile"])
+            if after[: len(before)] != before:
+                # Non-append history -- CLI flagged this premise as
+                # unverifiable from question data alone; degrade to the
+                # official verdict for this segment and log for monitoring
+                # (see docs/metaclaw_migration_plan.md "仍未决" item 1).
+                logger.warning(
+                    "[MetaClawRollout] round=%s done.log %s: history rewritten, "
+                    "not pure-append -- degrading to official verdict for this segment",
+                    round_record.get("id"), params["logfile"],
+                )
+            else:
+                new_lines = after[len(before):]
+                seg_round_local_pass = _check_new_log_lines(new_lines, params.get("task_prefix"))
+                if not seg_round_local_pass:
+                    seg_diag = _diagnose_log_segment(new_lines, params.get("task_prefix"))
+
+        seg_pass = seg_official_pass or seg_round_local_pass
+        seg_passes.append(seg_pass)
+        if not seg_pass and seg_diag:
+            diag_parts.append(seg_diag)
+
+    training_passed = all(seg_passes) if seg_passes else official_passed
+    if training_passed:
+        return True, ""
+    hint = "\n".join(diag_parts) if diag_parts else _build_opd_hint(round_record, inline_score)
+    return False, hint
 
 
 async def _run_round(
@@ -1084,7 +1455,24 @@ async def _run_round(
     Acc./Compl. aggregate any more than it counts as a real training
     verdict) -- otherwise it's the scoring_cmd.py-equivalent continuous
     score used for that aggregate.
+
+    2026-08-25: the returned inline_score dict also carries two additional
+    keys, `training_passed` and `training_hint` (see _compute_training_verdict
+    and docs/metaclaw_migration_plan.md "方案 v2") -- the round-local,
+    diff-based verdict/diagnostic that the caller should use for
+    eval_score/OPD hint/next-round feedback instead of the raw official
+    `passed`, which can be a historical-deficit false negative for a handful
+    of cumulative-count checker shapes. `_score_round_official`/
+    official_score (Acc./Compl.) are computed from the ORIGINAL inline_score
+    before these keys are added and are completely unaffected.
     """
+    # Snapshot BEFORE the agent runs -- must happen here, not after
+    # _compute_inline_score, since the whole point is to see what THIS
+    # round's own agent call adds relative to what already existed. Cheap
+    # (no subprocess) even when unused (see _compute_training_verdict:
+    # skipped entirely when the round officially passes).
+    before_snapshots = _prepare_before_snapshots(round_record, workspace_path)
+
     rc, stdout, stderr = -1, "", ""
     attempt = 0
     pause_wait_start: float | None = None
@@ -1158,6 +1546,18 @@ async def _run_round(
         if agent_succeeded else None
     )
 
+    # Round-local diff-based verdict (2026-08-25, Phase 1 -- see docs/
+    # metaclaw_migration_plan.md "方案 v2"). Computed AFTER official_score
+    # (which must only ever see the pristine official inline_score) --
+    # training_passed/training_hint are added to inline_score afterward,
+    # additive keys only, nothing existing is overwritten or removed.
+    training_passed, training_hint = (
+        _compute_training_verdict(round_record, inline_score, before_snapshots, workspace_path)
+        if agent_succeeded else (False, "")
+    )
+    inline_score["training_passed"] = training_passed
+    inline_score["training_hint"] = training_hint
+
     # Human-readable transcript (2026-08-18) -- mirrors openclaw-test's
     # student_chat.py print style (`>>`/`<<` turn markers, full untruncated
     # text) so a person tailing metaclaw_rollout.log can eyeball actual
@@ -1185,11 +1585,19 @@ async def _run_round(
     else:
         print(f"  << OpenClaw -> Query: AGENT FAILED (rc={rc})\n{stderr[:2000]}\n")
     score_str = f"{official_score['score']:.3f}" if official_score is not None else "N/A (infra failure)"
-    print(f"  verdict: passed={passed}  agent_succeeded={agent_succeeded}  official_score={score_str}")
+    print(
+        f"  verdict: passed={passed}  training_passed={training_passed}  "
+        f"agent_succeeded={agent_succeeded}  official_score={score_str}"
+    )
+    if training_passed and not passed:
+        print(f"  (round-local diff upgraded this round -- see docs/metaclaw_migration_plan.md 方案 v2)")
+    elif not training_passed and training_hint:
+        print(f"  training hint (diff-based, goes into eval_score=-1 + next round's feedback):\n{training_hint}\n")
 
     logger.info(
-        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s agent_succeeded=%s{_RESET}",
-        session_id, round_record["id"], passed, agent_succeeded,
+        f"{_GREEN}[MetaClawRollout] session=%s round=%s passed=%s training_passed=%s "
+        f"agent_succeeded=%s{_RESET}",
+        session_id, round_record["id"], passed, training_passed, agent_succeeded,
     )
     return inline_score, agent_succeeded, official_score, answer_text
 
@@ -1418,9 +1826,24 @@ async def run_day(
                         day_round_scores.append(official_score)
 
                     if agent_succeeded:
-                        passed = inline_score.get("passed", False)
-                        eval_score = 1.0 if passed else -1.0
-                        hint = "" if passed else _build_opd_hint(round_record, inline_score)
+                        # 2026-08-25 (see docs/metaclaw_migration_plan.md "方案
+                        # v2"): eval_score/OPD hint now key off training_passed
+                        # (the round-local diff verdict), not the raw official
+                        # `passed` -- relax-only, so this can only turn an
+                        # official FAIL into a training PASS, never the
+                        # reverse. training_hint (diff-based diagnosis) is
+                        # preferred over _build_opd_hint's aggregate stdout;
+                        # falls back to it only when training_hint is empty
+                        # (e.g. an OFFICIAL-only segment failed, or the
+                        # silent-failure case _build_opd_hint's own docstring
+                        # already documents).
+                        training_passed = inline_score.get(
+                            "training_passed", inline_score.get("passed", False)
+                        )
+                        eval_score = 1.0 if training_passed else -1.0
+                        hint = "" if training_passed else (
+                            inline_score.get("training_hint") or _build_opd_hint(round_record, inline_score)
+                        )
                         if hint:
                             print(f"  OPD hint (goes into next round's feedback):\n{hint}\n")
                         # session_done=True unconditionally (2026-08-19c) --

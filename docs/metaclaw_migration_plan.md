@@ -744,6 +744,170 @@ r9 -> check_filename.py --dir day06/ --ext json --min-count 5
 
 **待讨论，不在这次记录里下结论**：怎么修——是改变 checker 使用方式（比如把"这一轮自己有没有正确完成"和"累计进度"拆成两个独立信号）、还是改这次迁移自己的判分口径（比如不直接用 checker 原始 ±1，而是判断"这一轮相对上一轮，合规文件数有没有净增加"）、还是这本来就是 MetaClaw 官方题面设计本身的特性（可能官方自己的 Simulator/Skills+RL 训练方法压根不会在这种"半路失败再也追不上"的场景下卡住，因为他们从不用这套确定性 checker 做训练奖励，参见"三方对照"）——这些都还没讨论，留到下一轮跟用户和 CLI 一起决定。
 
+### 补充查证：day01-30 全部检查方式分阶段核查，发现第二类更严重的累计问题（`check_done_log.py`）+ 修复方向讨论（2026-08-25）
+
+**背景**：上一节的发现只核实了 day06-10。用户要求核查 day15 及之后每 5 天一个阶段是否用同一种检查方式——查完发现不是，而且 day21 起引入的 `check_done_log.py` 是一种结构上更严重的累计问题，不是"追不上门槛"，是"一旦历史里有一行写错，之后永远过不了"。
+
+**分阶段核查结果**（读了全部 30 天 `questions.json` 的 `eval.command` + `eval/scripts/` 下全部 5 个 checker 脚本源码）：
+
+| 阶段 | 主要检查脚本 | 是否累计跨轮次污染 |
+|------|------|------|
+| day01-05 | `check_iso8601.py`（+ 少量 `python -c` 内联正则）| 否——都是查"某个题面自带的已存在文件"的具体字段格式，不是新建文件计数，天然只反映这一轮自己的表现 |
+| day06-10 | `check_filename.py --dir --min-count` | 是——上一节已记录的累计文件数缺陷 |
+| day11-15 | 题面自带 `python -c` 里手写 `sorted(glob('dayXX/YYYYMMDD_*.ext'))`，`len(files)>=N` 判断，`&&` 接一个 `check_metadata.py` 校验其中被选中的一个文件 | 是，结构上跟 day06-10 同类——只是不经过 `check_filename.py` 的 `--dir` 参数，改成题面自己手写的 glob 计数 |
+| day16-20 | `check_backup.py`（新引入）与 `check_filename.py --dir --min-count` 混用 | `check_backup.py` 本身**否**（见下）；但同阶段仍混了几道 `--dir --min-count` 题，那几道继续是累计问题 |
+| day21-25 | `check_done_log.py --min-entries N`（新引入）与 `--dir`/`check_backup` 混用 | **是，且是更严重的一种**（见下） |
+| day26-30 | `check_backup` + `check_iso8601` + `check_metadata` + `check_done_log` 全部混用，偶尔仍带 glob 计数 | 视具体子检查而定，多种问题可能叠加在同一题里 |
+
+**逐个脚本核实**（读了 `check_metadata.py`/`check_backup.py`/`check_done_log.py` 全文，此前只读过 `check_filename.py`）：
+
+- `check_backup.py`：只查一个指定的具体文件名（如 `day20/weekly_status.json`）有没有对应 `.bak` 且内容跟原文件不同。一题绑定一个具体文件名，不同题目查不同文件，**没有跨轮次累计的结构**，本身没有问题。
+- `check_metadata.py`：只查传进来的那一个具体文件路径的 metadata 字段是否齐全合规（JSON 的 `meta.*`、MD 的 YAML frontmatter、PY 的 docstring `Meta:` 段、CSV 首行 `# meta:` 注释），同样是单文件、round-local，没有问题。
+- `check_done_log.py --min-entries N`：**比 `--dir --min-count` 更严重**。不是只比较条目数量，而是**每次调用都把 `done.log` 从第一行到最后一行全部重新按 `LINE_PATTERN`（`^\[DONE\] <ISO8601> \| <task_id> \| <summary，≤80字符>$`）校验一遍**：
+  ```python
+  for i, line in enumerate(lines):
+      m = LINE_PATTERN.match(line)
+      if not m:
+          fail(f"line {i+1} does not match format: {line!r}")
+  ```
+  **只要曾经有一轮往 `done.log` 写错过一行格式（哪怕是很多轮之前），之后所有轮次不管新写的行多规范，判定永远是 FAIL**——`--dir --min-count` 至少理论上"门槛不再涨了就有机会追平"，这个是只要历史里有一行格式不对，就**永久性**过不了，除非有人手动把那行坏日志改掉，训练过程中不会有这种介入。`--task-prefix`（查最后一行 task_id 前缀）的校验同样被挡在这个全量逐行校验之前，历史行一坏就永远走不到。
+
+**复合命令的连带问题**：day11 起大量题目是 `A && B` 形式（比如 `glob 计数 && check_metadata.py ...`，或 `check_filename.py --dir ... && check_done_log.py --min-entries ...`）。`check_backup.py`/`check_metadata.py`/`check_iso8601.py` 三个本身没有累计问题，但一旦排在它们前面的累计部分（glob 计数/`--dir --min-count`/`check_done_log`）因为历史欠账 FAIL，`&&` 短路，后面这几个原本没问题的检查根本没机会跑——即使这一轮的 metadata/backup 部分其实是对的，也拿不到任何信号。
+
+**修复方向讨论（延续上一节，本次讨论后收敛的思路，仍未实现）**：
+
+不能只改 checker 判定"数量"这一个维度了，要用**"round 开始前 / round 结束后"的 diff**——这个原理对文件计数和日志行计数是同一套：
+- **文件累计类**（day06-10 的 `--dir`，day11-15/16-23 里仍出现的 glob 计数）：round 开始前 snapshot 目录里已有哪些文件，round 结束后再 snapshot 一次，取差集找出"这一轮新写的文件"，对新文件单独跑一次跟 `check_filename.py::check_file()`（day01-05 单文件模式）同样口径的判定（命名正则 + 扩展名），而不是比较目录里的绝对总数。day06-10 能直接复用 `--dir` 的 argparse 参数拿到目录/扩展名；day11-15 起没有干净的 CLI flag，需要从题面自带的 `python -c` 文本里解析出实际用的 glob 表达式。
+- **日志行累计类**（day21-30 的 `check_done_log`）：同样的 diff 原理，换成"行"——round 开始前记 `done.log` 有几行、内容是什么，round 结束后只对**新追加的那几行**单独跑 `LINE_PATTERN` + 长度 + （若有 `--task-prefix`）前缀校验，完全不看历史行是否合规。这是"done.log 一旦写坏一行就永久卡死"这个问题唯一说得通的修法。
+- **复合命令**：`&&` 拼接的题目需要拆开分别判断——累计部分（文件计数/日志行）用上面的新逻辑判，`check_backup`/`check_metadata`/`check_iso8601` 部分照官方原始逻辑独立跑，两边分别判完再合并结果，不能再依赖 `&&` 的短路。
+- **只改训练奖励，不改官方 Acc./Compl. 口径**：官方 Table 1 的 Acc./Compl. 继续用 checker 的原始 pass/fail（绝对门槛/全量校验），一个字不改，保住跟论文的可比性——本来就是这套确定性 checker 从没被 MetaClaw 官方用作训练奖励，"用它做训练奖励"是这次迁移自己的设计，所以只在"checker 结果 → 训练用 `eval_score`"这一步的转换里做 diff-based 改动，不碰官方 checker 脚本或题面数据。这样同一道题会产生两个故意不同的判断：官方 Acc./Compl.（按官方口径可能仍是 FAIL）与训练奖励（按这一轮自身表现可能是 +1）。
+- **反馈文字也要一起改，不能只改分数**：现有 `_build_opd_hint`（file_check 分支只给 checker 原始 stdout）和 `_build_next_round_feedback`（叠加静态文案 + 过滤后的 stdout）目前对 `--dir`/glob 累计类检查，失败反馈只有聚合数字（`found 3, need 5`），从不指出"这一轮自己新写的文件具体哪里错"（对比 day01-05 单文件模式的 `check_file()`，失败信息精确到具体文件名+原因）。用上面同一次 diff 拿到的"这一轮新增的文件/日志行"，可以顺带给出跟单文件模式同款的具体诊断（没写新文件/写了但命名不对/命名对但扩展名不对），而不是回退到没有信息量的聚合计数——奖励判断和反馈文案共用同一次 diff，不用分两次实现。若训练侧已经因为净增判 +1，但反馈文字仍然是官方那句"绝对门槛失败"，两个信号会打架，需要同步调整措辞。
+- **两个被明确否决的替代方案**：(a) 让 agent 回头去补写早前欠下的文件——题面从不会要求这么做，要让 agent 这样做等于往题面塞了一条原本不存在的指令，改变了这道题在测什么；(b) 判负后由 driver 自己往目录里手动塞一个"正确"的文件把计数补平——这是伪造 workspace 状态骗过 checker，不是修复计分逻辑，会让后续题目看到的目录状态失真，比现在这个"不公平但真实"的状况更偏离复现真实 agent 行为。两者均未采纳。
+
+**尚未确定/未实现**：day11-15 起 glob 表达式怎么从 `python -c` 文本里稳定解析出来（还没设计具体的解析方式）；这一整套 diff-based 改动尚未开始写代码，也还没交给 CLI review。
+
+### 方案 v2：round 前后 diff 判定训练奖励（2026-08-25，CLI 用 30 天真实数据核对两轮后确认，Phase 1 可进入实现）
+
+**status：v1（"只是设计，代码完全未动"）已被本节取代。** v1 提出后交给 CLI 用真实 30 天 `questions.json` + 现有 driver 代码做只读核对，发现 4 类边界后修订为 v2；v2 再交 CLI 二次核对，**结论是"relax-only + 统一 training_passed + 分类 fallback 构成完整安全网，Phase 1 范围可以进入实现"**。本节是定稿版本，代码仍然完全未动，下一步是实现。
+
+**不变的两条原则**（v1 起就有，未变）：
+1. 只改"checker 结果 → 训练用 `eval_score`"这一步转换，不碰官方 checker 脚本、题面数据、`--min-count`/`--min-entries`/`--task-prefix` 的数值本身；官方 Acc./Compl.（`_score_round_official`/`_aggregate_acc_compl`）继续吃 `_compute_inline_score` 的原始 `passed`，一个字不改。
+2. 奖励判断和反馈文案共用同一次 diff，不分两次实现。
+
+**核心安全约束（v2 新增，v1 没有）——relax-only**：
+
+```python
+seg_training_pass = seg_official_pass or seg_round_local_pass
+```
+
+**diff 只能把官方判负翻成正，永远不能把官方判正翻成负。** 动机：v1 的"用 diff 结果替换官方判定"在存在性检查类（`sys.exit(0 if files else 1)`，27 题）上会制造一类新的假阴性——官方只要目录里已有任一合规文件（可能是更早轮次留下的）就 PASS，但如果这一轮任务是"修改已有文件"而非"新建文件"，diff 会判"本轮无新增"从而给 -1，比官方更严，方向刚好跟 v1 想解决的问题相反。加上这条约束后：diff 逻辑本身出任何错（解析偏了、快照时机不对），最坏结果是"没解开连坐"、退回现状，不会引入新的错误负信号——CLI 核对确认这条约束"正好堵住 A3 假阴性"，且隐含的"官方因历史配额已达标、本轮零产出仍判 +1"是跟官方一致的合理行为，不是 bug。
+
+**分类表（按 `eval.command` 特征分类，不按 day 段划分——CLI 核对：`--dir` 实际有 70 题，day16-23 还有 33 题，v1 按 day06-10 划分写窄了）**：
+
+| 类别 | 特征 | 题量（CLI 实测） | 处理 | Phase |
+|------|------|------|------|------|
+| A1 | `check_filename.py --dir [--min-count N]` | 70 | 目录 diff + PATTERN/ext | 1 |
+| A2 | glob 累计 `len(files)>=N` | 48 | glob 表达式 diff | 1 |
+| A3 | glob 存在性 `0 if files else 1` | 27 | 同 A2（受 relax-only 保护） | 1 |
+| B | `check_done_log.py --min-entries` | 46 题 / 75 段 | 日志行 diff | 1 |
+| C1 | glob + 内容/ISO 校验（day09/r3、day10/r6） | 2 | **fallback 官方**（判定语义是内容不是计数） | — |
+| C2 | 过滤式 glob（day11/r6，`[f for f in glob(...) if 'adr' in f]`） | 1 | **fallback 官方**（Phase 2 待定是否解析 filter predicate） | 2 |
+| C3 | 双 glob 双阈值（day26/r8，`len(py)>=2 and len(js)>=2`） | 1 | 两组独立 diff，`bool(new_py) and bool(new_js)` | 2 |
+| D | `check_backup`/`check_metadata`/`check_iso8601` | ~120 段 | 原样单独重跑，按 exit code，不改逻辑 | 1 |
+
+C1/C2 的识别方式：段内出现 `json.load`/`re.match`/`open(` 等内容访问，或 glob 结果进了列表推导过滤 → 不进 diff 路径。**识别不出来就 fallback，不猜**——配合 relax-only 约束，误 fallback 的代价只是这题没解开连坐，不会判错。CLI 全量 398 个 `&&` 段扫描确认这个分类边界干净，没有 count 和 content 混在同一段的情况。
+
+**机制 A：文件类 diff**（A1/A2/A3 共用）
+
+```python
+def _list_matching_files(directory: Path, pattern: re.Pattern, ext: str | None) -> set[str]:
+    """只读扫描，不修改任何状态。pattern 是 check_filename.py::PATTERN 的字面量复制
+    （单行稳定正则，风险等级同 _run_openclaw_agent 现有的"local copy"先例）。
+    ext=None 时不过滤扩展名（用于 glob 模式）。"""
+    if not directory.is_dir():
+        return set()
+    names = os.listdir(directory)
+    if ext is not None:
+        ext_lower = ext.lstrip(".").lower()
+        return {f for f in names if pattern.match(f) and f.rsplit(".", 1)[-1].lower() == ext_lower}
+    return {f for f in names if pattern.match(f)}
+```
+
+- **A1**：`directory`/`ext` 从 `round_record["eval"]["command"]` 解析 `--dir`/`--ext`（`_is_dir_mode_filename_check` 从布尔扩展成解析器）。
+- **A2/A3**：正则抠出 `glob.glob('...')` 的字面量表达式（CLI 实测 79/79 命中，0 例外），round 前后对**同一个表达式**调用 `glob.glob()`，不自己拼目录/正则/扩展名。
+- **C3（Phase 2）**：同一段抠出两个表达式，各自独立 diff。
+
+```python
+seg_round_local_pass = bool(after_set - before_set)
+seg_training_pass    = seg_official_pass or seg_round_local_pass   # relax-only
+```
+
+**同一次 diff 顺带给出具体反馈**：额外做一次不限制 `ext`/`pattern` 的"任意新文件" diff，三种情况对应三种具体提示——`new_compliant` 非空（过了，不加料）/ 空但任意新文件非空（挑最接近的一个，仿 `check_filename.py::check_file()` 措辞给出"命名对但扩展名不对"等具体诊断）/ 两者都空（"这一轮没有新增任何文件"）。
+
+**机制 B：done.log 行 diff**
+
+```python
+before_lines = _read_log_lines(logfile)   # round 开始前
+after_lines  = _read_log_lines(logfile)   # round 结束后
+```
+
+**前提假设**：纯追加（`after[:len(before)] == before`）。CLI 确认题面数据无法证实这一点——**实现里必须打监控日志记录该假设被违反的次数，违反时立刻退化到官方原始判定**，不按新逻辑判。触发率只能等 Phase 1 上线后靠监控日志观察，属于仍未决问题。
+
+```python
+new_lines = after_lines[len(before_lines):]
+seg_round_local_pass = (
+    bool(new_lines)
+    and all(_LINE_PATTERN.match(l) and len(_LINE_PATTERN.match(l).group(4)) <= 80 for l in new_lines)
+    and (_task_prefix_ok(new_lines[-1], task_prefix) if task_prefix else True)
+)
+seg_training_pass = seg_official_pass or seg_round_local_pass   # relax-only
+```
+
+`_LINE_PATTERN` 是 `check_done_log.py::LINE_PATTERN` 的字面量复制。带 `--task-prefix` 时查 `new_lines[-1]`——CLI 确认纯追加前提下与官方查 `lines[-1]` 等价。
+
+**复合命令（`&&` 拼接）**：按 ` && ` 切分（CLI 实测 0 反例）。逐段分类判定，**训练 `eval_score` = 各段 `seg_training_pass` 的 AND**——累计段用 diff 解连坐，D 类段仍按官方 exit code 严判，杜绝"文件数够了但 metadata 缺字段也给 +1"这种过度奖励；只要有一段 D 类官方 FAIL，即使累计段 diff 过，整体仍是 -1，这是防过度奖励的主闸，必须保持。**重跑 D 类段时整段原样交给 shell，不拆内部 `$(python -c ...)` 子壳**（CLI 明确点出的坑）。
+
+**relax-only 要求累计段也单独跑一次官方命令拿 `seg_official_pass`**（多 1 次 subprocess/段）：CLI 对全量 398 个 `&&` 段做启发式扫描，未发现任何写操作迹象（5 个官方 `check_*.py` 均为只读 `open`，题面自带 `python -c` 段未见 `write`/`a`/`w`/`unlink` 等），确认这个额外调用安全、开销可忽略。**可选优化**（非必须）：整链 `_compute_inline_score` 已 PASS 时，各段 `seg_official_pass=True` 可直接认定、跳过分段重跑，只在整链 FAIL 时才分段。
+
+**统一 `training_passed`，三处共用**（v1 的真实缺口，CLI 核对确认）：v1 只改了 `eval_score` 和 `_build_opd_hint`，漏了 `_build_next_round_feedback`——它的失败分支看的是 `inline_score.get("passed")`，结果会是训练判 +1、OPD 无 hint，但下一轮 `[Previous Feedback]` 里照样贴官方 `FAIL: expected >= N, found K` 静态聚合文案，信号只修好一半。改法：`training_passed`（仅 A/B 类生效，其余类 alias 官方 `passed`）同时驱动 `eval_score`、`_build_opd_hint` 是否产出 hint、`_build_next_round_feedback` 是否走失败分支。
+
+**失败文案的优先级（CLI 二次核对时补的一句实现约定，之前模糊）**：`training_passed=False` 时，失败文案**以 diff 诊断为主**（命名/扩展名/无新文件/新 log 行格式）；官方静态 `feedback.incorrect` 只能作次要补充，**不能盖过 diff 具体诊断**——不能再优先贴官方聚合 `FAIL: expected >= N, found K` 那一句。
+
+**接线点**（CLI 确认比预想简单）：`prepare_patched_openclaw_combine_select.sh` **不用改**（只消费 `_send_verdict_turn` 发来的 `eval_score`/`hint` JSON，格式不变）。改动全在 driver：
+1. `_run_round` 里、`_run_openclaw_agent` 调用**之前**：按分类结果做 before snapshot（目录 listing / glob 求值 / 日志行）——workspace 此时已由 `_prepare_work_copy` 建好且跨 round 持久，是最自然的插入点。
+2. agent 跑完：`_compute_inline_score` 照旧，供 `_score_round_official` → 官方 Acc./Compl. 完全不变。
+3. 新增 `_compute_training_verdict(...) -> (training_passed, hint_text)`：分段、after snapshot、逐段判定、AND、生成具体 hint。非累计类直接 alias 官方 `passed`。
+4. [metaclaw_rollout_driver.py:1420-1423](openclaw-rl/scripts/metaclaw/metaclaw_rollout_driver.py:1420) 那三行（`passed = inline_score.get("passed", False)` / `eval_score = 1.0 if passed else -1.0` / `hint = "" if passed else _build_opd_hint(...)`）改成消费 `training_passed` + diff hint。
+
+**Phase 划分**：
+- **Phase 1**：A1(70) + A2(48) + A3(27) + B(46题/75段) + D 段重跑 + relax-only + `training_passed` 三处接线。C1/C2/C3 全部 fallback 官方。
+- **Phase 2**：C3 双 glob 双阈值；C2 过滤式 glob（或维持 fallback——1 题，解析 filter predicate 的实现成本可能不划算，CLI 认为维持 fallback 更划算）。
+
+**仍未决 / 需实测**：
+1. done.log 非追加场景真实触发率——题面数据无法预判，只能等 Phase 1 上线后靠监控日志观察。
+2. 官方 Acc./Compl. 与训练信号会在"历史连坐但本轮净增"的题上分叉（报告里 Acc./Compl. 会看起来比训练信号差）——这是预期现象，不是新 bug，报告/文档里需要写一句避免误读。
+
+**当前状态**：设计已经过 CLI 两轮真实数据核对确认，**Phase 1 范围（A1/A2/A3/B/D + relax-only + 三处接线）可以进入实现**；代码仍然完全未动。
+
+### Phase 1 已实现（2026-08-25，本地验证通过，真实训练环境未验证）
+
+代码全部落在 `scripts/metaclaw/metaclaw_rollout_driver.py`：
+
+- **新增**：`_split_command_segments`/`_classify_segment`（8 类分类，A1/A2A3/B/OFFICIAL 四种可操作结果，C1/C2/C3 全部落进 OFFICIAL）、`_list_matching_files`/`_read_log_lines`/`_snapshot_segment`/`_prepare_before_snapshots`（before/after 快照）、`_diagnose_file_segment`/`_diagnose_log_segment`（具体反馈诊断）、`_check_new_log_lines`、`_rerun_segment_official`（segment 级独立重跑）、`_compute_training_verdict`（relax-only 汇总，`training_passed`/`training_hint` 的唯一产出点）。
+- **`_run_round` 改动**：函数入口新增 `before_snapshots = _prepare_before_snapshots(...)`（在 `_run_openclaw_agent` 调用之前，纯读操作，官方 Acc./Compl. 走的 `official_score` 完全不受影响）；`_compute_inline_score`/`official_score` 计算之后，新增 `_compute_training_verdict(...)` 调用，结果以**新增键**注入 `inline_score["training_passed"]`/`inline_score["training_hint"]`（不覆盖/删除任何已有字段）。
+- **`_build_next_round_feedback` 改动**：读取 `training_passed`；为 True 时构造一份 `passed` 强制为 True 的浅拷贝喂给官方 `_build_feedback_text`（跟真通过同样措辞，不是硬编码空字符串）；为 False 时优先用 `training_hint`，`training_hint` 为空才退回原有的 `_filtered_checker_stdout`（对应 CLI 二次核对补的那句"diff 诊断为主"实现约定）。
+- **`run_day` 主循环改动**（原 ~1420-1423 行）：`eval_score`/`hint` 改成消费 `training_passed`/`training_hint`（`inline_score.get("training_hint") or _build_opd_hint(...)` 的优先级顺序），不再直接用官方 `passed`。
+- **`prepare_patched_openclaw_combine_select.sh` 未改动**——按 CLI 确认，它只消费 `_send_verdict_turn` 发出的 `eval_score`/`hint` JSON，接口不变。
+
+**分类识别修正（实现中发现，v2 设计文本没预料到）**：`_classify_segment` 最初对含 `glob.glob(` 子串的任意段一律考虑 A2A3，day11+ 常见的 `check_metadata.py $(python -c "...glob.glob(...)...")` 这种"用 glob 选目标文件、本身是内容检查"的写法会被误分类——已加一条前置守卫：段内出现 `check_metadata.py`/`check_backup.py`/`check_iso8601.py` 时直接判 OFFICIAL，不再往下走 glob 分支。
+
+**验证**：
+1. `py_compile` 通过。
+2. 单元级合成测试（tmp workspace，覆盖：A1 净增文件把官方 FAIL 升级为 training PASS；本轮无新文件/新文件命名错误分别给出具体诊断而非聚合数字；官方已 PASS 时不触碰 diff 逻辑；复合命令里一段净增另一段没有，整体仍判负；两段都净增才整体判正；`done.log` 历史被改写时正确退化到官方判定并打日志）——全部通过。
+3. **全量 30 天真实数据分类扫描**（遍历全部 `questions.json` 的 `eval.command`，逐段分类计数）：A1=70、A2A3=75（=CLI 报告的 A2 48 + A3 27）、B=75 段——**与 CLI 两轮真实数据核对报告的数字完全一致**，是比单个样例测试更有说服力的验证。
+
+**仍未验证**：真实训练环境下这套逻辑的实际效果（`day12`+ 是否还会复现 `094611` 的 thinking 空转崩溃模式）、`done.log` 非追加场景的真实触发率（监控日志已埋点，等下一轮真实训练观察）、`_rerun_segment_official` 对每个 segment 额外一次 subprocess 调用在真实 GPU 训练节奏下的实际耗时影响。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：
