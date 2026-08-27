@@ -1989,31 +1989,108 @@
 - 已把 v2 定稿写入 `metaclaw_migration_plan.md`，取代 v1 那一节
 → 详见 `metaclaw_migration_plan.md`"方案 v2：round 前后 diff 判定训练奖励"
 
-**完成内容（续五，同一天）——CLI 最终确认 Phase 1 可以实现，已实现并本地验证：**
-- CLI 最终确认：v2 方向、relax-only、按 command 分类、A1/A2/A3/B/D 范围、`training_passed` 三处共用、只改 driver、官方 Acc./Compl. 不动全部对症；只强调实现时记住两点——重跑 `seg_official_pass` 时整段原样 shell、不拆 `$(...)`；`training_passed=False` 时失败文案以 diff 诊断为主，不再主推官方聚合 `found K < N`。这两点在实现中都落实了。
-- **已实现**（`scripts/metaclaw/metaclaw_rollout_driver.py`）：`_split_command_segments`/`_classify_segment`（分类）、`_snapshot_segment`/`_prepare_before_snapshots`（before/after 快照）、`_diagnose_file_segment`/`_diagnose_log_segment`（具体反馈诊断）、`_rerun_segment_official`（segment 级独立重跑）、`_compute_training_verdict`（relax-only 汇总）；`_run_round`/`_build_next_round_feedback`/`run_day` 主循环三处接线全部改成消费 `training_passed`/`training_hint`；`combine_select` 补丁按 CLI 确认未改动。
-- **实现中发现并修复一个 v2 设计没预料到的分类 bug**：`check_metadata.py $(python -c "...glob.glob(...)...")` 这种"用 glob 选目标文件、本身是内容检查"的写法，最初被误分类成 A2A3——已加前置守卫（段内出现 `check_metadata.py`/`check_backup.py`/`check_iso8601.py` 直接判 OFFICIAL）修复。
-- **验证**：`py_compile` 通过；单元级合成测试（tmp workspace）覆盖净增升级、无新文件/命名错误的具体诊断、官方已过不碰 diff、复合命令部分净增仍判负、`done.log` 历史改写正确退化并打日志，全部通过；**全量 30 天真实数据分类扫描**（不是单个样例）得到 A1=70、A2A3=75（=CLI 报告的 48+27）、B=75 段，**跟 CLI 两轮真实数据核对报告的数字完全一致**。
-- **仍未验证**：真实训练环境下的实际效果（day12+ 是否还复现 `094611` 崩溃模式）、`done.log` 非追加场景真实触发率（监控日志已埋点）、`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响
-→ 详见 `metaclaw_migration_plan.md`"Phase 1 已实现"一节
-
-### 当前状态（2026-08-25）
+### 历史状态（2026-08-25，已被 8/26 结果取代）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-21（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复 + 新基线 + K=6 里程碑均已就绪），另加：[x] **暂停窗口砍断在飞生成、误判成 timeout 而不是 503 的问题已修复**（`_AGENT_PAUSE_MARKERS` 扩展，28/28 历史数据零反例支持），预期能挽回 K=6 实验里丢掉的那类样本；[x] **"超长 thinking 空转"复现的真正机制已定位（经过一次自我纠正）**——最初以为是"中段 step-judge 跟最终结果脱钩"，已撤回；真正原因是 `check_filename.py --dir --min-count` 累计计数缺陷：这一轮即使做对了，也可能因为当天更早题目的欠账被 checker 判 -1，持续的"看似纠偏、实际拧不动"负反馈才是把模型逼向空转的机制，需要下一步单独讨论怎么修。`py_compile`+合成测试验证通过（pause-marker），真实训练完全未验证，不影响正在跑的 `day12` 这条训练。
+**MetaClaw 迁移**：同 08-21（历史状态，六处修复 + `METACLAW_TRAIN_UNTIL_DAY` + thinking 空转三处修复 + 新基线 + K=6 里程碑均已就绪），另加：[x] **暂停窗口砍断在飞生成、误判成 timeout 而不是 503 的问题已修复**（`_AGENT_PAUSE_MARKERS` 扩展，28/28 历史数据零反例支持），预期能挽回 K=6 实验里丢掉的那类样本；[x] **"超长 thinking 空转"复现的真正机制已定位（经过一次自我纠正）**——最初以为是"中段 step-judge 跟最终结果脱钩"，已撤回；真正原因是 `check_filename.py --dir --min-count` 累计计数缺陷：这一轮即使做对了，也可能因为当天更早题目的欠账被 checker 判 -1，持续的"看似纠偏、实际拧不动"负反馈才是把模型逼向空转的机制；[x] **diff-based 修复方案已定稿为 v2，经 CLI 两轮真实数据核对确认 Phase 1 范围可以进入实现，但代码完全未动**——设计文档已写完，尚未开始写任何代码。`py_compile`+合成测试验证通过（pause-marker），真实训练完全未验证，不影响正在跑的 `day12` 这条训练。
 
 ### 已知限制 / 未解决
-同 08-21（历史状态），未变，另加：**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。**累计跨轮次计数缺陷的 diff-based 修复（Phase 1）已实现并通过本地验证（py_compile+合成测试+全量 30 天真实数据分类扫描），但完全没有在真实训练环境跑过**——`day12`+ 是否真的不再复现 `094611` 的 thinking 空转崩溃模式，仍需下一轮训练验证，本地验证只能确认代码逻辑本身没错。
+同 08-21（历史状态），未变，另加：**`_AGENT_PAUSE_MARKERS` 扩展完全未在真实训练中验证**——合成测试只能确认代码逻辑正确，不能确认真实暂停窗口下这条新 marker 真的按预期挽回样本。**累计跨轮次计数缺陷的 diff-based 修复设计（v2）已通过 CLI 两轮核对，但完全没有代码实现**——覆盖范围比最初发现的 `check_filename.py --dir --min-count`（day06-10）更大：day11-15/16-23 的 glob 计数是同类问题，day21-30 的 `check_done_log.py --min-entries` 是更严重的一种（历史一行写错则永久 FAIL，不只是门槛追不上）。`455a54f` 那三处修复（next-round 反馈+`is_invalid_tool_use` 接线）不解决这类问题，下一轮训练如果还是崩，符合预期，不代表之前的诊断错了。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**diff-based 修复（Phase 1）已实现并本地验证通过，下一步是提交一轮真实训练验证**——继续跑到 day12+ 看是否还复现 `094611` 崩溃模式，同时观察 `done.log` 非追加监控日志是否触发。用户另开默认配置训练对比 `TRAIN_UNTIL_DAY` 行为一致性的任务仍然有效，可以并行推进
+2. **MetaClaw 迁移**：**diff-based 修复设计（v2）已通过 CLI 两轮核对确认可以进入实现，下一步是照设计开始写代码**——`_run_round`/`_compute_training_verdict`/driver 主循环三处接线。用户另开默认配置训练对比 `TRAIN_UNTIL_DAY` 行为一致性的任务仍然有效，可以并行推进
 3. 其余同 08-17
 
 ### 未验证
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
-- [ ] **diff-based 修复（Phase 1）在真实训练环境下的实际效果**——继续跑到 day12+ 是否还复现 `094611` 的 thinking 空转崩溃模式，是这次修复要解决的核心问题，本地验证无法回答
+- [ ] **累计跨轮次计数缺陷 diff-based 修复（v2，Phase 1）尚未开始实现**——设计已定稿并通过 CLI 两轮核对，代码完全未动
+- [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**——下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"且题目最终计分成功
+- [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前的 Frozen 窗口评测走的是训练自己的 harness，跟官方 bench 不完全同构
+- [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%、Acc. 相对**新基线（17.8%）**有没有提升——`--agent` 修复的核心验证点，注意不要再拿旧的 8.1% 做对比
+- [ ] `METACLAW_TRAIN_UNTIL_DAY` 设置为具体 K 值时，冻结是否真的生效（`[metaclaw-freeze]` 日志、样本提交数骤降为 0）、dayK 尾部竞态实际丢弃规模
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
+- [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
+- 其余同 08-19（历史状态，见上）
+
+---
+
+## 2026-08-26
+
+**目标：** 把 08-25 定稿、经 CLI 两轮核对确认的 diff-based 修复方案（v2）落成代码，覆盖 Phase 1 范围。
+
+**完成内容：**
+- **已实现**（`scripts/metaclaw/metaclaw_rollout_driver.py`）：`_split_command_segments`/`_classify_segment`（8 类分类）、`_snapshot_segment`/`_prepare_before_snapshots`（before/after 快照）、`_diagnose_file_segment`/`_diagnose_log_segment`（具体反馈诊断）、`_rerun_segment_official`（segment 级独立重跑）、`_compute_training_verdict`（relax-only 汇总，`training_passed`/`training_hint` 唯一产出点）；`_run_round`/`_build_next_round_feedback`/`run_day` 主循环三处接线全部改成消费 `training_passed`/`training_hint`；`combine_select` 补丁按 CLI 确认未改动。
+- **实现中发现并修复一个 v2 设计没预料到的分类 bug**：`check_metadata.py $(python -c "...glob.glob(...)...")` 这种"用 glob 选目标文件、本身是内容检查"的写法，最初被误分类成 A2A3——已加前置守卫（段内出现 `check_metadata.py`/`check_backup.py`/`check_iso8601.py` 直接判 OFFICIAL）修复。
+- **验证**：`py_compile` 通过；单元级合成测试（tmp workspace）覆盖净增升级、无新文件/命名错误的具体诊断、官方已过不碰 diff、复合命令部分净增仍判负、`done.log` 历史改写正确退化并打日志，全部通过；**全量 30 天真实数据分类扫描**（不是单个样例）得到 A1=70、A2A3=75（=CLI 报告的 48+27）、B=75 段，**跟 CLI 两轮真实数据核对报告的数字完全一致**。
+- **仍未验证**：真实训练环境下的实际效果（day12+ 是否还复现 `094611` 崩溃模式）、`done.log` 非追加场景真实触发率（监控日志已埋点）、`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响
+- 提交并推送（commit `d7b231f`，`feat(metaclaw): implement Phase 1 relax-only training verdict via round-local diff`，由 modelfactory 侧的 Cursor agent 代为 commit+push，非本地直接操作）
+→ 详见 `metaclaw_migration_plan.md`"Phase 1 已实现"一节
+
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：新增约 300 行分类/快照/诊断/汇总函数，`_run_round`/`_build_next_round_feedback`/`run_day` 三处接线改动
+- `docs/metaclaw_migration_plan.md`：新增"Phase 1 已实现"一节
+
+### 历史状态（2026-08-26，已被 8/27 结果取代）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-25（历史状态，暂停窗口修复 + thinking 空转真正机制定位均已就绪），另加：[x] **累计跨轮次计数缺陷的 diff-based 修复（Phase 1）已实现、本地验证通过、已提交推送**（`py_compile`+合成测试+全量 30 天真实数据分类扫描三重验证，分类数字跟 CLI 报告完全一致）。真实训练环境完全未验证。
+
+### 已知限制 / 未解决
+同 08-25（历史状态），未变，另加：**diff-based 修复（Phase 1）完全没有在真实训练环境跑过**——`day12`+ 是否真的不再复现 `094611` 的 thinking 空转崩溃模式，仍需下一轮训练验证，本地验证只能确认代码逻辑本身没错，不能确认训练效果。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**diff-based 修复（Phase 1）已实现并推送，下一步是提交一轮真实训练验证**
+3. 其余同 08-17
+
+### 未验证（截至 08-26 末，见 08-27 条目最新结果）
+- [ ] diff-based 修复（Phase 1）在真实训练环境下的实际效果
+- 其余同 08-25（历史状态，见上）
+
+---
+
+## 2026-08-27
+
+**目标：** 核实 Phase 1 修复在首次真实训练里的实际表现，处理核实中发现的问题。
+
+**完成内容：**
+- **CLI 用真实训练数据核实打分侧，结论是"改对了"**：
+  - **4 个升级案例全部核实无误**（`day06/r2`、`day08/r5`、`day08/r11`、`day09/r2`）——四个都是标准目标场景：本轮按要求写对了一个合规文件（如 `20260827_test_results_summary.json`），只因前面轮次欠账、累计总数没到 `--min-count` 阈值而被官方判 FAIL，现在全部拿到训练 +1
+  - **`passed=True` 而 `training_passed=False` 的反向情况 0 次**——relax-only 约束在真实数据上成立，不只是合成测试里成立
+  - **诊断文案确实具体化了**：`'ci_build_report.json' does not match YYYYMMDD_snake_case.ext pattern`，取代了原来的 `expected >= 2, found 1`；53 次 `no new file was created in this round` 对应工具调用坍缩那些轮，诊断准确
+  - 顺带确认设计预期成立：升级案例里 agent 用的是真实日期 `20260827` 而非题面场景日期 `20260326`——`--dir` 模式下任何 8 位日期都合规，判 +1 正确；day11+ 精确日期 glob 下同样写法不会被升级
+- **修复一处我在 Phase 1 自己引入的反馈质量回归（CLI 发现）：14 处 Python Traceback 泄漏进 agent 可见的 `[Previous Feedback]`**（判分不受影响）
+  - **根因不是"少了一层过滤"，是我多加了一层不该加的 fallback**：这个 hint 有两个消费者、需要两种不同的兜底——OPD hint（`run_day`）要 `_build_opd_hint` 的原始 stdout（本机制存在前就是这个行为），agent 可见反馈（`_build_next_round_feedback`）要 `_filtered_checker_stdout`（专门丢弃含 Traceback 的 stdout，这正是 08-20 加这个函数时的原始动机）。两个调用点本来各自都写好了自己的 fallback，但我在 `_compute_training_verdict` 内部又补了一次 `else _build_opd_hint(...)`，**等于在上游把两种策略强行统一成了 OPD 那一套**，agent 可见路径就走进 `if training_hint:` 分支、跳过了自己的过滤
+  - **修复（一行）**：`_compute_training_verdict` 只返回 diff 推导的诊断、没有就返回 `""`，不在函数内部做任何 fallback；两个调用点的 fallback 自动各自恢复。两处 docstring 补了说明，讲清楚"这两个 fallback 故意不同、不能在上游合并"，避免以后被当重复代码合掉
+  - **验证**：`py_compile` 通过；新增合成测试复现 CLI 报的真实场景（checker 崩溃吐 Traceback 的 OFFICIAL 类轮次），确认 agent 可见反馈不含 Traceback、官方静态文案仍在、**OPD hint 仍拿到原始 stdout（行为未变）**、diff 诊断存在时仍优先于聚合计数行；**并确认该测试非空转**——手动模拟修复前行为后重跑，Traceback 确实泄漏
+  - **教训**：Phase 1 的合成测试只覆盖了"diff 能产出诊断"的主路径，没覆盖"diff 产不出诊断、走 fallback"的兜底路径，而 bug 恰恰在后者；全量 30 天分类扫描也帮不上忙（只验证分类计数，不验证反馈文本内容）。**主路径验证通过不等于兜底路径验证通过**
+→ 详见 `metaclaw_migration_plan.md`"首次真实训练核实：打分改对了，但暴露一处我自己引入的反馈质量回归"
+
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`_compute_training_verdict` 去掉内部 fallback，两处 docstring 补充双 fallback 策略说明
+- `docs/metaclaw_migration_plan.md`：新增"首次真实训练核实"一节，"Phase 1 已实现"标题日期从 08-25 更正为 08-26
+
+### 当前状态（2026-08-27）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）。
+
+### 已知限制 / 未解决
+同 08-26（历史状态），另加：**Traceback 回归的修复本身尚未在真实训练中验证**——合成测试确认逻辑正确，但要确认真实训练里 `[Previous Feedback]` 不再出现 Traceback，仍需下一轮训练。**Phase 1 最核心的问题仍未回答**：打分改对了不等于训练效果变好，`day12`+ 是否还会复现 `094611` 的 thinking 空转崩溃模式，这次核实完全没有涉及（核实的是打分正确性，不是训练结果）。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**提交一轮带 Traceback 修复的完整训练，跑过 day12 看崩溃模式是否消失**——这是 Phase 1 真正要回答的问题，前面所有核实都只是"改动本身没错"，不是"改动有效"。同时观察 `done.log` 非追加监控日志是否触发、`[Previous Feedback]` 里 Traceback 是否归零
+3. 其余同 08-17
+
+### 未验证
+- [ ] **Phase 1 在真实训练环境下的实际效果**——`day12`+ 是否还复现 `094611` 的 thinking 空转崩溃模式，是这次修复要回答的核心问题，打分正确性核实无法替代
+- [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
+- [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
 - [ ] **`done.log` 非追加场景真实触发率**——监控日志已埋点（`_compute_training_verdict` 里 `logger.warning`），只能等真实训练跑起来后观察
 - [ ] **`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响**——本地未测过实际耗时，CLI 判断"可忽略"是基于全量 398 段无写操作迹象的静态扫描，不是真实计时
 - [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**——下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"且题目最终计分成功

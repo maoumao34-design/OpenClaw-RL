@@ -889,7 +889,7 @@ seg_training_pass = seg_official_pass or seg_round_local_pass   # relax-only
 
 **当前状态**：设计已经过 CLI 两轮真实数据核对确认，**Phase 1 范围（A1/A2/A3/B/D + relax-only + 三处接线）可以进入实现**；代码仍然完全未动。
 
-### Phase 1 已实现（2026-08-25，本地验证通过，真实训练环境未验证）
+### Phase 1 已实现（2026-08-26 提交，本地验证通过；首次真实训练结果见下一节）
 
 代码全部落在 `scripts/metaclaw/metaclaw_rollout_driver.py`：
 
@@ -907,6 +907,38 @@ seg_training_pass = seg_official_pass or seg_round_local_pass   # relax-only
 3. **全量 30 天真实数据分类扫描**（遍历全部 `questions.json` 的 `eval.command`，逐段分类计数）：A1=70、A2A3=75（=CLI 报告的 A2 48 + A3 27）、B=75 段——**与 CLI 两轮真实数据核对报告的数字完全一致**，是比单个样例测试更有说服力的验证。
 
 **仍未验证**：真实训练环境下这套逻辑的实际效果（`day12`+ 是否还会复现 `094611` 的 thinking 空转崩溃模式）、`done.log` 非追加场景的真实触发率（监控日志已埋点，等下一轮真实训练观察）、`_rerun_segment_official` 对每个 segment 额外一次 subprocess 调用在真实 GPU 训练节奏下的实际耗时影响。
+
+### 首次真实训练核实：打分改对了，但暴露一处我自己引入的反馈质量回归（2026-08-27）
+
+**CLI 用真实训练数据核实打分侧，结论是正确的**：
+
+- **4 个升级案例全部核实无误**（`day06/r2`、`day08/r5`、`day08/r11`、`day09/r2`），四个都是标准场景——本轮按要求写对了一个合规文件（如 `20260827_test_results_summary.json`），只因前面轮次欠账、累计总数没到 `--min-count` 阈值而被官方判 FAIL，现在全部拿到训练 +1，正是这次修复的目标场景。
+- **`passed=True` 而 `training_passed=False` 的反向情况 0 次**——relax-only 约束在真实数据上成立，不只是合成测试里成立。
+- **诊断文案确实具体化了**：`'ci_build_report.json' does not match YYYYMMDD_snake_case.ext pattern`，而不是原来的 `expected >= 2, found 1`；53 次 `no new file was created in this round` 对应工具调用坍缩的那些轮，诊断准确。
+- 顺带确认了一个设计预期：升级案例里 agent 用的是真实日期 `20260827` 而非题面场景日期 `20260326`——`--dir` 模式下任何 8 位日期都算合规，判 +1 正确；day11+ 切成精确日期 glob 后同样的写法不会被升级，符合 `_is_dir_mode_filename_check` 那条区分的设计意图。
+
+**但暴露一处回归：14 处 Python Traceback 泄漏进了 agent 可见的 `[Previous Feedback]`**（CLI 发现，判分不受影响，只影响反馈质量）。
+
+**根因比"少了一层过滤"更具体——是我在 Phase 1 里多加了一层不该加的 fallback**。这个 hint 有两个消费者，它们需要的兜底策略本来就不同：
+
+| 消费者 | 兜底策略 | 为什么不同 |
+|------|------|------|
+| OPD hint（`run_day`）| `_build_opd_hint` 的原始 checker stdout，不过滤 | 这是本机制存在之前就有的行为，蒸馏目标要的是最原始的失败事实 |
+| agent 可见的 next-round 反馈（`_build_next_round_feedback`）| `_filtered_checker_stdout`，**丢弃含 Traceback 的 stdout** | day01-05 题面自带的 `python -c` 没有异常处理，失败时会吐一整段调用栈，原样贴给模型只会让反馈更糊（这正是 2026-08-20 加 `_filtered_checker_stdout` 时的原始动机）|
+
+两个调用点各自本来就写好了自己的 fallback。但我在 `_compute_training_verdict` 内部又补了一次 `hint = "\n".join(diag_parts) if diag_parts else _build_opd_hint(...)`——**这等于把两个调用点各自不同的兜底策略，在上游强行统一成了 OPD 那一套**：`training_hint` 不再为空，agent 可见路径就走进了 `if training_hint:` 分支，把自己的 Traceback 过滤整个跳过了。
+
+**修复（一行）**：`_compute_training_verdict` 只返回 diff 推导出的诊断，没有就返回 `""`，不在函数内部做任何 fallback：
+
+```python
+return False, "\n".join(diag_parts)
+```
+
+两个调用点的 fallback 自动各自恢复——`run_day` 的 `training_hint or _build_opd_hint(...)` 拿到原始 stdout（跟改动前完全一致），`_build_next_round_feedback` 的 `else` 分支重新走 `_filtered_checker_stdout`（Traceback 被拦掉）。两处 docstring 都补了说明，讲清楚"这两个 fallback 故意不同、不能在上游合并"，避免以后又被当成重复代码合掉。
+
+**验证**：`py_compile` 通过；新增合成测试复现 CLI 报的真实场景（checker 崩溃吐 Traceback 的 OFFICIAL 类轮次）——确认 agent 可见反馈不含 Traceback、官方静态文案仍在、**OPD hint 仍然拿到原始 stdout（行为未变）**、diff 诊断存在时仍然优先于聚合计数行。**并且确认了这个测试不是空转的**：手动模拟修复前的行为（把 `training_hint` 填成 `_build_opd_hint` 的原始输出）后重跑，Traceback 确实泄漏——说明测试真的能抓住这个 bug，不是碰巧通过。
+
+**这次回归的教训**：Phase 1 的合成测试只覆盖了"diff 能产出诊断"的路径，没覆盖"diff 产不出诊断、走 fallback"的路径——而 bug 恰恰在后者。全量 30 天分类扫描也帮不上忙，因为它只验证分类计数，不验证反馈文本内容。**验证覆盖到了主路径不等于覆盖到了兜底路径**，这是本地验证通过、真实训练仍暴露问题的直接原因。
 
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 

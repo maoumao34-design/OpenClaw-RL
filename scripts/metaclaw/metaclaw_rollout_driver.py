@@ -1039,6 +1039,11 @@ def _build_next_round_feedback(
     official checker stdout -- CLI's explicit call: the round-local
     diagnosis must lead, the official aggregate "found K, need N" line is at
     most a secondary fallback now, not the primary failure text.
+    `training_hint` is diff-derived only and never contains a Traceback, so
+    it is appended as-is; the `else` branch keeping _filtered_checker_stdout
+    (which drops Traceback-bearing stdout) is load-bearing, not vestigial --
+    see _compute_training_verdict's docstring for the 2026-08-27 regression
+    that came from short-circuiting past it.
     """
     training_passed = inline_score.get("training_passed", inline_score.get("passed", False))
     feedback_score = inline_score
@@ -1352,6 +1357,26 @@ def _compute_training_verdict(
     command), training_passed is just an alias of the official `passed` and
     no diff logic runs at all -- the (cheap) before_snapshots computed for a
     round that turns out to officially pass are simply unused.
+
+    diagnostic_hint is the DIFF-DERIVED diagnosis only, and is deliberately
+    "" when the diff produced nothing usable (e.g. every failing segment was
+    an OFFICIAL-class one, which has no diff to describe). It must NOT fall
+    back to _build_opd_hint here (2026-08-27 fix, real-training regression
+    found by CLI): the two consumers of this hint need DIFFERENT fallbacks,
+    and collapsing them into one here silently destroyed the stricter of the
+    two --
+      - the OPD hint (run_day) falls back to _build_opd_hint's raw checker
+        stdout, unfiltered, exactly as it did before this whole mechanism
+        existed;
+      - the AGENT-VISIBLE next-round feedback (_build_next_round_feedback)
+        falls back to _filtered_checker_stdout, which drops stdout containing
+        a Python Traceback (day01-05's `python -c` snippets have no exception
+        handling and dump a whole stack on failure -- pasting that at the
+        model makes the feedback worse, not better).
+    Filling this in with _build_opd_hint made the agent-visible path take the
+    `if training_hint:` branch and skip its Traceback filter entirely: 14 real
+    Tracebacks reached [Previous Feedback] in the first real training run
+    with this code. Scoring was unaffected; feedback quality was not.
     """
     official_passed = inline_score.get("passed", False)
     if official_passed or not before_snapshots:
@@ -1402,8 +1427,10 @@ def _compute_training_verdict(
     training_passed = all(seg_passes) if seg_passes else official_passed
     if training_passed:
         return True, ""
-    hint = "\n".join(diag_parts) if diag_parts else _build_opd_hint(round_record, inline_score)
-    return False, hint
+    # Diff-derived diagnosis only -- "" when there is none. Each call site
+    # applies its own fallback (see this function's docstring); doing it here
+    # would force one fallback policy onto both.
+    return False, "\n".join(diag_parts)
 
 
 async def _run_round(
