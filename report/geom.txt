@@ -1,0 +1,27 @@
+slide size: 12192000 x 6858000  (13.33 x 7.50 in)
+--- Slide 1 ---
+  [TEXT_BOX (17)] TextBox 1
+      left=0.75in top=0.64in  w=8.79in h=2.58in :: 2026暑期实习生项目 / 实习小结
+  [PIC] Picture 2
+      left=7.43in top=1.71in  w=5.62in h=4.18in
+  [FREEFORM (5)] Freeform 4
+      left=11.82in top=5.85in  w=2.69in h=2.81in
+  [FREEFORM (5)] Freeform 5
+      left=0.75in top=3.93in  w=3.34in h=0.53in
+  [TEXT_BOX (17)] TextBox 6
+      left=0.89in top=4.03in  w=2.70in h=0.62in :: AI Lab - 毛泽辉 / 时间：8.20-8.31
+  [FREEFORM (5)] Freeform 7
+      left=11.11in top=6.64in  w=0.28in h=0.29in
+--- Slide 3 ---
+  [PH] 标题 1
+      left=0.53in top=0.32in  w=9.49in h=1.32in :: 自我介绍
+  [PH] 内容占位符 2
+      left=1.90in top=1.75in  w=8.08in h=5.22in :: 教育背景 / 本科：浙江大学 物理学系 / 硕士：南洋理工大学 应用人工智能 /
+  [PH] 灯片编号占位符 3
+      left=13.56in top=7.47in  w=0.51in h=0.18in :: 3
+  [PIC] 图片 5
+      left=10.42in top=0.84in  w=2.02in h=2.02in
+  [PIC] 图片 7
+      left=0.30in top=1.85in  w=1.38in h=1.10in
+  [PIC] 图片 9
+      left=6.67in top=1.93in  w=2.13in h=0.77in

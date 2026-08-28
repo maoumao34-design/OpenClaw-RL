@@ -1,0 +1,52 @@
+===== P0 Turn1 (343 chars) =====
+The sisters currently have $20 + 44 = 64$ signatures combined. To reach 100 signatures, they need $100 - 64 = 36$ more signatures.
+
+**Answer:** 36 signatures
+
+No file modification required yet (as requested). Let me know when you'd like me to write the solution to `homework/0.txt`.
+
+
+  ========================================================
+
+----- P0 Turn2 (220 chars) -----
+So far, Carol has 20 signatures and Jennifer has 44—that’s 64 total. They want to hit 100 by the end of summer, so they need 36 more signatures between them. 😊
+
+
+  ========================================================
+
+===== P1 Turn1 (834 chars) =====
+The problem states that a team of 4 painters worked **3/8 of a day every day** for 3 weeks. Here's the step-by-step solution:
+
+1. **Convert weeks to days**:  
+   $ 3 \text{ weeks} \times 7 \text{ days/week} = 21 \text{ days} $
+
+2. **Calculate total work per painter**:  
+   Each painter worked $ \frac{3}{8} $ of a day **per day** for 21 days:  
+   $$
+   21 \text{ days} \times \frac{3}{8} \text{ day
+
+----- P1 Turn2 (495 chars) -----
+Here's the quick breakdown:
+
+So, the painters worked 3/8 of a day *every single day* for 3 weeks. Let's see—3 weeks is 21 days total. 
+
+For each painter, that's 21 days × 3/8 of a day = 7.875 days of work. Then, since we want hours, we multiply by 24: 7.875 × 24 = **189 hours**.
+
+So yeah, each painter put in **189 hours** of work. No fancy formatting, just straight talk. 😊 Let me know if you'd lik
+
+===== P2 Turn1 (429 chars) =====
+The cost to repave Monica's street (150 meters) is $194/meter × 150 = **$29,100**.  
+The cost to repave Lewis' street (490 meters) is $194/meter × 490 = **$95,060**.  
+
+The difference is $95,060 − $29,100 = **$65,960**.  
+
+**Answer:** It costs **$65,960 more** to repave Lewis' street than Monica's.  
+
+Let me know when you'd like me to write this to `homework/2.txt`!
+
+
+  ===========================
+
+----- P2 Turn2 (461 chars) -----
+Okay, so Monica's street is 150 meters long, and Lewis' street is 490 meters. At $194 per meter, Monica's repaving would cost 150 times $194, which is $29,100. Lewis' street would be 490 times $194, which comes out to $95,060. If you subtract Monica's cost from Lewis', you get $95,060 minus $29,100, which equals $65,960. So, it's $65,960 more expensive to repave Lewis' street compared to Monica's.
+

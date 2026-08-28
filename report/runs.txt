@@ -1,0 +1,16 @@
+para0 lvl=0 sz_first=[22.0]
+   run0: bold=None sz=22.0 noProof=1 | '教育背景'
+para1 lvl=1 sz_first=[18.0]
+   run0: bold=None sz=18.0 noProof=1 | '本科：浙江大学 物理学系'
+para2 lvl=1 sz_first=[18.0]
+   run0: bold=None sz=18.0 noProof=1 | '硕士：南洋理工大学 应用人工智能'
+para3 lvl=0 sz_first=[22.0]
+   run0: bold=None sz=22.0 noProof=1 | '目前职位：通用人工智能研究\u3000｜\u3000导师：张亚红'
+para4 lvl=0 sz_first=[22.0]
+   run0: bold=None sz=22.0 noProof=1 | '工作内容简介：'
+   run1: bold=None sz=22.0 noProof=None | 'Agent '
+   run2: bold=None sz=22.0 noProof=None | '自进化方向 '
+   run3: bold=None sz=22.0 noProof=None | '—— '
+   run4: bold=None sz=22.0 noProof=None | '复现前沿论文，并探索将方法泛化到新的数据场景'
+para5 lvl=0 sz_first=[22.0]
+   run0: bold=None sz=22.0 noProof=1 | '个人爱好：游戏、动漫'

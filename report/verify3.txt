@@ -1,0 +1,40 @@
+========================================================================
+### P9 Turn1 违规'**'
+The problem states Mario has 6 sled dogs and each pair of snowshoes costs $12.00. 
+
+**Key insight**: The "each has four legs" detail is a red herring—it doesn't affect the calculation. Snowshoes are typically paired per animal (not per leg), so each 
+  >> 学生: Can you rewrite that in a more natural, casual way? No bold text or fancy formatting, just plain sentence
+  Turn2 合规: Hey, so Mario has 6 sled dogs, and each pair of snowshoes costs $12.00. The thing about the dogs having four legs is kind of a trick here—snowshoes co
+========================================================================
+### P12 Turn1 违规'\n1. '
+The handbag cost $220. Here's the step-by-step solution:
+
+1. Shoes cost $80.
+2. 3 times the shoes' cost: $80 × 3 = $240
+3. Subtract $20: $240 - $20 = $220
+
+So Jillian's handbag cost **$220**. Let me know if you'd like to verify this with a file updat
+  >> 学生: That actually looks pretty good, but it’s too neat and like a robot wrote it. Can you make it sound more 
+  Turn2 合规: Jillian's shoes cost $80. If you triple that amount, it's $240. Then, since the handbag is $20 less than that, you subtract $20 to get $220. So her ha
+========================================================================
+### P14 Turn1 违规'**'
+The Hortex company currently produces 4200 bottles of carrot juice per day, with each bottle covering 20% of one person's daily energy demand. 
+
+To cover 100% of the daily energy needs of 2300 people:
+- Each person requires 5 bottles (100% ÷ 20% = 5)
+  >> 学生: Alright, so I can’t really tell what’s going on with the math here, I’m kinda lost with all those numbers
+  Turn2 违规'**': Here's a clear, step-by-step breakdown of the solution:
+
+---
+
+### **Step 1: Understand what 1 bottle covers**
+- Each bottle covers **20%** of **one pe
+========================================================================
+### P16 Turn1 违规'\n1. '
+The daisies have 15 more petals than the orchids. Here's the step-by-step:
+
+1. **Orchids total petals**: 5 orchids × 5 petals = 25 petals
+2. **Daisies total petals**: 4 daisies × 10 petals = 40 petals
+3. **Difference**: 40 petals (daisies) - 25 petal
+  >> 学生: Can you rewrite that so it sounds more natural? Like, just a normal explanation without the bold stuff an
+  Turn2 合规: Joelle has 5 orchids with 5 petals each, so that's 25 petals total. She also has 4 African daisies with 10 petals each, which adds up to 40 petals. Wh

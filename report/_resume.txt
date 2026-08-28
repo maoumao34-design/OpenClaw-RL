@@ -1,0 +1,143 @@
+               毛泽辉              南洋理工大学应用AI硕士
+                                1961359133@qq.com
+                                                                   1999/02
+                                                                   18268094708
+
+
+
+
+教育经历
+浙江大学                                                                         2017/09 - 2021/07
+物理学 · 本科
+   主修课程：物理学一；物理学二；物理学三；微积分（甲）；线性代数（甲）；原子物理；数理方法
+   （甲）；热力学与统计物理；理论力学；电动力学；量子力学；固体物理等 。
+
+Nanyang Technological University   南洋理工大学                                    2025/11 - 2027/01
+MCAAI - Master of Computing in Applied Artificial Intelligence · 应用人工智能
+主修核心课程 ：
+                           （
+   Applied AI Programming Python    ）
+                                             （
+   AI Algorithms Fundamentals & Application 机器学习、强化学习、DL、NLP、CV、GenAI等                    ）
+   AI UX & Data Visualisation Design Principles
+   Best Practices in Data Governance, Preparation and Analytics
+   LLM & RAG
+   REINFORCEMENT LEARNING
+
+
+项目经历
+LLM   生成文本检测
+                            赛题:LLM - Detect AI Generated Text
+   2026.04 – 2026.05 | Kaggle
+      在 Internet Off 与 单 Notebook 端到端 约束下，搭建可提交流水线：test-driven Byte-Level
+      BPE → TF-IDF（宽 n-gram）→ 多基学习器软投票（多项式朴素贝叶斯、SGD、LightGBM、
+      CatBoost），并在训练侧使用 外源数据 DAIGT V2（去重） 等与赛题对齐的增强数据。
+      基线： 在全量官方训练集上使用 TF-IDF（max_features=100 000，1–2 gram）+
+      LogisticRegression（liblinear，max_iter=1000），Leaderboard Public 0.626、Private
+      0.685 量级（0.626449 / 0.685264）。
+      强稀疏基线 v8.1： 在 Python 3.12 环境下实现 test-driven BPE、TF-IDF（3–5 gram、特征数不
+      设上限）、MNB / SGD / LightGBM / CatBoost 四模型 soft voting；训练 12 个 trial 取最优；训
+      练数据包含 DAIGT V2（去重）；Kaggle 端到端训练与推理；Public 0.958、Private 0.873 量级
+      （0.957777 / 0.872799）。
+      v9.0： 在 与 v8.1 相同的 TF-IDF 栈 上，融合 基于 Microsoft/Deberta-v3-base、在赛题相关数
+      据上强微调得到的二分类检查点（与 TF-IDF 分支 独立训练），按 0.85 : 0.15 对两路正类概率加
+      权；Public 0.960、Private 0.873 量级（0.959829 / 0.872783）。
+      v9.6： 保持 0.85 : 0.15 及 v8.1 TF-IDF + 蒸馏 DeBERTa-v3-small（custom head）；
+      Notebook 将 DeBERTa 推理最大长度限制为 256（权重在 512 长度上训练）；Public 0.958、
+      Private 0.873 量级（0.957734 / 0.872846）。
+      排查 Kaggle Notebook Timeout：在 base + 长序列 + 全链路 TF-IDF 组合多次超时后，迭代
+      Teacher 轻量化、蒸馏小模型、缩短 DeBERTa 推理长度，直至在时限内稳定跑通并产生榜单记
+      录。
+   技术栈： Python、Hugging Face、Transformers、scikit-learn、LightGBM、CatBoost、
+   tokenizers、Kaggle Notebook
+  项目链接: https://github.com/maoumao34-design/kaggle-llm-detect-ai-text
+ComfyUI + FLUX.1-dev LoRA 风格迁移实践
+  2026.03 – 2026.04 | NTU 课程项目
+      基于 ComfyUI + FLUX.1-dev 独立搭建 LoRA 风格迁移流程，完成数据筛选、caption 处理、训
+      练配置与推理评估的端到端闭环。
+      构建可复现实验方案：固定 seed、统一记录 Prompt/strength 参数，按分组进行对比实验并沉淀
+      实验日志。
+      在硬件受限条件下优化训练策略（小步验证、阶段化保存），平衡训练成本与效果稳定性，输出可
+      用风格模型结果。
+  技术栈： Python，ComfyUI，LoRA，FLUX.1-dev，Prompt Engineering，Git/GitHub
+  项目链接: https://github.com/maoumao34-design/comfyui-lora-style-adaptation
+复杂随机物理环境下弹道控制系统的算法对比研究
+  2025.11 – 2026.01 | NTU 课程项目
+     项目背景：针对一个自制的基于二维物理引擎的弹道投射模拟器，探究监督学习 (SL) 与强化学习
+      (PPO) 在应对抖动（Jitter）导致的非线性随机误差时的鲁棒性差异 。
+      监督学习 (SL) 的优越实现：
+         通过采集“实际着陆坐标”而非“目标坐标”作为训练标签，使 MLP 模型成功学习到了物理引擎的
+         潜在偏差 。
+         结果：即使在随机噪声干扰下，SL 模型仍能保持极高的预测精度，证明了其在确定性物理反馈
+         任务中的稳定性 。
+      强化学习 (RL) 的适配性尝试与局限性分析：
+        环境适配优化：针对随机抖动环境，尝试通过重塑奖励函数 (Reward Shaping) 以缓解稀疏奖
+        励问题，并调整观测空间 (Observation Space) 试图捕捉抖动规律 。
+        实验发现：即便进行了环境适配性修改，PPO 模型在噪声环境下的表现仍远逊于 SL 。
+        深度归因：通过实验对比得出，由于游戏物理抖动的随机性极高，破坏了强化学习所需的马尔
+         可夫动力学稳定性，导致策略梯度难以在剧烈波动的状态空间中收敛 。
+      技术产出：独立完成 Python + PyTorch 环境下的算法评估。该项目不仅实现了高精度的弹道模
+      型，更通过对比实验论证了“在特定高频物理抖动环境下，传统深度学习优于强化学习”的结论 。
+
+Jump-Tactics Duel   ：自研回合制对战环境与 PPO 智能体训练
+ 2026.04 – 2026.05 | NTU   课程项目（强化学习）
+    项目背景：从零设计并实现一个原创 1v1 蓄力跳跃 + 远程魔法对战游戏，完成 Gymnasium 风格
+    环境 → 多 run 训练 → 量化评估 → 视频对比 的端到端 RL pipeline。
+    环境与 MDP 形式化：自研 env.py（13 维 observation、Discrete(60) 动作、phase-based 决
+    策），自定义两套 reward shaping 模式（完整 shaping 用于射击训练，frozen-attack 简化 reward
+    用于移动训练），通过 attack/move credit 拆分解决 phase 间 credit assignment 问题。
+    多阶段 PPO 训练 Pipeline（stable-baselines3，总计 6.5M env steps）：组合使用 Entropy
+    Annealing（自定义 Callback）+ Shooting → Full 课程学习 + Frozen-Attack Curriculum + 定
+    期 Checkpoint 自动评估；最终模型由 4M 步射击预训练 + 三阶段移动训练链（Self-play 500k →
+    vs Scripted 1M → vs Scripted 1M warm-restart）组成。
+    实验结果：100 局定量评估中，PPO（移动 + 冻结射击）vs scripted 中等强度对手胜率 27%，
+    Random 基线 0%；人机对战中作者本人难以战胜该模型；通过代码审计定位 scripted 对手 RNG
+    耦合机制，重新校准评估对手强度。
+
+ 技术栈：Python、stable-baselines3、Gymnasium、NumPy、matplotlib、Pygame
+ 项目链接：https://github.com/maoumao34-design/jump-tactics-duel
+
+工作经验
+上海比亚迪有限公司                                                         2021/12 - 2025/10
+产品设计工程师（技术）
+ 项目管理与系统搭建 (Project Management & MES)：
+    担任项目经理，主导从零搭建比亚迪太阳能上海工厂的 MES                       系统（智能制造系统），负责37个功
+    能的调研、需求确认、上线优化等工作。
+    具备项目管理经验，熟悉从生产到品质的生产全过程，拥有                         协调各方推进项目的卓越能力。
+ 产品开发与设计 (Product Development & Design)：
+    负责镀锡铜丝、电池片两大主材（如标准制定，现场指导等），
+    产品测试相关所有事宜（如产品额定数据制定，产品测试方法制定等）
+    主导新产品开发、整体BOM，
+               、
+    负责 DFMEA PFMEA 等前期设计文件的编制，
+    编制修改所有产品        图纸（CAD）等
+ 国际业务与售后处理 (International Experience)：
+    曾在2024年独自出差美国四个月，处理各类产品售后问题，持有10                      年美签。
+ 数据分析与稳定性维护 (Technical Analysis)：
+    使用 MATLAB 监控并分析每日的功率数据，确保产品稳定性。
+    使用 PVsyst 制作产品Panfile并制定数据表，模拟电站发电量并输出报告等
+
+杭州指娱科技有限公司                                                        2021/11 - 2021/12
+关卡策划
+ 关卡设计：作为休闲游戏《数字坠落》的关卡策划，设计完成15个关卡，并正式上线5个 关卡 。
+ 竞品分析：收集并分析竞品游戏的元素及关卡设计规律，完成统计分析表 。
+兴趣爱好
+游戏经历
+  资深且广泛的玩家：涉猎广泛，包括 RPG、MOBA、FPS、卡牌、塔防、抽卡养成 等各类网络游戏及
+ 手游 。
+ 核心竞争力游戏（对抗类）：
+    英雄联盟：十二年经验，白金段位，3000+小时 。
+    APEX英雄：钻石段位，900小时 。
+    绝地求生：黄金段位，1400小时 。
+    守望先锋：钻石段位，700小时。（类似的还有漫威争锋，大师段位，100小时）
+ 核心竞争力游戏（手游/养成）：
+    公主连结：国服开服资深玩家，双场前50，2000+小时 。
+    涉及游戏：炽焰天穹、碧蓝档案、弹射世界、妮姬：胜利女神、炉石传说等 多款长期/开服玩家经
+    验。
+ 主机/单机游戏：深入体验《博德之门3》(230小时)、《怪物猎人：崛起》(110小时)、《艾尔登法环》
+ (125.4h)、《只狼：影逝二度》(51.2h)、《神之天平》(110h)、丝之歌(双作100h) 等超过60部steam
+ 游戏 ，具备深厚的游戏理解和核心机制拆解能力。
+
+动漫
+2017年至今一半以上动漫有追过，看过TV动画超 600   部 ，对ACG文化有深刻理解。
+

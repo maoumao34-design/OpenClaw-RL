@@ -1,0 +1,6 @@
+[PH] 标题 1: left=0.53 top=0.32 w=9.49 h=1.32 right=10.02
+[PH] 内容占位符 2: left=0.53 top=1.75 w=12.68 h=5.22 right=13.21
+[PH] 灯片编号占位符 3: left=13.56 top=7.47 w=0.51 h=0.18 right=14.07
+[PIC] 图片 5: left=11.20 top=0.50 w=1.80 h=1.80 right=13.00
+[PIC] 图片 7: left=0.94 top=2.52 w=1.33 h=1.05 right=2.26
+[PIC] 图片 9: left=0.53 top=3.69 w=2.39 h=0.86 right=2.92

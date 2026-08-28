@@ -1,0 +1,39 @@
+=== Slide 1 (layout: Blank) ===
+  shape_id=2 type=TEXT_BOX (17) name='TextBox 1' TEXT='2026暑期实习生项目\n实习小结'
+  shape_id=3 type=PICTURE (13) name='Picture 2' [PICTURE]
+  shape_id=5 type=FREEFORM (5) name='Freeform 4' TEXT=''
+  shape_id=6 type=FREEFORM (5) name='Freeform 5' TEXT=''
+  shape_id=7 type=TEXT_BOX (17) name='TextBox 6' TEXT='XX Lab - 姓名\n时间：8.20-8.31'
+  shape_id=8 type=FREEFORM (5) name='Freeform 7' TEXT=''
+
+=== Slide 2 (layout: Title and Content) ===
+  shape_id=10 type=PLACEHOLDER (14) name='标题 9' TEXT='呈现大纲'
+  shape_id=11 type=PLACEHOLDER (14) name='内容占位符 10' TEXT='包括但不限于\n自我介绍\n工作目标及完成情况\n实习体会 & 自我评价\n规划展望'
+  shape_id=2 type=PLACEHOLDER (14) name='Slide Number Placeholder 1' TEXT='2'
+
+=== Slide 3 (layout: Title and Content) ===
+  shape_id=2 type=PLACEHOLDER (14) name='标题 1' TEXT='自我介绍'
+  shape_id=3 type=PLACEHOLDER (14) name='内容占位符 2' TEXT='教育背景\n专业方向\n目前职位及导师/经理姓名\n个人爱好\n….'
+  shape_id=4 type=PLACEHOLDER (14) name='灯片编号占位符 3' TEXT='3'
+
+=== Slide 4 (layout: Title and Content) ===
+  shape_id=2 type=PLACEHOLDER (14) name='标题 1' TEXT='工作目标及完成情况'
+  shape_id=3 type=PLACEHOLDER (14) name='内容占位符 2' TEXT='工作目标：\n完成情况：'
+  shape_id=4 type=PLACEHOLDER (14) name='灯片编号占位符 3' TEXT='4'
+
+=== Slide 5 (layout: Title and Content) ===
+  shape_id=2 type=PLACEHOLDER (14) name='标题 1' TEXT='实习体会&自我评价'
+  shape_id=3 type=PLACEHOLDER (14) name='内容占位符 2' TEXT='实习收获\n印象最深的一件事/一位同事等\n自我评价'
+  shape_id=4 type=PLACEHOLDER (14) name='灯片编号占位符 3' TEXT='5'
+
+=== Slide 6 (layout: Title and Content) ===
+  shape_id=2 type=PLACEHOLDER (14) name='标题 1' TEXT='职业规划'
+  shape_id=3 type=PLACEHOLDER (14) name='内容占位符 2' TEXT='职业目标\n短期目标\n中期目标\n长期目标\n行动方案'
+  shape_id=4 type=PLACEHOLDER (14) name='灯片编号占位符 3' TEXT='6'
+
+=== Slide 7 (layout: Section Header_White) ===
+  shape_id=3 type=PLACEHOLDER (14) name='Title 2' TEXT='Q&A'
+  shape_id=4 type=PLACEHOLDER (14) name='Slide Number Placeholder 3' TEXT='7'
+
+=== Slide 8 (layout: Blank) ===
+  shape_id=7 type=GROUP (6) name='组合 6'

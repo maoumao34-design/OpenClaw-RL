@@ -1,0 +1,6 @@
+[PH idx=0] Title 1: left=1.65 top=0.29 w=9.49 h=1.32 :: 印象最深的一件事 ｜ 联想暑期活动
+[PH idx=1] Content Placeholder 2: left=1.35 top=1.99 w=9.49 h=5.22 :: 作为 AI 发起者小组组长，与其他部门的实习生组队协作 / 五周时间，从 0 到
+[PH idx=4] Slide Number Placeholder 1: left=13.56 top=7.47 w=0.51 h=0.18 :: 9
+[PIC] 图片 5: left=10.08 top=0.75 w=3.20 h=2.40 比例=1.334
+[PIC] 图片 7: left=2.74 top=4.70 w=3.35 h=2.51 比例=1.334
+[PIC] 图片 9: left=8.10 top=4.70 w=3.35 h=2.51 比例=1.334

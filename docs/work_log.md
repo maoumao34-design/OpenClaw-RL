@@ -2067,7 +2067,10 @@
   - **修复（一行）**：`_compute_training_verdict` 只返回 diff 推导的诊断、没有就返回 `""`，不在函数内部做任何 fallback；两个调用点的 fallback 自动各自恢复。两处 docstring 补了说明，讲清楚"这两个 fallback 故意不同、不能在上游合并"，避免以后被当重复代码合掉
   - **验证**：`py_compile` 通过；新增合成测试复现 CLI 报的真实场景（checker 崩溃吐 Traceback 的 OFFICIAL 类轮次），确认 agent 可见反馈不含 Traceback、官方静态文案仍在、**OPD hint 仍拿到原始 stdout（行为未变）**、diff 诊断存在时仍优先于聚合计数行；**并确认该测试非空转**——手动模拟修复前行为后重跑，Traceback 确实泄漏
   - **教训**：Phase 1 的合成测试只覆盖了"diff 能产出诊断"的主路径，没覆盖"diff 产不出诊断、走 fallback"的兜底路径，而 bug 恰恰在后者；全量 30 天分类扫描也帮不上忙（只验证分类计数，不验证反馈文本内容）。**主路径验证通过不等于兜底路径验证通过**
+  - 提交并推送（commit `40c5450`）
 → 详见 `metaclaw_migration_plan.md`"首次真实训练核实：打分改对了，但暴露一处我自己引入的反馈质量回归"
+
+- **清掉 `git status` 里长期挂着的 `M scripts/launch_simulator.sh`（本地环境噪音，非项目内容，记一次免得反复排查）**：现象是 `git diff` 空、`git diff --numstat` 也空，但 `status` 一直显示 `M`、`update-index --refresh` 报 `needs update`。真实机制不是"CRLF 换行符差异"这种含糊说法（这是第一次给出的不完整解释，被追问后才查到底）：**索引 stat 缓存记的 `size=2195` 是 CRLF 检出形态，工作区实际文件是 LF 形态 `size=2124`**，差的 71 字节正好是该文件行数；git 每次看 size 不符就标记"可能改动"，读内容比对后又发现一致，于是 `diff` 空而 `M` 不消。三个哈希（索引 blob / 工作区 raw / 工作区经 clean filter）实测完全相同，确认零内容差异。**修法是 `git add` 该文件**——用当前 stat 重写索引缓存，内容经 clean filter 后与索引 blob 一致，因此暂存区为空、无任何东西可提交、工作区文件一字节未动。`core.filemode=false`，工作区 755 vs 索引 100644 的模式差异 git 本来就忽略，不是原因。
 
 **产出：**
 - `scripts/metaclaw/metaclaw_rollout_driver.py`：`_compute_training_verdict` 去掉内部 fallback，两处 docstring 补充双 fallback 策略说明

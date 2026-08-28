@@ -1,0 +1,43 @@
+========================================================================
+### P17  Turn1  规则判定=合规
+--- 模型 Turn1 全文 ---
+Jen spends $93 on food for her 3 fish in the month of May. Here's the calculation: 3 fish × $1/day × 31 days (May has 31 days) = $93.
+--- 学生 Turn2 ---
+You only gave me one number there. I need to see the actual work, like how you got that. Show me the whole step-by-step thing, not just the final number.
+
+========================================================================
+### P18  Turn1  规则判定=合规
+--- 模型 Turn1 全文 ---
+The total amount they pay is $38. Here's the calculation:
+
+- 2 adult tickets: 2 × $12 = $24
+- 1 child ticket: 1 × $8 = $8
+- 2 popcorns: 2 × $3 = $6
+
+Total: $24 + $8 + $6 = $38
+--- 学生 Turn2 ---
+Got it, looks like you did the work for me. Thanks, that’s all I need.
+
+========================================================================
+### P19  Turn1  规则判定=合规
+--- 模型 Turn1 全文 ---
+Kelly will have 90 cents left after buying the can of pop.
+--- 学生 Turn2 ---
+You only gave me the final number. I need to see the whole thing—show me how you got that, like the actual steps.
+
+========================================================================
+### P21  Turn1  规则判定=违规:'\n1. '
+--- 模型 Turn1 全文 ---
+Gerald had $50 left after spending $10 on a book.
+
+Here's how to solve it:
+
+1. The total amount ($100) is divided into 3 + 2 = 5 parts.
+2. Each part is worth $100 / 5 = $20.
+3. Gerald's share is 3 parts: 3 * $20 = $60.
+4. After spending $10, he has $60 - $10 = $50 left.
+--- 学生 Turn2 ---
+That looks good, but can you make it sound more like a regular person wrote it? Like less listy and not with the bold parts. Just write it out in normal sentences.
+
+  [retry] send_to_openclaw failed (
+

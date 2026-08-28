@@ -1,0 +1,17 @@
+TextBox 1:
+  p0r0 sz=62.7 noProof=1 | '2026暑期实习生项目'
+  p1r0 sz=77.37 noProof=1 | '实习小结'
+TextBox 6:
+  p0r0 sz=15.88 noProof=1 | 'AI Lab - 毛泽辉'
+  p1r0 sz=15.88 noProof=1 | '时间：8.20-8.31'
+slide3 last paras:
+  p0r0 noProof=1 | '教育背景'
+  p1r0 noProof=1 | '本科：浙江大学 物理学系'
+  p2r0 noProof=1 | '硕士：南洋理工大学 应用人工智能'
+  p3r0 noProof=1 | '目前职位：通用人工智能研究\u3000｜\u3000导师：张亚红'
+  p4r0 noProof=1 | '工作内容简介：'
+  p4r1 noProof=None | 'Agent '
+  p4r2 noProof=None | '自进化方向 '
+  p4r3 noProof=None | '—— '
+  p4r4 noProof=None | '复现前沿论文，并探索将方法泛化到新的数据场景'
+  p5r0 noProof=1 | '个人爱好：球类运动、游戏、动漫'

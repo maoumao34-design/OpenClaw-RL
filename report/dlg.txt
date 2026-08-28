@@ -1,0 +1,55 @@
+######################################################################
+### P0
+-- Turn 1 [违规] 学生: Hey, I have my homework in the file homework/0.txt in your workspace. Can you read it and 
+   模型(282): The sisters currently have $20 + 44 = 64$ signatures combined. To reach 100 signatures, they need $100 - 64 = 36$ more signatures.
+
+**Answer:** 36 signatures
+
+No file modification required yet (as requested). Let me know when you'
+-- Turn 2 [合规] 学生: Can you rewrite that in a more casual way? Like, drop the bold and the equation look, just
+   模型(159): So far, Carol has 20 signatures and Jennifer has 44—that’s 64 total. They want to hit 100 by the end of summer, so they need 36 more signatures between them. 😊
+-- Turn 3 [合规] 学生: Now can you add that answer to the end of the file homework/0.txt? Don’t overwrite what’s 
+   模型(225): The answer has been added to the end of `homework/0.txt`! 😊 Let me know if you'd like to do anything else with it.
+
+
+  Turn 4: Student confirmed problem 0 is done!
+
+############################################################
+######################################################################
+### P1
+-- Turn 1 [违规] 学生: Hey, I have my homework in the file homework/1.txt in your workspace. Can you read it and 
+   模型(773): The problem states that a team of 4 painters worked **3/8 of a day every day** for 3 weeks. Here's the step-by-step solution:
+
+1. **Convert weeks to days**:  
+   $ 3 \text{ weeks} \times 7 \text{ days/week} = 21 \text{ days} $
+
+2.
+-- Turn 2 [违规] 学生: That’s good, but it looks kinda robotic with the bold and the numbered steps. Can you make
+   模型(434): Here's the quick breakdown:
+
+So, the painters worked 3/8 of a day *every single day* for 3 weeks. Let's see—3 weeks is 21 days total. 
+
+For each painter, that's 21 days × 3/8 of a day = 7.875 days of work. Then, since we want hour
+-- Turn 3 [合规] 学生: That’s better, thanks. Now can you write the final answer to the file homework/1.txt for m
+   模型(494): The solution has been added to the end of `homework/1.txt` without replacing existing content. Here's what the file now contains:
+
+```
+Problem:
+A team of 4 painters worked on a mansion for 3/8ths of a day every day for 3 weeks. Ho
+######################################################################
+### P2
+-- Turn 1 [违规] 学生: Hey, I have my homework in the file homework/2.txt in your workspace. Can you read it and 
+   模型(368): The cost to repave Monica's street (150 meters) is $194/meter × 150 = **$29,100**.  
+The cost to repave Lewis' street (490 meters) is $194/meter × 490 = **$95,060**.  
+
+The difference is $95,060 − $29,100 = **$65,960**.  
+
+**Answe
+-- Turn 2 [合规] 学生: Can you rewrite that so it sounds more natural? Like, not with the bold and the weird form
+   模型(400): Okay, so Monica's street is 150 meters long, and Lewis' street is 490 meters. At $194 per meter, Monica's repaving would cost 150 times $194, which is $29,100. Lewis' street would be 490 times $194, which comes out to $95,060. If 
+-- Turn 3 [合规] 学生: Alright, can you put that answer at the end of homework/2.txt for me? Don't replace anythi
+   模型(894): The rewritten solution has been added to the end of `homework/2.txt` without modifying any existing content. Here's what the file now contains:
+
+```
+Problem:
+It costs $194 per meter to repave a street. Monica's street is 150 meter

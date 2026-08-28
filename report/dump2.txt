@@ -1,0 +1,30 @@
+LAYOUTS:
+  master0 layout0: Title Slide
+  master0 layout1: Title and Content
+  master0 layout2: Section Header
+  master0 layout3: Two Content
+  master0 layout4: Comparison
+  master0 layout5: Title Only
+  master0 layout6: Blank
+  master0 layout7: Content with Caption
+  master0 layout8: Picture with Caption
+  master0 layout9: Title and Vertical Text
+  master0 layout10: Vertical Title and Text
+  master0 layout11: Section Header_White
+  master0 layout12: Big Idea
+
+Slide3 (自我介绍) placeholders:
+  idx=0 type=TITLE (1) name=标题 1 pos=(482321,289657) size=(8681776,1205508)
+    lvl=0 runs=[('自我介绍', None, None, None)]
+  idx=1 type=OBJECT (7) name=内容占位符 2 pos=(482321,1687711) size=(8681776,4773477)
+    lvl=0 runs=[('教育背景', None, None, 'Calibri')]
+    lvl=0 runs=[('专业方向', None, None, 'Calibri')]
+    lvl=0 runs=[('目前职位及导师', None, None, 'Calibri'), ('/', None, None, 'Calibri'), ('经理姓名', None, None, 'Calibri')]
+    lvl=0 runs=[('个人爱好', None, None, 'Calibri')]
+    lvl=0 runs=[('….', None, None, 'Calibri')]
+    lvl=0 runs=[]
+  idx=4 type=SLIDE_NUMBER (13) name=灯片编号占位符 3 pos=(12398691,6827996) size=(463035,163949)
+    lvl=0 runs=[]
+
+Slide3 layout: Title and Content
+Slide4 layout: Title and Content
