@@ -940,6 +940,144 @@ return False, "\n".join(diag_parts)
 
 **这次回归的教训**：Phase 1 的合成测试只覆盖了"diff 能产出诊断"的路径，没覆盖"diff 产不出诊断、走 fallback"的路径——而 bug 恰恰在后者。全量 30 天分类扫描也帮不上忙，因为它只验证分类计数，不验证反馈文本内容。**验证覆盖到了主路径不等于覆盖到了兜底路径**，这是本地验证通过、真实训练仍暴露问题的直接原因。
 
+### 诊断：day17 thinking 断崖 → MC 格式失败 → Acc 崩塌，上游嫌疑是 FC 中间步骤的判官正奖励（2026-08-28）
+
+**这一节的结论经历过两次自我纠正**，两次都被 CLI 用真实数据否掉，过程一并记下来，避免以后重复同样的推断方式。
+
+**第一次推断（错，已否）**：拿 `day04/r5/turn3` 当"任务已完成后继续修改无关文件、仍拿 +1"的证据。CLI 查 `metaclaw_rollout.log:1339-1377` 后否掉：**该轮官方 checker 是 `passed=False`**（`check_iso8601.py` 抛 `AttributeError: 'list' object has no attribute 'get'`），任务压根没完成。这个样本只能证明"判官不惩罚修改本任务未要求的文件"，证明不了"完成之后才漂移"——它把"任务未完成"和"额外改无关文件"两个因素混在了一起。
+
+**第二次推断（错，已否）**：据此提出"完成后额外操作比例应随天数单调上升"的统计口径。CLI 指出两点：(a) 该口径**在现有日志里算不出来**——没有逐 turn 的 checker 状态、没有 `completion_turn`，最终 checker 只在 round 结束时跑一次；(b) 实际统计**否证**了这个预期——中间步骤 +1 的高峰在 day07-12（348 步 / 239 个 +1），day13 之后反而下降，day19-22 的下降还是幸存者偏差（generation 已 length/abort，形不成可判定的中间 turn）。
+
+**第三次推断（当前结论，有数据支撑）**：用户指出前两轮框架本身就有问题——(a) 拿 K=6 当参照系不对，K=6 不是目标，它存在的唯一原因就是全程训练会训坏；(b) **MC 退化更可能是 FC 训练的连带损害，不是独立问题**。第二点直接推翻了此前"差距在 MC 则判官消融无关"的说法：样本的**来源**是 FC，不代表它的**影响**只限于 FC，改的是同一份权重。
+
+按样本构成算，这个反驳是有力的：
+
+| 样本来源 | 数量（day01-22） | 占比 |
+|------|------|------|
+| FC 中间步骤（判官打分） | 628 | ~72% |
+| FC 最终轮（checker ±1） | ~161 | ~18% |
+| **FC 合计** | **~789** | **~90%** |
+| MC 最终轮 | ~85 | ~10% |
+
+**权重 90% 由 FC 派生信号塑造**，MC 只占 10%——MC 崩溃几乎不可能是那 10% 自己造成的。
+
+**CLI 随后补的两组数据让链条闭合**（`metaclaw_migration_20260827_163030` vs K=6 的 `20260820_122808`）：
+
+day16-22 的 MC 失败性质（按 `_compute_inline_score` 同款正则从实际回答重判，`report.json` 未保留 `format_valid`）：
+
+| | 格式失败 | 格式正确但答错 | 正确 |
+|---|---|---|---|
+| 本次 day16-22 | **17/26** | 6/26 | 3/26 |
+| K=6 day16-22 | **0/27** | 16/27 | 11/27 |
+
+按天的 thinking 长度与 `finish_reason`（本次 run 的 MC 轮次）：
+
+| Day | finish_reason | 平均 thinking | 平均 response tokens |
+|---|---|---|---|
+| 16 | 4 stop | 18k | 4.4k |
+| **17** | **3 length / 1 stop** | **115k** | **27.3k** |
+| 18 | 2 abort / 2 length | 133k | 30.7k |
+| 19 | 4 length | 143k | 34.5k |
+| 21 | 4 length | 145k | 34.4k |
+
+K=6 在 day17-22 的 MC **全部是 stop**，平均 thinking 约 4k-20k，无 length/abort。
+
+**所以真正的转折点是 day17（不是此前一直以为的 day12-14）**，链条是：
+
+```
+FC 中间步骤独立判官给 +1（其中 64 个样本 thinking ≥20k 且拿到 +1）
+  ↓  loss_mask = [1]*len(response_ids)，整段含 <think> 都进 loss
+长 thinking 被正强化，在持续训练中膨胀
+  ↓  day16 还是 18k，day17 跳到 115k
+生成撞 length 上限 / abort
+  ↓  MC 需要在末尾输出 \bbox{}，撞上限的生成永远输不出来
+MC 格式失败 17/26（K=6 为 0/27）→ MC 平均分 26.8% vs K=6 的 83.0%
+```
+
+**仍不能说已经证明"判官是唯一原因"**，但已经不是单样本推断——有明确的时间断点 + 格式失败性质对比 + 样本构成占比三项支撑。
+
+**顺带澄清 day11-15 的 FC 全 0**：两边（本次与 K=6 冻结）都是 0/6..0/9，**这是共同的能力墙，不是本次训练特有的退化**——day11 起题目从 `check_filename --dir`（只查命名）换成 `glob 精确日期 && check_metadata.py`，后者硬性要求 `meta.created_at`/`author`/`status` 三字段齐全且格式合规。这条线跟训练信号无关，不要跟上面的链条混在一起。
+
+**K=6 的正确定位**（此前用错了）：它不是目标，是**控制组**——同一 harness、同一数据、同一起点权重，唯一差别是"day6 之后有没有继续训练"。所以差值衡量的是"day7-22 这段训练造成了多大损害"（MC -20.9pt，FC -5.6pt），不是"离目标还差多远"。
+
+### 方案（待 CLI 查验，未实现）：中间轮次改吃本轮最终 checker 结果的消融实验（2026-08-28）
+
+**目的**：验证上一节链条的上游假设——**FC 中间步骤的独立判官正奖励，是不是超长 thinking 逐步膨胀的原因**。这是一次因果消融，不是性能优化。
+
+**为什么不是"直接删掉中间轮次"**（用户最初的设想，讨论后调整）：
+- 训练样本会从约 874 掉到约 246（约 -72%），训练步数从约 54 步掉到约 15 步——**跟"训得少所以好"混在一起**，而 K=6 已经演示过训得少更好，结论无法归因
+- file_check 的文件是在中间 tool-call 轮次写的，**最终轮往往只是"我已创建该文件"这类总结文本**；只留最终轮等于训总结、丢动作
+
+**采用的形态**：中间轮次**仍然提交为样本，样本量不变**，只把 reward 来源从"步骤判官分"换成"本轮最终 checker 的确定性 ±1"。判官仍然照常调用并记日志（用于事后对照），但分数不进训练。这样只替换一个变量。
+
+**开关**：`METACLAW_MIDROUND_REWARD`，默认 `judge`（现有行为，一字不改），设为 `outcome` 启用。沿用 `METACLAW_TRAIN_UNTIL_DAY` 的 opt-in 惯例。
+
+#### 已核实的机制前提（不是推断）
+
+1. **08-17 暂缓该设计的理由已自动失效**。当时写"代理没有 round 概念，只能靠 driver 串行调用这个前提，且两轮之间可能有杂音请求"——那是"一天一个 session"时期。**08-19c 改成每轮一个 session 之后，`session_id` 本身就是 round 边界**（`metaclaw-{test_id}-{group_id}-{round_id}`），`_pending_turn_data[session_id]` 天然覆盖整轮，不需要任何跨 round 推断；即使 OpenClaw 内部真有额外调用，它带的也是同一个 `session_id`，本来就属于这一轮。
+2. **继承链**：`OpenClawCombineSelectAPIServer` → `OpenClawCombineAPIServer` → `OpenClawOPDAPIServer`。`_opd_evaluate` 在 Select 层；`_maybe_submit_ready_samples` 在 Combine 层（覆盖了 OPD 层的同名方法）；verdict 分支在 OPD 层的 `_handle_request`。三层都要改。
+3. **verdict 不是一条新的训练 turn**（CLI 指出，已核实 `prepare_patched_openclaw_opd.sh` 的 `openclaw-rl-metaclaw-verdict-signal-skip` 补丁）：`max_tokens=0` 的请求**不创建新 pending turn**，而是对**本 session 最后一个真实 turn** 调 `_fire_opd_task(...)`，用 verdict JSON 当 next_state；最终 checker 分数出现在那个 turn 的 `opd_result` 里。所以不能理解为"verdict turn 到达即提交"。
+4. **异步补提交机制已存在**：`_fire_opd_task` 挂了 `task.add_done_callback(lambda _t: self._maybe_submit_ready_samples(session_id))`——**任务完成后会再次触发提交，且不带 `force_drop`**。verdict 路径下 `force_drop` 先跑、任务后完成，最终轮样本正是靠这个回调补交的。
+
+#### 设计
+
+**层 1 — `prepare_patched_openclaw_combine_select.sh`（`_opd_evaluate`）**
+
+只加显式标记，不改判分逻辑：
+- verdict 分支的两个 return 都加 `"metaclaw_verdict": True`
+- step-judge 分支的 return 加 `"metaclaw_round_step": True`、`"judge_raw_score": <majority vote 原始值>`、`"legacy_reward_would_have_been": <经 truncation/invalid-tool-use 覆盖后的分数>`
+
+**两个分数都要留**：`judge_raw_score` 是判官原始投票结果，`legacy_reward_would_have_been` 才是"不开这个开关时实际会用的 reward"——事后对照旧行为应当用后者。按 CLI 要求，**不靠 `turn_num`/`accepted`/`hint` 是否为空去猜测分支**。
+
+**层 2 — `prepare_patched_openclaw_combine.sh`（`_maybe_submit_ready_samples`）**
+
+真正决定"何时提交、用什么 reward"的位置。新增三个按 session 的状态：
+
+```
+self._metaclaw_held[session_id][turn_num] = (turn_data, opd_result)  # 滞留的中间轮次，含完整 opd_result
+self._metaclaw_outcome[session_id] = float                            # 本轮最终 checker 分，verdict 到达后写入
+self._metaclaw_verdict_fired[session_id] = True                       # 由层 3 设置，见下
+```
+
+`outcome` 模式下的分发规则：
+
+| 情况 | 处理 |
+|---|---|
+| `metaclaw_round_step` 且本轮 outcome **未知** | 移出 `pending`，**连同完整 `opd_result` 一起**存入 `_metaclaw_held`，不提交 |
+| `metaclaw_round_step` 且本轮 outcome **已知**（verdict 先完成的竞态） | 直接用已存 outcome 提交 |
+| `metaclaw_verdict` | 先记录 outcome → **flush 所有滞留轮次（用 outcome 当 reward）** → 再照原逻辑提交这一轮自己 |
+| `force_drop_without_next_state=True` 且 `_metaclaw_verdict_fired` **未置位** | 丢弃滞留轮次（基础设施失败路径，永远等不到 outcome） |
+| `force_drop_without_next_state=True` 且 `_metaclaw_verdict_fired` **已置位** | **不丢**（verdict 任务在飞，稍后回调会补 flush） |
+
+中间轮次继续走**现有的提交路径**（`_submit_rl_turn_sample`），不受判官 `accepted` 过滤影响——只替换 reward 来源。最终 verdict 轮次的 hint / reward 逻辑一字不改。
+
+**层 3 — `prepare_patched_openclaw_opd.sh`**
+
+- `__init__` 初始化上面三个 dict
+- `openclaw-rl-metaclaw-verdict-signal-skip` 分支里，`_fire_opd_task` 调用成功后**置位 `_metaclaw_verdict_fired[session_id]`**——必须显式标记，靠"是否还有未完成任务"推断不可靠：基础设施失败路径下中间轮次的任务同样可能未完成，两者靠任务状态无法区分
+- session 彻底结束（flush 完或丢弃完）后清理这三个 dict，避免无界增长
+
+#### 这个设计能消除什么、不能消除什么
+
+- **能**：失败 round 中的长 thinking 拿 +1 —— 这正是链条的上游
+- **不能**（CLI 指出，接受为已知残留）：**最终成功的 round 里，无效的额外操作仍会拿到正奖励**。`day04/r5` 那类"改了本任务未要求的文件"，只要该轮最终通过，仍是 +1。判官缺范围判据是独立成立的另一个缺陷（此前讨论的 A/B 方向），**不在这次消融范围内**，留待后续。
+
+#### 验收条件（CLI 提出的三条 + 补充）
+
+1. `_opd_evaluate` **显式返回** `metaclaw_verdict` / `metaclaw_round_step` 标记，不靠其它字段推断
+2. 滞留时**缓存完整 `opd_result`**，不只是 `turn_data`；同时记录 `judge_raw_score` 与 `legacy_reward_would_have_been` 两个分数
+3. **outcome 赋值与所有样本提交必须发生在 cleanup 之前**；且 verdict 之后才完成的 judge task 要能用已存的 session outcome 补提交（不能因为第一次 cleanup 时任务未完成就永久丢弃）
+4. 每个中间样本提交时打日志，记 `inherited_outcome` 与 `legacy_reward_would_have_been`，用于确认确实没有混入旧判官分
+5. **开关关闭时行为逐字节不变**，合成测试须覆盖
+
+#### 跑完之后看什么（主判据不是 Acc）
+
+1. **day17 那个断崖有没有消失**——按天平均 thinking 长度、`finish_reason=length` 占比
+2. **MC 格式失败率**——本次 day16-22 是 17/26，K=6 是 0/27，看能否压回去
+3. Acc./Compl. 只作次要参考——奖励源换了，绝对分数不直接可比
+
+**当前状态**：纯设计，代码未动，待 CLI 查验接线细节后再实现。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：
