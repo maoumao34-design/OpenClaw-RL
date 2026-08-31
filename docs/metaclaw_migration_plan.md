@@ -1076,7 +1076,34 @@ self._metaclaw_verdict_fired[session_id] = True                       # 由层 3
 2. **MC 格式失败率**——本次 day16-22 是 17/26，K=6 是 0/27，看能否压回去
 3. Acc./Compl. 只作次要参考——奖励源换了，绝对分数不直接可比
 
-**当前状态**：纯设计，代码未动，待 CLI 查验接线细节后再实现。
+#### CLI 查验补的一条边界（已采纳）：verdict task 自身失败
+
+原设计只区分了四种情况（verdict 未触发 / 已触发但 task 在跑 / 已成功拿到 outcome / 基础设施失败），**漏了"verdict 已触发但 `_opd_evaluate` task 抛异常或返回无效结果"**。这种情况下：`force_drop` 因为 `verdict_turn` 已置位而不丢弃滞留样本，异常分支又永远产不出 outcome——**滞留样本既不提交也不清理，永久留在内存里**。
+
+已补成明确终态：`pending` / `succeeded` / `failed` / `no_verdict`。task 抛异常或 outcome 无效时一律 **discard-and-cleanup**——丢弃本 session 滞留样本、清理状态、记 `failed`。**"verdict fired" 不等于"最终一定拿得到 outcome"**。
+
+实现上有个细节：task 抛异常时 `opd_result` 根本不存在，`metaclaw_verdict` 标记也就无从读取，所以**唯一能识别"失败的是 verdict task"的办法是拿 `turn_num` 跟记录的 `verdict_turn` 比对**——这也是 `verdict_turn` 存的是轮次号而不是布尔值的原因。
+
+CLI 另外三条验收点也已采纳：
+1. **现有丢弃门控必须在 outcome 缓存之前生效**——`is_aborted`/`generated_while_paused`/`is_duplicate_user_retry`/`skip_forced_negative_override`/`_metaclaw_training_frozen` 全部排在滞留逻辑之前，滞留不能复活本该丢弃的样本
+2. **`_eval_scores` 不能误记判官分**——滞留逻辑插在 `eval_score = opd_result.get(...)` 及其 `_eval_scores.append` **之前**，中间轮次的判官分不会被记成实际训练 reward
+3. **"默认行为逐字节不变"改成语义不变**——新增字段和日志后逐字节相同不可能；验收改为：默认 judge 下提交数量相同、每个样本 reward 相同、现有丢弃规则相同、verdict hint 行为相同、非 MetaClaw session 不受影响
+
+### 已实现（2026-08-28，本地验证通过，真实训练未验证）
+
+三层改动，全部在本项目自己的补丁脚本里，官方源码零改动：
+
+- **`prepare_patched_openclaw_combine_select.sh`（`_opd_evaluate`）**：verdict 分支两个 return 都加 `metaclaw_verdict: True`；step-judge 分支加 `metaclaw_round_step: True` + `judge_raw_score`（多数投票原始值，在 truncation/invalid-tool-use 覆盖**之前**捕获）+ `legacy_reward_would_have_been`（覆盖之后的值，**对照旧行为要用这个**）。判分逻辑一行未改。
+- **`prepare_patched_openclaw_combine.sh`（`_maybe_submit_ready_samples`）**：模块级读 `METACLAW_MIDROUND_REWARD`（默认 `judge`）；异常分支加 verdict-task-failed 的 discard-and-cleanup；主分发点加滞留/继承/flush 逻辑；循环之后加基础设施失败路径的滞留样本清理。
+- **`prepare_patched_openclaw_opd.sh`**：`__init__` 初始化 `self._metaclaw_round`（单个 dict，含 `held`/`outcome`/`verdict_turn`/`state` 四个字段，比三个独立 dict 的生命周期管理更简单）；verdict-signal-skip 分支在 `_fire_opd_task` 实际执行后记录 `verdict_turn`。
+- **`run_metaclaw_migration_modelfactory.sh`**：新增 `METACLAW_MIDROUND_REWARD` 声明并传给**训练后端进程**——读这个变量的是被训练进程 import 的代理侧代码，不是 driver，只传给 driver 会静默失效。
+
+**验证**：
+1. 三个补丁脚本对**真实官方源码**跑完整补丁链全部成功（所有锚点匹配，其中 combine 四处、combine_select 三处、opd 两处），`py_compile` 通过。
+2. 行为测试：从**补丁生成的真实代码**里抽出 `_maybe_submit_ready_samples` 执行，22 项断言覆盖八个场景——judge 模式三项（提交数量/reward/不建状态）、outcome 正常路径四项、判官 task 晚于 verdict 完成的竞态、verdict task 抛异常、verdict 返回无效 outcome、基础设施失败、verdict 在飞时 `force_drop` 不得丢弃、`is_aborted` 与 `_metaclaw_training_frozen` 两个既有门控仍先于滞留逻辑生效。全部通过。
+3. **测试非空转**：场景 6（无 verdict 必须丢）与场景 7（verdict 在飞不能丢）**互为反例**——判定条件写死成任一方向都会有一项失败，说明 `verdict_turn is None` 这个判据真的在起作用。
+
+**真实训练完全未验证**——下一步是跑一轮 `METACLAW_MIDROUND_REWARD=outcome` 的消融，主判据见上面"跑完之后看什么"。
 
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 

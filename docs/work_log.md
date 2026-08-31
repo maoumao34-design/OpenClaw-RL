@@ -40,19 +40,19 @@
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案设计已写完待 CLI 查验**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in）。
+**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变；三层补丁 + 启动脚本传参，九处锚点对真实官方源码验证通过，22 项行为断言覆盖八个场景含四个终态）。真实训练未验证。
 
 ### 已知限制 / 未解决
 同 08-26（历史状态），另加：**Traceback 回归的修复尚未在真实训练中验证**。**Phase 1 的核心问题仍未回答**：打分改对了不等于训练效果变好。**消融方案仍是纯设计、代码未动**，且它只能消除"失败 round 中的长 thinking 拿 +1"，**对最终成功 round 里的无效额外操作仍会给正奖励**（判官缺范围判据是独立的另一个缺陷，不在这次范围内）。**day11-15 的 FC 全 0 是 `check_metadata.py` 三字段硬要求造成的共同能力墙**（K=6 冻结模型同样 0），跟训练信号无关，不要跟 thinking 链条混为一谈。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**等 CLI 查验消融方案的接线细节，通过后实现并跑一轮消融**——主判据是 day17 断崖是否消失、MC 格式失败率能否压回去，**不是 Acc**（奖励源变了，绝对分数不直接可比）
+2. **MetaClaw 迁移**：**跑一轮 `METACLAW_MIDROUND_REWARD=outcome` 的消融**——主判据是 day17 断崖是否消失、MC 格式失败率能否从 17/26 压回去，**不是 Acc**（奖励源变了，绝对分数不直接可比）。同时确认日志里出现 `[openclaw-rl-metaclaw-midround-reward]` 的 held/flushed 行、且 `inherited_outcome` 与 `legacy_reward_would_have_been` 确实不同（证明判官分没混进训练）
 3. 其余同 08-17
 
 ### 未验证
 - [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——链条有数据支撑但未经消融证实，这是消融实验要回答的唯一问题
-- [ ] **消融方案的接线细节**——待 CLI 查验；已知最易出错处是"赋分/提交必须早于 cleanup"和"基础设施失败路径下滞留轮次的丢弃"
+- [ ] **消融开关在真实训练里的行为**——本地行为测试覆盖了八个场景，但真实环境下的异步时序（判官 task 与 verdict 的真实完成顺序、`force_drop` 的真实触发时机）无法在本地复现
 - [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，但训练效果层面未回答
 - [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
@@ -1698,7 +1698,16 @@
   - 自己补了一条 CLI 没提的竞态：**基础设施失败路径不产生 verdict，滞留轮次移出 `pending` 后 `force_drop` 就看不见了会永久泄漏**，必须由 OPD 层显式置位"verdict 已触发"标记来区分，靠任务完成状态推断不可靠
 → 详见 `metaclaw_migration_plan.md`"诊断：day17 thinking 断崖…"与"方案（待 CLI 查验，未实现）：中间轮次改吃本轮最终 checker 结果的消融实验"
 
+**完成内容（续二，同一天）——CLI 查验通过，消融方案已实现：**
+- **CLI 查验补了一条必要边界（已采纳）**：原设计漏了"verdict 已触发但 `_opd_evaluate` task 抛异常/返回无效结果"这种情况——`force_drop` 因 `verdict_turn` 已置位而不丢，异常分支又永远产不出 outcome，**滞留样本既不提交也不清理、永久留在内存**。已补成四个明确终态（`pending`/`succeeded`/`failed`/`no_verdict`），失败一律 discard-and-cleanup。实现上有个细节：task 抛异常时 `opd_result` 根本不存在、读不到 `metaclaw_verdict` 标记，**唯一能识别"失败的是 verdict task"的办法是拿 `turn_num` 跟记录的 `verdict_turn` 比对**——这也是该字段存轮次号而非布尔值的原因
+- CLI 另外三条验收点也已落实：现有丢弃门控排在滞留逻辑之前（滞留不能复活本该丢弃的样本）；滞留逻辑插在 `_eval_scores.append` 之前（判官分不会被记成实际训练 reward）；"逐字节不变"改为语义不变（提交数量/reward/丢弃规则/verdict hint/非 MetaClaw session 五项）
+- **已实现**：`prepare_patched_openclaw_combine_select.sh`（加显式标记 + 两个对照分数，判分逻辑零改动）、`prepare_patched_openclaw_combine.sh`（开关读取 + 异常路径终态 + 滞留/继承/flush 主逻辑 + 循环后基础设施失败清理）、`prepare_patched_openclaw_opd.sh`（`_metaclaw_round` 状态初始化 + 记录 `verdict_turn`）、`run_metaclaw_migration_modelfactory.sh`（**把 `METACLAW_MIDROUND_REWARD` 传给训练后端进程**——读它的是被训练进程 import 的代理侧代码，只传给 driver 会静默失效）
+- **验证**：三个补丁脚本对**真实官方源码**跑完整补丁链全部成功（九处锚点全部匹配）、`py_compile` 通过；行为测试从**补丁生成的真实代码**里抽出 `_maybe_submit_ready_samples` 执行，22 项断言覆盖八个场景（judge 模式三项、outcome 正常路径、判官 task 晚于 verdict 的竞态、verdict 抛异常、verdict 返回无效值、基础设施失败、verdict 在飞时不得丢弃、两个既有门控仍先生效）全部通过；**测试非空转**——场景 6 与场景 7 互为反例，判据写死成任一方向都会有一项失败
+- **真实训练完全未验证**
+→ 详见 `metaclaw_migration_plan.md`"已实现（2026-08-28…）"
+
 **产出：**
 - `docs/status_history.md`（新建）：37 个历史状态快照倒序归档
 - `docs/work_log.md`：当前状态移至顶部，规范一节更新，新增本条目
-- `docs/metaclaw_migration_plan.md`：新增诊断一节 + 消融方案设计一节
+- `docs/metaclaw_migration_plan.md`：新增诊断一节 + 消融方案设计一节 + 已实现一节
+- `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`、`scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：消融开关三层实现

@@ -103,6 +103,42 @@ import sys
 src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(src_path, encoding="utf-8").read()
 
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-midround-reward (2026-08-28, temporary, safe to
+# remove) -- see docs/metaclaw_migration_plan.md "方案：中间轮次改吃本轮
+# 最终 checker 结果的消融实验".
+#
+# Ablation switch. Default "judge" keeps every existing behavior; only
+# METACLAW_MIDROUND_REWARD=outcome activates any of the code below.
+#
+# Purpose: test whether the independent step judge's positive rewards on
+# intermediate FC turns are the upstream cause of the thinking inflation
+# that starts at day17 (see the diagnosis section in the migration doc).
+# Under "outcome", intermediate turns are STILL submitted -- sample count
+# is deliberately unchanged, because dropping them outright would drop
+# ~72% of the training mix and confound with "less training is better",
+# which the K=6 frozen run already demonstrated -- but their reward comes
+# from the round's deterministic checker verdict instead of the judge.
+# ---------------------------------------------------------------------
+midround_import_old = "logger = logging.getLogger(__name__)\n"
+if text.count(midround_import_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 'logger = logging.getLogger(__name__)' "
+        f"in {src_path} to anchor the midround-reward env read, found "
+        f"{text.count(midround_import_old)} (official file may have changed upstream)"
+    )
+midround_import_new = (
+    "logger = logging.getLogger(__name__)\n"
+    "\n"
+    "# --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n"
+    "import os as _mr_os\n"
+    "\n"
+    "_METACLAW_MIDROUND_REWARD = _mr_os.environ.get(\n"
+    "    \"METACLAW_MIDROUND_REWARD\", \"judge\"\n"
+    ").strip().lower()\n"
+)
+text = text.replace(midround_import_old, midround_import_new, 1)
+
 old_loop_head = (
     '        for turn_num in sorted(list(pending.keys())):\n'
     '            td = pending[turn_num]\n'
@@ -277,6 +313,220 @@ train_until_day_gate_new = (
     '            eval_score = opd_result.get("eval_score")\n'
 )
 text = text.replace(train_until_day_gate_old, train_until_day_gate_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-midround-reward: verdict task FAILURE terminal state
+# (2026-08-28, CLI review requirement).
+#
+# "verdict fired" must not be treated as "an outcome will definitely
+# arrive". If the verdict's _opd_evaluate task raises, the official
+# handler below logs and `continue`s -- the result dict never exists, so
+# the metaclaw_verdict marker is never seen, no outcome is ever recorded,
+# and force_drop refuses to discard held turns (because verdict_turn is
+# set). Held samples would then sit in memory forever: never submitted,
+# never cleaned up. Comparing turn_num against the recorded verdict_turn
+# is the only way to recognize this case, since the exception carries no
+# branch information.
+# ---------------------------------------------------------------------
+verdict_fail_old = (
+    '            except Exception as e:\n'
+    '                logger.warning(\n'
+    '                    "[OpenClaw-Combine] evaluation task failed session=%s turn=%d: %s",\n'
+    '                    session_id,\n'
+    '                    turn_num,\n'
+    '                    e,\n'
+    '                )\n'
+)
+if text.count(verdict_fail_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 evaluation-task-failed except block "
+        f"in {src_path}, found {text.count(verdict_fail_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+verdict_fail_new = (
+    '            except Exception as e:\n'
+    '                logger.warning(\n'
+    '                    "[OpenClaw-Combine] evaluation task failed session=%s turn=%d: %s",\n'
+    '                    session_id,\n'
+    '                    turn_num,\n'
+    '                    e,\n'
+    '                )\n'
+    '                # --- openclaw-rl-metaclaw-midround-reward (temporary) ---\n'
+    '                if _METACLAW_MIDROUND_REWARD == "outcome":\n'
+    '                    _mr = self._metaclaw_round.get(session_id)\n'
+    '                    if _mr is not None and _mr.get("verdict_turn") == turn_num:\n'
+    '                        _dropped = len(_mr.get("held", {}))\n'
+    '                        logger.warning(\n'
+    '                            "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
+    '                            "verdict task (turn=%d) FAILED -- no round outcome will "\n'
+    '                            "ever arrive, discarding %d held intermediate turn(s) "\n'
+    '                            "and clearing round state (terminal state: failed)",\n'
+    '                            session_id, turn_num, _dropped,\n'
+    '                        )\n'
+    '                        self._metaclaw_round.pop(session_id, None)\n'
+)
+text = text.replace(verdict_fail_old, verdict_fail_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-midround-reward: hold / inherit / flush dispatch.
+#
+# Placed AFTER skip_forced_negative_override and the train-until-day
+# freeze gate, and after the degraded-turn-drop check further up, so every
+# existing drop rule (is_aborted / generated_while_paused /
+# is_duplicate_user_retry / skip_forced_negative_override /
+# metaclaw_training_frozen) still fires FIRST -- holding must never
+# resurrect a sample the current rules would have discarded (CLI review
+# requirement). Placed BEFORE the `eval_score = opd_result.get(...)` line
+# and its self._eval_scores append, so an intermediate turn's judge score
+# can never be recorded as the sample's actual training reward.
+# ---------------------------------------------------------------------
+midround_dispatch_old = (
+    '            eval_score = opd_result.get("eval_score")\n'
+    '            if self._eval_mode and eval_score is not None:\n'
+)
+if text.count(midround_dispatch_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 eval_score/_eval_mode block in "
+        f"{src_path}, found {text.count(midround_dispatch_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+midround_dispatch_new = (
+    '            # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
+    '            if _METACLAW_MIDROUND_REWARD == "outcome" and (\n'
+    '                opd_result.get("metaclaw_verdict") or opd_result.get("metaclaw_round_step")\n'
+    '            ):\n'
+    '                _mr = self._metaclaw_round.setdefault(\n'
+    '                    session_id,\n'
+    '                    {"held": {}, "outcome": None, "verdict_turn": None, "state": "pending"},\n'
+    '                )\n'
+    '                if opd_result.get("metaclaw_verdict"):\n'
+    '                    _verdict_score = opd_result.get("eval_score")\n'
+    '                    if _verdict_score is None or not self._is_valid_rl_score(_verdict_score):\n'
+    '                        # Verdict arrived but carries no usable outcome -- same\n'
+    '                        # terminal state as the task raising: nothing to inherit,\n'
+    '                        # so discard rather than leak.\n'
+    '                        logger.warning(\n'
+    '                            "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
+    '                            "verdict turn=%d produced no valid outcome (%r) -- "\n'
+    '                            "discarding %d held intermediate turn(s) "\n'
+    '                            "(terminal state: failed)",\n'
+    '                            session_id, turn_num, _verdict_score, len(_mr["held"]),\n'
+    '                        )\n'
+    '                        self._metaclaw_round.pop(session_id, None)\n'
+    '                    else:\n'
+    '                        _mr["outcome"] = float(_verdict_score)\n'
+    '                        _mr["state"] = "succeeded"\n'
+    '                        # Flush BEFORE this verdict turn itself is submitted below,\n'
+    '                        # and before any session cleanup can run.\n'
+    '                        for _h_turn in sorted(_mr["held"].keys()):\n'
+    '                            _h_td, _h_res = _mr["held"][_h_turn]\n'
+    '                            logger.info(\n'
+    '                                "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
+    '                                "turn=%d flushed with inherited_outcome=%.1f "\n'
+    '                                "(judge_raw_score=%s legacy_reward_would_have_been=%s "\n'
+    '                                "-- judge score NOT used for training)",\n'
+    '                                session_id, _h_turn, _mr["outcome"],\n'
+    '                                _h_res.get("judge_raw_score"),\n'
+    '                                _h_res.get("legacy_reward_would_have_been"),\n'
+    '                            )\n'
+    '                            self._safe_create_task(\n'
+    '                                self._submit_rl_turn_sample(\n'
+    '                                    _h_td, session_id, float(_mr["outcome"]),\n'
+    '                                )\n'
+    '                            )\n'
+    '                        _mr["held"] = {}\n'
+    '                    # Fall through: the verdict turn itself keeps its normal\n'
+    '                    # reward/hint handling, unchanged from judge mode.\n'
+    '                else:\n'
+    '                    _known = _mr.get("outcome")\n'
+    '                    if _known is None:\n'
+    '                        _mr["held"][turn_num] = (td, opd_result)\n'
+    '                        logger.info(\n'
+    '                            "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
+    '                            "turn=%d held awaiting round outcome "\n'
+    '                            "(judge_raw_score=%s legacy_reward_would_have_been=%s)",\n'
+    '                            session_id, turn_num,\n'
+    '                            opd_result.get("judge_raw_score"),\n'
+    '                            opd_result.get("legacy_reward_would_have_been"),\n'
+    '                        )\n'
+    '                        continue\n'
+    '                    # Outcome already known: this judge task finished AFTER the\n'
+    '                    # verdict flush (real race -- the verdict path runs\n'
+    '                    # force_drop before intermediate tasks are necessarily done,\n'
+    '                    # and each task re-enters this method via its own done\n'
+    '                    # callback). Submit straight away with the stored outcome\n'
+    '                    # instead of dropping it.\n'
+    '                    logger.info(\n'
+    '                        "[openclaw-rl-metaclaw-midround-reward] session=%s turn=%d "\n'
+    '                        "late judge task, submitted with inherited_outcome=%.1f "\n'
+    '                        "(judge_raw_score=%s legacy_reward_would_have_been=%s)",\n'
+    '                        session_id, turn_num, _known,\n'
+    '                        opd_result.get("judge_raw_score"),\n'
+    '                        opd_result.get("legacy_reward_would_have_been"),\n'
+    '                    )\n'
+    '                    self._safe_create_task(\n'
+    '                        self._submit_rl_turn_sample(td, session_id, float(_known))\n'
+    '                    )\n'
+    '                    continue\n'
+    '\n'
+    '            eval_score = opd_result.get("eval_score")\n'
+    '            if self._eval_mode and eval_score is not None:\n'
+)
+text = text.replace(midround_dispatch_old, midround_dispatch_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-midround-reward: post-loop resolution of held turns
+# on the infrastructure-failure path.
+#
+# force_drop_without_next_state=True reaches here from two very different
+# places and they must NOT be treated the same:
+#   - the verdict path (openclaw_opd_api_server.py's verdict-signal-skip
+#     branch) runs it right after firing the verdict task, i.e. while an
+#     outcome is genuinely in flight -> held turns must survive;
+#   - _send_session_close_only (agent infrastructure failure) runs it
+#     without ever firing a verdict -> nothing will ever arrive, so held
+#     turns must be discarded here or they leak forever, since they are no
+#     longer in `pending` for the loop above to drop.
+# verdict_turn is None in exactly the second case.
+# ---------------------------------------------------------------------
+midround_postloop_old = (
+    '            elif has_valid_rl:\n'
+    '                self._safe_create_task(\n'
+    '                    self._submit_rl_turn_sample(td, session_id, float(eval_score))\n'
+    '                )\n'
+)
+if text.count(midround_postloop_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 has_valid_rl dispatch tail in "
+        f"{src_path}, found {text.count(midround_postloop_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+midround_postloop_new = (
+    '            elif has_valid_rl:\n'
+    '                self._safe_create_task(\n'
+    '                    self._submit_rl_turn_sample(td, session_id, float(eval_score))\n'
+    '                )\n'
+    '\n'
+    '        # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
+    '        if _METACLAW_MIDROUND_REWARD == "outcome" and force_drop_without_next_state:\n'
+    '            _mr = self._metaclaw_round.get(session_id)\n'
+    '            if _mr is not None and _mr.get("verdict_turn") is None:\n'
+    '                if _mr["held"]:\n'
+    '                    logger.info(\n'
+    '                        "[openclaw-rl-metaclaw-midround-reward] session=%s closed "\n'
+    '                        "without a verdict ever being fired (agent infrastructure "\n'
+    '                        "failure) -- discarding %d held intermediate turn(s) "\n'
+    '                        "(terminal state: no_verdict)",\n'
+    '                        session_id, len(_mr["held"]),\n'
+    '                    )\n'
+    '                self._metaclaw_round.pop(session_id, None)\n'
+    '            elif _mr is not None and _mr.get("state") == "succeeded" and not _mr["held"]:\n'
+    '                # Round finished cleanly and everything was flushed -- drop the\n'
+    '                # bookkeeping entry so it cannot grow without bound across a\n'
+    '                # 30-day run.\n'
+    '                self._metaclaw_round.pop(session_id, None)\n'
+)
+text = text.replace(midround_postloop_old, midround_postloop_new, 1)
 
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)

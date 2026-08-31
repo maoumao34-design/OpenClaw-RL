@@ -151,6 +151,15 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
+# 消融开关（2026-08-28，见 docs/metaclaw_migration_plan.md "方案：中间轮次
+# 改吃本轮最终 checker 结果的消融实验"）。默认 judge = 现有行为，一字不改。
+# 设成 outcome 时，round 内中间轮次仍然照常提交（样本量不变，避免跟"训得少
+# 所以好"混淆），但奖励来源从步骤判官分换成本轮最终 checker 的确定性 ±1。
+#
+# 必须传给**训练后端进程**而不只是 driver：读这个变量的是代理侧的
+# openclaw_combine_api_server.py（被训练进程 import），driver 自己不读它。
+METACLAW_MIDROUND_REWARD=${METACLAW_MIDROUND_REWARD:-judge}
+
 # 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
 # 建议先设 METACLAW_MAX_DAYS=1，确认整条链路（真实 openclaw agent 子
 # 进程、checker 执行、verdict 被代理正确识别、session_id 正确传递）
@@ -299,6 +308,7 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   METACLAW_MIGRATION_PROFILE="1" \
+  METACLAW_MIDROUND_REWARD="${METACLAW_MIDROUND_REWARD}" \
   bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!
