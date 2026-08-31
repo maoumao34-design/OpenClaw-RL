@@ -1137,6 +1137,130 @@ day06 反复失败
 
 **仍未决**：既然纯 RL 对这类任务可能有能力上限，那"完整训满 30 天并超过 K=6"这个目标本身是否现实、还是说必须补上 skill 通路才谈得上对标 Full 档——这个问题此前没有被正面考虑过，需要单独讨论。
 
+### `metaclaw_migration_20260831_154301` 复盘：outcome 消融训崩，根因是全负 batch（2026-08-31）
+
+首次 `METACLAW_MIDROUND_REWARD=outcome` 真实训练**发散**，checkpoint 已污染、不能作为后续起点。CLI 用 `training.log` 逐 step 核实的证据链：
+
+| step | batch reward | 正/负样本 | grad_norm | policy drift |
+|---|---|---|---|---|
+| 0 | -0.625 | 3 / 13 | 2.03 | 0.02 |
+| 3 | +0.125 | 9 / 7 | 4.43 | 0.10 |
+| 4 | -0.25 | 6 / 10 | 16.10 | 0.86 |
+| 6 起 | **-1.0** | **0 / 16** | 23.84→**2543.9** | 0.31→**21.94** |
+
+同期 K=6 的 judge 模式 batch reward 全为正、`grad_norm` 约 1.4-3.3、policy drift 稳定在 0.05-0.1。行为退化的时间点也对得上：step 3/4 之后首次出现 fresh session 的 `NO_REPLY`，step 6 起全 -1，之后响应长度从约 1370 掉到 160。
+
+**机制在源码层面确认（不是推测）**：
+
+```python
+# slime/utils/ppo_utils.py::get_grpo_returns
+returns.append(torch.ones_like(kl[i]) * rewards[i])   # 原始 reward 直接广播到每个 token
+```
+
+配上官方脚本的 `--n-samples-per-prompt 1` + `--disable-rewards-normalization`（我们的启动脚本原样继承），**advantage 就等于原始 reward，没有任何组内归一化**。一批 16 个全 -1 时，每个 token 的 advantage 都是 -1——只把模型刚产出的一切往下压、没有任何东西被往上推。
+
+**为什么 outcome 模式必然导致全负 batch**：round 真实通过率只有约 17%，而 judge 模式下中间步骤约 69% 是 +1。**step judge 一直是这套训练里唯一稳定的正信号来源**，换成忠实反映成败的信号后正样本就塌了。而且失败 round 往往轮次更多（模型在乱试），所以**样本层面的负样本占比比 round 通过率还要低**——这是个放大效应。
+
+**一个重要推论**：用户最初设想的"中间步骤完全不进训练、只留最终轮"（V1）**有同样的问题**，因为最终轮的通过率同样是 17%，而且每批只有 16 个样本、更容易凑出全负批。**不是思路不对，是它和 outcome 版共享同一个致命前提。**
+
+**同时查实的两个独立缺陷（已修复，commit `2944f87`）**：
+1. **硬负分被覆盖**：`day02/r2/turn2` 日志链完整——`invalid-tool-use-penalty ... eval_score 1.0 -> -1.0`，随后 `midround-reward ... inherited_outcome=1.0 ... legacy_reward_would_have_been=-1.0`，最终 `submitted ... index=24 score=1.0`。重复/退化的工具调用被正向强化。
+2. **结构性无效工具调用首发漏检**：`day05/r10` 嵌套 JSON 转义出错 → SGLang 报 `Failed to parse JSON part` → validation error 进上下文 → 模型开始反复输出 `{"name": "write", "arguments": {}}`；`day08/r1` 连续 17 次、单个 round 产出 23 个训练样本跨多个 batch。首发那一次 `is_invalid_tool_use=False`（规则 1a 只能拦第二发起的逐字重复），而规则 4 整段只对 Personal Agent Track 生效，MetaClaw 这边一条规则都没覆盖。
+
+**注意**：这两个修复本身正确且必须做，但**都会让负样本变多**，对全负 batch 是雪上加霜。**在 reward 方差问题解决之前，它们不构成"可以重新提交训练"的条件。**
+
+### 查证记录（六）：`toolcall-rl` 与 MetaClaw 各自怎么处理中间步骤——我们两边的关键细节都没照搬（2026-08-31）
+
+此前"三方对照"那张表把我们的步骤判官记成"刻意对齐 toolcall-rl"，逐字读两边源码后发现**这个说法不准确，而且掩盖了真正的风险差异**。
+
+**`toolcall-rl`（`generate_with_retool.py`）：整条轨迹一个 sample，中间步骤分是"加"在 outcome 上的**
+
+```python
+loss_masks += [1] * len(cur_response_token_ids)          # 模型生成 → 训练
+loss_masks += [0] * len(obs_tokens_ids)                  # 工具返回 → 不训练
+sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)  # 观察段补零占位
+assert len(response_token_ids) == len(sample.rollout_log_probs)   # 显式断言长度对齐
+sample.tokens = prompt_tokens_ids + response_token_ids
+sample.response_length = len(response_token_ids)         # response 段横跨整条轨迹
+```
+
+奖励合成（`reward_func`，856-893 行）：
+
+```python
+final_score = base_score + prm_step_coef * prm_step_mean
+```
+
+**关键差异：中间步骤分不替代 outcome，而是整条轨迹取平均后加一个标量微调**，`base_score`（确定性 `\boxed{}` 对错）永远在场当锚点。**单个步骤判错会被平均稀释**。
+
+另有两处我们完全没有的机制：
+- `if result["score"] < 0: tool_call_reward = (num_turns - 2)/2 * 0.1; score = min(-0.6, score + tool_call_reward)` —— **失败时按工具调用次数给补偿，且负分下限钳在 -0.6**，不是干脆的 -1
+- `if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]: break` —— **硬性轮次上限**，坏轨迹不可能无限膨胀
+
+**MetaClaw（`api_server.py::_submit_turn_sample`）：每次 LLM 调用一个 sample，靠 `loss_mask` 整段开关**
+
+```python
+exclude = not has_next_state or score == 0.0
+loss_mask = [0] * len(response_ids) if exclude else [1] * len(response_ids)
+```
+
+没有轨迹概念、不分中间/最终。但有一个我们没有的设计：**`score == 0.0` 的样本整段 `loss_mask=0`、不参与训练**——`prm_scorer` 是 `+1/-1/0` 三档，平票或全部解析失败即 0，**"判官拿不准"的样本被自动排除，不会硬塞一个方向进训练**。配套还有 `at-least-one guarantee`：整个 session 一个有效样本都没有时破例保留一个。
+
+**对我们的三点启示**：
+
+1. **"刻意对齐 toolcall-rl"这个说法要修正**。同样是二档 ±1，toolcall-rl 的步骤分是**平均后加权加到 outcome 上**（判错被稀释），我们是**每个中间步骤直接拿自己那份 ±1 当完整 reward**（判错原封不动进训练）。**风险等级完全不同。**
+2. **两边都不会让一个 round 产出十几二十个独立样本**：toolcall-rl 结构上不可能（一条轨迹一个 sample）+ `max_tool_calls` 上限；MetaClaw 靠 `score==0` 大量排除。**我们两条都没有**——这正是全负 batch 的直接成因。
+3. **toolcall-rl 的负分有下限且失败时给补偿**，显然预料到了"失败轨迹占多数"；我们是干脆的 -1，没有缓冲。
+
+### 方案：两条候选路线，分别实验（2026-08-31，待实现）
+
+两条都值得试，**分别跑、不要合在一起**，否则出了结果无法归因。
+
+#### 路线 A：轨迹级样本（照搬 toolcall-rl 结构）
+
+一个 round 只提交一个 sample，最终 checker 结果作为整条轨迹的 reward。
+
+**能解决**：中间"只调工具不产生结果"的步骤不再单独拿 +1；一个失败 round 从产出十几二十个 -1 压缩成 1 个；样本数不再被"模型乱试了多少轮"加权。全负 batch 的概率从必然降到约 `0.83^16 ≈ 5%`。
+
+**必须完成的六件事**（CLI 核实，`rollout_log_probs`/`teacher_log_probs` 在 `megatron_utils/actor.py:437-455` 都按 `response_length` 切片，长度必须严格对齐）：
+1. 保存每一轮模型生成片段及其 token span
+2. **重新定义 prompt/response 切分**——prompt 只留第一条 user 消息，其后全部算 response（当前 `loss_mask` 长度天生等于最后一轮 response，**物理上无法覆盖更早片段**，不是"调 loss_mask 就够了"）
+3. `loss_mask` 只在 assistant 生成片段置 1，工具返回/用户消息/系统提示置 0
+4. 拼接逐轮 `rollout_log_probs`，非生成段补零（照 toolcall-rl 加长度断言）
+5. **OPD/top-k 路径要重新处理整条序列的 teacher token/logprob**——这是最大的岔路，见下
+6. 每个 round 最多一个 sample，重复 invalid call 不能继续产出几十个
+
+**最大的未决点：OPD 怎么办**
+- 轨迹样本做成 **RL-only** → 实现最简单，但**等于把 Hybrid RL 的 OPD 那一半在 MetaClaw 上整个砍掉**。而 OPD 恰恰是本次迁移要验证的核心机制（三方对照表：MetaClaw 和 toolcall-rl 都没有 OPD，是 Personal Agent Track 独有、我们特意保留的）。砍掉它，实验就不再是"迁移 Hybrid RL"。
+- 轨迹样本**走 OPD** → 保住方法完整性，但要对整条轨迹重新做 hint 注入 + tokenize + teacher logprob 计算，工作量和出错面明显更大。
+
+**已知局限**（CLI 指出，接受为残留）：能解决"失败 round 的中间工具调用拿正奖励"，但**成功轨迹里的无关工具调用和长 thinking 仍会整体拿 +1**；若 checker 因历史文件残留误判成功，整条坏轨迹仍被正向训练。所以硬负分优先级、malformed/重复调用上限这些仍要保留。
+
+**实现前必须先做可行性验证**：拿真实日志的一个多轮 round，实测能否正确重建 token 序列、拼出长度对齐的 logprobs。验证不通过就不要动手。
+
+#### 路线 B：toolcall-rl 式奖励合成（不动样本结构）
+
+保持现有逐轮次样本结构，只改奖励合成方式：
+
+- 中间步骤 reward 从"各拿一份完整 ±1"改为 **`outcome + coef × 该轮判官分`**——outcome 提供方向，判官分只作微调不作主导（对齐 toolcall-rl 的 `base_score + prm_step_coef * prm_step_mean`）
+- 或更接近 MetaClaw：**判官分为 0（拿不准）的中间样本直接 `loss_mask=0` 排除**（需要先把判官从二档改成三档）
+
+**优点**：完全不碰 token 切分、logprobs、OPD 任何一处，代价远小于路线 A，同时缓解"判官判错直接进训练"和"全负 batch"两个问题（outcome 给方向、判官分给方差）。
+
+**缺点**：不解决"一个失败 round 产出十几二十个样本"——需要配合独立的样本数上限/重复调用去重。
+
+#### 两条路线共同的前置项
+
+无论走哪条，这些都要有（部分已完成）：
+- [x] 硬负分优先级（commit `2944f87`）
+- [x] 结构性无效工具调用检测，规则 6（commit `2944f87`）
+- [ ] 单个 round 的样本数上限 / 重复无效调用去重
+- [ ] 轨迹超 context 上限的处理
+- [ ] 每次实验都从**干净 base** 起步（`20260831_154301` 的 checkpoint 已污染）
+
+#### 仍未决
+
+`--disable-rewards-normalization` 去掉会怎样？如果批内归一化能把全负批变成零梯度而不是全负梯度，两条路线的安全边际都会大幅提高。**slime 在归一化开启、且整批 reward 相同（std=0）时的具体处理尚未查证**——这个查证很便宜，但它决定两条路线的风险底线。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

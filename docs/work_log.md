@@ -40,19 +40,20 @@
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变；三层补丁 + 启动脚本传参，九处锚点对真实官方源码验证通过，22 项行为断言覆盖八个场景含四个终态）。真实训练未验证。
+**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变）；[x] **硬负分优先级 + 结构性无效工具调用检测（规则 6）已修复**（commit `2944f87`）；[x] **outcome 消融训崩的根因已查清并在源码层面确认**（全负 batch + GRPO 无归一化）；[x] **`toolcall-rl`/MetaClaw 各自的中间步骤处理已逐字查证，两条候选路线已记录**。
 
 ### 已知限制 / 未解决
-同 08-26（历史状态），另加：**Traceback 回归的修复尚未在真实训练中验证**。**Phase 1 的核心问题仍未回答**：打分改对了不等于训练效果变好。**消融方案仍是纯设计、代码未动**，且它只能消除"失败 round 中的长 thinking 拿 +1"，**对最终成功 round 里的无效额外操作仍会给正奖励**（判官缺范围判据是独立的另一个缺陷，不在这次范围内）。**day11-15 的 FC 全 0 是 `check_metadata.py` 三字段硬要求造成的共同能力墙**（K=6 冻结模型同样 0），跟训练信号无关，不要跟 thinking 链条混为一谈。
+同 08-26（历史状态），另加：**`20260831_154301` 的 checkpoint 已污染，不能作为后续训练起点**。**在 reward 方差问题解决前不能重新提交训练**——已修的硬负分优先级和规则 6 都会让负样本变多，对全负 batch 是雪上加霜。**两条候选路线都未实现**：路线 A 的最大未决点是"OPD 要不要保住"（做成 RL-only 等于把 Hybrid RL 的一半砍掉，而那正是本次迁移要验证的核心机制）；路线 B 不解决"一个失败 round 产出十几二十个样本"，需配合样本数上限。**day11-15 的 FC 全 0 是能力墙**（K=6 冻结模型同样 0），跟训练信号无关。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**跑一轮 `METACLAW_MIDROUND_REWARD=outcome` 的消融**——主判据是 day17 断崖是否消失、MC 格式失败率能否从 17/26 压回去，**不是 Acc**（奖励源变了，绝对分数不直接可比）。同时确认日志里出现 `[openclaw-rl-metaclaw-midround-reward]` 的 held/flushed 行、且 `inherited_outcome` 与 `legacy_reward_would_have_been` 确实不同（证明判官分没混进训练）
+2. **MetaClaw 迁移**：**两条候选路线分别实验、不合在一起跑**（否则无法归因）。路线 A 动手前必须先做可行性验证（拿真实日志的多轮 round 实测能否重建 token 序列 + 拼出长度对齐的 logprobs）；路线 B 代价小可以先试。**每次实验都要从干净 base 起步。**
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——链条有数据支撑但未经消融证实，这是消融实验要回答的唯一问题
-- [ ] **消融开关在真实训练里的行为**——本地行为测试覆盖了八个场景，但真实环境下的异步时序（判官 task 与 verdict 的真实完成顺序、`force_drop` 的真实触发时机）无法在本地复现
+- [ ] **`--disable-rewards-normalization` 去掉会怎样**——slime 在归一化开启、整批 reward 相同（std=0）时的具体处理尚未查证。这个查证很便宜，但它决定两条路线的风险底线
+- [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全（逐轮 `response_logprobs` 都存着），但未实测；`rollout_log_probs`/`teacher_log_probs` 都按 `response_length` 严格切片，对不齐就是硬错误
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——原来的消融设计已被证明会因全负 batch 而发散，**这个问题至今没有被干净地回答过**
 - [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，但训练效果层面未回答
 - [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
@@ -1720,3 +1721,23 @@
 **产出：**
 - `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`、`scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：消融开关三层实现 + 启动脚本传参
 - `docs/metaclaw_migration_plan.md`：新增"CLI 查验补的一条边界"+"已实现（2026-08-28…）"两节
+
+**完成内容（续，同一天）——outcome 消融首次真实训练，训崩；查清根因并修两处独立缺陷：**
+- **首次 `METACLAW_MIDROUND_REWARD=outcome` 训练发散，checkpoint 已污染不能作后续起点**。CLI 逐 step 核实：step 0 起 batch reward 就偏负（3/13），step 4 grad_norm 跳到 16.1、policy drift 0.86，**step 6 起全 16 个样本都是 -1**，grad_norm 冲到 2543.9、drift 21.94，响应长度从约 1370 掉到 160。同期 K=6 的 judge 模式 batch reward 全为正、grad_norm 1.4-3.3
+- **机制已在源码层面确认**：`slime/utils/ppo_utils.py::get_grpo_returns` 把原始 reward 直接广播到每个 token，配上 `--n-samples-per-prompt 1` + `--disable-rewards-normalization`（我们的脚本原样继承官方），**advantage 就等于原始 reward、无任何组内归一化**——全 -1 的批次等于把模型刚产出的一切统一往下压
+- **为什么 outcome 模式必然全负**：round 通过率只有约 17%，而 judge 模式下中间步骤约 69% 是 +1——**step judge 一直是这套训练里唯一稳定的正信号来源**。而且失败 round 轮次更多，样本层面的负样本占比比 round 通过率还低。**重要推论：用户最初设想的"只留最终轮"（V1）有同样的问题**，最终轮通过率同样 17%、每批只有 16 个样本更容易凑出全负批——不是思路不对，是两者共享同一个致命前提
+- **修复两个独立缺陷（commit `2944f87`）**：(1) 硬负分被 outcome 继承覆盖——`day02/r2/turn2` 日志链完整（`eval_score 1.0 -> -1.0` → `inherited_outcome=1.0` → `submitted score=1.0`），重复/退化的工具调用被正向强化；改成 `_opd_evaluate` 上报 `hard_negative` 标记、两条提交路径都遵守，继承只替换判官分不替换硬规则判定。(2) 结构性无效工具调用首发漏检——查证发现缺口比 CLI 描述的更大：**规则 4 整段只对 Personal Agent Track 生效**（靠 `student-hw-N-` 推期望路径），MetaClaw 这边空参数 `write` 一条规则都没覆盖；新增任务无关的规则 6（参数无法解析、或 write/edit 无 path）
+- **两个修复都会让负样本变多**，对全负 batch 是雪上加霜——**在 reward 方差问题解决前，它们不构成"可以重新提交训练"的条件**
+→ 详见 `metaclaw_migration_plan.md`"`metaclaw_migration_20260831_154301` 复盘"
+
+**完成内容（续二，同一天）——查清 toolcall-rl 与 MetaClaw 各自怎么处理中间步骤，据此出两条候选路线：**
+- **修正了"三方对照"表里一处不准确的记载**：此前把我们的步骤判官记成"刻意对齐 toolcall-rl"。逐字读源码后确认——同样是二档 ±1，但 **toolcall-rl 的步骤分是整条轨迹取平均后加权加到 outcome 上**（`final_score = base_score + prm_step_coef * prm_step_mean`，判错被平均稀释、确定性 `base_score` 永远在场当锚点），我们是**每个中间步骤直接拿自己那份 ±1 当完整 reward**（判错原封不动进训练）。**风险等级完全不同**
+- 另查实 toolcall-rl 有两处我们没有的机制：失败时按工具调用次数给补偿且**负分下限钳在 -0.6**、`max_tool_calls` **硬性轮次上限**
+- **MetaClaw 侧**：每次 LLM 调用一个 sample，但 **`score == 0.0`（判官拿不准）的样本整段 `loss_mask=0` 不参与训练**（三档判官），配 `at-least-one guarantee` 兜底。我们的判官是二档、没有"弃权"档
+- **共同点**：两边都不会让一个 round 产出十几二十个独立样本（toolcall-rl 结构上不可能 + 轮次上限；MetaClaw 靠 `score==0` 排除）——**我们两条都没有，这正是全负 batch 的直接成因**
+- **据此记录两条候选路线，决定分别实验、不合在一起跑**（否则无法归因）：路线 A 轨迹级样本（照搬 toolcall-rl 结构，含 CLI 核实的 6 项必做工作和"OPD 怎么办"这个最大岔路）；路线 B toolcall-rl 式奖励合成（不动样本结构，代价远小，但需配合样本数上限）
+→ 详见 `metaclaw_migration_plan.md`"查证记录（六）"+"方案：两条候选路线，分别实验"
+
+**产出（续）：**
+- `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`：硬负分优先级 + 规则 6
+- `docs/metaclaw_migration_plan.md`：新增训练复盘、查证记录（六）、两条候选路线三节
