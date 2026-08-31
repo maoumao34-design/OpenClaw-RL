@@ -189,11 +189,19 @@ started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 command: $0 $*
 metaclaw_root: ${METACLAW_ROOT}
 checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
+metaclaw_midround_reward: ${METACLAW_MIDROUND_REWARD}
 EOF
 
 echo "日志目录: ${LOGS_DIR}"
 echo "METACLAW_ROOT: ${METACLAW_ROOT}"
 echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
+# 2026-08-31: 之前这个开关的实际生效值不落盘到任何地方，modelfactory 上
+# 任务提交环节（代码解释器/代码路径两个独立字段）环境变量能不能真的传
+# 到这里，本项目并未验证过——如果没传到，会静默回退成默认的 judge，
+# 训练侧和用户都不会有任何提示。这里把生效值同时打进屏幕日志和
+# RUN_MANIFEST.txt，训练一提交就能立刻确认到底是不是 outcome，而不是
+# 等跑了一天之后才去猜。
+echo "METACLAW_MIDROUND_REWARD（消融开关，实际生效值）: ${METACLAW_MIDROUND_REWARD}"
 
 # =====================================================================
 # 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
