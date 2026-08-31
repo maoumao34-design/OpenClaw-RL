@@ -160,6 +160,17 @@ METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 # openclaw_combine_api_server.py（被训练进程 import），driver 自己不读它。
 METACLAW_MIDROUND_REWARD=${METACLAW_MIDROUND_REWARD:-judge}
 
+# blend 模式的两个系数（2026-08-31，路线 B）。只在 METACLAW_MIDROUND_REWARD=blend
+# 时生效，其余模式完全不读。
+#   JUDGE_COEF   判官分的权重。默认 0.3 保证 |0.3×判官分| < 1，也就是 outcome
+#                永远决定符号、判官分只调幅度。调到 >0.4 时符号可能被翻转，
+#                此时要靠下面的 FAIL_CEILING 兜住。
+#   FAIL_CEILING 失败 round 的封顶（不是下限：失败样本再好也只能到这个值）。
+#                默认 coef=0.3 下它是惰性的（-1+0.3=-0.7 本来就低于 -0.6），
+#                存在意义是给调大 coef 时当符号保护。设 0 关闭。
+METACLAW_MIDROUND_JUDGE_COEF=${METACLAW_MIDROUND_JUDGE_COEF:-0.3}
+METACLAW_MIDROUND_FAIL_CEILING=${METACLAW_MIDROUND_FAIL_CEILING:--0.6}
+
 # 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
 # 建议先设 METACLAW_MAX_DAYS=1，确认整条链路（真实 openclaw agent 子
 # 进程、checker 执行、verdict 被代理正确识别、session_id 正确传递）
@@ -190,6 +201,8 @@ command: $0 $*
 metaclaw_root: ${METACLAW_ROOT}
 checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
 metaclaw_midround_reward: ${METACLAW_MIDROUND_REWARD}
+metaclaw_midround_judge_coef: ${METACLAW_MIDROUND_JUDGE_COEF}
+metaclaw_midround_fail_ceiling: ${METACLAW_MIDROUND_FAIL_CEILING}
 EOF
 
 echo "日志目录: ${LOGS_DIR}"
@@ -202,6 +215,9 @@ echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
 # RUN_MANIFEST.txt，训练一提交就能立刻确认到底是不是 outcome，而不是
 # 等跑了一天之后才去猜。
 echo "METACLAW_MIDROUND_REWARD（消融开关，实际生效值）: ${METACLAW_MIDROUND_REWARD}"
+if [ "${METACLAW_MIDROUND_REWARD}" = "blend" ]; then
+    echo "  blend 系数: JUDGE_COEF=${METACLAW_MIDROUND_JUDGE_COEF} FAIL_CEILING=${METACLAW_MIDROUND_FAIL_CEILING}"
+fi
 
 # =====================================================================
 # 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
@@ -317,6 +333,8 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   METACLAW_MIGRATION_PROFILE="1" \
   METACLAW_MIDROUND_REWARD="${METACLAW_MIDROUND_REWARD}" \
+  METACLAW_MIDROUND_JUDGE_COEF="${METACLAW_MIDROUND_JUDGE_COEF}" \
+  METACLAW_MIDROUND_FAIL_CEILING="${METACLAW_MIDROUND_FAIL_CEILING}" \
   bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

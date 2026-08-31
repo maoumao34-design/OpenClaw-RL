@@ -133,9 +133,71 @@ midround_import_new = (
     "# --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n"
     "import os as _mr_os\n"
     "\n"
+    "# judge   -- current behavior, intermediate turns keep the step judge's own +-1\n"
+    "# outcome -- intermediate turns inherit the round's deterministic checker result\n"
+    "#            verbatim. Tried in metaclaw_migration_20260831_154301 and it\n"
+    "#            diverged: round pass rate is ~17% while the judge was giving ~69%\n"
+    "#            +1, so replacing the judge wholesale collapsed the positive signal\n"
+    "#            and batches went 0/16 from step 6 on. Kept selectable for\n"
+    "#            comparison, but do not expect it to train.\n"
+    "# blend   -- route B (2026-08-31): outcome supplies the direction, the judge\n"
+    "#            score only nudges it. Mirrors toolcall-rl's\n"
+    "#            `final_score = base_score + prm_step_coef * prm_step_mean`, where a\n"
+    "#            misjudged step is diluted rather than becoming the entire reward.\n"
+    "#            The point is that rewards stop being a flat +-1: the batch gets a\n"
+    "#            spread of magnitudes instead of sixteen identical -1s. That matters\n"
+    "#            because reward normalization cannot help here -- every sample is\n"
+    "#            its own group of one (see openclaw_combine_api_server's\n"
+    "#            group_index assignment), so normalizing is identically zero and\n"
+    "#            --disable-rewards-normalization is mandatory, not a tunable.\n"
     "_METACLAW_MIDROUND_REWARD = _mr_os.environ.get(\n"
     "    \"METACLAW_MIDROUND_REWARD\", \"judge\"\n"
     ").strip().lower()\n"
+    "\n"
+    "# Weight on the judge's nudge under blend mode. toolcall-rl defaults its\n"
+    "# equivalent (prm_step_coef) to 1.0, but its base_score and step scores live on\n"
+    "# comparable scales there; here the outcome is a hard +-1, so a full-weight\n"
+    "# judge score could flip the sign and undo the point of the mode. Default 0.3\n"
+    "# keeps every blended reward strictly on the outcome's side of zero\n"
+    "# (|0.3 * judge| < 1), making the judge a magnitude adjustment only.\n"
+    "_METACLAW_MIDROUND_JUDGE_COEF = float(\n"
+    "    _mr_os.environ.get(\"METACLAW_MIDROUND_JUDGE_COEF\", \"0.3\")\n"
+    ")\n"
+    "\n"
+    "# Ceiling applied to a FAILED round's intermediate turns, mirroring\n"
+    "# toolcall-rl's `min(-0.6, score + tool_call_reward)`. Note that is a ceiling,\n"
+    "# not a floor: a failed sample can never score better than this. At the default\n"
+    "# coefficient it is INERT -- -1 + 0.3*1 = -0.7 is already below -0.6, so failed\n"
+    "# rewards land in [-1.3, -0.7] on their own. It exists as the sign guard for\n"
+    "# larger coefficients: at coef=1.0 (toolcall-rl's own default) an unclamped\n"
+    "# failed turn with a +1 judge would reach 0.0 and lose its sign entirely.\n"
+    "# Set to 0 to disable.\n"
+    "_METACLAW_MIDROUND_FAIL_CEILING = float(\n"
+    "    _mr_os.environ.get(\"METACLAW_MIDROUND_FAIL_CEILING\", \"-0.6\")\n"
+    ")\n"
+    "\n"
+    "\n"
+    "def _metaclaw_blend_reward(outcome, judge_score, hard_negative):\n"
+    "    \"\"\"Route B reward composition (2026-08-31).\n"
+    "\n"
+    "    outcome supplies the sign, the judge score only adjusts magnitude. A turn\n"
+    "    condemned by a forced-(-1) rule short-circuits to -1.0 regardless -- the\n"
+    "    same hard-negative precedence the other modes honor, since blending a\n"
+    "    known-invalid tool call back toward zero would defeat the override.\n"
+    "\n"
+    "    On a FAILED round the result is additionally capped at\n"
+    "    _METACLAW_MIDROUND_FAIL_CEILING so a nudge can never make a failure look\n"
+    "    near-neutral; on a SUCCEEDED round no cap applies, since there the judge\n"
+    "    nudge is what distinguishes a clean trajectory from a wasteful one.\n"
+    "    \"\"\"\n"
+    "    if hard_negative:\n"
+    "        return -1.0\n"
+    "    _base = float(outcome)\n"
+    "    _judge = 0.0 if judge_score is None else float(judge_score)\n"
+    "    _blended = _base + _METACLAW_MIDROUND_JUDGE_COEF * _judge\n"
+    "    if _base < 0 and _METACLAW_MIDROUND_FAIL_CEILING:\n"
+    "        _blended = min(_METACLAW_MIDROUND_FAIL_CEILING, _blended)\n"
+    "    return _blended\n"
 )
 text = text.replace(midround_import_old, midround_import_new, 1)
 
@@ -352,7 +414,7 @@ verdict_fail_new = (
     '                    e,\n'
     '                )\n'
     '                # --- openclaw-rl-metaclaw-midround-reward (temporary) ---\n'
-    '                if _METACLAW_MIDROUND_REWARD == "outcome":\n'
+    '                if _METACLAW_MIDROUND_REWARD in ("outcome", "blend"):\n'
     '                    _mr = self._metaclaw_round.get(session_id)\n'
     '                    if _mr is not None and _mr.get("verdict_turn") == turn_num:\n'
     '                        _dropped = len(_mr.get("held", {}))\n'
@@ -405,7 +467,7 @@ if text.count(midround_dispatch_old) != 1:
     )
 midround_dispatch_new = (
     '            # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
-    '            if _METACLAW_MIDROUND_REWARD == "outcome" and (\n'
+    '            if _METACLAW_MIDROUND_REWARD in ("outcome", "blend") and (\n'
     '                opd_result.get("metaclaw_verdict") or opd_result.get("metaclaw_round_step")\n'
     '            ):\n'
     '                _mr = self._metaclaw_round.setdefault(\n'
@@ -447,16 +509,23 @@ midround_dispatch_new = (
     '                            # tool call getting positively reinforced. Outcome\n'
     '                            # inheritance replaces the JUDGE score, never a hard\n'
     '                            # rule\'s verdict.\n'
-    '                            _h_reward = (\n'
-    '                                -1.0 if _h_res.get("hard_negative") else float(_mr["outcome"])\n'
-    '                            )\n'
+    '                            if _METACLAW_MIDROUND_REWARD == "blend":\n'
+    '                                _h_reward = _metaclaw_blend_reward(\n'
+    '                                    _mr["outcome"],\n'
+    '                                    _h_res.get("judge_raw_score"),\n'
+    '                                    _h_res.get("hard_negative"),\n'
+    '                                )\n'
+    '                            else:\n'
+    '                                _h_reward = (\n'
+    '                                    -1.0 if _h_res.get("hard_negative") else float(_mr["outcome"])\n'
+    '                                )\n'
     '                            logger.info(\n'
     '                                "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
-    '                                "turn=%d flushed with reward=%.1f "\n'
+    '                                "turn=%d mode=%s flushed with reward=%.3f "\n'
     '                                "(inherited_outcome=%.1f hard_negative=%s "\n'
-    '                                "judge_raw_score=%s legacy_reward_would_have_been=%s "\n'
-    '                                "-- judge score NOT used for training)",\n'
-    '                                session_id, _h_turn, _h_reward, _mr["outcome"],\n'
+    '                                "judge_raw_score=%s legacy_reward_would_have_been=%s)",\n'
+    '                                session_id, _h_turn, _METACLAW_MIDROUND_REWARD,\n'
+    '                                _h_reward, _mr["outcome"],\n'
     '                                _h_res.get("hard_negative"),\n'
     '                                _h_res.get("judge_raw_score"),\n'
     '                                _h_res.get("legacy_reward_would_have_been"),\n'
@@ -500,16 +569,25 @@ midround_dispatch_new = (
     '                    # and each task re-enters this method via its own done\n'
     '                    # callback). Submit straight away with the stored outcome\n'
     '                    # instead of dropping it.\n'
-    '                    # Same hard-negative precedence as the flush loop above.\n'
-    '                    _late_reward = (\n'
-    '                        -1.0 if opd_result.get("hard_negative") else float(_known)\n'
-    '                    )\n'
+    '                    # Same composition and hard-negative precedence as the\n'
+    '                    # flush loop above.\n'
+    '                    if _METACLAW_MIDROUND_REWARD == "blend":\n'
+    '                        _late_reward = _metaclaw_blend_reward(\n'
+    '                            _known,\n'
+    '                            opd_result.get("judge_raw_score"),\n'
+    '                            opd_result.get("hard_negative"),\n'
+    '                        )\n'
+    '                    else:\n'
+    '                        _late_reward = (\n'
+    '                            -1.0 if opd_result.get("hard_negative") else float(_known)\n'
+    '                        )\n'
     '                    logger.info(\n'
     '                        "[openclaw-rl-metaclaw-midround-reward] session=%s turn=%d "\n'
-    '                        "late judge task, submitted with reward=%.1f "\n'
+    '                        "mode=%s late judge task, submitted with reward=%.3f "\n'
     '                        "(inherited_outcome=%.1f hard_negative=%s "\n'
     '                        "judge_raw_score=%s legacy_reward_would_have_been=%s)",\n'
-    '                        session_id, turn_num, _late_reward, _known,\n'
+    '                        session_id, turn_num, _METACLAW_MIDROUND_REWARD,\n'
+    '                        _late_reward, _known,\n'
     '                        opd_result.get("hard_negative"),\n'
     '                        opd_result.get("judge_raw_score"),\n'
     '                        opd_result.get("legacy_reward_would_have_been"),\n'
@@ -558,7 +636,7 @@ midround_postloop_new = (
     '                )\n'
     '\n'
     '        # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
-    '        if _METACLAW_MIDROUND_REWARD == "outcome":\n'
+    '        if _METACLAW_MIDROUND_REWARD in ("outcome", "blend"):\n'
     '            _mr = self._metaclaw_round.get(session_id)\n'
     '            if (\n'
     '                _mr is not None\n'

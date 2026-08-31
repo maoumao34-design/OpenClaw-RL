@@ -1748,3 +1748,16 @@
 - **顺带修正自己前一条记录里的误读**：toolcall-rl 的 `min(-0.6, score + tool_call_reward)` 被我记成"负分下限钳在 -0.6"，**方向说反了**——`min` 取小值，实际是封顶，失败样本最好也只能到 -0.6。真实作用是"按工具调用次数把 -1 抬高到最多 -0.6，但绝不让它变正"，目的正是**让失败样本的幅度产生差异**
 - **据此反转两条路线的优先级**（此前把 A 当主方案是错的）：路线 B 才对症（连续 reward 分布直接打散全负批）；路线 A 只降低负样本**数量**、每个样本仍是干脆 ±1，全负批概率从必然降到约 5%，是改善不是解决。**执行顺序改为先做 B**
 → 详见 `metaclaw_migration_plan.md`"查证结果（2026-08-31）：靠打开归一化来救全负 batch 这条路走不通"
+
+**完成内容（续四，同一天）——实现路线 B（`METACLAW_MIDROUND_REWARD=blend`）：**
+- **新增第三种模式 `blend`**，`judge`（默认）/`outcome` 两种行为完全不变。核心是新的模块级函数 `_metaclaw_blend_reward(outcome, judge_score, hard_negative)`：**outcome 决定符号、判官分只调幅度**，对齐 toolcall-rl 的 `base_score + prm_step_coef * prm_step_mean`——判官判错会被稀释，而不是像 outcome 模式那样成为整个 reward
+- **两个可调系数**：`METACLAW_MIDROUND_JUDGE_COEF`（默认 0.3，保证 `|0.3×判官分| < 1`、outcome 永远决定符号）、`METACLAW_MIDROUND_FAIL_CEILING`（默认 -0.6，失败 round 的**封顶**不是下限）。**实现时发现并写进注释：默认 coef 下封顶是惰性的**（-1+0.3=-0.7 本来就低于 -0.6），它的存在意义是给 coef 调大时当符号保护——coef=1.0 时不封顶的话失败样本会到 0.0、符号丢失
+- **硬负分优先级在 blend 下同样最高**：`hard_negative` 直接短路成 -1.0，不参与混合（否则把已知无效的工具调用往零的方向拉，等于抵消 override）
+- **效果**：一个失败 round 的中间轮次不再是清一色 -1，而是按判官分散成 -1.3 / -1.0 / -0.7 三档——这正是全负 batch 需要的幅度差异，而归一化在这套架构下提供不了（每个样本自成一组）
+- **验证**：补丁链对真实官方源码重跑通过、`py_compile` 通过；22 项断言覆盖 blend 算术（含符号保持的 6 种组合）、失败 round 产生三档不同幅度、成功 round 仍能区分干净/浪费轨迹、`judge`/`outcome` 两模式逐条未变、系数与封顶可配置且封顶在高 coef 下确实起到符号保护作用。**两处测试预期写错被实际结果纠正**（误以为默认 coef 下封顶会生效），已按真实行为改正
+- 启动脚本三处接好：传参给训练后端、`RUN_MANIFEST.txt` 落盘、blend 模式下额外打印两个系数
+→ 详见 `metaclaw_migration_plan.md`"方案：两条候选路线"路线 B
+
+**产出（续二）：**
+- `scripts/prepare_patched_openclaw_combine.sh`：`blend` 模式 + `_metaclaw_blend_reward` + 两个系数
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：两个系数的默认值、传参、日志、manifest
