@@ -1741,3 +1741,10 @@
 **产出（续）：**
 - `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`：硬负分优先级 + 规则 6
 - `docs/metaclaw_migration_plan.md`：新增训练复盘、查证记录（六）、两条候选路线三节
+
+**完成内容（续三，同一天）——查证归一化能否救全负 batch：不能，且反转了两条路线的优先级：**
+- **查证结果是否定的**：`openclaw_combine_api_server.py:88-89/133-134` 显示 **`sample.group_index = next(self._group_counter)`——每个样本都被放进只含它自己的组**。而 `slime/ray/rollout.py::normalize_vals` 对单元素组恒等于零（`vals - vals.mean()` 长度 1 时恒为 0；带 std 归一化时直接 `zeros_like`），`dynamic_history` 与否两条分支同构。**开启归一化会把每个 reward 都变成 0，训练信号整个消失**；此外 `_drop_constant_reward_groups` 会把每个单元素组都判成"常数组"、整批丢弃只留一组
+- **所以 `--disable-rewards-normalization` 不是可调选项、是这套架构的必需项**（`--n-samples-per-prompt 1` + 一样本一组，组内没有方差可归一）。**全负 batch 无法靠配置解决，只能改 reward 分布本身**
+- **顺带修正自己前一条记录里的误读**：toolcall-rl 的 `min(-0.6, score + tool_call_reward)` 被我记成"负分下限钳在 -0.6"，**方向说反了**——`min` 取小值，实际是封顶，失败样本最好也只能到 -0.6。真实作用是"按工具调用次数把 -1 抬高到最多 -0.6，但绝不让它变正"，目的正是**让失败样本的幅度产生差异**
+- **据此反转两条路线的优先级**（此前把 A 当主方案是错的）：路线 B 才对症（连续 reward 分布直接打散全负批）；路线 A 只降低负样本**数量**、每个样本仍是干脆 ±1，全负批概率从必然降到约 5%，是改善不是解决。**执行顺序改为先做 B**
+→ 详见 `metaclaw_migration_plan.md`"查证结果（2026-08-31）：靠打开归一化来救全负 batch 这条路走不通"

@@ -1257,9 +1257,51 @@ loss_mask = [0] * len(response_ids) if exclude else [1] * len(response_ids)
 - [ ] 轨迹超 context 上限的处理
 - [ ] 每次实验都从**干净 base** 起步（`20260831_154301` 的 checkpoint 已污染）
 
-#### 仍未决
+#### 查证结果（2026-08-31）：靠打开归一化来救全负 batch 这条路走不通，且它改变了两条路线的优先级
 
-`--disable-rewards-normalization` 去掉会怎样？如果批内归一化能把全负批变成零梯度而不是全负梯度，两条路线的安全边际都会大幅提高。**slime 在归一化开启、且整批 reward 相同（std=0）时的具体处理尚未查证**——这个查证很便宜，但它决定两条路线的风险底线。
+原本记为"仍未决"的那个问题（`--disable-rewards-normalization` 去掉会怎样）已经查完，答案是**否定的，而且开了会让训练彻底停摆**。
+
+**决定性事实：我们每个样本都是独立的一组。**
+
+```python
+# openclaw_combine_api_server.py:88-89 / 133-134（opd 版同构）
+sample.index = next(self._index_counter)
+sample.group_index = next(self._group_counter)      # 每个样本一个全新 group_index
+await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))   # 组里只有它自己
+```
+
+归一化对单元素组是恒等于零的：
+
+```python
+# slime/ray/rollout.py::normalize_vals
+vals = vals - vals.mean()              # 长度 1 -> 恒为 0
+if std_normalization:
+    if len(vals) > 1: vals = vals / (vals.std() + 1e-6)
+    else: vals = torch.zeros_like(vals)   # 长度 1 -> 直接置 0
+```
+
+`dynamic_history` 与非 `dynamic_history` 两条分支都走同一个 `normalize_vals`，结果一致——**开启归一化会把每个 reward 都变成 0，训练信号整个消失**。
+
+还有第二道（同样只在归一化开启时才生效，目前是惰性的）：
+
+```python
+# slime/ray/rollout.py::_drop_constant_reward_groups
+if max(vals) - min(vals) <= 1e-12:
+    constant_groups.append(group_idx)
+```
+
+单元素组的 `max-min` 恒为 0，**每一组都会被判成"常数组"、整批丢弃只保留一组**。
+
+**结论**：`--disable-rewards-normalization` 不是可调选项，是这套架构下的必需项。官方脚本这么设，是因为 `--n-samples-per-prompt 1` + 一样本一组的结构下，组内根本没有方差可归一。**全负 batch 无法靠配置解决，只能靠改变 reward 分布本身。**
+
+**顺带修正上一节对 toolcall-rl 的一处误读**：`min(-0.6, score + tool_call_reward)` 此前被记成"负分下限钳在 -0.6"，**方向说反了**。`min` 取小值，实际是**封顶**——失败样本最好也只能到 -0.6，不会更高。真实效果是"按工具调用次数把 -1 抬高到最多 -0.6，但绝不让它变正"：`num_turns=2` 时补偿为 0、得分 -1；`num_turns>=10` 时补偿把 -1 抬到 -0.6 后封顶。**这个设计的作用恰恰是让失败样本的幅度产生差异，不再是清一色的 -1。**
+
+**因此两条路线的优先级要反过来**（此前把 A 当主方案、B 当便宜替代，这个排序错了）：
+
+- **路线 B 才是对症的那个**：`outcome + coef × 判官分` 天然产生连续分布，再配上 toolcall-rl 那套"按工具调用次数抬高失败分 + 封顶"，负样本的幅度就有了差异，不再是 16 个一模一样的 -1。
+- **路线 A 单独做解决不了这个问题**：它把一个失败 round 从 20 个 -1 压成 1 个 -1，降低的是负样本**数量**，但每个样本仍是干脆的 ±1、通过率仍是 17%。全负批概率从必然降到约 5%，是改善不是解决。
+
+**执行顺序改为：先做路线 B，再视结果决定要不要做路线 A。**
 
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
