@@ -151,7 +151,7 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
-# 消融开关（2026-08-28，见 docs/metaclaw_migration_plan.md "方案：中间轮次
+# 消融开关（2026-08-31，见 docs/metaclaw_migration_plan.md "方案：中间轮次
 # 改吃本轮最终 checker 结果的消融实验"）。默认 judge = 现有行为，一字不改。
 # 设成 outcome 时，round 内中间轮次仍然照常提交（样本量不变，避免跟"训得少
 # 所以好"混淆），但奖励来源从步骤判官分换成本轮最终 checker 的确定性 ±1。

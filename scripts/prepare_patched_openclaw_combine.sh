@@ -104,7 +104,7 @@ src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(src_path, encoding="utf-8").read()
 
 # ---------------------------------------------------------------------
-# openclaw-rl-metaclaw-midround-reward (2026-08-28, temporary, safe to
+# openclaw-rl-metaclaw-midround-reward (2026-08-31, temporary, safe to
 # remove) -- see docs/metaclaw_migration_plan.md "方案：中间轮次改吃本轮
 # 最终 checker 结果的消融实验".
 #
@@ -316,7 +316,7 @@ text = text.replace(train_until_day_gate_old, train_until_day_gate_new, 1)
 
 # ---------------------------------------------------------------------
 # openclaw-rl-metaclaw-midround-reward: verdict task FAILURE terminal state
-# (2026-08-28, CLI review requirement).
+# (2026-08-31, CLI review requirement).
 #
 # "verdict fired" must not be treated as "an outcome will definitely
 # arrive". If the verdict's _opd_evaluate task raises, the official

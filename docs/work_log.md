@@ -36,7 +36,7 @@
 
 ---
 
-## 当前状态（2026-08-28）
+## 当前状态（2026-08-31）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
@@ -1698,7 +1698,18 @@
   - 自己补了一条 CLI 没提的竞态：**基础设施失败路径不产生 verdict，滞留轮次移出 `pending` 后 `force_drop` 就看不见了会永久泄漏**，必须由 OPD 层显式置位"verdict 已触发"标记来区分，靠任务完成状态推断不可靠
 → 详见 `metaclaw_migration_plan.md`"诊断：day17 thinking 断崖…"与"方案（待 CLI 查验，未实现）：中间轮次改吃本轮最终 checker 结果的消融实验"
 
-**完成内容（续二，同一天）——CLI 查验通过，消融方案已实现：**
+**产出（08-28）：**
+- `docs/status_history.md`（新建）：37 个历史状态快照倒序归档
+- `docs/work_log.md`：当前状态移至顶部，规范一节更新
+- `docs/metaclaw_migration_plan.md`：新增诊断一节 + 消融方案设计一节
+
+---
+
+## 2026-08-31
+
+**目标：** 按 CLI 查验结果实现消融开关。
+
+**完成内容：**
 - **CLI 查验补了一条必要边界（已采纳）**：原设计漏了"verdict 已触发但 `_opd_evaluate` task 抛异常/返回无效结果"这种情况——`force_drop` 因 `verdict_turn` 已置位而不丢，异常分支又永远产不出 outcome，**滞留样本既不提交也不清理、永久留在内存**。已补成四个明确终态（`pending`/`succeeded`/`failed`/`no_verdict`），失败一律 discard-and-cleanup。实现上有个细节：task 抛异常时 `opd_result` 根本不存在、读不到 `metaclaw_verdict` 标记，**唯一能识别"失败的是 verdict task"的办法是拿 `turn_num` 跟记录的 `verdict_turn` 比对**——这也是该字段存轮次号而非布尔值的原因
 - CLI 另外三条验收点也已落实：现有丢弃门控排在滞留逻辑之前（滞留不能复活本该丢弃的样本）；滞留逻辑插在 `_eval_scores.append` 之前（判官分不会被记成实际训练 reward）；"逐字节不变"改为语义不变（提交数量/reward/丢弃规则/verdict hint/非 MetaClaw session 五项）
 - **已实现**：`prepare_patched_openclaw_combine_select.sh`（加显式标记 + 两个对照分数，判分逻辑零改动）、`prepare_patched_openclaw_combine.sh`（开关读取 + 异常路径终态 + 滞留/继承/flush 主逻辑 + 循环后基础设施失败清理）、`prepare_patched_openclaw_opd.sh`（`_metaclaw_round` 状态初始化 + 记录 `verdict_turn`）、`run_metaclaw_migration_modelfactory.sh`（**把 `METACLAW_MIDROUND_REWARD` 传给训练后端进程**——读它的是被训练进程 import 的代理侧代码，只传给 driver 会静默失效）
@@ -1707,7 +1718,5 @@
 → 详见 `metaclaw_migration_plan.md`"已实现（2026-08-28…）"
 
 **产出：**
-- `docs/status_history.md`（新建）：37 个历史状态快照倒序归档
-- `docs/work_log.md`：当前状态移至顶部，规范一节更新，新增本条目
-- `docs/metaclaw_migration_plan.md`：新增诊断一节 + 消融方案设计一节 + 已实现一节
-- `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`、`scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：消融开关三层实现
+- `scripts/prepare_patched_openclaw_{opd,combine,combine_select}.sh`、`scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：消融开关三层实现 + 启动脚本传参
+- `docs/metaclaw_migration_plan.md`：新增"CLI 查验补的一条边界"+"已实现（2026-08-28…）"两节
