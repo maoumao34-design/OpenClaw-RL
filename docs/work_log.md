@@ -36,24 +36,25 @@
 
 ---
 
-## 当前状态（2026-08-31）
+## 当前状态（2026-09-01）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变）；[x] **硬负分优先级 + 结构性无效工具调用检测（规则 6）已修复**（commit `2944f87`）；[x] **outcome 消融训崩的根因已查清并在源码层面确认**（全负 batch + GRPO 无归一化）；[x] **`toolcall-rl`/MetaClaw 各自的中间步骤处理已逐字查证，两条候选路线已记录**。
+**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变）；[x] **硬负分优先级 + 结构性无效工具调用检测（规则 6）已修复**（commit `2944f87`）；[x] **outcome 消融训崩的根因已查清并在源码层面确认**（全负 batch + advantage 退化成原始 reward）；[x] **真正的根因已定位到"用着 GRPO 估计器却一个真正的组都没有"**，`toolcall-rl`/MetaClaw 的分组方式与任务形态已逐字查证；[x] **批级基线方案已出，可行性已在源码层面查证**（slime 自带 `--custom-reward-post-process-path` 钩子，不用碰 `group_index`/队列），**待 CLI 在真实环境查证 5 个点后实现**。
 
 ### 已知限制 / 未解决
-同 08-26（历史状态），另加：**`20260831_154301` 的 checkpoint 已污染，不能作为后续训练起点**。**在 reward 方差问题解决前不能重新提交训练**——已修的硬负分优先级和规则 6 都会让负样本变多，对全负 batch 是雪上加霜。**两条候选路线都未实现**：路线 A 的最大未决点是"OPD 要不要保住"（做成 RL-only 等于把 Hybrid RL 的一半砍掉，而那正是本次迁移要验证的核心机制）；路线 B 不解决"一个失败 round 产出十几二十个样本"，需配合样本数上限。**day11-15 的 FC 全 0 是能力墙**（K=6 冻结模型同样 0），跟训练信号无关。
+同 08-26（历史状态），另加：**`20260831_154301` 的 checkpoint 已污染，不能作为后续训练起点**。**批级基线方案尚未实现，也未经真实环境查证**——5 个待查点见迁移文档。**`blend` 模式可能是多余的**：它照搬 toolcall-rl 的奖励合成，但 toolcall-rl 能靠它工作的前提是同时有 8 样本组内归一化，我们只搬了一半；默认关闭、回退成本低，视批级基线结果决定去留。**路线 A（轨迹级样本）仍未实现**，且它也只降低负样本数量、不产生正样本。**day11-15 的 FC 全 0 是能力墙**（K=6 冻结模型同样 0），跟训练信号无关。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**两条候选路线分别实验、不合在一起跑**（否则无法归因）。路线 A 动手前必须先做可行性验证（拿真实日志的多轮 round 实测能否重建 token 序列 + 拼出长度对齐的 logprobs）；路线 B 代价小可以先试。**每次实验都要从干净 base 起步。**
+2. **MetaClaw 迁移**：**等 CLI 在真实环境查证批级基线方案的 5 个点**，通过后实现并跑一轮。**先单独跑批级基线、不叠加 `blend`**（`METACLAW_MIDROUND_REWARD=judge` + 自定义钩子）——这是最干净的对照，只改 advantage 算法、reward 形态完全不变，跟 K=6 那次 judge 模式唯一差别就是基线。主判据是 `batch reward` 不再出现 `0/16`、`grad_norm`/`policy drift` 保持在 K=6 量级，**不是 Acc**。**必须从干净 base 起步。**
 3. 其余同 08-17
 
 ### 未验证
-- [ ] **`--disable-rewards-normalization` 去掉会怎样**——slime 在归一化开启、整批 reward 相同（std=0）时的具体处理尚未查证。这个查证很便宜，但它决定两条路线的风险底线
+- [ ] **批级基线方案的 5 个真实环境问题**——`load_function` 的路径格式与 modelfactory 上的放置位置、dummy 样本会不会污染批均值、真实到达钩子的样本数、std≈0 时全 0 advantage 是否可接受、与 `step_wise` estimator 是否冲突
+- [ ] **批级基线能否真的阻止发散**——源码层面确认了 advantage 会被中心化（必有正负），但真实训练里够不够稳定未知
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——原来的消融设计已被证明会因全负 batch 而发散，**这个问题至今没有被干净地回答过**；要等训练能稳定跑起来之后才谈得上重新验证
 - [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全（逐轮 `response_logprobs` 都存着），但未实测；`rollout_log_probs`/`teacher_log_probs` 都按 `response_length` 严格切片，对不齐就是硬错误
-- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——原来的消融设计已被证明会因全负 batch 而发散，**这个问题至今没有被干净地回答过**
 - [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，但训练效果层面未回答
 - [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
 - [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
@@ -1768,3 +1769,21 @@
 - **这推翻了上一条记录里"路线 B 才是对症的"这个判断**：blend 只提供幅度差异（-1.3/-1.0/-0.7），**在失败 round 里一个正样本都产生不了**，而崩溃的直接形态是 `0/16 正样本`。blend 是相对塑形、跟基线方案正交可叠加，但不应指望它单独解决问题
 - **记下两条待查证路径**：① 学 toolcall-rl 提高 `n_samples_per_prompt`（架构障碍大，初步判断不现实但未正式评估）；② 学 MetaClaw 做批级基线（改动最小且有官方先例，已知坑是 `_drain_output_queue` 的 `completed_groups[group_id] = group` 会让共享 group_id 的样本互相覆盖，需先改成累加，且还没查有没有别处假设 `group_index` 唯一）。**两条都要先查清可行性再选，不先动手**
 → 详见 `metaclaw_migration_plan.md`"查证记录（七）：GRPO 的'组'到底是什么"
+
+---
+
+## 2026-09-01
+
+**目标：** 查清 GRPO 分组机制、对照 toolcall-rl 与 MetaClaw 的任务形态，定出真正命中根因的方案。
+
+**完成内容：**
+- **日期更正**：昨天写的"查证记录（七）"实际提交于今天（`66e5b49`，09-01 10:03），文档里两处标题日期已从 08-31 改为 09-01
+- **查清 toolcall-rl 的任务形态，确认路径 ①（提高 `n_samples_per_prompt`）应排除**：它是**数学题 + Python 代码解释器**（ReTool/DAPO-Math-17k），一次采样 = 跑一遍沙箱、**用完即弃、彼此完全独立**，所以能开 8 份并发做 GRPO 组内比较。我们一次采样 = 真实 agent 跑一遍、**读写真实 workspace**，同一天 round 共享 workspace、day01→day30 严格顺序，采 8 次要开 8 份 workspace 且跑完状态各异、后续轮次不知接哪份。**GRPO 要求"多次采样可独立可丢弃"，我们的任务结构上违反这个前提**——这也解释了官方脚本本来就设 1，不是我们改小的
+- **反过来印证路径 ②**：MetaClaw 面对的正是同一种任务形态（连续、有持久 workspace、无法重复采样），它的解法就是放弃组内比较、改用批级基线。**这不是权宜之计，是同类任务下的合理设计**
+- **查清路径 ② 的可行性，结论是可行且比预想干净得多**：slime 自带 `--custom-reward-post-process-path` 钩子（`rollout.py:339-341`），在 `_post_process_rewards` 最顶部短路。**只要挂一个自定义函数就能实现批级基线，完全不用碰 `group_index`、不用改 `_drain_output_queue`**——之前担心的"共享 group_id 会互相覆盖"根本不会遇到。三个前提逐条核实：钩子拿到的是拍平后的完整一批（`rollout.py:253-256`）；可以保留 `--disable-rewards-normalization`（钩子不看这个标志，而关着它正好避开"单元素组被判常数组、整批丢弃"的陷阱）；`get_reward_value` 与我们写的 `{"score": ...}` 加官方 `--reward-key score` 对得上
+- **出方案待 CLI 在真实环境查证**（本地无法验证的 5 点：`load_function` 的路径格式与 modelfactory 上的放置位置、dummy 样本会不会污染批均值、真实到达钩子的样本数、std≈0 时全 0 advantage 是否可接受、与 `step_wise` estimator 是否冲突）
+- **记录了这一轮走过的弯路**：同一个问题被诊断了五次，前四次（中段脱钩已撤回 / 累计计数缺陷 / outcome 消融 / blend）**都在改 reward 的值，而问题出在 reward 到 advantage 的那一步**。`blend` 可能是多余的，默认关闭、回退成本低
+→ 详见 `metaclaw_migration_plan.md`"任务形态对照"+"方案（待 CLI 在真实环境查证）：批级基线"
+
+**产出：**
+- `docs/metaclaw_migration_plan.md`：新增任务形态对照、批级基线方案（含 5 个待查证点、实验设计、弯路记录）两节；两处标题日期更正

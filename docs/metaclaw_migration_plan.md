@@ -1303,7 +1303,7 @@ if max(vals) - min(vals) <= 1e-12:
 
 **执行顺序改为：先做路线 B，再视结果决定要不要做路线 A。**
 
-### 查证记录（七）：GRPO 的"组"到底是什么——我们用着 GRPO 估计器却一个组都没有（2026-08-31）
+### 查证记录（七）：GRPO 的"组"到底是什么——我们用着 GRPO 估计器却一个组都没有（2026-09-01）
 
 **这一节推翻了上一节"路线 B 才是对症的那个"这个判断。** 路线 B 已实现（`blend` 模式，commit `fa23472`），但查清 GRPO 分组机制后确认：**它只提供幅度差异，不产生正样本，对全负 batch 是缓解不是解药。**
 
@@ -1355,6 +1355,113 @@ def compute_advantages(batch: list[ConversationSample]) -> list[float]:
 已知的一个坑（**尚未查完**）：`_drain_output_queue` 是 `completed_groups[group_id] = group`，**共享 group_id 会让后来的样本覆盖先来的**，得先改成累加；还没查有没有别的地方假设了 `group_index` 唯一。
 
 **两条路径都要先查清可行性再选，不要先动手。**
+
+#### 任务形态对照：为什么 `n_samples_per_prompt=8` 在 toolcall-rl 可行、在我们这里不可行（2026-09-01）
+
+查了 `toolcall-rl/README.md`、`tool_sandbox.py::TOOL_CONFIGS`、`generate_with_retool.py::execute_predictions` 之后确认，**差别是结构性的，不是工程量问题**。
+
+toolcall-rl 的任务：**数学题 + Python 代码解释器**（基于 ReTool）。数据集 `DAPO-Math-17k`，一道题一个 prompt，标准答案是 `\boxed{}` 里的字符串；模型写代码 → 沙箱执行 → `<interpreter>结果</interpreter>` 回填上下文 → 继续推理 → 给答案。`max_turns: 16`、`max_tool_calls: 16`、工具只有一个 `code_interpreter`。
+
+| | toolcall-rl | 我们（MetaClaw-Bench） |
+|---|---|---|
+| 一次采样是什么 | 跑一遍代码解释器沙箱 | 真实 `openclaw agent` 跑一遍、**读写真实 workspace 文件** |
+| 采样之间的关系 | **完全独立**，沙箱用完即弃 | **同一天的 round 共享 workspace**，前一轮写的文件后一轮看得见 |
+| 重复采样 8 次 | 开 8 个沙箱并发，互不干扰 | 要开 8 份独立 workspace；**跑完状态各不相同，当天后续轮次不知道该接哪一份** |
+| 任务之间 | 每道数学题彼此独立 | **day01→day30 严格顺序**，后面的天依赖前面训出的权重（论文的在线学习假设） |
+| 正确答案 | 唯一的 `\boxed{}` 字符串 | checker 判 workspace 状态，且部分是累计跨轮次计数 |
+
+**核心矛盾**：GRPO 要求"同一 prompt 多次采样做相对比较"，这个前提要求**多次采样必须可独立、可丢弃**。数学题天然满足——8 次尝试互不影响，选谁都行。我们的任务**结构上违反这个前提**：round 不是"一道独立的题"，而是"30 天连续任务流里的一步"，它的产出（文件）就是下一步的输入。采样 8 次要么让 8 条时间线全部并行下去（成本 ×8 且发散成 8 个不同的"当天历史"），要么选一条丢掉 7 条——但被丢掉的 7 条正是 GRPO 需要的对照组，而选中的那条会把 workspace 定死。
+
+**结论：路径 ① 基本可以排除**——不是工程量大，是任务形态不支持。这也解释了官方 `openclaw-combine` 脚本本来就设成 1，不是我们改小的。
+
+**反过来，这让路径 ② 更有说服力**：MetaClaw 自己面对的就是同一种任务形态（30 天连续、有持久 workspace、无法重复采样），它给出的解法正是"放弃组内比较、改用批级基线"。**这不是权宜之计，是同类任务下的合理设计。**
+
+顺带补上"我们是不是在用缺半条腿的配置对标 Full 档"那个问题的一块：**我们不只缺 skill 通路，连 advantage 的算法都跟 MetaClaw 不一样**——它有批级基线，我们退化成了原始 reward。
+
+**关于已实现的 `blend`（路线 B）**：它照搬的是 **toolcall-rl** 的奖励合成方式（`base_score + coef × step_mean`）。但 toolcall-rl 之所以能靠这个工作，前提是它**同时**有 8 样本组内归一化；把它的奖励形态单独搬过来、却没有它的分组机制，等于只搬了一半。**若路径 ② 落地后证明 `blend` 是多余的或有干扰，应当回退**——它默认关闭（`METACLAW_MIDROUND_REWARD=judge`），回退成本只是删掉一个分支。
+
+### 方案（待 CLI 在真实环境查证，未实现）：批级基线，对齐 MetaClaw 的 `compute_advantages`（2026-09-01）
+
+**目标只有一个**：让 advantage 不再等于原始 reward，从而消除"全负 batch = 所有 token 一起被压、没有任何动作被强化"这个必然崩溃的结构。这是路径 ②。
+
+#### 为什么这个方案比预想的干净得多
+
+最初以为要"让同一批样本共享 `group_index` + 打开归一化"，并担心 `_drain_output_queue` 的 `completed_groups[group_id] = group` 会让共享 group_id 的样本互相覆盖。**查证后发现这条路根本不用走**——slime 自带一个正好合用的钩子：
+
+```python
+# slime/ray/rollout.py:339-341
+def _post_process_rewards(self, samples):
+    if self.custom_reward_post_process_func is not None:
+        return self.custom_reward_post_process_func(self.args, samples)   # 最顶部短路
+    ...默认的按 group_index 归一化...
+```
+
+由 `--custom-reward-post-process-path` 注册（`arguments.py:1342`）。调用点（`rollout.py:659`）：
+
+```python
+raw_rewards, rewards = self._post_process_rewards(samples)
+assert len(raw_rewards) == len(samples)
+train_data["rewards"] = rewards          # advantage 的来源
+train_data["raw_reward"] = raw_rewards   # 仅用于日志/指标
+```
+
+**所以只要挂一个自定义函数，就能直接实现批级基线——不碰 `group_index`、不碰队列、不碰任何现有补丁。** 之前担心的覆盖问题不会遇到。
+
+#### 三个前提已逐条核实
+
+1. **钩子拿到的 `samples` 是完整一批的扁平列表** —— `_get_rollout_data`（`rollout.py:253-256`）里 `while isinstance(data[0], list): data = list(itertools.chain.from_iterable(data))`，分组结构在进入转换前就被拍平，正是批级基线需要的粒度。
+2. **可以保留 `--disable-rewards-normalization`，两者不冲突** —— 自定义钩子在 `_post_process_rewards` 最顶部短路，根本不看 `rewards_normalization`；而 `_drop_constant_reward_groups` 的早退条件是 `if advantage_estimator not in ["grpo","gspo"] or not rewards_normalization: return samples`。**保持归一化关闭 → 不触发"每个单元素组都被判成常数组、整批被丢"的陷阱，同时仍能通过钩子拿到基线。**
+3. **reward 取值链路对得上** —— `Sample.get_reward_value` 是 `self.reward[args.reward_key]`，官方脚本设了 `--reward-key score`，我们提交时写的是 `sample.reward = {"score": float(eval_score)}`。
+
+#### 实现形态
+
+新增一个函数（放在 `scripts/metaclaw/` 下的新文件，不改任何现有文件）：
+
+```python
+def metaclaw_batch_baseline(args, samples):
+    """对齐 MetaClaw 自己的 metaclaw/data_formatter.py::compute_advantages。
+
+    返回 (raw_rewards, rewards)：raw 用于日志，rewards 用于算 advantage。
+    """
+    raw = [s.get_reward_value(args) for s in samples]
+    mean_r = sum(raw) / len(raw)
+    std_r = (sum((r - mean_r) ** 2 for r in raw) / len(raw)) ** 0.5
+    return raw, [(r - mean_r) / (std_r + 1e-8) for r in raw]
+```
+
+训练脚本加一行 `--custom-reward-post-process-path <该函数的导入路径>`。**改动量：一个新文件 + 一行参数。**
+
+#### 需要 CLI 在真实环境查证的点（本地无法验证）
+
+1. **`--custom-reward-post-process-path` 的路径格式** —— `load_function` 期望什么形式（`module.path:func` 还是 `module.path.func`？文件路径还是可导入模块名？），以及这个文件在 modelfactory 上要放在哪、`PYTHONPATH` 是否能解析到。
+2. **`samples` 里是否可能混入 dummy/removed 样本** —— 调用点之前有 `_drop_removed_samples`、`_make_dummy_samples`（`rollout.py:648-657`，当样本数不足 `dp_size` 时会注入 dummy）。**dummy 样本的 reward 会不会污染批均值**，需要确认；若会，函数里要排除 `metadata.get("dummy_removed_sample")`。
+3. **批大小是否足以支撑基线** —— `--rollout-batch-size 16`，但实际到达钩子的样本数会被 `disable_rollout_trim_samples`/`global_batch_size` 逻辑调整，真实每批多少个样本需要实测。**样本太少时批均值噪声会很大**。
+4. **std 接近 0 的退化情况** —— 若一批 reward 恰好全相同（例如全 -1），`std_r ≈ 0`，`(r-mean)/(0+1e-8)` 会得到 0/1e-8 = 0，结果是全 0 advantage（等于这批不训练）。**这是否是可接受的行为**，还是应该像 MetaClaw 那样保留、或加一个"全同批直接跳过"的显式分支，需要判断。
+5. **跟 `step_wise` advantage estimator 是否冲突** —— 官方脚本用的是 `--advantage-estimator grpo`，但 `_post_process_step_wise_rewards` 是另一条独立路径（`rollout.py:676`），确认我们不会同时踩到。
+
+#### 实验设计
+
+**先单独跑批级基线，不叠加 `blend`**（即 `METACLAW_MIDROUND_REWARD=judge` + 自定义钩子）。理由：这是最干净的对照——**只改 advantage 算法，reward 形态完全不变**，跟 K=6 那次 judge 模式唯一的差别就是基线。如果它有效，再考虑要不要叠加 `blend`。
+
+主判据：
+1. **`batch reward` 与正负样本数**——不再出现 `0/16`；advantage 有正有负
+2. **`grad_norm` 与 `policy drift`**——保持在 K=6 那次的量级（1.4-3.3 / 0.05-0.1），而不是冲到 2543.9 / 21.94
+3. Acc./Compl. 是次要参考
+
+**必须从干净 base 起步**（`20260831_154301` 的 checkpoint 已污染）。
+
+#### 这一轮走过的弯路（留作记录，避免重复）
+
+按时间顺序，这个问题被诊断了四次，前三次都不对或不完整：
+
+1. **"中段 step-judge 跟最终结果脱钩"** → 已撤回（2026-08-25），中段 +1 本身是合理的过程 shaping
+2. **"累计计数缺陷导致正确做法被判负"** → 是真实缺陷、已修（Phase 1），但**不是训崩的原因**
+3. **"中间步骤判官奖励长 thinking"→ 做 outcome 消融** → 实现了，但**一跑就发散**，因为它把唯一的正信号来源拿掉了
+4. **"改奖励合成形态"→ 做 `blend`** → 实现了，但查清 GRPO 分组后发现**它只给幅度差异、产生不了正样本**，对全负 batch 是缓解不是解药
+
+**真正的根因直到第五次才找到**：我们用着 GRPO 估计器却一个真正的组都没有，advantage 退化成原始 reward。**前四次都在改 reward 的值，而问题出在 reward 到 advantage 的那一步。**
+
+已实现但可能多余的东西：`blend` 模式（默认关闭，回退成本低）。Phase 1 的 diff 判定、硬负分优先级、规则 6 都是独立成立的真实修复，与本方案无关，保留。
 
 #### 三个方案的重新排序
 
