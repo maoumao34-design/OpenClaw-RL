@@ -1787,3 +1787,17 @@
 
 **产出：**
 - `docs/metaclaw_migration_plan.md`：新增任务形态对照、批级基线方案（含 5 个待查证点、实验设计、弯路记录）两节；两处标题日期更正
+
+**完成内容（续，同一天）——CLI 环境查证回来，实现批级基线：**
+- **CLI 五点查证全部有结论，其中三点我本地源码复核过**：① `load_function` 是 `rpartition(".")` 点分路径（同脚本里 `--custom-loss-function-path openclaw_topk_select_loss.xxx` 就是同款先例）；② dummy 确实污染——`_make_dummy_samples` 在 `_post_process_rewards` 之前注入、reward=0.0，**补充一点 CLI 没提：dummy 自己 `loss_mask=[0]` 不产生梯度，危害是它的 0.0 把批均值拉偏、扭曲真实样本的 advantage**；⑤ 与 `step_wise` 无冲突。③ batch 稳定 16、④ std≈0 可接受，采纳 CLI 判断
+- **CLI 更正主判据是对的，我原来那条是明确错误**："batch reward 不再出现 0/16" 站不住——批级基线根本不改 reward、只改 advantage
+- **但不同意 CLI 的实验设计**（它建议先跑 judge+基线当对照）：judge 模式本来就没发散（K=6 grad_norm 1.4-3.3 正常），基线的核心机制是抢救全负 batch，在不出现全负 batch 的模式里跑等于不触发。更根本的一条：**二值奖励下批中心化在同号样本间不产生任何区分度**——所有 +1 拿同一个正 advantage（69% 为 +1 时：`+1→+0.67`、`-1→-1.49`，效果是稀有负样本被放大 2.2 倍，但不区分 +1 里哪个是长 thinking）。**改为直接跑 `outcome` + 基线**
+- **已实现**：`prepare_patched_openclaw_combine.sh` 额外生成独立模块 `metaclaw_batch_baseline.py` 到 `DEST_DIR`（= `PATCHED_COMBINE_DIR`，已在 PYTHONPATH 上）；`run_openclaw_topk_select_modelfactory.sh` 在 `METACLAW_MIGRATION_PROFILE=1` 分支注入 `--custom-reward-post-process-path`，带幂等判断和失败即报错。**只影响 MetaClaw 迁移场景**。`--disable-rewards-normalization` 保持不变且注释写明原因，避免以后被"顺手清理"
+- **验证**：两脚本 `bash -n` 通过；补丁链跑通、模块正确生成；注入位置落在 `TOPK_SELECT_ARGS` 数组内紧邻 `--advantage-estimator grpo`、注入后语法正确。18 项断言覆盖全 -1 批→advantage 全 0、混合批产生正负、多数为正时稀有负样本幅度更大、dummy 不影响真实样本 advantage、`remove_sample` 无 metadata 时也排除、单样本/全 dummy 不崩、**连续 reward 能在同号内产生区分度而二值不能**、slime 的返回长度契约
+- **按用户要求不保留可选对照**（不加 judge+基线的开关，模式切换本来就是现成的环境变量）。**`blend` 暂时保留但理由是实测出来的**：批级基线只有在 reward 连续时才能在同号样本间产生区分度，而 `blend` 是唯一的连续来源，两者互补——但**不要同时跑**，无法归因
+→ 详见 `metaclaw_migration_plan.md`"CLI 真实环境查证结果 + 本地复核"与"已实现（2026-09-01）"
+
+**产出（续）：**
+- `scripts/prepare_patched_openclaw_combine.sh`：生成 `metaclaw_batch_baseline.py`
+- `scripts/run_openclaw_topk_select_modelfactory.sh`：注入 `--custom-reward-post-process-path`
+- `docs/metaclaw_migration_plan.md`：查证结果、已实现、实验设计三节

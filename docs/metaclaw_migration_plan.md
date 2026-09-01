@@ -1431,7 +1431,38 @@ def metaclaw_batch_baseline(args, samples):
 
 训练脚本加一行 `--custom-reward-post-process-path <该函数的导入路径>`。**改动量：一个新文件 + 一行参数。**
 
-#### 需要 CLI 在真实环境查证的点（本地无法验证）
+#### CLI 真实环境查证结果 + 本地复核（2026-09-01）
+
+五点全部有结论，其中三点我在本地源码复核过：
+
+| # | 问题 | 结论 | 谁验证的 |
+|---|---|---|---|
+| 1 | `load_function` 路径格式 | **点分路径**（`path.rpartition(".")` + `importlib.import_module`），不是 `module:func` | **本地复核确认**；同脚本里 `--custom-loss-function-path openclaw_topk_select_loss.openclaw_topk_select_loss_function` 就是同款先例 |
+| 2 | dummy 是否污染均值 | **会**。`_make_dummy_samples` 在 `_post_process_rewards` 之前注入（`rollout.py:648-659`），reward=0.0 | **本地复核确认**。补充：dummy 自己 `loss_mask=[0]` 不产生梯度，危害是**它的 0.0 把批均值拉偏、扭曲真实样本的 advantage**；又因 `_drop_removed_samples` 先跑，此刻 `remove_sample=True` 的只剩 dummy |
+| 3 | 真实 batch 大小 | 稳定 16，噪声可接受；`ACTOR_GPUS=4 + TP=4 → dp_size=1`，真实 run 几乎不会出现 dummy（但排除逻辑仍要写） | CLI（需日志） |
+| 4 | std≈0 | 可接受且优于全压：advantage 全 0 = 这批不更新。MetaClaw 同款。**建议打 warning 而不是另开分支** | CLI 判断，采纳 |
+| 5 | 与 `step_wise` 冲突 | 无冲突，训练用 `--advantage-estimator grpo` | **本地复核确认** |
+
+**CLI 的主判据更正是对的，而且我原来那条是明确的错误**：我写的"batch reward 不再出现 0/16"站不住——**批级基线根本不改 reward，只改 advantage**，日志里的 `0/16` 照旧。
+
+**但我不同意 CLI 的实验设计推荐**（它建议先跑 `judge` + 基线作为"干净对照"），有两条理由：
+
+1. **judge 模式本来就没发散**。K=6 那次 `grad_norm` 1.4-3.3、drift 0.05-0.1 一切正常，发散只发生在 outcome 模式。而基线的核心机制恰恰是抢救全负 batch，在几乎不会出现全负 batch 的模式里跑它，**这个机制大概率一次都不触发**。
+2. **二值奖励下，批中心化在同号样本之间不产生任何区分度**——这一条比 CLI 讲的"测不到 thinking 膨胀"更根本。中心化只移动零点、缩放幅度，**所有 +1 拿到同一个正 advantage**。举例 69% 为 +1 时：mean=0.38、std≈0.925 → `+1 → +0.67`、`-1 → -1.49`，效果是**稀有的负样本被放大到正样本的 2.2 倍**（标准的基线行为，强调意外结果），但不会区分 +1 里哪个是长 thinking。
+
+**因此改为直接跑 `outcome` + 批级基线**：那才是真正发散过的配置，基线的抢救机制会被真实触发，而且能干净回答"advantage 退化是不是 outcome 崩盘的主因"。
+
+#### 已实现（2026-09-01，本地验证通过，真实训练未验证）
+
+- **`prepare_patched_openclaw_combine.sh`**：额外生成一个独立模块 `metaclaw_batch_baseline.py` 到 `DEST_DIR`。之所以是独立模块而不是打补丁进官方文件——slime 是按 import 路径加载它的，而且它替换的是整个函数而非编辑某一行。`DEST_DIR` 就是 `PATCHED_COMBINE_DIR`，已被训练启动脚本前置到 `PYTHONPATH`，所以导入路径就是 `metaclaw_batch_baseline.metaclaw_batch_baseline`。
+- **`run_openclaw_topk_select_modelfactory.sh`**：`METACLAW_MIGRATION_PROFILE=1` 分支里注入 `--custom-reward-post-process-path`，带幂等判断（`grep -q` 避免重复注入）和失败即报错。**只在 MetaClaw 迁移场景加，Personal Agent Track 不受影响**——那边的 reward 分布没有"通过率 17%、整批同号"这个问题。
+- **`--disable-rewards-normalization` 保持不变，不要去掉**（注释里写明了原因，避免以后被人"顺手清理"）。
+
+**验证**：两个脚本 `bash -n` 通过；补丁链对真实官方源码跑通、模块正确生成；注入后的脚本语法正确且位置落在 `TOPK_SELECT_ARGS` 数组内、紧邻 `--advantage-estimator grpo`。18 项断言覆盖：全 -1 批 → advantage 全 0（不再是全压）、3/13 混合批产生正负两号、多数为正时稀有负样本幅度更大、dummy 拿零 advantage 且**不影响真实样本的 advantage**、`remove_sample` 无 metadata 标记时也被排除、单样本/全 dummy 批不崩、**连续 reward（blend）能在同号内产生区分度而二值不能**（把上面那条限制变成可执行的断言）、以及 slime 会 assert 的返回长度契约。
+
+**`blend` 的去留**：暂时保留，理由不是"留着以防万一"，而是上面那条实测——**批级基线只有在 reward 连续时才能在同号样本间产生区分度，而 `blend` 是唯一的连续来源**。两者是互补的，但**不要同时跑**（无法归因）。等批级基线单独跑出结果，再决定要不要叠加或删除。
+
+#### 原始待查证清单（已全部有结论，保留供追溯）
 
 1. **`--custom-reward-post-process-path` 的路径格式** —— `load_function` 期望什么形式（`module.path:func` 还是 `module.path.func`？文件路径还是可导入模块名？），以及这个文件在 modelfactory 上要放在哪、`PYTHONPATH` 是否能解析到。
 2. **`samples` 里是否可能混入 dummy/removed 样本** —— 调用点之前有 `_drop_removed_samples`、`_make_dummy_samples`（`rollout.py:648-657`，当样本数不足 `dp_size` 时会注入 dummy）。**dummy 样本的 reward 会不会污染批均值**，需要确认；若会，函数里要排除 `metadata.get("dummy_removed_sample")`。
@@ -1441,11 +1472,11 @@ def metaclaw_batch_baseline(args, samples):
 
 #### 实验设计
 
-**先单独跑批级基线，不叠加 `blend`**（即 `METACLAW_MIDROUND_REWARD=judge` + 自定义钩子）。理由：这是最干净的对照——**只改 advantage 算法，reward 形态完全不变**，跟 K=6 那次 judge 模式唯一的差别就是基线。如果它有效，再考虑要不要叠加 `blend`。
+**跑 `METACLAW_MIDROUND_REWARD=outcome` + 批级基线，不叠加 `blend`。** 选 `outcome` 而不是 `judge` 的理由见上面对 CLI 实验设计的异议：只有 `outcome` 是真正发散过的配置，基线的抢救机制才会被触发。
 
-主判据：
-1. **`batch reward` 与正负样本数**——不再出现 `0/16`；advantage 有正有负
-2. **`grad_norm` 与 `policy drift`**——保持在 K=6 那次的量级（1.4-3.3 / 0.05-0.1），而不是冲到 2543.9 / 21.94
+**主判据（reward 侧的计数不会变，别盯它）**：
+1. **`[metaclaw-batch-baseline]` 日志行**——这是基线是否生效的唯一直接证据：`reward_mean`/`reward_std`、advantage 的 `min/max/pos/neg`。全 0 方差时会打 warning
+2. **`grad_norm` 与 `train_rollout_logprob_abs_diff`**——对照 K=6 的 1.4-3.3 / 0.05-0.1，而不是 outcome 那次的 2543.9 / 21.94
 3. Acc./Compl. 是次要参考
 
 **必须从干净 base 起步**（`20260831_154301` 的 checkpoint 已污染）。

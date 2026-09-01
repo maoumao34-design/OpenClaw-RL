@@ -98,10 +98,135 @@ fi
 mkdir -p "${DEST_DIR}"
 
 python3 - "${SRC}" "${DEST}" <<'PY'
+import os
 import sys
 
 src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(src_path, encoding="utf-8").read()
+
+# ---------------------------------------------------------------------
+# Source of the batch-baseline reward post-processor, written out verbatim
+# below. Kept as a literal here (rather than a checked-in .py under
+# scripts/) so the whole proxy-side toolchain stays in one place and the
+# file lands in DEST_DIR, which is already on the training process's
+# PYTHONPATH.
+# ---------------------------------------------------------------------
+BATCH_BASELINE_SRC = '''"""Batch-level advantage baseline for the MetaClaw migration.
+
+Registered via slime's --custom-reward-post-process-path, which short-circuits
+at the top of RolloutManager._post_process_rewards. Returns (raw_rewards,
+rewards); `rewards` is what becomes the advantage, `raw_rewards` is only
+logged.
+
+Why this exists
+---------------
+slime's get_grpo_returns broadcasts a sample's scalar reward across all of its
+tokens, and GRPO's own normalization works per group_index. Our proxy assigns
+every sample its own group_index and the training script sets
+--n-samples-per-prompt 1, so each group holds exactly one sample and
+normalizing it is identically zero -- which is why
+--disable-rewards-normalization is mandatory here rather than a tunable. The
+consequence is that the advantage degenerates into the raw reward: a batch
+where every sample is -1 pushes down every token the model just produced with
+nothing pushed up, which is how metaclaw_migration_20260831_154301 diverged
+(grad_norm 2543.9, policy drift 21.94).
+
+Raising --n-samples-per-prompt the way toolcall-rl does (8 attempts at one
+math problem, normalized within the group) is not available to us: one sample
+here means running the real agent against a real workspace that later rounds
+read from, in a strict day01->day30 order, so eight samples would need eight
+workspaces with no principled way to choose which one the day continues from.
+
+MetaClaw itself faces exactly this task shape and answers it with a batch
+baseline instead of within-group comparison -- metaclaw/data_formatter.py::
+compute_advantages centres and scales over the whole batch. This module is
+that, applied through slime's hook. It touches neither group_index nor the
+output queue.
+
+What it does and does not fix
+-----------------------------
+It removes the "all-negative batch means uniform suppression" failure mode: an
+all-identical batch now yields zero advantage (that batch simply does not
+update) instead of pushing everything down. It does NOT discriminate within a
+sign when rewards are binary -- centring +-1 moves the zero point and rescales,
+but every +1 still receives the same positive advantage. Rewards would have to
+be continuous for that.
+"""
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def _is_dummy(sample):
+    """slime injects placeholder samples when a batch is smaller than dp_size.
+
+    They carry reward 0.0 and loss_mask [0], so they never contribute gradient
+    themselves -- but left in the statistics their zeros drag the batch mean
+    and distort every real sample's advantage. _drop_removed_samples has
+    already run by this point, so remove_sample can only be true for these.
+    """
+    meta = getattr(sample, "metadata", None) or {}
+    return bool(meta.get("dummy_removed_sample")) or bool(
+        getattr(sample, "remove_sample", False)
+    )
+
+
+def metaclaw_batch_baseline(args, samples, **kwargs):
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    real_indices = [i for i, s in enumerate(samples) if not _is_dummy(s)]
+
+    if len(real_indices) < 2:
+        logger.warning(
+            "[metaclaw-batch-baseline] only %d real sample(s) in a batch of %d -- "
+            "no baseline can be formed, emitting zero advantage (this batch will "
+            "not update the policy)",
+            len(real_indices),
+            len(samples),
+        )
+        return raw_rewards, [0.0] * len(raw_rewards)
+
+    values = [raw_rewards[i] for i in real_indices]
+    mean_r = sum(values) / len(values)
+    std_r = (sum((v - mean_r) ** 2 for v in values) / len(values)) ** 0.5
+
+    advantages = [0.0] * len(raw_rewards)
+    for i in real_indices:
+        advantages[i] = (raw_rewards[i] - mean_r) / (std_r + 1e-8)
+
+    # Observability is not optional here: the baseline changes the advantage
+    # only, never the reward, so the reward-side counters this run is compared
+    # against (batch reward, +/- sample counts) look identical whether or not
+    # this function is doing anything. These lines are the only evidence that
+    # it ran and had an effect.
+    real_advs = [advantages[i] for i in real_indices]
+    n_pos = sum(1 for a in real_advs if a > 0)
+    n_neg = sum(1 for a in real_advs if a < 0)
+    if std_r <= 1e-8:
+        logger.warning(
+            "[metaclaw-batch-baseline] batch of %d real sample(s) has zero reward "
+            "variance (all %.3f) -- advantage is all zero, this batch will not "
+            "update the policy. That is the intended degenerate case: previously "
+            "such a batch suppressed every token uniformly.",
+            len(real_indices),
+            mean_r,
+        )
+    else:
+        logger.info(
+            "[metaclaw-batch-baseline] n_real=%d/%d reward_mean=%.4f reward_std=%.4f "
+            "-> advantage min=%.4f max=%.4f pos=%d neg=%d",
+            len(real_indices),
+            len(samples),
+            mean_r,
+            std_r,
+            min(real_advs),
+            max(real_advs),
+            n_pos,
+            n_neg,
+        )
+
+    return raw_rewards, advantages
+'''
 
 # ---------------------------------------------------------------------
 # openclaw-rl-metaclaw-midround-reward (2026-08-31, temporary, safe to
@@ -685,6 +810,23 @@ text = text.replace(midround_postloop_old, midround_postloop_new, 1)
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override/metaclaw_training_frozen turns, gates both OPD and RL submission paths) -> {dest_path}")
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-batch-baseline (2026-09-01, temporary, safe to
+# remove) -- see docs/metaclaw_migration_plan.md "方案：批级基线，对齐
+# MetaClaw 的 compute_advantages".
+#
+# Emitted as a SEPARATE module (not a patch into the official file) because
+# slime loads it by import path via --custom-reward-post-process-path, and
+# because it replaces a whole function rather than editing one. Written into
+# DEST_DIR, which the training launcher already prepends to PYTHONPATH
+# (run_openclaw_topk_select_modelfactory.sh's PATCHED_COMBINE_DIR), so the
+# import path is simply `metaclaw_batch_baseline.metaclaw_batch_baseline`.
+# ---------------------------------------------------------------------
+baseline_path = os.path.join(os.path.dirname(dest_path), "metaclaw_batch_baseline.py")
+with open(baseline_path, "w", encoding="utf-8") as f:
+    f.write(BATCH_BASELINE_SRC)
+print(f"wrote batch-baseline reward post-processor -> {baseline_path}")
 PY
 
 echo "已生成 openclaw_combine_api_server.py 补丁: ${DEST_DIR}/openclaw_combine_api_server.py（_maybe_submit_ready_samples 拦截 is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override，OPD+RL 两条提交路径一起挡住，见 docs/issues_log.md 2026-08-13 条目）"
