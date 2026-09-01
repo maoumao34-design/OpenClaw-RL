@@ -1303,6 +1303,70 @@ if max(vals) - min(vals) <= 1e-12:
 
 **执行顺序改为：先做路线 B，再视结果决定要不要做路线 A。**
 
+### 查证记录（七）：GRPO 的"组"到底是什么——我们用着 GRPO 估计器却一个组都没有（2026-08-31）
+
+**这一节推翻了上一节"路线 B 才是对症的那个"这个判断。** 路线 B 已实现（`blend` 模式，commit `fa23472`），但查清 GRPO 分组机制后确认：**它只提供幅度差异，不产生正样本，对全负 batch 是缓解不是解药。**
+
+**slime 标准数据路径里，"组"是同一 prompt 的多次采样**（`slime/rollout/data_source.py:102-111`）：
+
+```python
+for prompt_sample in prompt_samples:
+    group = []
+    for _ in range(self.args.n_samples_per_prompt):
+        sample = copy.deepcopy(prompt_sample)          # 同一个 prompt
+        sample.group_index = self.sample_group_index   # 同一个 group_index
+        group.append(sample)
+    self.sample_group_index += 1                       # 换下一道题才换组
+```
+
+**三方的分组方式对照（全部读源码确认）**：
+
+| | 组是什么 | 配置 | 全负 batch 会怎样 |
+|---|---|---|---|
+| **toolcall-rl** | 同一道题独立采样 8 次 | `--n-samples-per-prompt 8`，`--rollout-batch-size 32`，`grpo` | 组内 8 次有对有错 → 减组均值后必有正负；全同的组被 `_drop_constant_reward_groups` 整组丢弃 |
+| **MetaClaw** | **没有组**，整批一起归一化 | 自己的 `compute_advantages` | **减批均值后必有正负，问题结构性不存在** |
+| **我们** | **每个样本自成一组** | `--n-samples-per-prompt 1` + `--disable-rewards-normalization` | **advantage = 原始 reward，全负 = 所有 token 一起被压，无任何强化** |
+
+**MetaClaw 的实现**（`metaclaw/data_formatter.py:217-230`）：
+
+```python
+def compute_advantages(batch: list[ConversationSample]) -> list[float]:
+    """Centre-and-scale rewards within the batch (GRPO style: (r - mean) / (std + eps))."""
+    rewards = [s.reward for s in batch]
+    mean_r = sum(rewards) / len(rewards)
+    std_r = (sum((r - mean_r) ** 2 for r in rewards) / len(rewards)) ** 0.5
+    return [(r - mean_r) / (std_r + 1e-8) for r in rewards]
+```
+
+注释自称 "GRPO style"，但严格说这是**批级基线**（REINFORCE with baseline）——GRPO 要求组内是同一 prompt 的多次采样，这里是不同任务的样本混在一起归一化。**但正因如此，它对"整批都是负 reward"免疫**：减去批均值后，比均值好的样本必然拿到正 advantage。
+
+**结论：我们是三者里唯一会崩的配置——用着 GRPO 的估计器，却一个真正的组都没有。** `--n-samples-per-prompt 1` 不是随便设的：我们的"一次采样"是真实 agent 跑一遍、会改真实 workspace，要采 8 次就得开 8 份独立 workspace，而且 8 次跑完状态各不相同，当天后续轮次不知道该接哪一份。这是真实的架构障碍。
+
+#### 两条候选路径（待查清后选择，均未实现）
+
+**路径 ①：学 toolcall-rl —— `n_samples_per_prompt > 1`**
+
+要解决"8 份 workspace 并行 + 之后接哪一份"的架构问题。**初步判断代价过大、可能不现实**，但尚未正式评估过，先记下不排除。
+
+**路径 ②：学 MetaClaw —— 批级基线**
+
+让同一批样本共享 `group_index`，再打开归一化，等价于减批均值。**对我们架构改动最小，且有官方先例**（MetaClaw 自己就这么做，而我们本来就是在迁移 MetaClaw 的场景）。
+
+已知的一个坑（**尚未查完**）：`_drain_output_queue` 是 `completed_groups[group_id] = group`，**共享 group_id 会让后来的样本覆盖先来的**，得先改成累加；还没查有没有别的地方假设了 `group_index` 唯一。
+
+**两条路径都要先查清可行性再选，不要先动手。**
+
+#### 三个方案的重新排序
+
+| 方案 | 能否产生正样本 | 状态 |
+|---|---|---|
+| 路径 ②（批级基线） | **能**（减批均值后必有正负） | 待查证可行性 |
+| 路径 ①（多次采样） | 能（组内有对有错） | 架构障碍大，待评估 |
+| 路线 A（轨迹级样本） | 不能，只降低负样本数量 | 未实现 |
+| 路线 B（`blend`，已实现） | **不能**，只提供幅度差异 | 已实现，单独跑大概率仍会崩 |
+
+**`blend` 保留价值**：它做的是相对塑形（让模型知道哪些步骤"没那么糟"），跟基线方案正交，可以叠加使用；但**不应指望它单独解决全负 batch**。
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

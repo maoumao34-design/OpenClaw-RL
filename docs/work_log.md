@@ -1761,3 +1761,10 @@
 **产出（续二）：**
 - `scripts/prepare_patched_openclaw_combine.sh`：`blend` 模式 + `_metaclaw_blend_reward` + 两个系数
 - `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：两个系数的默认值、传参、日志、manifest
+
+**完成内容（续五，同一天）——查清 GRPO 的"组"机制，推翻了刚做完的路线 B 的定位：**
+- **查清三方分组方式（全部读源码）**：slime 标准路径里"组"= 同一 prompt 的多次采样（`data_source.py:102-111`，同 prompt 复制 N 份、共享 `group_index`）。**toolcall-rl** 用 `--n-samples-per-prompt 8`——同一道题独立采 8 次，组内有对有错，减组均值后必有正负，全同的组被 `_drop_constant_reward_groups` 整组丢弃。**MetaClaw** 没有组概念，`data_formatter.py::compute_advantages` 直接对**整批**做 `(r - mean) / (std + eps)`——注释自称 "GRPO style" 但严格说是批级基线，**正因如此对"整批全负"免疫**
+- **我们是三者里唯一会崩的配置**：`--n-samples-per-prompt 1` + 每样本自成一组 → **用着 GRPO 估计器却一个真正的组都没有**，advantage 退化成原始 reward。而 `n_samples_per_prompt=1` 不是随便设的——我们一次采样是真实 agent 跑一遍会改 workspace，采 8 次要开 8 份独立 workspace 且不知道后续轮次接哪份，是真实架构障碍
+- **这推翻了上一条记录里"路线 B 才是对症的"这个判断**：blend 只提供幅度差异（-1.3/-1.0/-0.7），**在失败 round 里一个正样本都产生不了**，而崩溃的直接形态是 `0/16 正样本`。blend 是相对塑形、跟基线方案正交可叠加，但不应指望它单独解决问题
+- **记下两条待查证路径**：① 学 toolcall-rl 提高 `n_samples_per_prompt`（架构障碍大，初步判断不现实但未正式评估）；② 学 MetaClaw 做批级基线（改动最小且有官方先例，已知坑是 `_drain_output_queue` 的 `completed_groups[group_id] = group` 会让共享 group_id 的样本互相覆盖，需先改成累加，且还没查有没有别处假设 `group_index` 唯一）。**两条都要先查清可行性再选，不先动手**
+→ 详见 `metaclaw_migration_plan.md`"查证记录（七）：GRPO 的'组'到底是什么"
