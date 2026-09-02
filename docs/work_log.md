@@ -36,37 +36,37 @@
 
 ---
 
-## 当前状态（2026-09-01）
+## 当前状态（2026-09-02）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变）；[x] **硬负分优先级 + 结构性无效工具调用检测（规则 6）已修复**（commit `2944f87`）；[x] **outcome 消融训崩的根因已查清并在源码层面确认**（全负 batch + advantage 退化成原始 reward）；[x] **真正的根因已定位到"用着 GRPO 估计器却一个真正的组都没有"**，`toolcall-rl`/MetaClaw 的分组方式与任务形态已逐字查证；[x] **批级基线方案已出，可行性已在源码层面查证**（slime 自带 `--custom-reward-post-process-path` 钩子，不用碰 `group_index`/队列），**待 CLI 在真实环境查证 5 个点后实现**。
+**MetaClaw 迁移**：同 09-01（历史状态），另加：[x] **目标已重设为"跑满 30 天、总分高于只训到 day6"**，判据随之改为"整体持续变好、绝不训坏"，而不是每一批信号都更对；[x] **两次失败已归结为同一个病**——二值 reward 区分不了"答对且简洁"和"答对但啰嗦"，而 `loss_mask` 覆盖整段 response（含 `<think>`）；[x] **`blend` 已删除**（实测它会让全失败 round 里被判官认可的那一步拿到 +1.121 的正 advantage，摧毁"全负批不更新"这条安全性质）；[x] **长度感知的正奖励已实现**（只对 reward>0 生效、按响应 token、覆盖所有模式的所有正样本、负样本一律平坦 -1）；[x] **批级基线已改成只减均值不除 std**（`|adv| ≤ 2`，1 正 15 负从 3.873 降到 1.875）；[x] **41 项断言全部通过、双向非空洞性已验证**。
 
 ### 已知限制 / 未解决
-同 08-26（历史状态），另加：**`20260831_154301` 的 checkpoint 已污染，不能作为后续训练起点**。**批级基线方案尚未实现，也未经真实环境查证**——5 个待查点见迁移文档。**`blend` 模式可能是多余的**：它照搬 toolcall-rl 的奖励合成，但 toolcall-rl 能靠它工作的前提是同时有 8 样本组内归一化，我们只搬了一半；默认关闭、回退成本低，视批级基线结果决定去留。**路线 A（轨迹级样本）仍未实现**，且它也只降低负样本数量、不产生正样本。**day11-15 的 FC 全 0 是能力墙**（K=6 冻结模型同样 0），跟训练信号无关。
+同 09-01（历史状态），另加：**`20260902_094458` 的 checkpoint 已污染**（day06-r8 thinking 已到 120945），跟 `20260831_154301` 一样不能作为起点，下一次必须从干净 base 起步。**round 轮数没有上限**——day06-r7 空转 186 轮是那次崩溃的起点，杠杆（driver 的 `round_timeout` / 代理侧按 `_turn_counts` 拒绝）副作用未查清，**本轮刻意没动**。**退化熔断尚无指标与阈值依据，同样没做**。`L0=6000` 的代价是明确接受的：一次健康但偏长的 9k 成功会拿 0.73 而不是 1.0。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**等 CLI 在真实环境查证批级基线方案的 5 个点**，通过后实现并跑一轮。**先单独跑批级基线、不叠加 `blend`**（`METACLAW_MIDROUND_REWARD=judge` + 自定义钩子）——这是最干净的对照，只改 advantage 算法、reward 形态完全不变，跟 K=6 那次 judge 模式唯一差别就是基线。主判据是 `batch reward` 不再出现 `0/16`、`grad_norm`/`policy drift` 保持在 K=6 量级，**不是 Acc**。**必须从干净 base 起步。**
-3. 其余同 08-17
+2. **MetaClaw 迁移**：**跑一轮"复现 `20260827_163030` 的 judge 配置 + 批级基线 + 两项防训坏补丁"**，不用 outcome、不用 blend，**从干净 base 起步**。判据：① day17 不再出现 18k→115k 的 thinking 断崖；② day16-22 的 MC 格式失败率明显低于 17/26；③ Acc. 可以低于只训到 day6 那次，但不能出现 day20-22 归零式崩塌；④ 全负批 advantage 全 0、不再出现约 3.87 的稀有正样本放大；⑤ `[metaclaw-batch-baseline]` 与 `[openclaw-rl-metaclaw-length-aware-success]` 两类日志行必须真的出现（**reward 侧计数不会变，别盯它**）
+3. 跑完之后再谈轮数上限和退化熔断——两者都需要先拿到这一轮的日志才有依据
+4. 其余同 08-17
 
 ### 未验证
-- [ ] **批级基线方案的 5 个真实环境问题**——`load_function` 的路径格式与 modelfactory 上的放置位置、dummy 样本会不会污染批均值、真实到达钩子的样本数、std≈0 时全 0 advantage 是否可接受、与 `step_wise` estimator 是否冲突
-- [ ] **批级基线能否真的阻止发散**——源码层面确认了 advantage 会被中心化（必有正负），但真实训练里够不够稳定未知
-- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——原来的消融设计已被证明会因全负 batch 而发散，**这个问题至今没有被干净地回答过**；要等训练能稳定跑起来之后才谈得上重新验证
-- [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全（逐轮 `response_logprobs` 都存着），但未实测；`rollout_log_probs`/`teacher_log_probs` 都按 `response_length` 严格切片，对不齐就是硬错误
-- [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，但训练效果层面未回答
+- [ ] **长度感知正奖励在真实训练里的效果**——41 项本地断言只证明算术和边界正确，"它能否真的挡住 thinking 膨胀"要真实训练回答
+- [ ] **`L0=6000`/`L1=16000` 这两个阈值是否合适**——取自 K=6 与 `20260827` 的正样本长度分布（p90 5.3k vs 6.9k），是有依据的估计，不是实测最优
+- [ ] **只减均值的批级基线能否真的阻止发散**——去掉了放大器，但"够不够稳"未知
+- [ ] **两项改动叠加后会不会把正信号压得太弱**——长度打折 + 批中心化都在缩小正 advantage，有没有过度未知
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——至今没有被干净地回答过（承接 09-01）
+- [ ] **round 轮数上限的两个候选杠杆各自的副作用**——`round_timeout` 与代理侧按 `_turn_counts` 拒绝，都没查
+- [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全但未实测（承接 09-01）
+- [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，训练效果层面未回答
 - [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
-- [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
-- [ ] **`done.log` 非追加场景真实触发率**——监控日志已埋点（`_compute_training_verdict` 里 `logger.warning`），只能等真实训练跑起来后观察
-- [ ] **`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响**——本地未测过实际耗时，CLI 判断"可忽略"是基于全量 398 段无写操作迹象的静态扫描，不是真实计时
-- [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**——下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"且题目最终计分成功
-- [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前的 Frozen 窗口评测走的是训练自己的 harness，跟官方 bench 不完全同构
-- [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%、Acc. 相对**新基线（17.8%）**有没有提升——`--agent` 修复的核心验证点，注意不要再拿旧的 8.1% 做对比
-- [ ] `METACLAW_TRAIN_UNTIL_DAY` 设置为具体 K 值时，冻结是否真的生效（`[metaclaw-freeze]` 日志、样本提交数骤降为 0）、dayK 尾部竞态实际丢弃规模
-- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
-- [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
-- 其余同 08-19（历史状态，见上）
+- [ ] **`done.log` 非追加场景真实触发率**——监控已埋点，等真实训练观察
+- [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**
+- [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前走的是训练自己的 harness
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾（承接 08-18，仍未解开）
+- [ ] 官方 MetaClaw Compl. 非零的真实原因——开放问题，不阻塞
+- 其余同 09-01（历史状态，见 [`status_history.md`](status_history.md)）
 
 ---
 
@@ -1801,3 +1801,30 @@
 - `scripts/prepare_patched_openclaw_combine.sh`：生成 `metaclaw_batch_baseline.py`
 - `scripts/run_openclaw_topk_select_modelfactory.sh`：注入 `--custom-reward-post-process-path`
 - `docs/metaclaw_migration_plan.md`：查证结果、已实现、实验设计三节
+
+## 2026-09-02
+
+**目标：** 目标重设为"跑满 30 天且不训坏"之后，删掉 `blend`、把二值奖励里缺失的"简洁度"这一维补上、并去掉批级基线里的放大器。
+
+**完成内容：**
+- **目标重设，判据跟着变**：此前每一轮改动的隐含目标都是"让这一批的训练信号更对"；现在的目标是**跑满 30 天、总分高于只训到 day6**。"有效"是相对于"只训到 day6"说的——后面天数客观更难、效果变差可以接受，**真正的要求是不能因此把模型训坏**。这直接推翻了我上一轮的一条判断：当时把"44% 的批次 advantage 全 0"当缺陷报了出来，**按新目标看，全负批→advantage 全 0 恰恰是想要的安全性质**，从此是硬约束
+- **两次失败归结为同一个病**：`20260827_163030`（judge）是判官持续认可越来越长的 thinking → day17 thinking 18k→115k → 吐不出收尾的 `oxed{}` → MC 格式失败 17/26；`20260902_094458`（outcome+基线）是 day06-r7 空转 186 轮 → flush 倒出 186 个 `-1` → 该批 1 正 15 负 → 基线（当时还除 std）给那个 `response_len=10273` 的**啰嗦的成功** 3.873 → step 8 `grad_norm=3.69` → day06-r8 thinking 到 120945。**共同点：二值 reward 区分不了"答对且简洁"和"答对但啰嗦"，而 `loss_mask` 覆盖整段 response（含 `<think>`）**
+- **删除 `blend`**（用户此前已要求，本轮落实）。删除理由是实测出来的、不是"用不上"：连续化同时作用在负样本上，一个**整轮全失败**的 round 也有了 reward 方差（-1.3/-1.0/-0.7），基线随即为它算出真实 advantage，被判官认可的那一步拿到 **+1.121**——从彻底失败的轨迹里正向强化了一步。它摧毁的正是上面那条硬约束。**这条推理已写成可执行断言留在测试里**，防止以后有人重新引入
+- **新增长度感知的正奖励** `_metaclaw_length_aware_reward`：`score = reward × (1 - 0.9 × clip((L-L0)/(L1-L0),0,1))`，`L0=6000`、`L1=16000`、地板 0.1。几处刻意的取舍：**只对 `reward>0` 生效、负样本一律平坦 -1（承重，否则就是重造 `blend`）**；地板取 0.1 不取 0（答对但长仍是答对，不能过零）；**单位是响应 token 不是 thinking 字符**（token 才是 `loss_mask`/`response_length` 覆盖的东西）；阈值取自真实分布（只训到 day6 的正样本 p90 约 5.3k、`20260827` 约 6.9k，`L0` 卡在两者之间，只惩罚漂移区间）；**落点在两个 `_submit_*_turn_sample` 而不是 outcome 分派逻辑**——后者只在 outcome 模式下运行，而下一次跑 judge 配置，挂在提交函数上才能覆盖所有模式的所有正样本，那里也是唯一拿得到真实 `response_length` 的地方；**不做开关**，只暴露两个阈值
+- **批级基线改成只减均值、不除 std**。MetaClaw 自己是除 std 的、上一版照搬了，但对我们的批形态是错的：reward 在 ±1 附近时批越偏斜除数越小，**稀有的那一号被无界放大**（1 正 15 负 → 正 3.873；11 正 5 负 → 负 -1.483）。**两端对我们都是活的**：round 通过率约 17%（1 正批是常态），判官约 69% 给正分（稀有负样本被放大）。**我上一轮只算了后一半就下结论，没算前一半——而实际炸掉训练的恰恰是前一半**。只减均值保留全部想要的性质（全同批仍精确居中到 0）且**有界**：`|adv| ≤ 2`，1 正 15 负给 +1.875/-0.125
+- **更正 CLI 的一处算术**：它给的 1 正 15 负"+0.94/-0.06"是把 reward 当 {1,0} 算的；±1 下正确值是 **+1.875/-0.125**，它据此提的验收断言 `|adv|<1` 会直接挂掉，正确的界是 `|adv| ≤ 2`
+- **明确不做的事**：不回退批级基线（只改掉除 std）、不重新启用 `blend`、不动官方 Acc./Compl. 判分、**不加"advantage 为 0 时跳过 OPD"**——OPD 的 advantage 来自 teacher-vs-rollout 的 logprob 差、跟 reward 无关，而 `PRM_TEACHER_LOAD = POLICY_TORCH_DIST` 就是 base，这条 OPD 实际是"拉回 base"的正则项，在难题批次上大概率是稳定力量而非泄漏
+- **验证**：三个补丁脚本 `bash -n` 通过；补丁链对真实官方源码跑通、`py_compile` 通过；两个落点确认落在 `sample.reward` 赋值之前。新增 `scripts/tests/test_length_aware_and_baseline.py`，**41 项断言、直接跑补丁脚本真实生成的代码**（不在测试里重写被测逻辑）。**双向非空洞性已验证**：改回除 std → 挂在 "1 pos / 15 neg -> pos advantage 1.875"；拿掉 `if reward <= 0` 守卫 → 挂在 "negative at len=10273 stays exactly -1.0"，两次都已还原
+- **下一次跑的配置反转了上一轮的选择**：改回 judge、不用 outcome。上一轮选 outcome 是为了触发基线的抢救机制，但 `20260902_094458` 已证明 outcome 会一次性倒出上百个负样本、自己制造极端偏斜批；judge 才是那次"跑到 day22、没崩、只是中途变差"的配置，新目标下要修的正是它
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md) "2026-09-02：目标重定为『跑满 30 天且不训坏』之后的三项改动"
+
+**主要问题：**
+- **round 轮数没有上限**，day06-r7 空转 186 轮是那次崩溃的起点 → 两个候选杠杆（driver 的 `round_timeout`，当前 `None`；代理侧按 `_turn_counts` 超阈值拒绝）副作用都没查清，**本轮刻意没动**，待下一轮日志再定
+- **退化熔断**（按运行时指标自动冻结）指标与阈值都还没有依据 → 同样没做
+- `20260902_094458` 的 checkpoint 已污染 → 下一次必须从干净 base 起步
+
+**产出：**
+- `scripts/prepare_patched_openclaw_combine.sh`：删除 `blend`（含 `_metaclaw_blend_reward`、两个系数、三处模式门、两处 reward 分支）；新增 `_metaclaw_length_aware_reward` 及其两个落点；批级基线改为只减均值
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：删除两个 blend 系数（声明/透传/落盘/打印），换成 `METACLAW_LEN_DECAY_L0`/`L1`
+- `scripts/tests/test_length_aware_and_baseline.py`（新增）：41 项回归断言
+- `docs/metaclaw_migration_plan.md`：新增 2026-09-02 一节；两处 `blend` 旧结论加更正框

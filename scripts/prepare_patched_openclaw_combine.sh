@@ -147,10 +147,36 @@ What it does and does not fix
 -----------------------------
 It removes the "all-negative batch means uniform suppression" failure mode: an
 all-identical batch now yields zero advantage (that batch simply does not
-update) instead of pushing everything down. It does NOT discriminate within a
-sign when rewards are binary -- centring +-1 moves the zero point and rescales,
-but every +1 still receives the same positive advantage. Rewards would have to
-be continuous for that.
+update) instead of pushing everything down. It does NOT by itself discriminate
+within a sign -- that is what the length-aware reward in the proxy is for.
+
+Mean only, deliberately NOT divided by std
+------------------------------------------
+MetaClaw's own compute_advantages divides by (std + 1e-8), and this module did
+too until 2026-09-01. Dividing is wrong for our batch shape. With rewards near
++-1 the divisor shrinks as the batch gets more lopsided, so the rarer sign gets
+amplified without bound:
+
+    pos/neg in a batch of 16   pos_adv   neg_adv
+    1 / 15                      3.873     -0.258
+    4 / 12                      1.732     -0.577
+    8 / 8                       1.000     -1.000
+    11 / 5                      0.674     -1.483
+
+Both tails are live for us. Round pass rate is ~17%, so 1-positive batches are
+routine -- metaclaw_migration_20260902_094458 produced one when day06-r7 spun
+186 turns and flushed 186 negatives, handing day06-r6 (a CORRECT but 10273-token
+answer) an advantage of 3.873; grad_norm hit 3.69 at step 8 and thinking reached
+120945 chars two rounds later. The other tail is just as real: the step judge
+returns ~69% positive, so a rare negative reaches -1.483.
+
+Subtracting the mean alone keeps every property we actually wanted -- an
+all-identical batch still centres to exactly zero -- while bounding the result:
+with rewards in [-1, 1] the advantage is |r - mean| <= 2, and a 1-positive batch
+of 16 gives +1.875 / -0.125 rather than +3.873 / -0.258. Rare events still
+dominate their batch, which is correct, but they can no longer be scaled into a
+gradient spike. The scale that is lost is a constant factor absorbed by the
+learning rate.
 """
 
 import logging
@@ -188,11 +214,15 @@ def metaclaw_batch_baseline(args, samples, **kwargs):
 
     values = [raw_rewards[i] for i in real_indices]
     mean_r = sum(values) / len(values)
+    # Diagnostic only -- std no longer scales the advantage, but it is still the
+    # cheapest way to spot the degenerate all-identical batch in the logs.
     std_r = (sum((v - mean_r) ** 2 for v in values) / len(values)) ** 0.5
 
+    # Mean only. See "Mean only, deliberately NOT divided by std" above before
+    # reintroducing the divisor.
     advantages = [0.0] * len(raw_rewards)
     for i in real_indices:
-        advantages[i] = (raw_rewards[i] - mean_r) / (std_r + 1e-8)
+        advantages[i] = raw_rewards[i] - mean_r
 
     # Observability is not optional here: the baseline changes the advantage
     # only, never the reward, so the reward-side counters this run is compared
@@ -265,66 +295,141 @@ midround_import_new = (
     "#            +1, so replacing the judge wholesale collapsed the positive signal\n"
     "#            and batches went 0/16 from step 6 on. Kept selectable for\n"
     "#            comparison, but do not expect it to train.\n"
-    "# blend   -- route B (2026-08-31): outcome supplies the direction, the judge\n"
-    "#            score only nudges it. Mirrors toolcall-rl's\n"
-    "#            `final_score = base_score + prm_step_coef * prm_step_mean`, where a\n"
-    "#            misjudged step is diluted rather than becoming the entire reward.\n"
-    "#            The point is that rewards stop being a flat +-1: the batch gets a\n"
-    "#            spread of magnitudes instead of sixteen identical -1s. That matters\n"
-    "#            because reward normalization cannot help here -- every sample is\n"
-    "#            its own group of one (see openclaw_combine_api_server's\n"
-    "#            group_index assignment), so normalizing is identically zero and\n"
-    "#            --disable-rewards-normalization is mandatory, not a tunable.\n"
+    "#\n"
+    "# A third mode, `blend` (outcome plus a weighted judge nudge, mirroring\n"
+    "# toolcall-rl's base_score + prm_step_coef * prm_step_mean), existed briefly\n"
+    "# and was REMOVED on 2026-09-01. It is not coming back, and the reason is\n"
+    "# worth keeping so nobody reintroduces it: spreading a failed round's turns\n"
+    "# across distinct rewards (-1.3 / -1.0 / -0.7) gives an entirely-failed round\n"
+    "# non-zero reward variance, so the batch baseline then computes real\n"
+    "# advantages for it -- the judge-approved step inside a round that failed\n"
+    "# outright comes out at roughly +1.12 and gets positively reinforced. Flat\n"
+    "# -1 on every failure is what makes an all-negative batch centre to exactly\n"
+    "# zero advantage, which is the property that keeps hard days from damaging\n"
+    "# the model. blend traded that safety away for magnitude spread.\n"
     "_METACLAW_MIDROUND_REWARD = _mr_os.environ.get(\n"
     "    \"METACLAW_MIDROUND_REWARD\", \"judge\"\n"
     ").strip().lower()\n"
     "\n"
-    "# Weight on the judge's nudge under blend mode. toolcall-rl defaults its\n"
-    "# equivalent (prm_step_coef) to 1.0, but its base_score and step scores live on\n"
-    "# comparable scales there; here the outcome is a hard +-1, so a full-weight\n"
-    "# judge score could flip the sign and undo the point of the mode. Default 0.3\n"
-    "# keeps every blended reward strictly on the outcome's side of zero\n"
-    "# (|0.3 * judge| < 1), making the judge a magnitude adjustment only.\n"
-    "_METACLAW_MIDROUND_JUDGE_COEF = float(\n"
-    "    _mr_os.environ.get(\"METACLAW_MIDROUND_JUDGE_COEF\", \"0.3\")\n"
-    ")\n"
+    "# --- openclaw-rl-metaclaw-length-aware-success (2026-09-01) ---\n"
+    "# Discount a POSITIVE reward by how long the response was. Nothing else is\n"
+    "# touched: negatives stay flat at -1, and the official Acc./Compl. scoring is\n"
+    "# untouched (this only shapes the training reward).\n"
+    "#\n"
+    "# Why: reward is binary, so answering correctly in 2k tokens and answering\n"
+    "# correctly in 10k tokens earn exactly the same +1, while loss_mask covers the\n"
+    "# whole response including <think>. metaclaw_migration_20260827_163030 died of\n"
+    "# this -- the judge kept approving ever-longer thinking, thinking hit 115k\n"
+    "# chars at day17, generations stopped emitting a closing \\\\boxed{}, and MC\n"
+    "# collapsed (17/26 format failures against K=6's 0/27). The later outcome run\n"
+    "# blew up the same way through a single long success: day06-r6 passed the\n"
+    "# checker at response_len 10273 and, as the only positive in its batch, was\n"
+    "# amplified hard enough to move the policy into a permanently verbose regime.\n"
+    "#\n"
+    "# Anchors from real runs: K=6 (healthy) positive response_len med ~2.5k, p90\n"
+    "# ~5.3k, max ~9k; 20260827 (drifting) med ~3.3k, p90 ~6.9k, max ~13k. L0 sits\n"
+    "# between the two p90s deliberately -- it leaves K=6's normal range alone and\n"
+    "# starts discounting exactly where the drift lives. The cost is explicit and\n"
+    "# accepted: a healthy-but-long K=6-style success at 9k tokens scores 0.73\n"
+    "# rather than 1.0.\n"
+    "#\n"
+    "# Measured in RESPONSE TOKENS, not thinking characters: tokens are what\n"
+    "# loss_mask and response_length actually cover, and mixing the two units is\n"
+    "# how a log-side number silently stops matching the training-side one.\n"
+    "_METACLAW_LEN_DECAY_L0 = float(_mr_os.environ.get(\"METACLAW_LEN_DECAY_L0\", \"6000\"))\n"
+    "_METACLAW_LEN_DECAY_L1 = float(_mr_os.environ.get(\"METACLAW_LEN_DECAY_L1\", \"16000\"))\n"
+    "# Floor stays strictly positive: a correct-but-very-long answer is worse than a\n"
+    "# correct-and-short one, but it is still not a failure and must not cross zero.\n"
+    "_METACLAW_LEN_DECAY_FLOOR = float(_mr_os.environ.get(\"METACLAW_LEN_DECAY_FLOOR\", \"0.1\"))\n"
     "\n"
-    "# Ceiling applied to a FAILED round's intermediate turns, mirroring\n"
-    "# toolcall-rl's `min(-0.6, score + tool_call_reward)`. Note that is a ceiling,\n"
-    "# not a floor: a failed sample can never score better than this. At the default\n"
-    "# coefficient it is INERT -- -1 + 0.3*1 = -0.7 is already below -0.6, so failed\n"
-    "# rewards land in [-1.3, -0.7] on their own. It exists as the sign guard for\n"
-    "# larger coefficients: at coef=1.0 (toolcall-rl's own default) an unclamped\n"
-    "# failed turn with a +1 judge would reach 0.0 and lose its sign entirely.\n"
-    "# Set to 0 to disable.\n"
-    "_METACLAW_MIDROUND_FAIL_CEILING = float(\n"
-    "    _mr_os.environ.get(\"METACLAW_MIDROUND_FAIL_CEILING\", \"-0.6\")\n"
-    ")\n"
     "\n"
+    "def _metaclaw_length_aware_reward(reward, response_len):\n"
+    "    \"\"\"Scale a positive reward down as the response gets longer.\n"
     "\n"
-    "def _metaclaw_blend_reward(outcome, judge_score, hard_negative):\n"
-    "    \"\"\"Route B reward composition (2026-08-31).\n"
-    "\n"
-    "    outcome supplies the sign, the judge score only adjusts magnitude. A turn\n"
-    "    condemned by a forced-(-1) rule short-circuits to -1.0 regardless -- the\n"
-    "    same hard-negative precedence the other modes honor, since blending a\n"
-    "    known-invalid tool call back toward zero would defeat the override.\n"
-    "\n"
-    "    On a FAILED round the result is additionally capped at\n"
-    "    _METACLAW_MIDROUND_FAIL_CEILING so a nudge can never make a failure look\n"
-    "    near-neutral; on a SUCCEEDED round no cap applies, since there the judge\n"
-    "    nudge is what distinguishes a clean trajectory from a wasteful one.\n"
+    "    reward <= 0 is returned untouched, and that is load-bearing rather than an\n"
+    "    optimisation. If failures also varied with length, an entirely-failed round\n"
+    "    would gain reward variance, the batch baseline would compute real\n"
+    "    advantages for it, and its least-bad turns would be positively reinforced --\n"
+    "    exactly the trap that got `blend` removed. Flat negatives are what make an\n"
+    "    all-negative batch centre to zero.\n"
     "    \"\"\"\n"
-    "    if hard_negative:\n"
-    "        return -1.0\n"
-    "    _base = float(outcome)\n"
-    "    _judge = 0.0 if judge_score is None else float(judge_score)\n"
-    "    _blended = _base + _METACLAW_MIDROUND_JUDGE_COEF * _judge\n"
-    "    if _base < 0 and _METACLAW_MIDROUND_FAIL_CEILING:\n"
-    "        _blended = min(_METACLAW_MIDROUND_FAIL_CEILING, _blended)\n"
-    "    return _blended\n"
+    "    if reward <= 0:\n"
+    "        return reward\n"
+    "    if _METACLAW_LEN_DECAY_L1 <= _METACLAW_LEN_DECAY_L0:\n"
+    "        return reward\n"
+    "    _span = _METACLAW_LEN_DECAY_L1 - _METACLAW_LEN_DECAY_L0\n"
+    "    _over = (float(response_len) - _METACLAW_LEN_DECAY_L0) / _span\n"
+    "    _over = min(max(_over, 0.0), 1.0)\n"
+    "    return reward * (1.0 - (1.0 - _METACLAW_LEN_DECAY_FLOOR) * _over)\n"
 )
 text = text.replace(midround_import_old, midround_import_new, 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-length-aware-success: apply the decay at the two --
+# and only two -- places where a reward is written onto a Sample.
+#
+# Deliberately applied HERE rather than inside the midround dispatch: the
+# dispatch only runs under METACLAW_MIDROUND_REWARD=outcome, whereas the
+# next run reproduces the 20260827 judge configuration. Hooking the two
+# submission functions covers every positive sample in every mode --
+# intermediate step-judge turns, outcome-inherited turns, and the round's
+# own final verdict turn alike -- with no mode-specific branching to keep
+# in sync. It is also the only point where the sample's real
+# response_length is known.
+#
+# `response_ids` is the same list assigned to sample.response_length and
+# covered by loss_mask, so the length the reward is computed from is
+# exactly the length being trained on.
+# ---------------------------------------------------------------------
+len_decay_opd_old = (
+    '        sample.reward = {"score": reward}\n'
+    '\n'
+    '        tag = "OPD+RL" if reward != 0.0 else "OPD"\n'
+)
+if text.count(len_decay_opd_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 OPD+RL reward assignment in "
+        f"{src_path}, found {text.count(len_decay_opd_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+len_decay_opd_new = (
+    '        # --- openclaw-rl-metaclaw-length-aware-success ---\n'
+    '        # An OPD-only sample carries reward 0.0 and is left untouched by the\n'
+    '        # decay, so the tag below still classifies it correctly.\n'
+    '        _scored_reward = _metaclaw_length_aware_reward(reward, len(response_ids))\n'
+    '        if _scored_reward != reward:\n'
+    '            logger.info(\n'
+    '                "[openclaw-rl-metaclaw-length-aware-success] session=%s "\n'
+    '                "response_len=%d reward %.3f -> %.3f",\n'
+    '                session_id, len(response_ids), reward, _scored_reward,\n'
+    '            )\n'
+    '        sample.reward = {"score": _scored_reward}\n'
+    '\n'
+    '        tag = "OPD+RL" if reward != 0.0 else "OPD"\n'
+)
+text = text.replace(len_decay_opd_old, len_decay_opd_new, 1)
+
+len_decay_rl_old = '        sample.reward = {"score": float(eval_score)}\n'
+if text.count(len_decay_rl_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 RL-only reward assignment in "
+        f"{src_path}, found {text.count(len_decay_rl_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+len_decay_rl_new = (
+    '        # --- openclaw-rl-metaclaw-length-aware-success ---\n'
+    '        _scored_reward = _metaclaw_length_aware_reward(\n'
+    '            float(eval_score), len(response_ids)\n'
+    '        )\n'
+    '        if _scored_reward != float(eval_score):\n'
+    '            logger.info(\n'
+    '                "[openclaw-rl-metaclaw-length-aware-success] session=%s "\n'
+    '                "response_len=%d reward %.3f -> %.3f",\n'
+    '                session_id, len(response_ids), float(eval_score), _scored_reward,\n'
+    '            )\n'
+    '        sample.reward = {"score": _scored_reward}\n'
+)
+text = text.replace(len_decay_rl_old, len_decay_rl_new, 1)
 
 old_loop_head = (
     '        for turn_num in sorted(list(pending.keys())):\n'
@@ -539,7 +644,7 @@ verdict_fail_new = (
     '                    e,\n'
     '                )\n'
     '                # --- openclaw-rl-metaclaw-midround-reward (temporary) ---\n'
-    '                if _METACLAW_MIDROUND_REWARD in ("outcome", "blend"):\n'
+    '                if _METACLAW_MIDROUND_REWARD == "outcome":\n'
     '                    _mr = self._metaclaw_round.get(session_id)\n'
     '                    if _mr is not None and _mr.get("verdict_turn") == turn_num:\n'
     '                        _dropped = len(_mr.get("held", {}))\n'
@@ -592,7 +697,7 @@ if text.count(midround_dispatch_old) != 1:
     )
 midround_dispatch_new = (
     '            # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
-    '            if _METACLAW_MIDROUND_REWARD in ("outcome", "blend") and (\n'
+    '            if _METACLAW_MIDROUND_REWARD == "outcome" and (\n'
     '                opd_result.get("metaclaw_verdict") or opd_result.get("metaclaw_round_step")\n'
     '            ):\n'
     '                _mr = self._metaclaw_round.setdefault(\n'
@@ -634,16 +739,9 @@ midround_dispatch_new = (
     '                            # tool call getting positively reinforced. Outcome\n'
     '                            # inheritance replaces the JUDGE score, never a hard\n'
     '                            # rule\'s verdict.\n'
-    '                            if _METACLAW_MIDROUND_REWARD == "blend":\n'
-    '                                _h_reward = _metaclaw_blend_reward(\n'
-    '                                    _mr["outcome"],\n'
-    '                                    _h_res.get("judge_raw_score"),\n'
-    '                                    _h_res.get("hard_negative"),\n'
-    '                                )\n'
-    '                            else:\n'
-    '                                _h_reward = (\n'
-    '                                    -1.0 if _h_res.get("hard_negative") else float(_mr["outcome"])\n'
-    '                                )\n'
+    '                            _h_reward = (\n'
+    '                                -1.0 if _h_res.get("hard_negative") else float(_mr["outcome"])\n'
+    '                            )\n'
     '                            logger.info(\n'
     '                                "[openclaw-rl-metaclaw-midround-reward] session=%s "\n'
     '                                "turn=%d mode=%s flushed with reward=%.3f "\n'
@@ -694,18 +792,10 @@ midround_dispatch_new = (
     '                    # and each task re-enters this method via its own done\n'
     '                    # callback). Submit straight away with the stored outcome\n'
     '                    # instead of dropping it.\n'
-    '                    # Same composition and hard-negative precedence as the\n'
-    '                    # flush loop above.\n'
-    '                    if _METACLAW_MIDROUND_REWARD == "blend":\n'
-    '                        _late_reward = _metaclaw_blend_reward(\n'
-    '                            _known,\n'
-    '                            opd_result.get("judge_raw_score"),\n'
-    '                            opd_result.get("hard_negative"),\n'
-    '                        )\n'
-    '                    else:\n'
-    '                        _late_reward = (\n'
-    '                            -1.0 if opd_result.get("hard_negative") else float(_known)\n'
-    '                        )\n'
+    '                    # Same hard-negative precedence as the flush loop above.\n'
+    '                    _late_reward = (\n'
+    '                        -1.0 if opd_result.get("hard_negative") else float(_known)\n'
+    '                    )\n'
     '                    logger.info(\n'
     '                        "[openclaw-rl-metaclaw-midround-reward] session=%s turn=%d "\n'
     '                        "mode=%s late judge task, submitted with reward=%.3f "\n'
@@ -761,7 +851,7 @@ midround_postloop_new = (
     '                )\n'
     '\n'
     '        # --- openclaw-rl-metaclaw-midround-reward (temporary, safe to remove) ---\n'
-    '        if _METACLAW_MIDROUND_REWARD in ("outcome", "blend"):\n'
+    '        if _METACLAW_MIDROUND_REWARD == "outcome":\n'
     '            _mr = self._metaclaw_round.get(session_id)\n'
     '            if (\n'
     '                _mr is not None\n'

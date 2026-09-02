@@ -9,6 +9,40 @@
 
 ---
 
+## 历史状态（2026-09-01，已被 9/2 结果取代）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：同 08-26（历史状态），另加：[x] **Phase 1 打分逻辑已用真实训练数据核实正确**（4 个升级案例全部无误、反向 0 次、诊断文案具体化生效）；[x] **Traceback 泄漏进 agent 可见反馈的回归已修复**（`_compute_training_verdict` 去掉多余 fallback，合成测试已确认非空转）；[x] **`20260827_163030` 训练的退化机制已定位到 day17 thinking 断崖，链条有三项数据支撑**（格式失败 17/26 vs K=6 的 0/27、thinking 18k→115k 的时间断点、FC 派生样本占权重约 90%）；[x] **消融方案已通过 CLI 查验并实现**（中间轮次改吃本轮最终 checker 结果，`METACLAW_MIDROUND_REWARD` opt-in，默认 `judge` 行为不变）；[x] **硬负分优先级 + 结构性无效工具调用检测（规则 6）已修复**（commit `2944f87`）；[x] **outcome 消融训崩的根因已查清并在源码层面确认**（全负 batch + advantage 退化成原始 reward）；[x] **真正的根因已定位到"用着 GRPO 估计器却一个真正的组都没有"**，`toolcall-rl`/MetaClaw 的分组方式与任务形态已逐字查证；[x] **批级基线方案已出，可行性已在源码层面查证**（slime 自带 `--custom-reward-post-process-path` 钩子，不用碰 `group_index`/队列），**待 CLI 在真实环境查证 5 个点后实现**。
+
+### 已知限制 / 未解决
+同 08-26（历史状态），另加：**`20260831_154301` 的 checkpoint 已污染，不能作为后续训练起点**。**批级基线方案尚未实现，也未经真实环境查证**——5 个待查点见迁移文档。**`blend` 模式可能是多余的**：它照搬 toolcall-rl 的奖励合成，但 toolcall-rl 能靠它工作的前提是同时有 8 样本组内归一化，我们只搬了一半；默认关闭、回退成本低，视批级基线结果决定去留。**路线 A（轨迹级样本）仍未实现**，且它也只降低负样本数量、不产生正样本。**day11-15 的 FC 全 0 是能力墙**（K=6 冻结模型同样 0），跟训练信号无关。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**等 CLI 在真实环境查证批级基线方案的 5 个点**，通过后实现并跑一轮。**先单独跑批级基线、不叠加 `blend`**（`METACLAW_MIDROUND_REWARD=judge` + 自定义钩子）——这是最干净的对照，只改 advantage 算法、reward 形态完全不变，跟 K=6 那次 judge 模式唯一差别就是基线。主判据是 `batch reward` 不再出现 `0/16`、`grad_norm`/`policy drift` 保持在 K=6 量级，**不是 Acc**。**必须从干净 base 起步。**
+3. 其余同 08-17
+
+### 未验证
+- [ ] **批级基线方案的 5 个真实环境问题**——`load_function` 的路径格式与 modelfactory 上的放置位置、dummy 样本会不会污染批均值、真实到达钩子的样本数、std≈0 时全 0 advantage 是否可接受、与 `step_wise` estimator 是否冲突
+- [ ] **批级基线能否真的阻止发散**——源码层面确认了 advantage 会被中心化（必有正负），但真实训练里够不够稳定未知
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——原来的消融设计已被证明会因全负 batch 而发散，**这个问题至今没有被干净地回答过**；要等训练能稳定跑起来之后才谈得上重新验证
+- [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全（逐轮 `response_logprobs` 都存着），但未实测；`rollout_log_probs`/`teacher_log_probs` 都按 `response_length` 严格切片，对不齐就是硬错误
+- [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，但训练效果层面未回答
+- [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
+- [ ] **`METACLAW_TRAIN_UNTIL_DAY` 默认关闭时是否真的与当前 `day12` 训练行为完全一致**——用户即将验证，这次改动能不能信任的前提
+- [ ] **`done.log` 非追加场景真实触发率**——监控日志已埋点（`_compute_training_verdict` 里 `logger.warning`），只能等真实训练跑起来后观察
+- [ ] **`_rerun_segment_official` 额外 subprocess 调用在真实训练节奏下的耗时影响**——本地未测过实际耗时，CLI 判断"可忽略"是基于全量 398 段无写操作迹象的静态扫描，不是真实计时
+- [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**——下一轮训练需要确认日志里出现"pause-retry (matched 'LLM request timed out')"且题目最终计分成功
+- [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前的 Frozen 窗口评测走的是训练自己的 harness，跟官方 bench 不完全同构
+- [ ] `metaclaw_migration_20260820_*`（六处修复已合入）完整 30 天跑完后，`Compl.` 是否脱离 0.0%、Acc. 相对**新基线（17.8%）**有没有提升——`--agent` 修复的核心验证点，注意不要再拿旧的 8.1% 做对比
+- [ ] `METACLAW_TRAIN_UNTIL_DAY` 设置为具体 K 值时，冻结是否真的生效（`[metaclaw-freeze]` 日志、样本提交数骤降为 0）、dayK 尾部竞态实际丢弃规模
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾，具体机制是什么（承接 08-18，仍未解开）
+- [ ] 官方 MetaClaw Compl. 非零的真实原因（OpenClaw CLI 版本差异 or 官方外层脚本另有处理）——开放问题，不阻塞
+- 其余同 08-19（历史状态，见上）
+
+---
+
 ## 历史状态（2026-08-26，已被 8/27 结果取代）
 
 ### 已就绪
