@@ -111,17 +111,23 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
     # sglang context 是否溢出无关（同上面 SMOKE_PROFILE 分支的既有结论：
     # 是否需要一起调大待真实训练报错验证，不提前假设）。
     #
-    # --rollout-batch-size 16 -> 8（2026-09-03，轨迹级样本）：一个 round 现在
-    # 只产出 1 个样本，而 turn 级下实测约 4.44 个（20260827_163030 的健康段
-    # day01-15，见 docs/metaclaw_migration_plan.md「按健康段而不是全程标定」）。
-    # rollout_batch_size 数的是「组」，所以更新次数 = round 数 ÷ 它，与
-    # n_samples_per_prompt 无关：346 个 round 下 batch 8 给 43 次更新。
-    # 为什么不取 4（86 次、更接近健康基准的约 94 次）：n_samples=1 时组内只有
-    # 一个样本、没有比较对象，advantage 就是原始 ±1，按 round 通过率约 17%
-    # 算 batch 4 有约 47% 的批次全负（= 均匀打压所有 token），batch 8 是 23%，
-    # batch 16 降到 5% 但只剩 21 次更新。8 是这三者里最不坏的折中，不是最优；
-    # 等上了 n_samples=8（全负组会被 slime 的常数组丢弃逻辑直接丢掉，不再是
-    # 打压），batch 4 才变得可选。
+    # --rollout-batch-size 16 -> 8 + --use-dynamic-global-batch-size
+    #（2026-09-03，按题成组）：代理侧现在把一个 round 的全部 turn 样本
+    # 用同一个 group_index 一次性入队，而 _drain_output_queue 数的是**组**
+    #（openclaw_combine_select_rollout.py:110 的 target_data_size =
+    # args.rollout_batch_size），所以 8 就是**8 道完整的题**。
+    # 再开 --use-dynamic-global-batch-size：slime 不再用
+    # rollout_batch_size × n_samples // num_steps 这个公式，而是从**实际收到
+    # 的样本数**反推 global_batch_size（rollout.py:287，没有 dynamic_history
+    # 时 desired_steps=1），于是「收满 8 道题的全部 turn → 训练一次」。
+    # 两个必须一起改：只改 batch-size 不开 dynamic，公式会把 gbs 定成 8，
+    # 而一批实际有约 35 个样本（健康段 4.44 turn/题），会被切成 4 步并且
+    # 把一道题劈到不同 step 里，按题成组的意义就没了。
+    #
+    # 为什么是 8 不是 4：346 道题 ÷ 8 = 43 次更新（day22 那次约 96 次），
+    # 每次吃约 35 个样本而不是 16 个——总数据量一样，是「43 次大步」对
+    # 「96 次小步」。目标是「跑满 30 天且不训坏」，少而大的步更稳。取 4 能
+    # 追平到 86 次，但全负批概率从 0.83^8≈23% 涨到 0.83^4≈47%，不划算。
     sed -i \
         -e 's/--save-interval 100/--save-interval 10/' \
         -e 's/export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="65536"/' \
@@ -131,6 +137,22 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         "${PATCHED}"
     if ! grep -q -- "--rollout-batch-size 8" "${PATCHED}"; then
         echo "错误：--rollout-batch-size 未能改成 8（官方脚本可能已改动）" >&2
+        exit 1
+    fi
+    # 幂等注入：按题成组必须配 dynamic gbs 和 1/N advantage 缩放钩子，
+    # 三者少一个这套设计就不成立，所以放在同一个分支里、各自带失败即报错。
+    if ! grep -q -- "--use-dynamic-global-batch-size" "${PATCHED}"; then
+        sed -i -e 's|--rollout-batch-size 8|--rollout-batch-size 8\n   --use-dynamic-global-batch-size|' "${PATCHED}"
+    fi
+    if ! grep -q -- "--use-dynamic-global-batch-size" "${PATCHED}"; then
+        echo "错误：--use-dynamic-global-batch-size 注入失败" >&2
+        exit 1
+    fi
+    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
+        sed -i -e 's|--disable-rewards-normalization|--disable-rewards-normalization\n   --custom-reward-post-process-path metaclaw_round_scale.metaclaw_round_scale|' "${PATCHED}"
+    fi
+    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
+        echo "错误：--custom-reward-post-process-path 注入失败" >&2
         exit 1
     fi
 fi

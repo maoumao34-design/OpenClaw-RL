@@ -1649,6 +1649,9 @@ global_batch_size = rollout_batch_size × n_samples_per_prompt // num_steps_per_
 
 ### 方案（待 CLI 在真实环境查证，未实现）：轨迹级样本，一个 round = 一个样本（2026-09-03）
 
+> **本节已于同日被推翻并删除实现，保留作记录。** 真实训练中约 96/120 个 round 因前缀重建失败被整轮丢弃，根因是 OpenClaw 重放历史时剥掉 reasoning（`dropReasoningFromHistory`），扁平轨迹**无法忠实构造**。取代它的是"方案：按题成组 + 1/N advantage 缩放"，推导见那一节开头。
+
+
 #### 定位（重要，别当成控制变量实验）
 
 跟"跑到 day22"那次（`20260827_163030`）相比，这个方案至少变了五件事：样本单位、奖励来源、每轮样本数、OPD hint 作用范围、多了一条长度保护。**跑出来变好或变坏都归不到单一原因上。** 它的定位是"换一种结构上站得住的形态，看能不能跑起来"，不是 A/B。
@@ -1837,6 +1840,91 @@ driver 里 `round_session_id = f"metaclaw-{test_id}-{group_id}-{round_id}"`（20
 - **跑得比 day22 那次好，则 `n_samples=8` 只会更好**，可以直接接着做。
 - **对标的是 `20260827_163030` 的前半段（day01–15），不是它的全程。**后半段本身就是被污染的形态，拿它当基准等于拿病态当常态。
 - **无论好坏，都不能把结果归因到"只改了粒度"**——这一次至少同时变了五件事。
+
+---
+
+### 方案（已实现，真实训练未验证）：按题成组 + 1/N advantage 缩放（2026-09-03，取代轨迹级）
+
+#### 为什么轨迹级不成立——这是一条不可能性，不是实现难度
+
+CLI 用真实训练跑出来的结果：**约 96 个 round 因前缀重建失败被整轮丢弃，只有约 24 个进训、且全是 `turns=1`**（单轮不需要拼观测）；超长丢弃 0 次、mask 不匹配 0 次。**进训率约 20%，多轮 tool 的题几乎全在 turn1→turn2 就挂。**
+
+真实原因**不是** compaction（我们自己代码里那句 `Most likely cause is OpenClaw compacting` 是错的诊断，已删除），而是 **OpenClaw 在重放历史时剥掉 assistant 的 reasoning**。源码确认（`openclaw/src/agents/transcript-policy.ts:174`）：
+
+```ts
+...(isStrictOpenAiCompatible
+  ? { dropReasoningFromHistory: !shouldPreserveReasoningContentReplay(params) }
+  : {}),
+```
+
+`shouldPreserveReasoningContentReplay`（`openai-transport-stream.ts:4076`）只在四种情况返回 true：`requiresReasoningContentOnAssistantMessages`、`thinkingFormat` 为 `deepseek`/`zai`、模型元数据可信、模型 id 在硬编码白名单里。**我们的自定义 openai-compat provider + `metaclaw-bench/qwen3-4b` 四条全不命中 → reasoning 被剥掉。**
+
+**顺带闭环一个挂了很久的未验证项**：CLI 的数据里 `thinking=5786 字符 ↔ response=1542 token`，说明 **reasoning 确实在 `response_ids` 里、确实被 `loss_mask` 覆盖**，"thinking 膨胀经 loss_mask 训进去"那套解释在机制上是成立的。
+
+**由此得到的不可能性**：
+
+- turn t 的**真实生成**是 `think_t + call_t`
+- turn t+1 的**真实上下文**只有 `call_t`
+
+一条扁平序列对 turn t 只能二选一：
+
+| 选择 | 后果 |
+|---|---|
+| **带 `think_t`** | 后面所有 turn 的上下文是模型从未见过的，且训练会教它去注意推理时根本不存在的东西 |
+| **不带 `think_t`** | turn t 自己的生成被错误表示——训那一段等于教模型**不思考直接吐工具调用** |
+
+**没有第三种。**mask 只把 token 移出 loss、不移出上下文，所以掩码解决不了。**一条自回归序列表达不了"生成过、随后从上下文里消失"，因此每 turn 一个样本是唯一忠实的表示法。**
+
+（附带纠正一处此前的错误论断：我曾说"拼 thinking 会让重要性比失控"。查证后是错的——`--use-rollout-logprobs` 我们没开，`old_log_probs = batch["log_probs"]` 由训练引擎在提交序列上**重算**（`loss.py:876`），比值自洽；TIS/ICE 也没开，`rollout_log_probs` 只喂 `train_rollout_logprob_abs_diff` 这一个诊断指标。真正的反对理由是上表那条，不是数值失控。）
+
+**还有一个配置开关存在但不推荐**：`requiresReasoningContentOnAssistantMessages` 是 openclaw.json 里合法的 per-model `compat` 字段（`src/config/zod-schema.core.ts:233`），设 `true` 就会保留 reasoning。不推荐的理由：turn 1 的 response 就 1542 token，多轮全保留会很快逼近 `contextWindow: 50000` → **真的触发 `safeguard` 压缩 → 前缀又断，只是换个地方失败**；而且 agent 行为变了，跟 K=6 / day22 / 官方基线全部不可比。
+
+#### 方案：样本仍按 turn，成组按 round，advantage 除以 N
+
+- **样本单位不变**：每 turn 一个样本，各自带**真实的 prompt 和真实的 response**，**零重建**——前缀问题从根上消失
+- **成组按 round**：一个 round 的全部 turn 共用一个 `group_index`，在 verdict 到达时**一次性入队**
+- **奖励**：全部 turn 共用本轮 checker 的确定性 ±1，**步骤判官彻底不用**
+- **advantage 除以该轮 turn 数**（`metaclaw_round_scale.py`，走 `--custom-reward-post-process-path`）
+
+轨迹级原本要买的四样东西全部拿到：
+
+| | 轨迹级（已废） | 按题成组 + 1/N |
+|---|---|---|
+| thinking 被训练 | ✓ | ✓ |
+| 中间工具调用被训练 | ✓ | ✓ |
+| 每轮权重相等 | ✓ | ✓（1/N）|
+| 单个 round 不能主宰 batch | ✓ | ✓ |
+| 上下文与推理一致 | **✗（不可能构造）** | ✓ |
+| 需要前缀重建 | 需要 | **不需要** |
+
+**唯一真正的代价**：每 turn 一样本意味着 turn n 的 prompt 含全部历史，每轮前向是 **O(N²)** 而不是 O(N)（6 轮 round 约 100k token vs 轨迹级约 20k）。**但这正是今天已经在付的成本**，是回到现状、不是退步；轨迹级本来能省下来，现在省不了。
+
+#### 「收满 8 道题再训练」：slime 有一等支持
+
+- `_drain_output_queue` 数的是**组**（`openclaw_combine_select_rollout.py:110` 的 `target_data_size = args.rollout_batch_size`），而 `rollout.py:254` 会把组摊平（`while isinstance(data[0], list): chain.from_iterable`）——**没有任何地方断言一个组必须有 `n_samples_per_prompt` 个成员**
+- `--use-dynamic-global-batch-size`（`arguments.py:1558`）让 slime 不再用公式算 `global_batch_size`，而是**从实际收到的样本数反推**（`rollout.py:287`，无 `dynamic_history` 时 `desired_steps=1`）
+
+配置：`--rollout-batch-size 8` + `--use-dynamic-global-batch-size` + `--custom-reward-post-process-path metaclaw_round_scale.metaclaw_round_scale`。**三者少一个设计就不成立**（只改 batch-size 不开 dynamic，公式会把 gbs 定成 8，而一批实际约 35 个样本，会被切成 4 步并把一道题劈到不同 step 里），所以三处都带失败即报错。
+
+**顺带补掉一个残留风险**：一个 batch 恒等于 **8 道完整的题**，全负批要求 8 道题全失败（`0.83⁸ ≈ 23%`），而不是"一道 20 轮的失败题塞满 16 个 turn 名额"。
+
+**更新次数**：346 ÷ 8 = **43 次**（day22 那次约 96 次），每次吃约 35 个样本而不是 16 个——**总数据量一样，是「43 次大步」对「96 次小步」**。目标是"跑满 30 天且不训坏"，少而大的步更稳，所以这个取舍是有意的。取 `rollout-batch-size 4` 能追平到 86 次，但全负批概率从 23% 涨到 47%，不划算。
+
+#### 同时修掉的两处
+
+1. **`Most likely cause is OpenClaw compacting` 这句错误诊断已删除**，真实原因是 `dropReasoningFromHistory`。
+2. **OPD hint 的落点**：`_append_hint_to_messages` 是从后往前找最后一条 user 消息，而在 verdict 轮那是**工具结果**——把 checker 反馈贴在那里等于教模型把"文件名写错了"当成工具观测的一部分。改成贴到本轮**第一条** user 消息（题目，一 round 一 session 所以它就是任务本身），再把其余对话原样接回。
+
+#### 已知残留风险
+
+- **1/N 只压幅度、不改符号。** 8 道题全失败时仍是全负批、仍是均匀打压，只是强度降到 1/N。**这是 `n_samples=1` 没有组内比较的固有问题，本方案不解决**，要靠 `n_samples=8`。
+- **`_drain_output_queue` 有 `if any(sample.status == ABORTED for sample in group): continue`**，按题成组后**一个 turn abort 会丢整道题**。`is_aborted` 的 turn 在上游 `degraded-turn-drop` 就被拦掉、到不了队列，预期影响为零，但真实训练要确认这条路径。
+
+#### 验证（2026-09-03，本地，真实训练未验证）
+
+五个脚本 `bash -n`；补丁链对真实官方源码跑通、`py_compile` 通过。新增 `scripts/tests/test_metaclaw_round_group.py`，**40 项断言直接跑补丁脚本真实生成的代码**：1/N 算术；**1/2/5/20/186 轮的 round 贡献恒等于 1.0**（186 就是 `20260902_094458` 里主宰整批的那个真实 round）；混合 batch 按 round 求和而不是按 turn；非 MetaClaw 样本原样透传（钩子短路了 `_post_process_rewards`，必须复现默认行为）；五种畸形 turn 数回退；dummy / 空批 / 返回长度契约；以及代理侧"整轮只入队一次""中间轮只 hold 不打分""hint 贴题目"的源码级检查。
+
+**非空洞性双向验证**：关掉 1/N → 挂在"4 轮 round 每个样本拿 1/4"；去掉成组入队 → 挂在"整轮只入队一次"。两次都已还原。
 
 ---
 

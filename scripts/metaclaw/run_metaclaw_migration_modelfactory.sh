@@ -151,16 +151,6 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
-# 轨迹级样本的长度上限（2026-09-03）。**没有开关，轨迹级对所有 metaclaw-
-# 前缀的 session 一直生效**，只有这个阈值可调，单位是 prompt+response 的
-# token 总数。
-# 32768 是硬天花板不是建议值：开着 --use-dynamic-batch-size 时 slime 按
-# token 预算把样本打包成 micro-batch，单条样本长过 --max-tokens-per-gpu
-# 就永远打不进任何一包。31000 贴着天花板留余量。
-# 标定用的是 20260827_163030 的**健康段**（day01-15：中位约 17k、p90 约
-# 23k），不是全程——全程 p90 约 47k 全部来自它已经退化的后半段，拿那个标
-# 定等于拿病态当常态。健康段下 31000 只丢约 2%，24576 会白丢 7%。
-METACLAW_TRAJ_MAX_TOKENS=${METACLAW_TRAJ_MAX_TOKENS:-31000}
 
 # 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
 # 建议先设 METACLAW_MAX_DAYS=1，确认整条链路（真实 openclaw agent 子
@@ -191,17 +181,13 @@ started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 command: $0 $*
 metaclaw_root: ${METACLAW_ROOT}
 checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
-sample_unit: trajectory (one round = one sample)
-metaclaw_traj_max_tokens: ${METACLAW_TRAJ_MAX_TOKENS}
+sample_unit: per-turn samples, one group per round (1/N advantage scaling)
 EOF
 
 echo "日志目录: ${LOGS_DIR}"
 echo "METACLAW_ROOT: ${METACLAW_ROOT}"
 echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
-# 2026-09-03：轨迹级样本没有开关、一直生效，但阈值传丢了会静默回退成代理侧
-# 的默认值。代理侧自己在 import 时也会打一行 effective 值，两边对得上才算
-# 真的传到了训练后端进程（这个传播路径至今没有被验证过）。
-echo "样本单位: 轨迹级（一个 round = 一个样本），长度上限 METACLAW_TRAJ_MAX_TOKENS=${METACLAW_TRAJ_MAX_TOKENS}"
+echo "样本单位: 每 turn 一个样本，一个 round 一个 group（advantage 按 1/N 缩放）"
 
 # =====================================================================
 # 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
@@ -316,7 +302,6 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   METACLAW_MIGRATION_PROFILE="1" \
-  METACLAW_TRAJ_MAX_TOKENS="${METACLAW_TRAJ_MAX_TOKENS}" \
   bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

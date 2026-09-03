@@ -40,11 +40,14 @@
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：**`scripts/` 已全面回退到 `20260827_163030`（跑到 day22 那次）的代码状态**，与 `40c5450` **逐字节相同**（`git diff --numstat 40c5450 -- scripts/` 无输出；三个补丁脚本对真实官方源码生成的代理文件 `diff -rq` 完全一致，且不再产出 `metaclaw_batch_baseline.py`）。回退掉的是 08-31~09-02 加的全部内容：批级基线、长度感知正奖励、规则 6、outcome 模式全套（含硬负分优先级、墓碑清理）、blend 残留、以及它们的回归测试。**Phase 1 的 diff 判定和 Traceback 泄漏修复保留**（它们本来就在 `40c5450` 里，是 day22 那次实际用的代码）。文档一律不回退，全部保留为记录。
+**MetaClaw 迁移**：[x] **「按题成组 + 1/N advantage 缩放」已实现**——每 turn 一个样本（各带真实 prompt/response，**零重建**）；一个 round 的全部 turn 共用 `group_index`、verdict 时一次性入队；advantage 除以该轮 turn 数；`--rollout-batch-size 8` + `--use-dynamic-global-batch-size` = **收满 8 道完整的题训练一次**。40 项断言与双向非空洞性本地通过，**真实训练未验证**。[x] **轨迹级方案已被真实训练证伪并删除**（约 96/120 个 round 因前缀重建失败整轮丢弃）：根因是 OpenClaw 重放历史时剥掉 reasoning（`dropReasoningFromHistory`，源码确认），**扁平序列表达不了"生成过、随后从上下文里消失"，每 turn 一样本是唯一忠实的表示法**。[x] **步骤判官已彻底停用**（奖励 = 本轮 checker 判定）；[x] **OPD hint 改贴本轮题目**（此前会贴到工具结果上）。[x] 09-03 上午的全面回退基线仍然成立：`scripts/` 曾逐字节回到 `40c5450`，本轮改动都是从那个干净起点长出来的。
 
 ### 已知限制 / 未解决
 - **day22 那次为什么中途变差，至今没有答案。**原来的解释（thinking 膨胀经 loss_mask 训进去）依赖"reasoning 在 `response_ids` 里"这个**从未验证过**的前提，见下方未验证第一条。
 - **09-02/09-03 两次工具塌陷的机制已定位到代码层面，但没有修**（回退掉了触发它的三项改动，不等于修好了底层结构）。三层：① 空回复 turn 会变成 2~3 token 的样本（官方 `if not response_ids and not response_text.strip()` 守卫因 `response_text` 永远含 `<|im_end|>` 而形同虚设）；② slime 的 `sum_of_sample_mean` 每样本先取均值再求和，2 token 样本与 5000 token 样本等权；③ 批级基线放大稀有正样本。
+- **1/N 只压幅度、不改符号**：8 道题全失败时仍是全负批、仍是均匀打压（约 23% 的批次），只是强度降到 1/N。**`n_samples=1` 没有组内比较，这条要靠 `n_samples=8` 才解决。**
+- **更新次数 43 次 vs day22 那次约 96 次**（每次吃约 35 个样本而不是 16 个，总数据量一样）——读结果时要扣掉。
+- **`_drain_output_queue` 的 `any(... ABORTED ...)` 在按题成组后会让一个 turn abort 丢掉整道题**，预期影响为零（上游 `degraded-turn-drop` 已拦），但真实训练要确认。
 - **中间轮次的信号结构本身可疑**：MetaClaw 迁移用的是 toolcall-rl 式 step judge（开放式"好不好"，无事实锚点）且写死 `accepted: False`（无 hint、只剩拉回 base 的正则），而 Personal Agent 用的 `_build_prm_eval_prompt` 是**以 next_state 为证据**判定、且每个 turn 都能拿 OPD hint。中间轮次约占训练混合 72%。**这是下一步讨论的方向，尚未实现。**
 - `20260902_094458` / 09-03 两次的 checkpoint 均已污染，不能作为起点。
 - **round 轮数仍无上限**（186 轮空转的案例）。
@@ -53,7 +56,7 @@
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**轨迹级样本方案已写完，等 CLI 在真实环境查证九点**（第 1 条前缀重建成功率不过则整个方案不成立）。**CLI 已用真实日志核实完 ④⑥⑧⑨**（并修正了我两处估算：samples/round 全程是 4.04 不是 2.0；轨迹中位 17~18k、全程约 13% 超 32768 硬天花板）。**①②③⑤⑦ 与 `METACLAW_*` 传播仍全开，其中 ① 前缀重建至今零证据。****基准改用健康段（day01–15）而不是全程**（用户更正）：硬丢弃阈值 24576→**31000**（健康段只丢约 2%），轨迹长度 p90 本身当退化早期指标（健康约 23k、污染约 47k，**越过 30k 报警**）。**代价如实记录：改用健康段基准后更新次数差距扩大到"不到一半"（43 vs 约 94），本轮自带此 handicap。****顺序改为「先基线、后训练」**：先跑 `METACLAW_TRAIN_UNTIL_DAY=0` 的**按题隔离零训练基线**（零代码改动），它既补上「K=6 vs 基线」一直缺的那一格（此前对照混着协议差），又**顺带在全 30 天上量出轨迹级方案的成败条件（前缀重建成功率），不用烧训练算力**。基线过了再跑轨迹级训练：**跑满 30 天、不单独做冒烟**，内设检查点 A（day02，验管线）与检查点 B（day08–10，对标健康画像），不达标当场杀掉。见迁移文档"方案：轨迹级样本，一个 round = 一个样本"。**方案已实现**（`_metaclaw_build_trajectory` 前缀差分拼轨迹 + `_fire_opd_task` 门 + 两条提交路径读 `metaclaw_loss_mask` + 长度守卫 31000 + `rollout-batch-size` 8），34 项断言与双向非空洞性本地通过，**真实训练未验证**；步骤判官与 OPD 均无需改动（前者自动变死代码，后者构造天然对齐整轮）。
+2. **MetaClaw 迁移**：**先跑 `METACLAW_TRAIN_UNTIL_DAY=0` 的按题隔离零训练基线**（零代码改动），它同时补上「K=6 vs 基线」一直缺的那一格（此前对照混着按题/按天的协议差）。基线拿到后再跑「按题成组 + 1/N」的训练：**跑满 30 天、不单独做冒烟**，内设检查点 A（day02，验管线）与检查点 B（day08–10，对标健康画像），不达标当场杀掉。**轨迹级方案已于 09-03 当天被 OpenClaw 的 `dropReasoningFromHistory` 行为推翻并删除**，见迁移文档"方案：按题成组 + 1/N advantage 缩放"。
 3. 其余同 08-17
 
 ### 未验证
@@ -1898,6 +1901,8 @@
 - `docs/metaclaw_migration_plan.md`：新增"按健康段而不是全程标定"一节；硬丢弃阈值 24576→31000；检查点 B 改为对标健康画像并加入 p90>30k 报警；读结果规则补 handicap 与对标窗口
 
 **完成内容（续四，同一天）——实现轨迹级样本：**
+> **（同日稍晚被推翻，见下方「续七」：OpenClaw 在重放历史时会剥掉 thinking，扁平轨迹无法忠实构造，本节实现的代码当天已删除。保留记录是为了留住"为什么此路不通"这条推导。）**
+
 - **`prepare_patched_openclaw_opd.sh`：新增 `_metaclaw_build_trajectory()`（前缀差分拼轨迹）+ `_fire_opd_task` 顶部的门。** 中间 turn **不触发任何判官、不产生样本**，留在 `_pending_turn_data` 里；verdict 到达时把 1..N 折成一条，模型输出段 `loss_mask=1`、观测段 `loss_mask=0`、观测段 logprob 补 `0.0`——对齐 toolcall-rl 的 `generate_with_retool.py:709-765`
 - **观测段用前缀差分算出来**（`turn[n+1].prompt_text` 减去 `turn[n].prompt_text + response_text`），不去识别工具返回的格式；**对不上就整轮丢弃并打日志**，绝不拼出错序列。因此观测段天然含 chat template 脚手架（`<|im_end|>`、下一条 `<|im_start|>user … assistant`），mask 成 0 完全正确
 - **步骤判官不需要单独删**：唯一会 fire 的任务带的是 verdict next_state，走 `_opd_evaluate` 的第一个分支，`elif turn_data.get("metaclaw_round_mode")` 那条步骤判官分支对 MetaClaw 自动变成死代码。**select 补丁一个字没改**
@@ -1941,3 +1946,30 @@
 
 **产出（续六）：**
 - `docs/metaclaw_migration_plan.md`：查证记录（九）新增两节
+
+**完成内容（续七，同一天）——CLI 跑出训练发现轨迹级方案被 OpenClaw 行为推翻，改做「按题成组 + 1/N advantage 缩放」并实现：**
+- **CLI 的真实训练结果：约 96 个 round 因前缀重建失败被整轮丢弃，只有约 24 个进训且全是 `turns=1`（单轮不需要拼观测），超长丢弃 0 次、mask 不匹配 0 次。**进训率约 20%，且学到的全是"一锤子"短轨迹，多轮 tool 的题几乎全在 turn1→turn2 就挂
+- **CLI 的诊断（"不是 compaction，是下一轮历史里剥掉了 thinking"）我在 OpenClaw 源码里核实了，而且比它更确定**：`transcript-policy.ts:174` 对 strict OpenAI-compatible provider 设 `dropReasoningFromHistory = !shouldPreserveReasoningContentReplay(...)`，而后者只在 `requiresReasoningContentOnAssistantMessages` / `thinkingFormat` 为 `deepseek`/`zai` / 模型元数据可信 / 模型 id 在硬编码白名单 四种情况返回 true——我们的自定义 provider + `metaclaw-bench/qwen3-4b` 四条全不命中。**所以我们自己代码里那句 `Most likely cause is OpenClaw compacting` 是错的诊断，已删除**
+- **顺带闭环了一个挂了很久的未验证项**：`thinking=5786 字符 ↔ response=1542 token` 说明 **reasoning 确实在 `response_ids` 里、确实被 `loss_mask` 覆盖**，"thinking 膨胀经 loss_mask 训进去"那套解释机制上成立
+- **纠正我自己上一条的一个错误结论**：我说过拼 thinking 会让重要性比失控——查证后是错的。`--use-rollout-logprobs` 我们没开，`old_log_probs = batch["log_probs"]` 由训练引擎在提交的序列上**重算**（`loss.py:876`），比值自洽；TIS/ICE 也没开，`rollout_log_probs` 在我们的配置里**只喂 `train_rollout_logprob_abs_diff` 这一个诊断指标**
+- **推导出一条不可能性，这是本次方向变更的真正依据**：turn t 的真实生成是 `think_t + call_t`，而 turn t+1 的真实上下文只有 `call_t`。一条扁平序列对 turn t 只能二选一——**带 think 则后面所有 turn 的上下文是假的；不带 think 则 turn t 自己的生成被错误表示、训它等于教模型"别思考直接调工具"**。没有第三种（mask 只移出 loss、不移出上下文）。**因此每 turn 一个样本是唯一忠实的表示法，不是"更省事的选择"**
+- **改做方案 ③「按题成组 + 1/N」并实现**：样本仍是每 turn 一个（各自带真实 prompt 和真实 response，**零重建**），但**一个 round 的全部 turn 共用一个 `group_index`、在 verdict 时一次性入队**，且 advantage 除以该轮 turn 数。轨迹级原本要买的四样东西（thinking 被训、工具调用被训、每轮权重相等、单轮不能主宰 batch）全部拿到，代价只是省不下那笔 O(N²) 前向计算——**而那是回到现状，不是退步**
+- **用户提出「收满 8 个轨迹级样本再训练」，查证后确认 slime 有一等支持**：`_drain_output_queue` 数的是**组**且 `rollout.py:254` 会把组摊平（`while isinstance(data[0], list): chain.from_iterable`），**没有任何地方断言一个组必须有 `n_samples_per_prompt` 个成员**；再配 `--use-dynamic-global-batch-size`（`rollout.py:287`，无 `dynamic_history` 时 `desired_steps=1`）就是"收满 8 道题的全部 turn → 训练一次"。**这同时补掉了我上一条提醒的残留风险**：一个 batch 恒等于 8 道完整的题，全负批要求 8 道题全失败（`0.83⁸≈23%`），而不是"一道 20 轮的失败题塞满 16 个 turn 名额"
+- **实现清单**：`prepare_patched_openclaw_opd.sh` 删掉轨迹拼接函数、fire 门简化成"中间轮只 hold 不打分"；`prepare_patched_openclaw_combine.sh` 新增 `_metaclaw_submit_round()`（一次性成组入队，绝不增量 put——`_drain_output_queue` 是 `completed_groups[gid] = group` **覆盖**语义，分两次 put 会丢成员）+ 两条提交路径支持"交回样本而不入队" + 新模块 `metaclaw_round_scale.py`（1/N 钩子）；`run_openclaw_topk_select_modelfactory.sh` 改 `--rollout-batch-size 8` 并幂等注入 `--use-dynamic-global-batch-size` 与 `--custom-reward-post-process-path`（三者少一个设计就不成立，各自带失败即报错）；`prepare_patched_openclaw_combine_select.sh` 把 OPD hint 改贴到本轮**第一条** user 消息（题目），此前会贴到最后一条 user 消息——在 verdict 轮那是**工具结果**，等于教模型把"文件名写错了"当成工具观测的一部分
+- **验证**：五个脚本 `bash -n`、补丁链对真实官方源码跑通、`py_compile` 通过；新增 `scripts/tests/test_metaclaw_round_group.py`，**40 项断言直接跑补丁脚本真实生成的代码**，覆盖 1/N 算术、**1/2/5/20/186 轮的 round 贡献恒等于 1.0**（186 就是 `20260902_094458` 里主宰整批的那个真实 round）、混合 batch 按 round 求和而不是按 turn、非 MetaClaw 样本原样透传（钩子短路了 `_post_process_rewards`，必须复现默认行为）、五种畸形 turn 数回退、dummy/空批/返回长度契约，以及代理侧成组入队/持有中间轮/hint 落点的源码级检查
+- **非空洞性双向验证**：关掉 1/N → 挂在"4 轮 round 每个样本拿 1/4"；去掉成组入队 → 挂在"整轮只入队一次"。两次都已还原
+- **删除上午实现的轨迹级代码与其测试**（`_metaclaw_build_trajectory`、`metaclaw_loss_mask` 两处消费点、`METACLAW_TRAJ_MAX_TOKENS`、`test_metaclaw_trajectory_sample.py`），不留死代码
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"方案：按题成组 + 1/N advantage 缩放"
+
+**主要问题（续七）：**
+- **1/N 只压幅度、不改符号**：8 道题全失败时仍是全负批、仍是均匀打压，只是强度降到 1/N。按 round 通过率约 17% 算这种批次约占 23% → **这是 `n_samples=1` 没有组内比较的固有问题，③ 不解决**，要靠 `n_samples=8`
+- **更新次数 43 次 vs day22 那次约 96 次**（每次吃约 35 个样本而不是 16 个，总数据量一样）→ 读结果时要扣掉；取 `rollout-batch-size 4` 能追平到 86 次但全负批概率涨到 47%，不划算
+- `_drain_output_queue` 有 `if any(sample.status == ABORTED for sample in group): continue`，**按题成组后一个 turn abort 会丢整道题** → `is_aborted` 的 turn 在上游 `degraded-turn-drop` 就被拦掉、到不了队列，预期影响为零，但**真实训练要确认这条路径**
+
+**产出（续七）：**
+- `scripts/prepare_patched_openclaw_opd.sh`：删轨迹拼接、简化 fire 门、删错误的 compaction 诊断
+- `scripts/prepare_patched_openclaw_combine.sh`：`_metaclaw_submit_round` + 成组入队 + `metaclaw_round_scale.py` 生成
+- `scripts/prepare_patched_openclaw_combine_select.sh`：OPD hint 改贴本轮题目
+- `scripts/run_openclaw_topk_select_modelfactory.sh`：`--rollout-batch-size 8` + dynamic gbs + reward 钩子注入
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：移除 `METACLAW_TRAJ_MAX_TOKENS`，落盘/打印改为样本单位说明
+- `scripts/tests/test_metaclaw_round_group.py`（新增，40 项）；删除 `scripts/tests/test_metaclaw_trajectory_sample.py`
