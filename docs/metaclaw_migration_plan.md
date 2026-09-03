@@ -1603,6 +1603,148 @@ MetaClaw 自己的 `compute_advantages` 是除 std 的，我们上一版照搬�
 1. **round 轮数上限**。`20260902_094458` 里 day06-r7 空转 186 轮是灾难的起点。现有唯一的杠杆是 driver 里 `_run_round` 那个调用点的 `round_timeout`（当前是 `None`），另一个候选是代理侧在 `_turn_counts` 超阈值后直接拒绝。两者的副作用还没查清，**先不动**。
 2. **退化熔断**（按某个运行时指标自动冻结训练）。指标选什么、阈值多少，都还没有依据，同样先不动。
 
+### 查证记录（八）：`toolcall-rl` 到底怎么处理"调用次数不确定的中间步骤"（2026-09-03）
+
+09-01 的查证记录（六）只看到了奖励合成那一层，漏了最关键的一层：**样本粒度**。重查 `toolcall-rl/generate_with_retool.py` 全文，结论如下。
+
+**一条轨迹 = 一个样本，不是一个 turn 一个样本。** 多轮拼成一条 token 序列，工具返回用 loss_mask 挖掉（`generate_with_retool.py:709-765`）：
+
+```python
+response_token_ids += cur_response_token_ids      # 模型输出
+loss_masks       += [1] * len(cur_response_token_ids)
+...
+response_token_ids += obs_tokens_ids              # 工具返回
+loss_masks       += [0] * len(obs_tokens_ids)
+sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
+assert len(response_token_ids) == len(sample.rollout_log_probs)
+```
+
+**"这一轮调了几次工具"因此根本不是一个问题**——调得多序列长一点，样本数永远是 1。上限只有 `max_turns=16` / `max_tool_calls=16` 和 context 长度。这正是我们一直没解决的那个问题（一个 round 产出几个样本、怎么分组）在它那边压根不存在的原因。
+
+**它同时记录每一段模型输出的 token 区间**（`step_action_spans`，`{step_index, token_start, token_end}`），落进 `sample.metadata["step_wise"]["step_token_spans"]`。PRM 对每一步异步打分，但**这些分不会变成独立样本**，只进 metadata。
+
+**奖励合成**（`reward_func:856`）：`outcome_reward = math_dapo_compute_score(...)`，然后 `step_scores_with_outcome = [step + outcome for step in step_scores]`——**整条轨迹的最终结果加到每一步上，PRM 只负责在轨迹内部做区分**。
+
+**`--advantage-estimator step_wise`**（PRM 版用它，`retool_qwen3_4b_prm_rl.sh:108`）：归一化在 `slime/ray/rollout.py:530` 做，按 **`(group_index, step_index)`** 分桶——第 3 步跟同一道题另外 7 条轨迹的第 3 步比；桶内方差 ≤1e-12 **整桶丢弃**，样本所有 step 都被丢就 `remove_sample = True`；最后 `loss.py:645` 把每步归一化后的标量**广播到它自己的 token 区间**（`full_adv[start:end] = step_reward`，再乘 `loss_mask`）。
+
+**推论一：09-01 设想的"在 reward 钩子里做轨迹级 advantage 再广播"，slime 里已经有了，就是 `step_wise`。** 我们自己写的批级基线是在重造一个更差的轮子。
+
+**推论二：把 per-step PRM 关掉（`prm_step_coef=0`）后，`step_scores_with_outcome` 退化成"每一步都等于该轮 checker 判定"**，于是同一 round 的 n 次尝试若结果全同 → 每个 `(group, step)` 桶方差为 0 → **整桶被官方逻辑丢弃 → 这批不更新**。我们千辛万苦想要的"全负批不训坏"，是官方逻辑白送的。而且此时所有 step 分数相同，`step_wise` 广播一个标量到全部 masked token，**等价于 `n_samples_per_prompt=n` 的普通 GRPO**——所以最小可行版本用 `grpo` 就够，不必上 `step_wise`。
+
+**权重更新规模**（`slime/utils/arguments.py:1948`）：
+
+```
+global_batch_size = rollout_batch_size × n_samples_per_prompt // num_steps_per_rollout
+```
+
+| | rollout_batch | n_samples | steps_per_rollout | 每次更新的样本数 |
+|---|---|---|---|---|
+| toolcall-rl（PRM 版 `step_wise`）| 32 | 8 | 2 | **128 条轨迹** |
+| toolcall-rl（非 PRM 版 `grpo`）| 32 | 8 | 2 | **128 条轨迹** |
+| 我们现在 | 16 | 1 | 1 | 16 个 **turn** |
+
+两个变体的 `n_samples_per_prompt` **都是 8**，跟 advantage estimator 无关——8 是配方核心，不是调参。
+
+---
+
+### 方案（待 CLI 在真实环境查证，未实现）：轨迹级样本，一个 round = 一个样本（2026-09-03）
+
+#### 定位（重要，别当成控制变量实验）
+
+跟"跑到 day22"那次（`20260827_163030`）相比，这个方案至少变了五件事：样本单位、奖励来源、每轮样本数、OPD hint 作用范围、多了一条长度保护。**跑出来变好或变坏都归不到单一原因上。** 它的定位是"换一种结构上站得住的形态，看能不能跑起来"，不是 A/B。
+
+真正的单变量版本（只改奖励、不改样本单位）**已经做过了，就是 `METACLAW_MIDROUND_REWARD=outcome`，`20260831_154301` 一跑就发散**。所以"只把中间步打分换成整轮打分"这条路本身已被证伪；这个方案跟它的差别**只在于同一轮的 N 个 turn 是留成 N 个样本还是并成 1 条**，而 outcome 当初炸掉，炸的正是后者。
+
+#### 合并样本单位带来的三个结构性后果（outcome 模式当时都没有）
+
+1. **每一轮的梯度权重终于相等。** `sum_of_sample_mean`（`slime/backends/megatron_utils/cp_utils.py:70`）是每个样本先取均值、再对样本求和，所以**一个跑了 20 轮的 round 现在贡献 20 份梯度，1 轮答完的 round 只贡献 1 份**——"啰嗦、反复调工具"这件事自带 20 倍权重加成，跟答得对不对无关。轨迹级之后每个 round 恰好算一次。
+2. **一个 round 再也无法主宰一个 batch。** day06-r7 空转 186 轮 → 一次性倒出 186 个 `-1` → 该批 1 正 15 负，正是 outcome 发散的直接形态。轨迹级下它就是 1 个样本。
+3. **2~3 token 的空回复样本消失**，被吸收进整条轨迹里的一小段。
+
+#### 一个现成的有利条件：session 已经就是 round
+
+driver 里 `round_session_id = f"metaclaw-{test_id}-{group_id}-{round_id}"`（2026-08-19c 起，每 round 一个全新空 transcript）。**所以一个代理 session 精确对应一条轨迹，不需要额外的 round 键**；而且每轮从空 transcript 开始，round 内触发 OpenClaw context 压缩的概率比共享 session 时低（但不为零，见待查证 ②）。
+
+#### 样本构造：前缀差分
+
+代理侧已有 `_pending_turn_data[session_id][turn_num]`，每个 turn 存着 `prompt_ids / response_ids / response_logprobs / prompt_text / response_text / messages`。verdict 到达时按下面的方式拼一条：
+
+```
+轨迹 prompt = turn[1].prompt_text
+轨迹 response = R1 + Obs1 + R2 + Obs2 + ... + RN
+其中  Rn   = turn[n].response_text                                            loss_mask=1
+      Obsn = turn[n+1].prompt_text 去掉 (turn[n].prompt_text + Rn) 之后剩下的部分   loss_mask=0
+```
+
+**观测段用前缀差分算出来，不去猜工具返回长什么样**，因此它天然包含 chat template 的脚手架（`<|im_end|>`、下一条 `<|im_start|>user ... <|im_start|>assistant\n`），这些正是模型条件依赖、但不该被训练的 token，mask 成 0 完全正确。
+
+**这个算法自带失败检测**：若 `turn[n+1].prompt_text` 不以 `turn[n].prompt_text + Rn` 开头（context 压缩、消息被重写等），**当场判定重建失败、整轮丢弃并打日志**，绝不拼出一条错序列。
+
+`rollout_log_probs` 照抄 toolcall-rl：模型输出段用该 turn 的 `response_logprobs`（官方代码已保证与 `response_ids` 等长），观测段补 `0.0`，末尾加硬断言。
+
+**一个已知的近似**：前缀检查在**文本**层面做（权威），但各段是各自 tokenize 再拼接的，跨段边界可能与"整体 tokenize 一次"不完全一致。这跟官方现在 `response_ids = tokenizer(response_text)` 已有的近似是同一类，但轨迹级下段数更多。需要实测漂移量（待查证 ③）。
+
+#### 提交时机
+
+从"某个 turn 的 PRM 任务完成就提交"改成"**本轮 verdict 到达时，把整条轨迹作为唯一一个样本提交**"。中间 turn 不再触发任何 PRM/判官任务。
+
+#### 奖励与 OPD
+
+- **奖励 = 本轮 checker 的确定性 ±1**（`metaclaw_verdict` 分支已有），**步骤判官整个消失**。
+- **OPD 的构造一行都不用改。** `_append_hint_to_messages`（`openclaw_opd_api_server.py:139`）是从后往前找最后一条 user 消息贴 hint；轨迹级下 `messages` 就是本轮初始消息列表，最后一条 user 消息正好是本轮题目，hint 落点天然正确。随后 `enhanced_full_text = enhanced_prompt_text + response_text`，把 `response_text` 换成整条轨迹之后，语义正好变成"如果这道题一开始就带着这个 hint，模型会怎么走完这一整轮"——**checker 给的 hint（比如文件名写错）本来就是针对整轮的，不是针对某个 turn 的**。
+- **观测 token 不会污染蒸馏**：`openclaw_topk_select_loss.py:435` 的 `opd_loss = sum_of_sample_mean(opd_pg_tokens)`，而 `sum_of_sample_mean` 乘了 `loss_mask`，所以 GRPO 项和 OPD 项**一起**把 mask=0 的观测段排除。
+
+#### 长度保护（前置必做，不是可选）
+
+轨迹级下，一个失控的 round 不再是"多产负样本"，而是"**这条样本根本进不了训练**"——`--max-tokens-per-gpu 32768` 是训练侧打包上限。
+
+分两层，**第一层保证正确性、不依赖任何未验证的杠杆**：
+
+1. **代理侧硬丢弃**：拼完的轨迹 token 数超过阈值（建议 24576，给 prompt 留头寸）→ 打日志 + 丢弃整轮，不提交。永远安全，无需新机制。
+2. **轮数上限（优化项，可后置）**：让失控的 round 早点停，避免白跑。两个候选杠杆——driver 的 `round_timeout`（当前 `None`，墙钟）和代理侧按 `_turn_counts` 超阈值拒绝——**副作用都没查过**（待查证 ⑤）。toolcall-rl 的锚点是 `max_turns=16 / max_tool_calls=16`。
+
+#### 配置改动
+
+| 参数 | 现在 | 改成 | 理由 |
+|---|---|---|---|
+| `--rollout-batch-size` | 16 | **8** | 每轮样本从约 2.0 降到 1.0，不改的话更新次数减半 |
+| `--n-samples-per-prompt` | 1 | **1（本阶段不动）** | 先验证管线，`n_samples=8` 是下一阶段 |
+| `--disable-rewards-normalization` | 开 | **保持开** | `n_samples=1` 时每组只有 1 个样本，开归一化会被 `_drop_constant_reward_groups` 整批判成常数组 |
+| `--advantage-estimator` | grpo | **grpo（不动）** | 所有 step 同分时 `step_wise` 与 grpo 等价，不必上 |
+
+**样本预算重算**（修正 09-03 讨论中最初的错误估计）：`20260902` 到 day06-r8 是 step 8，day01~day05 共 56 个 round 加 day06 的 8 个约 64 个 round，8 步 × 16 样本 = 128 个样本 → **约 2.0 个样本/round**。因此：
+
+| | 30 天总样本 | 每次更新 | 总更新次数 |
+|---|---|---|---|
+| 现在（turn 级）| 346 × 2 约 690 | 16 | **约 43** |
+| 轨迹级 `n_samples=1` | 346 | 8 | **43** |
+
+**更新次数基本不变**，真正的差别在每个样本的信息量。（保留：`20260902` 是 outcome 模式且 day06-r7 那次 186 样本 flush 把平均搅乱了，这个 2.0 只是量级参考，真值见待查证 ④。）
+
+**`n_samples=1` 的固有风险**：advantage = 原始 ±1，全负批 = 均匀打压。按 round 通过率约 17%，batch 8 时 `0.83^8` 约 23% 的批次全负（batch 16 时 5%）。**所以 `n_samples=1` 只能当管线验证，不能当训练配置**；`n_samples=8` 才是消掉这个风险的东西（77% 的组内同时有成功和失败，全失败的那 23% 被常数桶逻辑丢弃 = 这组不更新）。
+
+#### 需要 CLI 在真实环境查证的九点（本地无法验证）
+
+1. **前缀重建成功率**——统计有多少 round 满足"每个 `turn[n+1].prompt_text` 都以 `turn[n].prompt_text + turn[n].response_text` 开头"。**这条不过，整个方案不成立。**
+2. **round 内是否发生 OpenClaw context 压缩/历史重写**——它是 ① 失败的主要来源。session 每轮全新，理论上概率低，但没验证过。
+3. **token 边界漂移**——`len(tokenizer(拼接后的整段文本))` 与"各段分别 tokenize 后长度之和"的差值分布。
+4. **现在真实的样本数/更新次数**——按天统计 judge 模式日志里 `submitted ... sample` 的行数与总 step 数，用来核实上面那个"约 2.0 个样本/round"。
+5. **轮数上限的两个杠杆各自的副作用**——`round_timeout`（driver 侧墙钟）与代理侧按 `_turn_counts` 拒绝，哪个安全、会不会让 OpenClaw 进入异常状态。
+6. **轨迹长度分布**——有多少 round 拼完超过 24576 / 32768 token（决定硬丢弃阈值会不会把大量数据丢掉）。
+7. **teacher logprob 的开销**——`_compute_teacher_log_probs` 从约 2k token 的序列变成 10~20k，耗时与显存是否可接受。
+8. **`--rollout-max-response-len 8192` 是否会约束 `sample.response_length`**——轨迹的 response 长度会远超它，slime 里有没有地方拿这个值做断言或缓冲区尺寸。
+9. **`rollout_batch_size=8` 与 `dp_size` 的关系**——会不会更频繁触发 `_make_dummy_samples`（样本数不足 `dp_size` 时注入 reward=0.0 的占位样本）。
+
+顺带仍未闭环的一条：**`METACLAW_*` 环境变量到底有没有传到训练后端进程，至今没有验证过**（`judge` 是默认值，"看起来对"证明不了传播成功）。
+
+#### 冒烟验收（2 天，不看分数）
+
+`METACLAW_MAX_DAYS=2` 跑一次，只看四件事：① 前缀重建成功率；② 每天提交的样本数应约等于当天 round 数（day01=10、day02=11）；③ 轨迹 token 长度分布与硬丢弃命中率；④ OPD hint 在 round 级任务上的接受率（`_select_best_hint` 要求 `score==1 且 len(hint)>10`，hint 来源从终轮变成整轮，接受率会不会掉）。
+
+**不要停在 `n_samples=1` 上跑满 30 天**——43 次更新既证明不了方法有效也证明不了无效。冒烟通过就直接上 `n_samples=8` + 打开 `rewards_normalization`。
+
+---
+
 ### 查证记录（二）：2026-08-14 续，三项此前标记"待验证"的假设逐一核查
 
 用户明确要求"不要默认是对的"，继续查证前一版方案里几处未经验证就写下的假设，结果如下：

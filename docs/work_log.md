@@ -52,7 +52,7 @@
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：代码已回到干净基线，**等用户的新思路**再决定下一步改什么。在那之前不再叠加改动。
+2. **MetaClaw 迁移**：**轨迹级样本方案已写完，等 CLI 在真实环境查证九点**（第 1 条前缀重建成功率不过则整个方案不成立）。通过后先跑 `METACLAW_MAX_DAYS=2` 冒烟、只验管线不看分数，再上 `n_samples=8`。见迁移文档"方案：轨迹级样本，一个 round = 一个样本"。**代码仍停在干净基线上，方案未实现。**
 3. 其余同 08-17
 
 ### 未验证
@@ -1851,3 +1851,22 @@
 **产出：**
 - `scripts/`（5 个文件）：恢复到 `40c5450`；删除 `scripts/tests/test_length_aware_and_baseline.py`
 - `docs/work_log.md`、`docs/status_history.md`：本条目 + 状态归档
+
+**完成内容（续，同一天）——重查 toolcall-rl 的样本粒度，出轨迹级样本方案：**
+- **重查 `toolcall-rl/generate_with_retool.py` 全文，发现 09-01 的查证记录（六）漏了最关键的一层——样本粒度**：它是**一条轨迹一个样本**，多轮拼成一条 token 序列、工具返回用 `loss_mask=[0]` 挖掉（`generate_with_retool.py:709-765`）。**"这一轮调了几次工具"在它那边根本不是问题**——调得多序列长一点，样本数永远是 1。我们一直纠结的"一个 round 产出几个样本、怎么分组"在它的形态下不存在
+- **`--advantage-estimator step_wise`（PRM 版用的）就是我 09-01 设想的东西**：`slime/ray/rollout.py:530` 按 `(group_index, step_index)` 分桶归一化，桶内方差 ≤1e-12 整桶丢弃，`loss.py:645` 把每步标量广播到它的 token 区间。**我们自己写的批级基线是在重造一个更差的轮子**
+- **推论：把 per-step PRM 关掉后，同一 round 的 n 次尝试若结果全同 → 桶方差为 0 → 整桶被官方逻辑丢弃 → 这批不更新。"全负批不训坏"这条性质是官方白送的**；且此时所有 step 同分，`step_wise` 等价于普通 GRPO，最小版本用 `grpo` 就够
+- **查清权重更新规模**（`slime/utils/arguments.py:1948`：`global_batch = rollout_batch × n_samples // num_steps_per_rollout`）：toolcall-rl 两个变体都是 32×8//2 = **128 条轨迹/次更新**，`n_samples_per_prompt` 都是 8（跟 estimator 无关，是配方核心）；我们现在是 16×1//1 = 16 个 **turn**/次更新
+- **用户指出"K=6 那次每条轨迹实际只采到约 2 个样本"，算下来是对的**：`20260902` 到 day06-r8 是 step 8，约 64 个 round、8 步 × 16 = 128 个样本 → **约 2.0 样本/round**。**这修正了我当天早些时候的错误估计**——我原本按 batch 16 算出"轨迹级只有 21 步、太少"，实际按 batch 8 是 43 步，**跟现在的约 43 步基本相同**，轨迹级在更新次数上根本不是退步，差别在每个样本的信息量
+- **确认用户关于 OPD 的判断成立，而且这块一行都不用改**：`_append_hint_to_messages`（`openclaw_opd_api_server.py:139`）从后往前找最后一条 user 消息贴 hint，轨迹级下正好是本轮题目；`enhanced_full_text = enhanced_prompt_text + response_text` 换成整条轨迹后语义正确——checker 给的 hint（文件名写错之类）本来就是针对整轮的。且 `openclaw_topk_select_loss.py:435` 的 `opd_loss = sum_of_sample_mean(...)` 乘了 `loss_mask`，**观测 token 不会污染蒸馏**
+- **发现一个此前没注意到的结构性偏置**：`sum_of_sample_mean` 是每样本先取均值再对样本求和，所以**一个跑了 20 轮的 round 现在贡献 20 份梯度，1 轮答完的只贡献 1 份**——"啰嗦、反复调工具"自带 20 倍权重加成，跟答得对不对无关。轨迹级之后每个 round 恰好算一次
+- **明确了这个方案和 outcome 模式的真实差别**："不做中间步打分、整轮共用一个分"我们**已经做过了**（outcome 模式，`20260831_154301` 一跑就发散）。轨迹级跟它的差别**只在于同一轮的 N 个 turn 是留成 N 个样本还是并成 1 条**——而 outcome 当初炸掉炸的正是后者（186 轮 round 一次倒出 186 个负样本主宰整批）
+- **写出完整方案**：前缀差分拼轨迹（自带失败检测，对不上就整轮丢弃）、verdict 到达时一次性提交、代理侧硬长度丢弃（24576，前置必做，因为超过 `--max-tokens-per-gpu 32768` 的样本根本进不了训练）、`rollout_batch_size` 16→8、`n_samples=1` 先验证管线。**明确写清它不是单变量对照**（至少变了五件事），以及 `n_samples=1` 只能当管线验证不能当训练配置（batch 8 时约 23% 的批次全负）
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"查证记录（八）"与"方案：轨迹级样本，一个 round = 一个样本"
+
+**主要问题（续）：**
+- **方案有九个点本地无法验证**，其中第 1 条（前缀重建成功率）不过则整个方案不成立 → 已列成清单交 CLI 在真实环境查
+- `METACLAW_*` 环境变量的传播**仍未验证**（承接本条目上半）
+
+**产出（续）：**
+- `docs/metaclaw_migration_plan.md`：新增查证记录（八）+ 轨迹级样本方案两节
