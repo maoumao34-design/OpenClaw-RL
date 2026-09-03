@@ -151,28 +151,6 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
-# 消融开关（2026-08-31，见 docs/metaclaw_migration_plan.md "方案：中间轮次
-# 改吃本轮最终 checker 结果的消融实验"）。默认 judge = 现有行为，一字不改。
-# 设成 outcome 时，round 内中间轮次仍然照常提交（样本量不变，避免跟"训得少
-# 所以好"混淆），但奖励来源从步骤判官分换成本轮最终 checker 的确定性 ±1。
-#
-# 必须传给**训练后端进程**而不只是 driver：读这个变量的是代理侧的
-# openclaw_combine_api_server.py（被训练进程 import），driver 自己不读它。
-METACLAW_MIDROUND_REWARD=${METACLAW_MIDROUND_REWARD:-judge}
-
-# 长度感知的正奖励（2026-09-01）。**没有开关，一直生效**——它是防训坏补丁，
-# 不是可选对照。只有两个阈值可调，单位是**响应 token 数**（不是 thinking 字符
-# 数），即 sample.response_length / loss_mask 实际覆盖的长度。
-#   L0  低于它不打折（默认 6000）。取在 K=6 健康跑的 p90(5.3k) 之上、
-#       20260827 漂移跑的 p90(6.9k) 之下，刻意只惩罚漂移区间。
-#   L1  达到它打到地板（默认 16000）。
-# 只对 reward > 0 的样本生效；负样本一律保持平坦的 -1，这一点是承重的——
-# 让失败样本也随长度变化，会给"整轮全失败"的 round 制造 reward 方差，
-# 批级基线随即为它算出真实 advantage，其中最不糟的那一步会被正向强化。
-# 这正是 blend 被删掉的原因，不要重新引入。
-METACLAW_LEN_DECAY_L0=${METACLAW_LEN_DECAY_L0:-6000}
-METACLAW_LEN_DECAY_L1=${METACLAW_LEN_DECAY_L1:-16000}
-
 # 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
 # 建议先设 METACLAW_MAX_DAYS=1，确认整条链路（真实 openclaw agent 子
 # 进程、checker 执行、verdict 被代理正确识别、session_id 正确传递）
@@ -202,24 +180,11 @@ started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 command: $0 $*
 metaclaw_root: ${METACLAW_ROOT}
 checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
-metaclaw_midround_reward: ${METACLAW_MIDROUND_REWARD}
-metaclaw_len_decay_l0: ${METACLAW_LEN_DECAY_L0}
-metaclaw_len_decay_l1: ${METACLAW_LEN_DECAY_L1}
 EOF
 
 echo "日志目录: ${LOGS_DIR}"
 echo "METACLAW_ROOT: ${METACLAW_ROOT}"
 echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
-# 2026-08-31: 之前这个开关的实际生效值不落盘到任何地方，modelfactory 上
-# 任务提交环节（代码解释器/代码路径两个独立字段）环境变量能不能真的传
-# 到这里，本项目并未验证过——如果没传到，会静默回退成默认的 judge，
-# 训练侧和用户都不会有任何提示。这里把生效值同时打进屏幕日志和
-# RUN_MANIFEST.txt，训练一提交就能立刻确认到底是不是 outcome，而不是
-# 等跑了一天之后才去猜。
-echo "METACLAW_MIDROUND_REWARD（消融开关，实际生效值）: ${METACLAW_MIDROUND_REWARD}"
-# 同理：长度感知打折没有开关、总是生效，但两个阈值传丢了会静默回退成
-# 代理侧的默认值，所以把实际生效值一起打出来。
-echo "长度感知正奖励阈值（响应 token）: L0=${METACLAW_LEN_DECAY_L0} L1=${METACLAW_LEN_DECAY_L1}"
 
 # =====================================================================
 # 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
@@ -334,9 +299,6 @@ CUDA_VISIBLE_DEVICES="${TRAINING_CUDA_DEVICES}" \
   PATCHED_COMBINE_SELECT_DIR="${PATCHED_COMBINE_SELECT_DIR}" \
   OPENCLAW_RL_GIT_SHA="${OPENCLAW_RL_GIT_SHA}" \
   METACLAW_MIGRATION_PROFILE="1" \
-  METACLAW_MIDROUND_REWARD="${METACLAW_MIDROUND_REWARD}" \
-  METACLAW_LEN_DECAY_L0="${METACLAW_LEN_DECAY_L0}" \
-  METACLAW_LEN_DECAY_L1="${METACLAW_LEN_DECAY_L1}" \
   bash "${SCRIPTS_DIR}/../run_openclaw_topk_select_modelfactory.sh" \
   > "${LOGS_DIR}/training.log" 2>&1 &
 TRAINING_PID=$!

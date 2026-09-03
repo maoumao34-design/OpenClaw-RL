@@ -36,29 +36,29 @@
 
 ---
 
-## 当前状态（2026-09-02）
+## 当前状态（2026-09-03）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
-**MetaClaw 迁移**：同 09-01（历史状态），另加：[x] **目标已重设为"跑满 30 天、总分高于只训到 day6"**，判据随之改为"整体持续变好、绝不训坏"，而不是每一批信号都更对；[x] **两次失败已归结为同一个病**——二值 reward 区分不了"答对且简洁"和"答对但啰嗦"，而 `loss_mask` 覆盖整段 response（含 `<think>`）；[x] **`blend` 已删除**（实测它会让全失败 round 里被判官认可的那一步拿到 +1.121 的正 advantage，摧毁"全负批不更新"这条安全性质）；[x] **长度感知的正奖励已实现**（只对 reward>0 生效、按响应 token、覆盖所有模式的所有正样本、负样本一律平坦 -1）；[x] **批级基线已改成只减均值不除 std**（`|adv| ≤ 2`，1 正 15 负从 3.873 降到 1.875）；[x] **41 项断言全部通过、双向非空洞性已验证**。
+**MetaClaw 迁移**：**`scripts/` 已全面回退到 `20260827_163030`（跑到 day22 那次）的代码状态**，与 `40c5450` **逐字节相同**（`git diff --numstat 40c5450 -- scripts/` 无输出；三个补丁脚本对真实官方源码生成的代理文件 `diff -rq` 完全一致，且不再产出 `metaclaw_batch_baseline.py`）。回退掉的是 08-31~09-02 加的全部内容：批级基线、长度感知正奖励、规则 6、outcome 模式全套（含硬负分优先级、墓碑清理）、blend 残留、以及它们的回归测试。**Phase 1 的 diff 判定和 Traceback 泄漏修复保留**（它们本来就在 `40c5450` 里，是 day22 那次实际用的代码）。文档一律不回退，全部保留为记录。
 
 ### 已知限制 / 未解决
-同 09-01（历史状态），另加：**`20260902_094458` 的 checkpoint 已污染**（day06-r8 thinking 已到 120945），跟 `20260831_154301` 一样不能作为起点，下一次必须从干净 base 起步。**round 轮数没有上限**——day06-r7 空转 186 轮是那次崩溃的起点，杠杆（driver 的 `round_timeout` / 代理侧按 `_turn_counts` 拒绝）副作用未查清，**本轮刻意没动**。**退化熔断尚无指标与阈值依据，同样没做**。`L0=6000` 的代价是明确接受的：一次健康但偏长的 9k 成功会拿 0.73 而不是 1.0。
+- **day22 那次为什么中途变差，至今没有答案。**原来的解释（thinking 膨胀经 loss_mask 训进去）依赖"reasoning 在 `response_ids` 里"这个**从未验证过**的前提，见下方未验证第一条。
+- **09-02/09-03 两次工具塌陷的机制已定位到代码层面，但没有修**（回退掉了触发它的三项改动，不等于修好了底层结构）。三层：① 空回复 turn 会变成 2~3 token 的样本（官方 `if not response_ids and not response_text.strip()` 守卫因 `response_text` 永远含 `<|im_end|>` 而形同虚设）；② slime 的 `sum_of_sample_mean` 每样本先取均值再求和，2 token 样本与 5000 token 样本等权；③ 批级基线放大稀有正样本。
+- **中间轮次的信号结构本身可疑**：MetaClaw 迁移用的是 toolcall-rl 式 step judge（开放式"好不好"，无事实锚点）且写死 `accepted: False`（无 hint、只剩拉回 base 的正则），而 Personal Agent 用的 `_build_prm_eval_prompt` 是**以 next_state 为证据**判定、且每个 turn 都能拿 OPD hint。中间轮次约占训练混合 72%。**这是下一步讨论的方向，尚未实现。**
+- `20260902_094458` / 09-03 两次的 checkpoint 均已污染，不能作为起点。
+- **round 轮数仍无上限**（186 轮空转的案例）。
+- 其余同 09-02（历史状态）。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**跑一轮"复现 `20260827_163030` 的 judge 配置 + 批级基线 + 两项防训坏补丁"**，不用 outcome、不用 blend，**从干净 base 起步**。判据：① day17 不再出现 18k→115k 的 thinking 断崖；② day16-22 的 MC 格式失败率明显低于 17/26；③ Acc. 可以低于只训到 day6 那次，但不能出现 day20-22 归零式崩塌；④ 全负批 advantage 全 0、不再出现约 3.87 的稀有正样本放大；⑤ `[metaclaw-batch-baseline]` 与 `[openclaw-rl-metaclaw-length-aware-success]` 两类日志行必须真的出现（**reward 侧计数不会变，别盯它**）
-3. 跑完之后再谈轮数上限和退化熔断——两者都需要先拿到这一轮的日志才有依据
-4. 其余同 08-17
+2. **MetaClaw 迁移**：代码已回到干净基线，**等用户的新思路**再决定下一步改什么。在那之前不再叠加改动。
+3. 其余同 08-17
 
 ### 未验证
-- [ ] **长度感知正奖励在真实训练里的效果**——41 项本地断言只证明算术和边界正确，"它能否真的挡住 thinking 膨胀"要真实训练回答
-- [ ] **`L0=6000`/`L1=16000` 这两个阈值是否合适**——取自 K=6 与 `20260827` 的正样本长度分布（p90 5.3k vs 6.9k），是有依据的估计，不是实测最优
-- [ ] **只减均值的批级基线能否真的阻止发散**——去掉了放大器，但"够不够稳"未知
-- [ ] **两项改动叠加后会不会把正信号压得太弱**——长度打折 + 批中心化都在缩小正 advantage，有没有过度未知
-- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——至今没有被干净地回答过（承接 09-01）
-- [ ] **round 轮数上限的两个候选杠杆各自的副作用**——`round_timeout` 与代理侧按 `_turn_counts` 拒绝，都没查
-- [ ] **路线 A 的 token 序列重建与 logprob 拼接是否可行**——原料齐全但未实测（承接 09-01）
+- [ ] **reasoning 到底在不在被训练的 token 里**——`response_ids` 由 `apply_chat_template` 渲染 assistant 消息得到，Qwen3 模板会不会渲染 `reasoning_content` 本地无法确认。**这条决定"thinking 膨胀"这个叙事成不成立**，查法：`awk '/thinking=[0-9]+ chars/{t=$0} /MAIN session=.*response_tokens=/{print t" || "$0}' training.log`
+- [ ] **`METACLAW_*` 环境变量到底有没有传到训练后端进程**——从未验证过（代码注释里记过这个担心）；`judge` 是默认值，所以"模式看起来对"证明不了传播成功
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——至今没有被干净地回答过（承接 09-01/09-02）
 - [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，训练效果层面未回答
 - [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
 - [ ] **`done.log` 非追加场景真实触发率**——监控已埋点，等真实训练观察
@@ -66,7 +66,7 @@
 - [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前走的是训练自己的 harness
 - [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾（承接 08-18，仍未解开）
 - [ ] 官方 MetaClaw Compl. 非零的真实原因——开放问题，不阻塞
-- 其余同 09-01（历史状态，见 [`status_history.md`](status_history.md)）
+- 其余同 09-02（历史状态，见 [`status_history.md`](status_history.md)）
 
 ---
 
@@ -1828,3 +1828,26 @@
 - `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：删除两个 blend 系数（声明/透传/落盘/打印），换成 `METACLAW_LEN_DECAY_L0`/`L1`
 - `scripts/tests/test_length_aware_and_baseline.py`（新增）：41 项回归断言
 - `docs/metaclaw_migration_plan.md`：新增 2026-09-02 一节；两处 `blend` 旧结论加更正框
+
+## 2026-09-03
+
+**目标：** 两次 judge 配方训练同形塌陷，查清机制后按用户要求把代码全面退回到"跑到 day22"那次的状态，为新思路清出干净起点。
+
+**完成内容：**
+- **两次训练同形塌陷**（`161947` day05 起 write=0；`174248` day03 尚好、day04 已坏、day05-r1 已 0 write）。CLI 给出的根因是"judge 中间步不要求工具/落盘/非空回复就发 +1"——**这条观察是真的，但解释不了这次为什么会崩**：`20260827_163030` 用的是同一个 judge、同一套判据，跑到了 day22 只是慢慢变差。**CLI 没有做差分**，停在了一个所有版本都成立的现象上
+- **做差分后，08-27 以来在 judge 模式下真正生效的只有三项**：规则 6、批级基线、长度感知。CLI 自己报告长度感知命中 ≈0，等于排除了第三项
+- **在源码层面定位到三层叠加的机制**：① `openclaw_opd_api_server.py:775` 的 `response_text = full_text[len(prompt_text):]` 保留了 `<|im_end|>`，所以官方守卫 `if not response_ids and not response_text.strip()` **形同虚设**——空回复 turn 照常进队列，被训练的 token 就是模板骨架；② `slime/backends/megatron_utils/cp_utils.py:70` 的 `sum_of_sample_mean` 除的是**每个样本自己的 token 数**，2 token 样本与 5000 token 样本等权，即那 2 个 token 各承受约 2500 倍单 token 梯度——**给 +1 是训"立刻闭嘴"，给 -1 是训"永不停止"，两个方向都坏**；③ 只减均值的基线在偏斜批下仍能把稀有正样本放大到约 +1.875、多数类压到 -0.125
+- **外加结构性偏置**：7 条硬负分规则里 1a/1b/2a/2b/6 **五条都在 `if tool_calls:` 内**，规则 4 在 MetaClaw 下因拿不到 `student-hw-N-` 而整段跳过。负压力天然只打调用工具的 turn，"长想 + 空回复"几乎免疫 → **"不调工具"成为规避 -1 的最优解**
+- **排除了我原本最怀疑的规则 6 大面积误伤**：查 OpenClaw 的 `src/agents/agent-tools.params.ts:91` `REQUIRED_PARAM_GROUPS`，`write`/`edit` 的必填参数就是 `path`，键名是对的
+- **讨论中用户指出方向性问题：Personal Agent 的做法比 toolcall-rl / MetaClaw 本身更适合迁移**。核对代码后确认成立，差异是三条具体的东西：① 判据锚点——`_build_prm_eval_prompt` 是"**以 next_state 为证据**"（role='tool' 成功返回 → 正分），而 `_build_metaclaw_step_judge_messages` 是开放式"helpful and correct"，**没有事实锚点**；② 中间轮次的教学信号——Personal Agent 每个 turn 都走 hint judge 拿 OPD hint（蒸馏目标是"被提示改进过的自己"），MetaClaw 的 step-judge 分支写死 `accepted: False`，OPD 退化成只剩"别漂太远"的 base 正则，**没有任何"该改成什么样"的信号**，而中间轮次约占训练混合 72%；③ 批级基线是官方从来没有的东西。**①+② 决定能不能变好，③ 决定崩不崩**——我上一轮修的全在 ③ 这条线上
+- **按用户要求全面回退**：`scripts/` 整体恢复到 `40c5450`（day22 那次实际用的 commit）。**验证方式是逐字节比对而不是逐条核对**：`git diff --numstat 40c5450 -- scripts/` 无输出；用回退后的三个补丁脚本对真实官方源码重新生成代理文件，`diff -rq` 与 `40c5450` 生成的完全一致，且不再产出 `metaclaw_batch_baseline.py`。回退前先确认 08-27 以来 `scripts/` 是**纯增量**（`--numstat` 全部 `N 0`），所以整体 checkout 即精确还原
+- **文档一律不回退**，全部保留为记录（含被推翻的结论和更正框）
+
+**主要问题：**
+- **day22 那次为什么变差，仍然没有答案** → 原解释依赖"reasoning 在 `response_ids` 里"这个从未验证的前提，已列入未验证清单并给出查法
+- 塌陷的三层机制**只是被回退绕开了，没有修** → 记入已知限制，等新思路定方向后再决定怎么处理
+- `METACLAW_*` 环境变量是否真的传到训练后端**至今未验证** → 同上，`judge` 是默认值使得"看起来对"证明不了任何事
+
+**产出：**
+- `scripts/`（5 个文件）：恢复到 `40c5450`；删除 `scripts/tests/test_length_aware_and_baseline.py`
+- `docs/work_log.md`、`docs/status_history.md`：本条目 + 状态归档

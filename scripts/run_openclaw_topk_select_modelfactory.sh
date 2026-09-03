@@ -116,32 +116,6 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         -e 's/--rollout-max-context-len 32768/--rollout-max-context-len 65536/' \
         -e 's/--sglang-context-length 32768/--sglang-context-length 65536/' \
         "${PATCHED}"
-
-    # --- openclaw-rl-metaclaw-batch-baseline (2026-09-01) ---
-    # 挂上批级基线的 reward 后处理函数，见 docs/metaclaw_migration_plan.md
-    # "方案：批级基线，对齐 MetaClaw 的 compute_advantages"。
-    #
-    # 只在 MetaClaw 迁移场景加，Personal Agent Track 不受影响——那边的
-    # reward 分布没有"通过率只有 17%、整批同号"这个问题。
-    #
-    # 模块名不带路径：文件由 prepare_patched_openclaw_combine.sh 生成到
-    # PATCHED_COMBINE_DIR，而该目录已经被上面的 PYTHONPATH 补丁前置，所以
-    # 直接按模块名导入即可。load_function 用的是 rpartition(".")，点分路径，
-    # 不是 module:func 形式。
-    #
-    # --disable-rewards-normalization 保持不变、不要去掉：自定义钩子在
-    # _post_process_rewards 最顶部短路，根本不看这个标志；而关着它正好避开
-    # _drop_constant_reward_groups 把每个单样本组判成"常数组"、整批丢弃只
-    # 留一组的陷阱。两者不冲突。
-    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
-        sed -i \
-            -e 's|--disable-rewards-normalization|--disable-rewards-normalization\n   --custom-reward-post-process-path metaclaw_batch_baseline.metaclaw_batch_baseline|' \
-            "${PATCHED}"
-    fi
-    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
-        echo "错误：批级基线参数注入失败（未找到 --disable-rewards-normalization 锚点）" >&2
-        exit 1
-    fi
 fi
 
 python3 - "${PATCHED}" "${REPO_ROOT}" <<'PY'
