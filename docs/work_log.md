@@ -52,7 +52,7 @@
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
-2. **MetaClaw 迁移**：**轨迹级样本方案已写完，等 CLI 在真实环境查证九点**（第 1 条前缀重建成功率不过则整个方案不成立）。**CLI 已用真实日志核实完 ④⑥⑧⑨**（并修正了我两处估算：samples/round 全程是 4.04 不是 2.0；轨迹中位 17~18k、全程约 13% 超 32768 硬天花板）。**①②③⑤⑦ 与 `METACLAW_*` 传播仍全开，其中 ① 前缀重建至今零证据。****基准改用健康段（day01–15）而不是全程**（用户更正）：硬丢弃阈值 24576→**31000**（健康段只丢约 2%），轨迹长度 p90 本身当退化早期指标（健康约 23k、污染约 47k，**越过 30k 报警**）。**代价如实记录：改用健康段基准后更新次数差距扩大到"不到一半"（43 vs 约 94），本轮自带此 handicap。**安排：**直接跑满 30 天、不单独做冒烟**，内设检查点 A（day02，验管线）与检查点 B（day08–10，对标健康画像），不达标当场杀掉。见迁移文档"方案：轨迹级样本，一个 round = 一个样本"。**代码仍停在干净基线上，方案未实现。**
+2. **MetaClaw 迁移**：**轨迹级样本方案已写完，等 CLI 在真实环境查证九点**（第 1 条前缀重建成功率不过则整个方案不成立）。**CLI 已用真实日志核实完 ④⑥⑧⑨**（并修正了我两处估算：samples/round 全程是 4.04 不是 2.0；轨迹中位 17~18k、全程约 13% 超 32768 硬天花板）。**①②③⑤⑦ 与 `METACLAW_*` 传播仍全开，其中 ① 前缀重建至今零证据。****基准改用健康段（day01–15）而不是全程**（用户更正）：硬丢弃阈值 24576→**31000**（健康段只丢约 2%），轨迹长度 p90 本身当退化早期指标（健康约 23k、污染约 47k，**越过 30k 报警**）。**代价如实记录：改用健康段基准后更新次数差距扩大到"不到一半"（43 vs 约 94），本轮自带此 handicap。**安排：**直接跑满 30 天、不单独做冒烟**，内设检查点 A（day02，验管线）与检查点 B（day08–10，对标健康画像），不达标当场杀掉。见迁移文档"方案：轨迹级样本，一个 round = 一个样本"。**方案已实现**（`_metaclaw_build_trajectory` 前缀差分拼轨迹 + `_fire_opd_task` 门 + 两条提交路径读 `metaclaw_loss_mask` + 长度守卫 31000 + `rollout-batch-size` 8），34 项断言与双向非空洞性本地通过，**真实训练未验证**；步骤判官与 OPD 均无需改动（前者自动变死代码，后者构造天然对齐整轮）。
 3. 其余同 08-17
 
 ### 未验证
@@ -1895,3 +1895,23 @@
 
 **产出（续三）：**
 - `docs/metaclaw_migration_plan.md`：新增"按健康段而不是全程标定"一节；硬丢弃阈值 24576→31000；检查点 B 改为对标健康画像并加入 p90>30k 报警；读结果规则补 handicap 与对标窗口
+
+**完成内容（续四，同一天）——实现轨迹级样本：**
+- **`prepare_patched_openclaw_opd.sh`：新增 `_metaclaw_build_trajectory()`（前缀差分拼轨迹）+ `_fire_opd_task` 顶部的门。** 中间 turn **不触发任何判官、不产生样本**，留在 `_pending_turn_data` 里；verdict 到达时把 1..N 折成一条，模型输出段 `loss_mask=1`、观测段 `loss_mask=0`、观测段 logprob 补 `0.0`——对齐 toolcall-rl 的 `generate_with_retool.py:709-765`
+- **观测段用前缀差分算出来**（`turn[n+1].prompt_text` 减去 `turn[n].prompt_text + response_text`），不去识别工具返回的格式；**对不上就整轮丢弃并打日志**，绝不拼出错序列。因此观测段天然含 chat template 脚手架（`<|im_end|>`、下一条 `<|im_start|>user … assistant`），mask 成 0 完全正确
+- **步骤判官不需要单独删**：唯一会 fire 的任务带的是 verdict next_state，走 `_opd_evaluate` 的第一个分支，`elif turn_data.get("metaclaw_round_mode")` 那条步骤判官分支对 MetaClaw 自动变成死代码。**select 补丁一个字没改**
+- **OPD 也一个字没改，实测确认**：verdict 分支用的是 `turn_data["messages"] / .get("tools") / ["response_text"]`，全部被 `_traj` 替换；`_append_hint_to_messages` 从后往前找最后一条 user 消息，轨迹级下正好是本轮题目。checker 给的 hint（文件名写错之类）本来就是针对整轮的
+- **`prepare_patched_openclaw_combine.sh`：两条提交路径都读 `metaclaw_loss_mask`**（`_submit_turn_sample` / `_submit_rl_turn_sample`）。长度不匹配时**直接 return 丢样本、不回退成全 1**——回退等于把工具返回当成模型自己写的来训。非轨迹样本没有这个字段，Personal Agent Track 行为逐字不变
+- **长度守卫 31000**（`METACLAW_TRAJ_MAX_TOKENS`，无开关只有阈值）：超了整轮丢弃。理由是硬约束不是偏好——开着 `--use-dynamic-batch-size` 时单条样本长过 `--max-tokens-per-gpu 32768` 就打不进任何一个 micro-batch。代理侧 import 时打印生效值，跟启动脚本打印的值对得上才算真的传到训练后端（**这条传播路径至今没验证过**）
+- **`--rollout-batch-size 16 → 8`**（只在 `METACLAW_MIGRATION_PROFILE=1` 分支，带 `grep` 校验），注释里写清了为什么不取 4
+- **验证**：三个补丁脚本 `bash -n` + 补丁链对真实官方源码跑通 + `py_compile` 通过；新增 `scripts/tests/test_metaclaw_trajectory_sample.py`，**34 项断言，直接跑补丁脚本真实生成的代码**。覆盖：三轮 round 的文本顺序/长度/掩码**逐段位置**（不只是总数对）、观测段 logprob 归零而动作段保留 SGLang 真值、`prompt+response == 末轮 prompt+response` 这条前缀不变量、单轮 round、只折叠 ≤ verdict turn 的轮次、压缩/重写/截断三种前缀失败、logprob 长度不符、空 pending、阈值可调且计的是 prompt+response、以及消费侧两条路径确实读掩码且不匹配时拒绝
+- **非空洞性双向验证**：关掉前缀检查 → 挂在"压缩的 turn-2 prompt 应被丢弃"；把观测段掩码从 0 改成 1 → 挂在"只有模型自己的 token 可训练"。两次都已还原
+- **同时修掉一个测试里写错的预期**：我原本断言"turn-2 prompt 被截短一个字符应被拒绝"，实际不该拒绝——只要仍以 `prompt+response` 开头，短一点只代表观测短，无法与"被截断"区分，拒绝它会误伤正常轮次。已改成"短于 turn1 的 prompt+response 才拒绝"，并补一条断言把这个**有意为之的行为**固定下来
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"方案：轨迹级样本，一个 round = 一个样本"
+
+**产出（续四）：**
+- `scripts/prepare_patched_openclaw_opd.sh`：`_metaclaw_build_trajectory` + `_fire_opd_task` 门 + 阈值与启动日志
+- `scripts/prepare_patched_openclaw_combine.sh`：两条提交路径读 `metaclaw_loss_mask`
+- `scripts/run_openclaw_topk_select_modelfactory.sh`：`--rollout-batch-size` 8
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：`METACLAW_TRAJ_MAX_TOKENS` 声明/透传/落盘/打印
+- `scripts/tests/test_metaclaw_trajectory_sample.py`（新增）：34 项回归断言

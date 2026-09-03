@@ -280,6 +280,179 @@ def _strip_openclaw_timestamp_prefix(text):
 _METACLAW_SESSION_RE = re.compile(r"^metaclaw-")
 
 
+# --- openclaw-rl-metaclaw-trajectory-sample (2026-09-03) ---
+# See docs/metaclaw_migration_plan.md "方案：轨迹级样本，一个 round = 一个样本".
+#
+# A MetaClaw round becomes ONE training sample instead of one sample per turn,
+# mirroring toolcall-rl (generate_with_retool.py:709-765): model output carries
+# loss_mask 1, tool observations carry loss_mask 0, and log probs are padded
+# with 0.0 across the observation spans. "How many tool calls did this round
+# make" stops being a question -- more calls just means a longer sequence.
+#
+# There is deliberately NO on/off switch. It is gated on
+# turn_data["metaclaw_round_mode"] (i.e. session_id starts with "metaclaw-"),
+# so the Personal Agent Track is untouched; a MetaClaw run either does this or
+# gets reverted, it is not an ablation to keep around.
+#
+# Why this matters beyond "no more step judge" (the step-judge-vs-verdict
+# change alone was already tried as METACLAW_MIDROUND_REWARD=outcome and
+# diverged in 20260831_154301): slime's sum_of_sample_mean weighs every SAMPLE
+# equally, so today a round that took 20 turns contributes 20x the gradient of
+# a round answered in 1 -- verbosity earns a 20x bonus that has nothing to do
+# with being right. One sample per round makes every round count exactly once,
+# and makes it impossible for a single runaway round to dominate a batch (the
+# 186-turn round in 20260902_094458 flushed 186 negatives into one batch; here
+# it would be one sample).
+#
+# Hard ceiling: with --use-dynamic-batch-size, slime packs samples into
+# micro-batches under a token budget, so a sample longer than
+# --max-tokens-per-gpu can never be packed into ANY micro-batch. 32768 is
+# therefore a wall, not a suggestion. The default below sits just under it.
+# Calibrated on the HEALTHY window of 20260827_163030 (day01-15: median ~17k,
+# p90 ~23k), not the full run -- the full run's p90 of ~47k comes entirely
+# from its already-degraded second half, i.e. from the very behaviour we are
+# trying to fix, so calibrating on it would be treating the pathology as the
+# norm. At 31000 the healthy window loses ~2% of rounds; at 24576 it would
+# lose ~7% for nothing.
+_METACLAW_TRAJ_MAX_TOKENS = int(os.environ.get("METACLAW_TRAJ_MAX_TOKENS", "31000"))
+logger.info(
+    "[openclaw-rl-metaclaw-trajectory-sample] effective METACLAW_TRAJ_MAX_TOKENS=%d "
+    "(set=%r)",
+    _METACLAW_TRAJ_MAX_TOKENS, os.environ.get("METACLAW_TRAJ_MAX_TOKENS"),
+)
+
+
+def _metaclaw_build_trajectory(pending, last_turn_num, tokenizer):
+    """Fold turns 1..last_turn_num of one MetaClaw round into a single sample.
+
+    Returns replacement turn_data fields, or None if the round must be dropped
+    (with the reason already logged).
+
+    The observation segments are derived by PREFIX DIFF rather than by trying
+    to recognise what a tool result looks like: turn n+1's prompt_text is
+    whatever turn n's prompt_text plus its response_text was, plus the new
+    observation. That makes the segmentation independent of tool formatting,
+    and -- more importantly -- self-checking: if the prefix relation does not
+    hold (OpenClaw compacted the history, rewrote messages, ...), we KNOW the
+    reconstruction is invalid and drop the round instead of silently training
+    on a wrongly spliced sequence.
+
+    The observation segment therefore includes the chat-template scaffolding
+    (`<|im_end|>`, the next `<|im_start|>user ... <|im_start|>assistant\\n`).
+    That is correct: those tokens are context the model conditions on but must
+    not be trained on, which is exactly what loss_mask 0 means.
+    """
+    turn_nums = sorted(t for t in pending if t <= last_turn_num)
+    if not turn_nums:
+        return None
+    turns = [pending[t] for t in turn_nums]
+
+    prompt_text = turns[0]["prompt_text"]
+    prompt_ids = turns[0]["prompt_ids"]
+
+    response_ids = []
+    loss_mask = []
+    logprobs = []
+    text_parts = []
+
+    # Everything of the assembled text emitted so far, used as the prefix the
+    # next turn's prompt must start with.
+    consumed = prompt_text
+
+    for i, td in enumerate(turns):
+        # --- action segment: trained on ---
+        act_ids = td["response_ids"]
+        act_lps = td["response_logprobs"]
+        # The official main-turn handler already truncates/pads response_logprobs
+        # to len(response_ids); assert rather than re-derive, so a future change
+        # there fails loudly here instead of silently misaligning the trajectory.
+        if len(act_lps) != len(act_ids):
+            logger.warning(
+                "[openclaw-rl-metaclaw-trajectory-sample] turn=%d logprob/token "
+                "length mismatch (%d vs %d) -- dropping round",
+                turn_nums[i], len(act_lps), len(act_ids),
+            )
+            return None
+        response_ids += list(act_ids)
+        loss_mask += [1] * len(act_ids)
+        logprobs += list(act_lps)
+        text_parts.append(td["response_text"])
+        consumed += td["response_text"]
+
+        if i + 1 >= len(turns):
+            break
+
+        # --- observation segment: conditioned on, not trained on ---
+        next_prompt = turns[i + 1]["prompt_text"]
+        if not next_prompt.startswith(consumed):
+            logger.warning(
+                "[openclaw-rl-metaclaw-trajectory-sample] prefix reconstruction "
+                "FAILED between turn=%d and turn=%d (turn %d's prompt does not "
+                "extend turn %d's prompt+response; consumed=%d chars, "
+                "next_prompt=%d chars) -- dropping round. Most likely cause is "
+                "OpenClaw compacting or rewriting the conversation history.",
+                turn_nums[i], turn_nums[i + 1], turn_nums[i + 1], turn_nums[i],
+                len(consumed), len(next_prompt),
+            )
+            return None
+        obs_text = next_prompt[len(consumed):]
+        obs_ids = tokenizer(obs_text, add_special_tokens=False)["input_ids"]
+        response_ids += obs_ids
+        loss_mask += [0] * len(obs_ids)
+        logprobs += [0.0] * len(obs_ids)
+        text_parts.append(obs_text)
+        consumed = next_prompt
+
+    if not (len(response_ids) == len(loss_mask) == len(logprobs)):
+        logger.warning(
+            "[openclaw-rl-metaclaw-trajectory-sample] assembled length mismatch "
+            "(ids=%d mask=%d logprobs=%d) -- dropping round",
+            len(response_ids), len(loss_mask), len(logprobs),
+        )
+        return None
+
+    total_tokens = len(prompt_ids) + len(response_ids)
+    if total_tokens > _METACLAW_TRAJ_MAX_TOKENS:
+        logger.warning(
+            "[openclaw-rl-metaclaw-trajectory-sample] assembled trajectory is "
+            "%d tokens over %d turn(s), above the %d limit -- dropping round. "
+            "A sample longer than --max-tokens-per-gpu cannot be packed into "
+            "any micro-batch, so submitting it would be worse than dropping it.",
+            total_tokens, len(turns), _METACLAW_TRAJ_MAX_TOKENS,
+        )
+        return None
+
+    trainable = sum(loss_mask)
+    logger.info(
+        "[openclaw-rl-metaclaw-trajectory-sample] assembled turns=%d "
+        "prompt_tokens=%d response_tokens=%d trainable_tokens=%d "
+        "(observation tokens masked: %d)",
+        len(turns), len(prompt_ids), len(response_ids), trainable,
+        len(response_ids) - trainable,
+    )
+
+    return {
+        "prompt_ids": prompt_ids,
+        "prompt_text": prompt_text,
+        "response_ids": response_ids,
+        "response_text": "".join(text_parts),
+        "response_logprobs": logprobs,
+        # New field. The two submit paths in openclaw_combine_api_server.py are
+        # patched to honour it instead of assuming [1] * len(response_ids);
+        # absent for every non-trajectory sample, so they fall back to the
+        # official behaviour untouched.
+        "metaclaw_loss_mask": loss_mask,
+        # The round's opening messages: its last user message IS the round's
+        # task, which is exactly where _append_hint_to_messages puts the OPD
+        # hint. That is why the OPD construction needs no change -- the hint
+        # the checker produces ("wrong filename", ...) was always about the
+        # whole round, never about one turn.
+        "messages": turns[0]["messages"],
+        "tools": turns[0].get("tools"),
+        "metaclaw_traj_turns": len(turns),
+    }
+
+
 # openclaw-rl-metaclaw (temporary, safe to remove) -- see
 # docs/metaclaw_migration_plan.md "查证记录（三）" for the full design
 # rationale. Judges an INTERMEDIATE tool-call turn inside a MetaClaw-Bench
@@ -859,6 +1032,58 @@ fire_opd_task_new = (
     '    def _fire_opd_task(self, session_id: str, turn_num: int, turn_data: dict[str, Any], next_state: dict[str, Any]):\n'
     '        if not self._prm_enabled or not next_state:\n'
     '            return\n'
+    '\n'
+    '        # --- openclaw-rl-metaclaw-trajectory-sample (2026-09-03) ---\n'
+    '        # A MetaClaw round is ONE sample. Intermediate turns therefore fire\n'
+    '        # no judge and produce no sample of their own -- they stay in\n'
+    '        # _pending_turn_data and get folded into the trajectory when the\n'
+    '        # round\'s verdict arrives. Placed at the very top of this method so\n'
+    '        # no per-turn machinery below (duplicate-retry bookkeeping, PRM task\n'
+    '        # creation) runs for a turn that will never be submitted on its own.\n'
+    '        #\n'
+    '        # Side effect worth stating: the step-judge branch of _opd_evaluate\n'
+    '        # (`elif turn_data.get("metaclaw_round_mode")`) becomes unreachable\n'
+    '        # for MetaClaw, because the only task we ever fire carries a verdict\n'
+    '        # next_state and hits the branch above it. That is intended -- the\n'
+    '        # step judge is exactly the ungrounded signal this change removes --\n'
+    '        # and it is why no edit to the select patch is needed.\n'
+    '        if turn_data.get("metaclaw_round_mode"):\n'
+    '            _is_verdict = False\n'
+    '            if next_state.get("role") == "user":\n'
+    '                try:\n'
+    '                    _parsed = json.loads(\n'
+    '                        _flatten_message_content(next_state.get("content"))\n'
+    '                    )\n'
+    '                except (TypeError, ValueError):\n'
+    '                    _parsed = None\n'
+    '                _is_verdict = (\n'
+    '                    isinstance(_parsed, dict)\n'
+    '                    and _parsed.get("metaclaw_verdict") is True\n'
+    '                )\n'
+    '            _pending = self._pending_turn_data.get(session_id, {})\n'
+    '            if not _is_verdict:\n'
+    '                logger.info(\n'
+    '                    "[openclaw-rl-metaclaw-trajectory-sample] session=%s turn=%d "\n'
+    '                    "held (intermediate turn, no judge, no sample) -- awaiting "\n'
+    '                    "this round\'s verdict",\n'
+    '                    session_id, turn_num,\n'
+    '                )\n'
+    '                return\n'
+    '            _traj = _metaclaw_build_trajectory(_pending, turn_num, self.tokenizer)\n'
+    '            # Fold: the intermediate turns are now part of this turn\'s sample\n'
+    '            # (or the round is being dropped). Either way they must leave\n'
+    '            # `pending`, or _maybe_submit_ready_samples would keep seeing\n'
+    '            # task-less turns and the session would never drain.\n'
+    '            for _t in [t for t in list(_pending) if t < turn_num]:\n'
+    '                _pending.pop(_t, None)\n'
+    '            if _traj is None:\n'
+    '                # Reconstruction failed or the trajectory is untrainably long;\n'
+    '                # the reason is already logged by the builder. Drop the whole\n'
+    '                # round rather than submit a wrongly spliced sequence.\n'
+    '                _pending.pop(turn_num, None)\n'
+    '                self._maybe_submit_ready_samples(session_id)\n'
+    '                return\n'
+    '            turn_data.update(_traj)\n'
     '\n'
     '        # --- openclaw-rl-duplicate-user-retry-penalty (temporary, safe to remove) ---\n'
     '        _seen = self._seen_user_messages.setdefault(session_id, set())\n'

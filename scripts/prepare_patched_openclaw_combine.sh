@@ -278,6 +278,52 @@ train_until_day_gate_new = (
 )
 text = text.replace(train_until_day_gate_old, train_until_day_gate_new, 1)
 
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-trajectory-sample (2026-09-03): honour an explicit
+# loss mask when the sample is a folded MetaClaw round.
+#
+# prepare_patched_openclaw_opd.sh assembles a whole round into one sample
+# (see _metaclaw_build_trajectory there) whose response interleaves the
+# model's own output with the tool observations it conditioned on. The
+# observations must not be trained on -- this is toolcall-rl's
+# `loss_masks += [0] * len(obs_tokens_ids)` (generate_with_retool.py:764),
+# and it is load-bearing twice over: slime's sum_of_sample_mean divides by
+# loss_mask.sum(), and openclaw_topk_select_loss.py's opd_loss goes through
+# the same reducer, so a correct mask keeps the observation tokens out of
+# BOTH the GRPO term and the distillation term.
+#
+# Both submission paths are patched with the same block: _submit_turn_sample
+# (OPD+RL / OPD-only) and _submit_rl_turn_sample (RL-only). turn_data lacks
+# the key for every non-trajectory sample, so the official all-ones
+# behaviour is untouched on the Personal Agent Track.
+# ---------------------------------------------------------------------
+loss_mask_old = '        sample.loss_mask = [1] * len(response_ids)\n'
+if text.count(loss_mask_old) != 2:
+    raise SystemExit(
+        f"patch failed: expected exactly 2 loss_mask assignments in {src_path} "
+        f"(_submit_turn_sample and _submit_rl_turn_sample), found "
+        f"{text.count(loss_mask_old)} (official file may have changed upstream "
+        "-- update this patch)"
+    )
+loss_mask_new = (
+    '        # --- openclaw-rl-metaclaw-trajectory-sample ---\n'
+    '        _mc_loss_mask = turn_data.get("metaclaw_loss_mask")\n'
+    '        if _mc_loss_mask is not None and len(_mc_loss_mask) == len(response_ids):\n'
+    '            sample.loss_mask = list(_mc_loss_mask)\n'
+    '        else:\n'
+    '            if _mc_loss_mask is not None:\n'
+    '                # Never silently fall back to all-ones here: that would train\n'
+    '                # on the tool observations as if the model had written them.\n'
+    '                logger.error(\n'
+    '                    "[openclaw-rl-metaclaw-trajectory-sample] session=%s mask/token "\n'
+    '                    "length mismatch (%d vs %d) -- refusing to guess, dropping sample",\n'
+    '                    session_id, len(_mc_loss_mask), len(response_ids),\n'
+    '                )\n'
+    '                return\n'
+    '            sample.loss_mask = [1] * len(response_ids)\n'
+)
+text = text.replace(loss_mask_old, loss_mask_new, 2)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override/metaclaw_training_frozen turns, gates both OPD and RL submission paths) -> {dest_path}")

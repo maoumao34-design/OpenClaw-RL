@@ -110,12 +110,29 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
     # --max-tokens-per-gpu 32768 不动——这是训练侧单 GPU 显存预算，跟
     # sglang context 是否溢出无关（同上面 SMOKE_PROFILE 分支的既有结论：
     # 是否需要一起调大待真实训练报错验证，不提前假设）。
+    #
+    # --rollout-batch-size 16 -> 8（2026-09-03，轨迹级样本）：一个 round 现在
+    # 只产出 1 个样本，而 turn 级下实测约 4.44 个（20260827_163030 的健康段
+    # day01-15，见 docs/metaclaw_migration_plan.md「按健康段而不是全程标定」）。
+    # rollout_batch_size 数的是「组」，所以更新次数 = round 数 ÷ 它，与
+    # n_samples_per_prompt 无关：346 个 round 下 batch 8 给 43 次更新。
+    # 为什么不取 4（86 次、更接近健康基准的约 94 次）：n_samples=1 时组内只有
+    # 一个样本、没有比较对象，advantage 就是原始 ±1，按 round 通过率约 17%
+    # 算 batch 4 有约 47% 的批次全负（= 均匀打压所有 token），batch 8 是 23%，
+    # batch 16 降到 5% 但只剩 21 次更新。8 是这三者里最不坏的折中，不是最优；
+    # 等上了 n_samples=8（全负组会被 slime 的常数组丢弃逻辑直接丢掉，不再是
+    # 打压），batch 4 才变得可选。
     sed -i \
         -e 's/--save-interval 100/--save-interval 10/' \
         -e 's/export CONTEXT_LENGTH="32768"/export CONTEXT_LENGTH="65536"/' \
         -e 's/--rollout-max-context-len 32768/--rollout-max-context-len 65536/' \
         -e 's/--sglang-context-length 32768/--sglang-context-length 65536/' \
+        -e 's/--rollout-batch-size 16/--rollout-batch-size 8/' \
         "${PATCHED}"
+    if ! grep -q -- "--rollout-batch-size 8" "${PATCHED}"; then
+        echo "错误：--rollout-batch-size 未能改成 8（官方脚本可能已改动）" >&2
+        exit 1
+    fi
 fi
 
 python3 - "${PATCHED}" "${REPO_ROOT}" <<'PY'
