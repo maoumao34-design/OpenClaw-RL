@@ -52,7 +52,8 @@
 - `20260902_094458` / 09-03 两次的 checkpoint 均已污染，不能作为起点。
 - **round 轮数仍无上限**（186 轮空转的案例）。
 - **⚠ 基准口径已更正（2026-09-03）：定版基线 17.8%/0% 整体作废**（跑在带 session-key 兜底 bug 的 OpenClaw 构建上，文件写进 `workspace-main/`），**训练效果一律改用 K=0（34.9%/13.4%）作对照**。**K=6 的"正面训练效果"已被证伪**——K=0 零训练就有 34.9%/13.4%，与 K=6 的 37.3%/13.9% 基本重合，**训练增益接近 0**。此前所有"相对 17.8% 提升"的表述（含对外汇报）需要更正。
-- **我们的 harness 比官方宽松，最强候选是我们自己加的反馈加料**：`_build_next_round_feedback` 在官方静态文本之上追加 checker 真实 stdout，并在 `check_filename.py --dir` 模式下**直接把通过判据告诉模型**（224 道 file_check 里 70 道是这个模式）。量级待用对照实验量化。
+- **环境侧已恢复成与论文一致（2026-09-04）**：三项反馈加料（含直接泄露 checker 判据的 `_FC_DIR_MODE_NOTE`）全部移进 OPD hint（模型看不见），`[Previous Feedback]` 恢复官方原文；`training_passed` 不再覆盖环境反馈；infra 失败轮记 0 分进分母。**所有现有跑分（含 K=0 的 34.9%/13.4%）随之作废，需要重跑基线。**
+- **论文 Table 1 已从原文核实并转录**（Part I：GPT-5.2 Baseline 41.1/14.7、Kimi-K2.5 Baseline 21.4/2.0、Kimi Full 40.6/≈16.5），**Compl 定义与我们一致**。**仍未解释：4B 零训练的 Compl 13.4% 贴着 GPT-5.2 的 14.7%**——三项加料已被逐题统计排除为主因，剩下的已知差异是按题隔离 session 与 context 65536，待单变量实验。
 - **MetaClaw 论文 Table 1 从未转录进本项目文档、本地也没有 PDF**，"论文 Baseline 约 21%/约 2%"是二手数字；且 `Compl.` 是本项目自定义的量。**核实前不能拿论文当锚点。**
 - **协议偏离（2026-09-03 查清）：官方 MetaClaw 按天共用一个 session- 其余同 09-02（历史状态）。
 
@@ -1996,3 +1997,28 @@
 
 **产出（续八）：**
 - `docs/metaclaw_migration_plan.md`：新增"口径重大更正（2026-09-03）"一节；定版基线与 K=6 两处加作废/撤回标注
+
+## 2026-09-04
+
+**目标：** 用刚核实的论文 Table 1 定位"我们的 harness 把题变简单了多少"，并把环境侧恢复成与论文一致。
+
+**完成内容：**
+- **从论文原文核实了 Table 1**（`D:\MAO\Paper\MetaClaw`，此前项目文档里从未转录过）。Part I（30 天 346 题，跟我们同一套）：GPT-5.2 Baseline **41.1 / 14.7**、GPT-5.2 Skills 44.0 / 17.1、Kimi-K2.5 Baseline **21.4 / 2.0**、Kimi Skills 28.3 / 2.0、Kimi Full 40.6 / ≈16.5。**Compl 定义已核实与我们一致**（论文："fraction of file-check outputs passing all automated checker assertions simultaneously"；官方 `_score_file_check` 是二值 1.0/0.0），此前担心的口径不一致不存在
+- **异常点定位**：我们用 4B 零训练拿到 Compl 13.4%，**贴着 GPT-5.2 Baseline 的 14.7%**。同时指出"我们 vs Kimi 2.0%"这个对比很弱——两个前沿模型之间 Compl 差 7 倍，说明该指标对环境极度敏感
+- **找到边界搞错的地方并修复**：OPD hint 进 `teacher_tokens`、模型看不见；而 `[Previous Feedback]` 进**下一轮的 query**、模型读得到。2026-08-20 加的三项加料**全部加在了后者**，等于加在 benchmark 上。**现已全部移进 `_build_opd_hint`**，`_build_next_round_feedback` 恢复成官方 `_build_feedback_text` 原样输出
+- **其中最严重的是 `_FC_DIR_MODE_NOTE`**——它把 checker 的通过判据直接告诉模型，而 224 道 file_check 里 70 道（31%）是 `--dir` 模式。**CLI 的逐题统计表明它不是 Compl 的主因**（30 道通过里只有 8 道 `--dir`，且 `P(pass|dir)=11.4%` **低于** `P(pass|非dir)=14.3%`，day01–05 的 `--dir` 通过数为 0），这个反证很干净、予以采纳；**但"没买到多少"不是继续把答案递给模型的理由**，照样移走
+- **同时移除 `training_passed` 对环境反馈的覆盖**：此前 Phase 1 把一道官方判 FAIL 的题升级成 PASS 时，会连带把可见反馈也改成"correct"，让**环境跟官方 checker 意见不一致**。现在两条通道**故意分开**：环境说 MetaClaw-Bench 说的，训练信号说我们认为的
+- **修掉分母泄漏**：原来 `if official_score is not None: append`，而 `official_score` 在 agent 崩溃时为 None——**那些轮次从分子和分母同时消失**，Acc./Compl. 变成"在跑通的题上"算。官方是无条件打分、崩掉记 0 留在分母。量级不大（K=6 为 343/346，约 1%），但方向同样是抬高我们。**训练侧刻意不动**：这些轮次仍不提交 verdict、不产生伪造的 -1
+- **验证**：`py_compile` 通过；新增 `scripts/tests/test_metaclaw_env_fidelity.py`，**24 项断言跑 driver 真实函数并与官方 `_build_feedback_text` 逐字节比对**（本地导入 MetaClaw-official）——四种情形下输出完全相等、三项加料都不再出现在 agent 可见文本里、Phase 1 升级过的轮次 agent 看到的仍是失败、OPD hint 侧三项全在且 `--dir` 提示不会误加到 day11 起的精确日期检查、静默失败仍返回空 hint、分母的结构性检查 + `_aggregate_acc_compl` 上的数值验证
+- **非空洞性双向验证**：把 `_FC_DIR_MODE_NOTE` 塞回环境侧 → 挂在"ours == official"；把零分 append 用 `if False:` 屏蔽 → 挂在"零分记录是 else 分支"（第一版这条断言写弱了、屏蔽后仍通过，已改成结构性检查后才咬得住）。均已还原
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"已实现（2026-09-04）：把环境侧恢复成论文一致"
+
+**主要问题：**
+- **所有现有跑分（含 K=0 的 34.9%/13.4%）在这次改动后不再可比** → 必须重跑基线；代价接受，它们本来就跟论文不可比
+- **"4B 零训练贴着 GPT-5.2 的 Compl"仍未解释**——三项加料已被 CLI 统计排除为主因 → 剩下的已知差异是**按题隔离 session**（08-19c）和 context 从官方声明的 50000 提到 65536，需要单变量实验量化
+- 一条便宜的先导信号还没做：在现有 K=0 日志里看 **Compl 随"当天第几轮"是否衰减**（按题隔离下应当是平的）
+
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`_build_next_round_feedback` 恢复官方原样；三项加料移入 `_build_opd_hint`；infra 失败轮记 0 分进分母
+- `scripts/tests/test_metaclaw_env_fidelity.py`（新增，24 项）
+- `docs/metaclaw_migration_plan.md`：新增"已实现（2026-09-04）"一节，含论文 Table 1 转录

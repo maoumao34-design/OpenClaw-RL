@@ -896,8 +896,20 @@ async def _send_session_close_only(
     )
 
 
-def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) -> str:
+def _build_opd_hint(
+    round_record: dict[str, Any],
+    inline_score: dict[str, Any],
+    answer_text: str = "",
+) -> str:
     """Build the OPD hint text for a FAILED round, per round type.
+
+    2026-09-04: this is now the ONLY home for the extra diagnostic material
+    this project adds on top of MetaClaw-Bench. It used to be split across two
+    places, and the other place was the wrong one -- see
+    _build_next_round_feedback's docstring. The hint never reaches the model
+    (it goes into teacher_tokens as the distillation target's conditioning),
+    so putting everything here keeps the environment byte-identical to
+    official while the trainer still gets the richer signal.
 
     NOT the same as MetaClaw-Bench's own _build_feedback_text -- that
     function is designed for feedback shown to the NEXT round (a different
@@ -930,12 +942,25 @@ def _build_opd_hint(round_record: dict[str, Any], inline_score: dict[str, Any]) 
     if question_type == "file_check":
         stdout = (inline_score.get("stdout") or "").strip()
         stderr = (inline_score.get("stderr") or "").strip()
-        if stdout:
-            return stdout
-        if stderr:
-            return stderr
-        return ""
-    return _build_feedback_text(round_record, inline_score)
+        hint = stdout or stderr
+        if not hint:
+            return ""
+        # Moved here from the agent-visible feedback (2026-09-04). Only ever
+        # appended for check_filename.py's lenient --dir mode, never for the
+        # exact-date glob checks used from day11 onward.
+        if _is_dir_mode_filename_check(round_record):
+            hint = f"{hint}{_FC_DIR_MODE_NOTE}"
+        return hint
+
+    text = _build_feedback_text(round_record, inline_score)
+    # Moved here from the agent-visible feedback (2026-09-04). Without it,
+    # a run of format failures produces byte-identical hints and the
+    # distillation target has nothing to distinguish them -- the original
+    # 2026-08-20 motivation, which is a training concern and belongs on this
+    # side of the boundary.
+    if text == FORMAT_ERROR and answer_text.strip():
+        text = f"{text} (your previous response: {answer_text.strip()[:120]!r})"
+    return text
 
 
 # Sanity cap so an otherwise-clean FAIL line doesn't turn the next-round
@@ -1000,76 +1025,42 @@ def _is_dir_mode_filename_check(round_record: dict[str, Any]) -> bool:
 def _build_next_round_feedback(
     round_record: dict[str, Any], inline_score: dict[str, Any], answer_text: str,
 ) -> str:
-    """Wraps MetaClaw-official's own _build_feedback_text with narrowly-scoped,
-    additive-only augmentations -- never replaces or removes the official
-    static text, each gated so it can only ever fire on an actual FAILURE (a
-    round that already produced non-empty static feedback), matching the
-    real-data investigation in docs/metaclaw_migration_plan.md ("方案：
-    next-round 反馈 + FORMAT_ERROR + is_invalid_tool_use", 2026-08-20).
+    """Return MetaClaw-official's own next-round feedback, verbatim.
 
-    Three independent pieces, safe to reason about separately:
-    - multi_choice format failures (feedback text == FORMAT_ERROR, the
-      literal constant from prompts.py) get a snippet of the model's own
-      actual failed response appended, so 20+ consecutive format failures
-      (confirmed in real day10-14 collapse data) no longer produce
-      byte-identical feedback every single time.
-    - file_check failures get the checker's real stdout appended, if (and
-      only if) it looks clean (see _filtered_checker_stdout).
-    - file_check failures ALSO get a date-genericization note appended, if
-      (and only if) this round's checker is confirmed to be check_filename.py
-      --dir mode (see _is_dir_mode_filename_check) -- never applied to the
-      exact-date glob checks used from day11 onward.
+    2026-09-04: this used to append three augmentations on top of the official
+    text (an MC failed-response snippet, the checker's real stdout, and
+    _FC_DIR_MODE_NOTE). They have all been MOVED INTO THE OPD HINT
+    (_build_opd_hint), because they were on the wrong side of the boundary.
 
-    2026-08-25 (see docs/metaclaw_migration_plan.md "方案 v2: round 前后
-    diff 判定训练奖励", CLI review): `_compute_training_verdict` may have
-    already upgraded this round to `inline_score["training_passed"]=True`
-    despite the official checker's raw `passed=False` -- a historical-deficit
-    false negative (an earlier round in the same day fell behind a
-    cumulative min-count/min-entries threshold), not a real mistake THIS
-    round made. This function must treat that the same as a genuine pass --
-    otherwise eval_score/OPD would say "fine" while the very next round's
-    visible [Previous Feedback] still says "FAIL: expected >= N, found K",
-    splitting the two signals apart (exactly the gap CLI's review caught).
-    Building `feedback_score` as a shallow copy with `passed` forced True
-    keeps this consistent with however a genuine pass is normally worded
-    (`feedback.correct`, often empty) instead of hardcoding "" here.
+    The distinction that was missed when they were added: the OPD hint goes
+    into teacher_tokens and the model never sees it, so it can carry anything
+    useful. [Previous Feedback] goes into the NEXT ROUND'S QUERY -- the model
+    reads it -- so anything added there changes what the benchmark measures.
+    Adding to it was not "giving the trainer a better signal", it was making
+    the benchmark easier and inflating our own Acc./Compl.
 
-    When training_passed is still False, the diff-based diagnostic
-    (`inline_score["training_hint"]`, if any) takes priority over the
-    official checker stdout -- CLI's explicit call: the round-local
-    diagnosis must lead, the official aggregate "found K, need N" line is at
-    most a secondary fallback now, not the primary failure text.
-    `training_hint` is diff-derived only and never contains a Traceback, so
-    it is appended as-is; the `else` branch keeping _filtered_checker_stdout
-    (which drops Traceback-bearing stdout) is load-bearing, not vestigial --
-    see _compute_training_verdict's docstring for the 2026-08-27 regression
-    that came from short-circuiting past it.
+    The worst of the three was _FC_DIR_MODE_NOTE, which stated the checker's
+    acceptance criterion outright ("any valid 8-digit date + snake_case
+    filename satisfies this check") in the round after a failed
+    check_filename.py --dir round; 70 of the 224 file_check rounds are that
+    mode. CLI's per-round statistics on the 20260903_170555 K=0 run showed it
+    was not in fact the main driver of our Compl (8 of 30 passes were --dir,
+    and P(pass|dir)=11.4% is BELOW P(pass|non-dir)=14.3%), but "it did not buy
+    much" is not a reason to keep handing the model the answer key.
+
+    Also removed here: the training_passed override, which forced passed=True
+    into the feedback whenever Phase 1's round-local diff verdict upgraded a
+    round the official checker had failed. Keeping the visible feedback
+    consistent with the training signal was the right goal at the time, but it
+    achieved that by making the ENVIRONMENT disagree with the official
+    checker. The two channels are now deliberately separate: the environment
+    says exactly what MetaClaw-Bench says, and the training signal
+    (eval_score + OPD hint) says what we think, with no leakage between them.
+
+    answer_text is kept in the signature (unused) so the call site does not
+    have to change if a future augmentation ever legitimately belongs here.
     """
-    training_passed = inline_score.get("training_passed", inline_score.get("passed", False))
-    feedback_score = inline_score
-    if training_passed and not inline_score.get("passed", False):
-        feedback_score = {**inline_score, "passed": True}
-
-    text = _build_feedback_text(round_record, feedback_score)
-    if not text:
-        return text
-
-    if text == FORMAT_ERROR and answer_text.strip():
-        snippet = answer_text.strip()[:120]
-        text = f"{text} (your previous response: {snippet!r})"
-
-    if round_record.get("type") == "file_check" and not training_passed:
-        training_hint = inline_score.get("training_hint", "")
-        if training_hint:
-            text = f"{text}\n{training_hint}"
-        else:
-            stdout_line = _filtered_checker_stdout(inline_score)
-            if stdout_line:
-                text = f"{text}\n{stdout_line}"
-        if _is_dir_mode_filename_check(round_record):
-            text = f"{text}{_FC_DIR_MODE_NOTE}"
-
-    return text
+    return _build_feedback_text(round_record, inline_score)
 
 
 # ---------------------------------------------------------------------------
@@ -1849,8 +1840,47 @@ async def run_day(
                         round_timeout=None,
                         retry=retry,
                     )
+                    # 2026-09-04 denominator fix: an infra-failed round is
+                    # scored 0 and KEPT, not dropped.
+                    #
+                    # It used to be `if official_score is not None: append`,
+                    # which silently removed those rounds from both the
+                    # numerator and the denominator -- so a round the agent
+                    # crashed on simply stopped existing, and Acc./Compl. were
+                    # computed over "rounds that worked" rather than over the
+                    # 346-question benchmark. MetaClaw-official does not do
+                    # that: _run_group calls _compute_inline_score on whatever
+                    # came back (empty answer included), writes it to
+                    # infer_result.json, and `metaclaw-bench scoring` then
+                    # scores every round in the test list -- a crashed round is
+                    # a 0, in the denominator. The old behaviour inflated our
+                    # numbers relative to the paper's, small (K=6 was 343/346,
+                    # about 1%) but in the same direction as several other
+                    # differences we are trying to remove.
+                    #
+                    # Deliberately does NOT feed the training signal: the
+                    # `if agent_succeeded:` branch below is untouched, so no
+                    # verdict is submitted for these rounds and no fabricated
+                    # -1 sample reaches the queue. Scoring and training stay
+                    # separate, which is the same boundary the feedback change
+                    # in _build_next_round_feedback restores.
                     if official_score is not None:
                         day_round_scores.append(official_score)
+                    else:
+                        day_round_scores.append({
+                            "test_id": test_id,
+                            "group_id": group.get("id", "unknown"),
+                            "round_id": round_record.get("id", "unknown"),
+                            "question_type": round_record.get("type", "multi_choice"),
+                            "score": 0.0,
+                            "metrics": {"infra_failure": True},
+                        })
+                        logger.warning(
+                            "[MetaClawRollout] day=%s round=%s infra failure -- "
+                            "scored 0 and kept in the denominator (official "
+                            "harness does the same); no training sample submitted",
+                            test_id, round_record.get("id", "unknown"),
+                        )
 
                     if agent_succeeded:
                         # 2026-08-25 (see docs/metaclaw_migration_plan.md "方案
@@ -1869,10 +1899,11 @@ async def run_day(
                         )
                         eval_score = 1.0 if training_passed else -1.0
                         hint = "" if training_passed else (
-                            inline_score.get("training_hint") or _build_opd_hint(round_record, inline_score)
+                            inline_score.get("training_hint")
+                            or _build_opd_hint(round_record, inline_score, answer_text)
                         )
                         if hint:
-                            print(f"  OPD hint (goes into next round's feedback):\n{hint}\n")
+                            print(f"  OPD hint (training-side only, the agent never sees it):\n{hint}\n")
                         # session_done=True unconditionally (2026-08-19c) --
                         # was `session_done=is_last_round` back when a whole
                         # day was one session. Every round is now its own

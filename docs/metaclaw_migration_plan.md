@@ -220,6 +220,77 @@ Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐
 
 Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23）——这部分是被 `rl-training-headers` 标记污染拖累过的，`--agent` 修复后的新基线证实**这两次结果都被大量 Context overflow（49.1%）严重拉低**，不是"4B 模型在 file_check 上一题都做不对"这么简单的能力上限结论——旧结论里"关键结论"那部分已被推翻，不再采信。
 
+### 已实现（2026-09-04）：把环境侧恢复成论文一致，加料全部移进 OPD
+
+承接"口径重大更正（2026-09-03）"。K=0 跑出 34.9% / 13.4% 之后，对照刚从论文原文核实的 Table 1（Part I，30 天 346 题，跟我们同一套题）：
+
+| Model | Condition | Acc. (%) | Compl. (%) |
+|---|---|---|---|
+| GPT-5.2 | Baseline | 41.1 | **14.7** |
+| GPT-5.2 | MetaClaw (Skills) | 44.0 | 17.1 |
+| Kimi-K2.5 | Baseline | 21.4 | **2.0** |
+| Kimi-K2.5 | MetaClaw (Skills) | 28.3 | 2.0 |
+| Kimi-K2.5 | MetaClaw (Full) | 40.6 | ≈16.5（2.0 × 8.25，见摘要"8.25×"）|
+
+**Compl 的定义已核实与我们一致**——论文原文："file-check completion rate (fraction of file-check outputs passing all automated checker assertions simultaneously)"，而官方 `_score_file_check`（`scoring_cmd.py:153`）是二值 `1.0 if passed else 0.0`，我们的 `_aggregate_acc_compl` 取 file_check 分数均值 = 通过率。之前担心的口径不一致不存在。
+
+**异常点**：我们用 **Qwen3-4B、零训练**拿到 Compl 13.4%，**贴着 GPT-5.2 Baseline 的 14.7%**。这不可能是能力，只能是 harness。（注意"我们 13.4% vs Kimi 2.0%"这个对比很弱——两个前沿模型之间 Compl 差 7 倍，说明这个指标本身对环境/工具可靠性极度敏感；真正的异常是贴着 GPT-5.2 那一格。）
+
+#### 改动一：`[Previous Feedback]` 恢复成官方原文
+
+**问题的本质是边界搞错了**：
+
+| 通道 | 去处 | 模型看得见 | 影响官方分数 |
+|---|---|---|---|
+| **OPD hint** | `teacher_tokens`（蒸馏目标的条件） | 否 | 否 |
+| **`[Previous Feedback]`** | 下一轮的 query（`with_feedback` → `_run_round`） | **是** | **是** |
+
+2026-08-20 加的三项加料全部加在了**后者**，也就是加在了 benchmark 上：
+
+1. MC 格式失败 → 附上模型自己失败回复的片段
+2. file_check 失败 → 附上 checker 的真实 stdout（或 Phase 1 的 diff 诊断）
+3. **`check_filename.py --dir` 模式 → 追加 `_FC_DIR_MODE_NOTE`**："any valid 8-digit date + snake_case filename satisfies this check -- the exact date shown above is only an example, not a literal requirement."
+
+第三条直接把 checker 的通过判据交给模型，而 **224 道 file_check 里 70 道（31%）是这个模式**。
+
+**CLI 在 `20260903_170555` 上的逐题统计表明它并不是 Compl 的主因**：30 道通过里只有 8 道是 `--dir`（占 26.7%，低于 `--dir` 在全库的 31%），且 `P(pass|dir)=11.4%` **低于** `P(pass|非dir)=14.3%`，day01–05 的高 Compl 里 `--dir` 通过数为 0。这个反证很干净，`--dir` 提示可以排除为主因。
+
+**但"没买到多少"不是继续把答案递给模型的理由。**三项全部移进 `_build_opd_hint`——它进 `teacher_tokens`、模型永远看不到，训练信号一分不少，环境恢复忠实。
+
+**同时移除 `training_passed` 覆盖**：此前 Phase 1 的 round 内 diff 判定若把一道官方判 FAIL 的题升级成 PASS，会连带把**环境反馈**也改成"correct"。当初的动机（让训练信号和可见反馈不打架）是对的，但做法让**环境跟官方 checker 意见不一致**。现在两条通道**故意分开**：环境说的就是 MetaClaw-Bench 说的，训练信号（`eval_score` + OPD hint）说我们认为的，互不渗透。
+
+#### 改动二：infra 失败的轮次记 0 分并留在分母里
+
+原来是 `if official_score is not None: day_round_scores.append(official_score)`，而 `official_score = ... if agent_succeeded else None`——**agent 崩掉的轮次从分子和分母里同时消失**，Acc./Compl. 变成"在跑通了的题上"算的，而不是在 346 题的 benchmark 上算的。
+
+官方不是这样：`_run_group` 无条件调 `_compute_inline_score`（answer 为空也照算）、写进 `infer_result.json`，`metaclaw-bench scoring` 之后对题单里**每一道**打分——崩掉的那道是 0 分、留在分母里。
+
+量级不大（K=6 是 343/346，约 1%），但方向跟其他几处一样都是抬高我们，一并修掉。
+
+**刻意不改训练侧**：`if agent_succeeded:` 那个分支原样保留，这些轮次仍然不提交 verdict、不产生伪造的 -1 样本。打分和训练保持分离，跟改动一恢复的是同一条边界。
+
+#### 验证（2026-09-04，本地）
+
+`py_compile` 通过；新增 `scripts/tests/test_metaclaw_env_fidelity.py`，**24 项断言直接跑 driver 的真实函数**，并把结果与**官方 `_build_feedback_text` 逐字节比对**（本地导入 MetaClaw-official）：
+
+- 四种情形（失败的 `--dir` 轮 / 失败的普通 file_check / 通过轮 / MC 格式失败）下 `_build_next_round_feedback` 输出 **== 官方输出**
+- 判据提示、checker stdout、模型自己的失败回复 **都不再出现在 agent 可见的文本里**
+- **Phase 1 升级过的轮次，agent 看到的仍然是失败**（与官方一致）
+- OPD hint 侧三项**全在**：stdout、`--dir` 判据提示（且**不**追加到 day11 起的精确日期 glob 检查）、MC 失败回复片段；静默失败仍返回空 hint（2026-08-19 定的行为不变）
+- 分母：结构性检查确认零分记录就是 `official_score is not None` 的 `else` 分支；`_aggregate_acc_compl` 上验证"多一道 0 分"确实把 Compl 从 100% 拉到 2/3
+
+**非空洞性三向验证**：把 `_FC_DIR_MODE_NOTE` 重新塞回环境侧 → 挂在"失败的 `--dir` 轮 ours == official"；把零分 append 用 `if False:` 屏蔽 → 挂在"零分记录是 else 分支"。均已还原。
+
+#### 影响与下一步
+
+**所有现有跑分（含刚跑完的 K=0 34.9%/13.4%）在这次改动后不再可比，需要重新建基线。**代价接受，因为它们本来就跟论文不可比。
+
+下一步：**重跑 `METACLAW_TRAIN_UNTIL_DAY=0`**，得到第一个环境侧与论文一致的零训练基线。这个数字才是后续所有训练效果的对照锚点，也才谈得上跟 Table 1 的 Kimi/GPT-5.2 两行并排看。
+
+**仍未解释的**：即便三项加料被 CLI 的统计排除为主因，"4B 零训练贴着 GPT-5.2 的 Compl"这件事还没有解释。剩下的已知差异是**按题隔离 session**（我们 08-19c 加的，官方按天共用）和 context 从官方声明的 50000 提到 65536。**建议在新基线之后做单变量实验**：K=0 + 按天共用 session，量出这一条值多少个点。另有一条便宜的先导信号：在现有 K=0 日志里看 **Compl 随"当天第几轮"是否衰减**——按题隔离下应当是平的，官方按天则应衰减。
+
+---
+
 ### 口径重大更正（2026-09-03）：定版基线作废、K=6 的训练增益被证伪、以及"我们把题变简单了"的证据
 
 本节推翻本文件上方多处已定版的结论，**以本节为准**。触发它的是同日跑完的 `METACLAW_TRAIN_UNTIL_DAY=0` 零训练基线。
