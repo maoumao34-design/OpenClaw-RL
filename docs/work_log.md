@@ -51,8 +51,10 @@
 - **中间轮次的信号结构本身可疑**：MetaClaw 迁移用的是 toolcall-rl 式 step judge（开放式"好不好"，无事实锚点）且写死 `accepted: False`（无 hint、只剩拉回 base 的正则），而 Personal Agent 用的 `_build_prm_eval_prompt` 是**以 next_state 为证据**判定、且每个 turn 都能拿 OPD hint。中间轮次约占训练混合 72%。**这是下一步讨论的方向，尚未实现。**
 - `20260902_094458` / 09-03 两次的 checkpoint 均已污染，不能作为起点。
 - **round 轮数仍无上限**（186 轮空转的案例）。
-- **协议偏离（2026-09-03 查清）：官方 MetaClaw 按天共用一个 session，我们从 08-19c 起是按题隔离。**因此**绝对分数不能跟论文 Table 1 或 17.8% 定版基线比**（那是协议差不是训练效果）；我们自己几次跑之间仍可比。暂不改回——改回会跟 K=6/day22 不可比，且 `safeguard` 压缩会打断前缀不变量、废掉轨迹级方案。记为待偿还的债。**性质比"数字不可比"更重：官方按天的上下文压力正是论文用 S（记忆/技能）解决的那部分任务，我们不迁移 S、又按题切掉了这部分，等于把自己不会做的题去掉了——测的题目范围本身就不同。****待定决策点：K=0 基线出来后若与 17.8% 差距很大，必须重新讨论按题/按天，不能默认继续。**
-- 其余同 09-02（历史状态）。
+- **⚠ 基准口径已更正（2026-09-03）：定版基线 17.8%/0% 整体作废**（跑在带 session-key 兜底 bug 的 OpenClaw 构建上，文件写进 `workspace-main/`），**训练效果一律改用 K=0（34.9%/13.4%）作对照**。**K=6 的"正面训练效果"已被证伪**——K=0 零训练就有 34.9%/13.4%，与 K=6 的 37.3%/13.9% 基本重合，**训练增益接近 0**。此前所有"相对 17.8% 提升"的表述（含对外汇报）需要更正。
+- **我们的 harness 比官方宽松，最强候选是我们自己加的反馈加料**：`_build_next_round_feedback` 在官方静态文本之上追加 checker 真实 stdout，并在 `check_filename.py --dir` 模式下**直接把通过判据告诉模型**（224 道 file_check 里 70 道是这个模式）。量级待用对照实验量化。
+- **MetaClaw 论文 Table 1 从未转录进本项目文档、本地也没有 PDF**，"论文 Baseline 约 21%/约 2%"是二手数字；且 `Compl.` 是本项目自定义的量。**核实前不能拿论文当锚点。**
+- **协议偏离（2026-09-03 查清）：官方 MetaClaw 按天共用一个 session- 其余同 09-02（历史状态）。
 
 ### 下一步
 1. **OpenClaw-RL 复现**：同 08-17
@@ -1973,3 +1975,24 @@
 - `scripts/run_openclaw_topk_select_modelfactory.sh`：`--rollout-batch-size 8` + dynamic gbs + reward 钩子注入
 - `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：移除 `METACLAW_TRAJ_MAX_TOKENS`，落盘/打印改为样本单位说明
 - `scripts/tests/test_metaclaw_round_group.py`（新增，40 项）；删除 `scripts/tests/test_metaclaw_trajectory_sample.py`
+
+**完成内容（续八，同一天）——K=0 零训练基线跑完，推翻三条已定版结论：**
+- **K=0（30 天 346 题跑完）：Acc 34.9% / Compl 13.4%（30/224），训练步数 0。**对照：定版 CLI 基线 17.8%/0%、K=6（训了 day1–6）37.3%/13.9%
+- **最重要的一条：K=0 与 K=6 基本重合（34.9 vs 37.3、13.4 vs 13.9）→「K=6 是第一次拿到正面训练效果证据」这条结论被证伪、已撤回。**那个"相对 17.8% 的提升"几乎全部来自 harness 路径差（driver vs 官方 CLI），**训练本身增益接近 0**
+- **定版基线 17.8%/0% 整体作废**（不只是 Compl 那一格）：根因是 OpenClaw 构建里的 session-key 兜底 bug——`session.ts:331-337` 的最后一层兜底 `buildExplicitSessionIdSessionKey({sessionId, agentId: opts.agentId})` 传的是**原始值**而不是同函数前面已算好的 `storeAgentId`，`normalizeAgentId(undefined) → "main"`；**而这个兜底必走**，因为官方 `_prepare_session` 只 `touch` `.jsonl`、**从不调 `_register_session_in_json`**（后者唯一调用点在 `update_type=="session"` 分支，而 346 道题的 `update` 全为空）。于是不传 `--agent` 时文件落进 `workspace-main/`，checker 读的是 `workspace_copy`。**"file_check 是真实能力上限"这条结论一并撤回**
+- **同时纠正我自己前一天说反的一句**：我把 `--agent` 修复列成"我们比官方宽松的地方"，说反了——**对论文而言它是恢复对等**（若论文用的构建没这个 bug），只对我们那个坏掉的定版基线才是差异
+- **记下 `--agent` 缺口是三层的**（`_run_openclaw_agent` argv / `_run_question` 往下传 / `_run_group` 调用点），只补第一层无效——定版基线号称打过 agentfix 却仍 Compl=0，最可能就是只补了第一层。以后再用 `metaclaw-bench run` 打基线必须三层全补
+- **基准口径改为 K=0**：`K=6 vs K=0`、`新方案 vs K=0` 干净，`任何东西 vs 17.8%` 不干净。**此前所有"相对 17.8% 提升"的表述（含对外汇报）都要更正**
+- **查出"我们把题变简单了"的最强候选，而且是我们自己 08-20 加的**：官方 `_build_feedback_text` 对 file_check 只读静态 `feedback.correct/incorrect`；我们的 `_build_next_round_feedback` 在其上只增不减地追加三样——MC 格式失败附上模型自己的失败回复片段、**file_check 失败附上 checker 真实 stdout**（官方那段静态文字经常描述的是另一种失败原因）、**以及 `check_filename.py --dir` 模式下追加 `_FC_DIR_MODE_NOTE`——这句直接把 checker 的通过判据告诉模型**。实测统计：**224 道 file_check 里有 70 道（31%）正是这个模式**
+- **给出一条可量化的验证**：统计 K=0 report 里通过的 30 道 file_check 中有多少是 `--dir` 模式，若占绝大多数则这一条基本解释整个 Compl 差距
+- **顺带排除一条**：pause-retry 只在权重同步暂停窗口触发，K=0 没有训练步、没有暂停窗口，**对 K=0 不成立**
+- **发现一个必须补的洞**：本地没有 MetaClaw 论文 PDF，`paper_index.md`/`paper_understanding.md` 里**完全没有 MetaClaw 的 Table 1**——所有"论文 Baseline 约 21%/约 2%"的说法都是二手转述、从未核实；而且 **`Compl.` 本身就是本项目为对应 Table 1 自己定义的量**（官方 `report_cmd.py` 没这个概念），若论文的分母或判据不同，这个比较根本不成立。**核实前不再用它当锚点**
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"口径重大更正（2026-09-03）"
+
+**主要问题（续八）：**
+- **对外汇报已经用过"相对基线提升明显"的说法**（本周周报里也有）→ 需要主动更正，这一条比技术本身要紧
+- **"我们比论文宽松多少"目前只有定性清单、没有量化** → 需要逐项关掉自己的加料做对照实验
+- **MetaClaw 论文 Table 1 未核实** → 阻塞"跟论文比"这一整类结论
+
+**产出（续八）：**
+- `docs/metaclaw_migration_plan.md`：新增"口径重大更正（2026-09-03）"一节；定版基线与 K=6 两处加作废/撤回标注

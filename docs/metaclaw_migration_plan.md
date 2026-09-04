@@ -220,7 +220,101 @@ Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐
 
 Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23）——这部分是被 `rl-training-headers` 标记污染拖累过的，`--agent` 修复后的新基线证实**这两次结果都被大量 Context overflow（49.1%）严重拉低**，不是"4B 模型在 file_check 上一题都做不对"这么简单的能力上限结论——旧结论里"关键结论"那部分已被推翻，不再采信。
 
+### 口径重大更正（2026-09-03）：定版基线作废、K=6 的训练增益被证伪、以及"我们把题变简单了"的证据
+
+本节推翻本文件上方多处已定版的结论，**以本节为准**。触发它的是同日跑完的 `METACLAW_TRAIN_UNTIL_DAY=0` 零训练基线。
+
+#### 一、K=0 的结果：K=6 的"训练效果"基本不存在
+
+| 指标 | **K=0（零训练）** | 定版 CLI 基线 | K=6（训了 day1–6） |
+|---|---|---|---|
+| Acc | **34.9%** | 17.8% | 37.3% |
+| Compl | **13.4%**（30/224） | 0.0% | 13.9% |
+| 训练步数 | 0 | 0 | day1–6 有更新 |
+
+（K=0：`logs/metaclaw_migration_20260903_170555/report/`，30 天 346 题跑完。）
+
+**K=0 与 K=6 基本重合**（34.9 vs 37.3、13.4 vs 13.9）。因此本文件上方"K=6 freeze run"一节里那条结论——
+
+> 这是这次 MetaClaw 迁移从"改 bug、修链路"阶段第一次拿到的正面训练效果证据……Acc. 从基线 17.8% 提升到 37.3%，`Compl.` 从 0% 提升到 13.9%
+
+**已被证伪，予以撤回。**那个"提升"几乎全部来自 harness 路径差（driver vs 官方 CLI），**训练本身的增益接近 0**。同一节里"冻结窗单独看依然比基线同范围高出一截"这条佐证同样失效，因为它比的也是那个作废的基线。
+
+#### 二、定版基线（17.8% / 0%）整体作废，不只是 Compl 那一格
+
+原因是 OpenClaw 这个构建里的一个 session-key 兜底 bug，而不是模型能力：
+
+`openclaw/src/agents/command/session.ts:331-337`，`resolveSessionKeyForRequest` 的最后一层兜底
+
+```ts
+if (requestedSessionId && !sessionKey) {
+    sessionKey = buildExplicitSessionIdSessionKey({
+      sessionId: requestedSessionId,
+      agentId: opts.agentId,        // ← 原始值，不是前面已算好的 storeAgentId
+    });
+}
+```
+
+而 `buildExplicitSessionIdSessionKey`（:93）走 `normalizeAgentId(undefined) → DEFAULT_AGENT_ID = "main"`（`routing/session-key.ts:27`）。同一个函数前面明明已经算出了正确的 `storeAgentId = requestedAgentId ?? defaultAgentId`（配置里只有 `metaclaw_agent` 一个 agent 时它就是对的），**兜底这里没用它**。
+
+**而这个兜底是必走的**：官方 `_prepare_session`（`infer_cmd.py:423`）只 `touch` 了 `.jsonl`，**从不调 `_register_session_in_json`**；后者唯一调用点在 `_execute_update` 的 `update_type == "session"` 分支（:546），而 **346 道题的 `update` 字段全部为空**（已实测）。所以整个 benchmark 跑完这个注册函数一次都不会被调用 → session store 永远没有匹配条目 → 每轮都落兜底 → 不传 `--agent` 就变成 `agent:main:explicit:<sid>` → 文件落进 OpenClaw 内建的 `workspace-main/`，而 `_patch_agent_workspace` 只改了 `metaclaw_agent` 那一条。
+
+**因此上方"基线结果"一节里这条结论撤回**：
+
+> `Compl.`（file_check）在新旧基线里都是 0.0%……file_check 类任务确实是真实的能力上限，不是链路/overflow 问题
+
+它不是能力上限，是**文件写到了 checker 看不到的目录**。
+
+**注意 `--agent` 缺口是三层的**，只补最显眼的第一层无效：`_run_openclaw_agent`（:378，argv 里根本没有 `--agent`）、`_run_question`（:753，签名有 `agent_id` 但要往下传）、`_run_group` 调用点（:920-935，**官方压根没传**）。定版基线号称打过 agentfix 补丁却仍是 Compl=0，最可能就是只补了第一层。**以后若再用 `metaclaw-bench run` 打基线，必须三层全补。**
+
+**这同时说明 `--agent` 修复的性质**：对论文而言它是**恢复对等**（若论文用的构建没有这个兜底 bug），不是放水；对我们自己那个定版基线而言才是差异。
+
+**待验证（服务器上）**：`grep -n "buildExplicitSessionIdSessionKey" -A 8 <march_2026_3_8>/src/agents/command/session.ts` —— 三月版兜底传的若是解析后的 id，则论文没有这个问题，上述推断成立；若三月版也传 raw，则论文基线的非零 Compl 另有来源，需要重新解释。（MetaClaw-official 和 OpenClaw-RL-official 一样**没有锁定 OpenClaw 版本**，已查 `package.json`/`requirements.txt`/README，只能靠行为对比来定。）
+
+#### 三、新的基准口径
+
+- **训练效果一律以 K=0（34.9% / 13.4%）为对照基准**，不再用 17.8% / 0%。
+- `K=6 vs K=0`、`新方案 vs K=0` 是干净的比较；`任何东西 vs 17.8%` 不是。
+- 此前所有基于"相对 17.8% 提升"的表述（含对外汇报）都需要更正。
+
+#### 四、我们比官方/论文宽松的地方（"为什么题变简单了"）
+
+K=0 用 4B、零训练拿到 Compl 13.4%，而论文 Baseline 的 Compl 据称只有约 2%（**二手数字，见第五节**）。差距要有来源。按证据强度排：
+
+**1. `[Previous Feedback]` 我们加了料，官方没有（最强候选，且是我们自己 2026-08-20 加的）**
+
+官方 `_build_feedback_text`（`infer_cmd.py:725`）对 file_check 只做一件事：读静态的 `feedback.correct` / `feedback.incorrect` 文本。
+
+我们的 `_build_next_round_feedback`（`metaclaw_rollout_driver.py:1000`）在它之上**只增不减**地追加三样：
+
+- MC 格式失败 → 附上模型自己失败回复的片段
+- **file_check 失败 → 附上 checker 的真实 stdout**（或 Phase 1 的 diff 诊断），而官方那段静态文字经常描述的是**另一种**失败原因（见"查证记录（二）"第 1 条）
+- **file_check 失败且 checker 是 `check_filename.py --dir` 模式 → 追加 `_FC_DIR_MODE_NOTE`**：
+  > *"any valid 8-digit date + snake_case filename satisfies this check -- the exact date shown above is only an example, not a literal requirement."*
+
+**第三条最重：它直接把 checker 的通过判据告诉了模型。而 224 道 file_check 里有 70 道（31%）正是 `check_filename.py --dir` 模式**（实测统计）。
+
+**可量化的验证**：在 K=0 的 report 里统计——**通过的 30 道 file_check 中，有多少道是 `check_filename.py --dir` 模式**。若占绝大多数，这一条基本就解释了整个 Compl 差距。
+
+**2. 按题隔离 session**（我们 08-19c 加，官方按天共用）—— 已确认存在，量级未知。
+
+**3. 日期敏感性**：部分 checker 对"今天/本周五"敏感，我们跑在 2026-09-03，定版基线跑在 2026-08-20，论文又是另一个日期。方向不定，未量化。
+
+**4. 重试**：`AGENT_RETRY`/`VERDICT_RETRY` 默认都是 0；pause-retry 只在权重同步暂停窗口触发，**K=0 没有训练步、没有暂停窗口，所以这一条对 K=0 不成立**，可以排除。
+
+#### 五、一个必须补的洞：MetaClaw 论文的 Table 1 从未被转录进本项目文档
+
+本地没有 MetaClaw 论文 PDF（只有 OpenClaw-RL 那篇），`paper_index.md` / `paper_understanding.md` 里也**完全没有 MetaClaw 的 Table 1**。所有"论文 Baseline 约 21% Acc / 约 2% Compl"的说法都是**二手转述，从未核实**。
+
+而且 **`Compl.` 本身就是本项目为对应 Table 1 自己定义的量**（"仅 file_check 通过率"，官方 `report_cmd.py` 没有这个概念，见上方"report.json 没有 Compl. 字段"一条）——**如果论文的 Compl 分母或判据跟我们不同，13.4% vs 2% 这个比较本身就不成立。**
+
+**在拿到论文原文核实 Table 1（数值 + Compl 定义 + baseline 用的是哪个模型）之前，不要再用它当锚点。**
+
+---
+
 ### 基线结果（用于后续对比，2026-08-21 定版，`--agent` 修复后的新基线，评测本身跑于 2026-08-20）
+
+> **⚠ 2026-09-03 作废**：这份基线跑在带 session-key 兜底 bug 的 OpenClaw 构建上，文件被写进 `workspace-main/` 而非 checker 读的目录，Compl=0 是构建产物不是能力上限。**训练效果的对照基准已改为 K=0（34.9%/13.4%）**，详见上方"口径重大更正（2026-09-03）"。以下内容保留作记录。
 
 **这是本次 MetaClaw 迁移当前唯一采信的训练前基线，取代 2026-08-18 版**。选用理由：同一套"agentfix"harness（已部署 `--agent metaclaw_agent` 修复）下跑了三个不同 SGLang seed 的独立结果——`247444587`（Acc=17.7%，overflow 17.9%）、`589953305`（Acc=15.3%，overflow 5.5%）、`465485731`（Acc=17.8%，overflow 4.6%）——选 Acc 最高且 overflow 最低的 `465485731` 这次作为正式基线，其余两次仅作对照记录（不是丢弃，三次结果都指向同一个结论，互相印证）。
 
@@ -679,6 +773,8 @@ CLI 当时提出的具体方案（把 30 天拆成两段，前 K 天正常训练
 
 **记法（可直接引用）**：
 > K=6 freeze run 122808（commit 0882f69）：主报全程 live Acc.=37.3%/Compl.=13.9%（343/346 题），相对 agentfix 基线 seed465 的 17.8%/0% 提升明显；训练窗 day1-6 为 61.4%/45.0%，冻结窗 day7-30 为 31.9%/7.1%。主口径为全程聚合（对齐论文边训边分），冻结窗仅作分段诊断。
+
+> **⚠ 2026-09-03 撤回**：同 harness 的零训练基线 K=0 是 34.9%/13.4%，与本次 37.3%/13.9% 基本重合——**本段所述的"训练效果"实际上接近 0**，那个提升来自 harness 路径差而不是训练。详见"口径重大更正（2026-09-03）"。
 
 **意义**：这是这次 MetaClaw 迁移从"改 bug、修链路"阶段第一次拿到的正面训练效果证据——用**跟论文一致的全程 live 聚合口径**衡量，Acc. 从基线 17.8% 提升到 37.3%，`Compl.` 从 0% 提升到 13.9%（这次迁移第一次观测到非零的 `Compl.`）；Train/Frozen 分段拆分作为补充诊断，进一步确认这个提升不完全是"混合了多种权重状态"的假象——冻结窗单独看依然比基线同范围（约 16.2%）高出一截。
 
