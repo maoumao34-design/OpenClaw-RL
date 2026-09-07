@@ -2061,3 +2061,22 @@
 **产出（续）：**
 - `docs/metaclaw_migration_plan.md`：新增查证记录（十）；三处 2026-09-05 标注改正为 2026-09-07
 - 三个脚本内的 `2026-09-05` 注释同步改正
+
+**完成内容（续二，同一天）——查清我们跑的是 Part II 的题、却一直在对 Part I 的那一列：**
+- **起因**：`scope=day` 对照跑到 day17 是 Acc 49.9% / Compl 36.3%，比按题隔离（41.4% / 21.0%）**更高**而不是更低，4B 零训练的 Compl 变成 GPT-5.2 Part I 基线（14.7%）的 2.5 倍——异常不但没消失反而放大。**用户指出 Table 1 有两个 Part、怀疑我们搞错了对象**
+- **论文附录里 Part I / Part II 是两套完全不同的东西**：A.1「Part I」= 控制一个 OpenClaw 安装、**只有 `run_command` 一个工具**、示例是 `openclaw status` / `openclaw agents add`；A.2「Part II」= 注入 IDENTITY.md / USER.md 的 workspace；A.3 三段模板明确标注 MC 和 FC 模板都属于 **Part II**，而 Part I 的模板是"real OpenClaw session, `train.jsonl`"
+- **逐条比对确认我们跑的是 Part II**：MC 作答格式 `box{X} or box{X,Y}` 与 A.3 Part II 模板**逐字相同**；FC 判分脚本就是 A.3 Part II 例子里的 `check_iso8601.py`；FC 反馈文案是 ISO8601 + 时区；workspace 复制 AGENTS/USER/SOUL 身份文件（A.2 = Part II）；`all_tests.json` 带 `preference_tags`（output_format 30 / file_naming 25 / …），而 **A.7 的标题就是 "Part II Implicit Preference Rules"**；工具集是 OpenClaw 原生全套而不是 Part I 的单一 `run_command`
+- **Part I 的数据在 `MetaClaw-official/examples/train.jsonl`**（72 条），第一条与 A.3 的 Part I 模板**逐字相同**（"[Sat 2026-02-21 07:25 EST] I grant you read access to …gog/skill.md… add ten meetings to Google Calendar"），且在 `examples/` 下不在 `benchmark/data/` 里——**我们从来没跑过 Part I**
+- **换成 Part II 那一列之后异常消失**：GPT-5.2 Baseline 44.9 / **58.4**、Kimi-K2.5 Baseline 21.1 / **18.2**；我们 36.3% 落在两者之间、**明显低于 GPT-5.2**，排序正常。**持续一周的"4B 打平 GPT-5.2"异常，根源就是对错了列**
+- **但换列也不是严格可比**：论文 Part II 是 14 天 / 588 题（434 MC + 154 FC，MC 占 74%），我们跑的是 30 天 / 346 题（122 MC + 224 FC，FC 占 65%）；而 30 天/346 题恰好是论文 **Part I 的规模**——**公开仓库这份题集跟论文任何一个 Part 都不是同一份数据**。Table 1 里没有任何一格对我们 like-for-like
+- **需要作废的既有结论**：09-03 起"4B 零训练贴着 GPT-5.2 的 14.7%"（对错了列）；由此展开的整条"我们的 harness 把题变简单了"排查线（**追的是幻影**——该线的实际产出仍有效，但动机前提是错的）；08-14 起"跟论文 Table 1 方法学对齐"要限定为"**指标定义**对齐"而非"题集对齐"
+- **不受影响的**：定版基线 17.8%/0% 因 session-key 缺陷失真（独立问题）；K=6 ≈ K=0、训练增益接近 0（同 harness 内部对照）
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"查证记录（十一）"
+
+**主要问题（续二）：**
+- **我在上一轮讨论里还犯了一个算术错误**：把"day01–17 有 42 道 `--dir` 题"当成"42 道 `--dir` 通过"，据此推出"45 道通过里最多 3 道是内容题、内容类通过率 3.7%"。CLI 用实际数据纠正：**16 道 dir + 29 道内容题，内容类通过率 35.4%（day）/ 22.0%（round）**，其中 metadata 类仍是 0/36。"只会起名字"这个结论不成立
+- CLI 同时否掉了我的"撒文件碾阶梯"假设：通过的 dir 题平均 surplus = 0.25（13/16 恰好卡在 min_count），是一题补一个合格名爬阶梯，不是靠数量砸过
+- **主指标仍应拆成"命名类 / 内容类"两栏**报，但内容类是约 35%（day）不是 3.7%
+
+**产出（续二）：**
+- `docs/metaclaw_migration_plan.md`：新增查证记录（十一）

@@ -220,6 +220,85 @@ Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐
 
 Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23）——这部分是被 `rl-training-headers` 标记污染拖累过的，`--agent` 修复后的新基线证实**这两次结果都被大量 Context overflow（49.1%）严重拉低**，不是"4B 模型在 file_check 上一题都做不对"这么简单的能力上限结论——旧结论里"关键结论"那部分已被推翻，不再采信。
 
+### 查证记录（十一）：我们跑的是 Part II 的题，却一直在对 Part I 的那一列（2026-09-07）
+
+**这条推翻本项目自 08-14 以来所有"跟论文 Table 1 比"的结论。**
+
+#### 起因
+
+`scope=day` 对照跑到 day17 时 Acc 49.9% / Compl 36.3%，比按题隔离（41.4% / 21.0%）**更高**，而不是我们预期的更低。一个 4B 零训练模型的 Compl 变成 GPT-5.2 Part I 基线（14.7%）的 2.5 倍，异常不但没消失反而放大。用户指出 Table 1 有两个 Part，怀疑两阶段方法不同、我们搞错了对象。
+
+#### 论文附录里 Part I 和 Part II 是两套完全不同的东西
+
+**A.1 Agent System Prompt (MetaClaw-Bench Part I)**：
+
+> Part I evaluates agents on **OpenClaw CLI tasks** via a programmatic rollout loop…
+> "You are an expert CLI agent **controlling an OpenClaw installation**… by issuing CLI commands via the `run_command` tool"
+> **"The single tool exposed to the agent is `run_command`"**（schema 只有一个字符串参数 `command`，示例 `openclaw status`、`openclaw agents add --name bot1 --model gpt-4o`、`done`）
+
+**A.2 Agent Identity Context (MetaClaw-Bench Part II)**：注入 IDENTITY.md / USER.md 等 workspace 上下文文件。
+
+**A.3 Task Question Templates** 里三段模板，标签写得很清楚：
+
+- **Multi-choice question (Part II, Day 01 / r1)** → `Please answer using \bbox{X} or \bbox{X,Y} format.`
+- **File-check question (Part II, Day 01 / r21)** → `Save as day01/decision_log_r21.json`，`Eval: python scripts/check_iso8601.py ...`，反馈 `Time/date fields must use ISO 8601 with +08:00 timezone`
+- **Part I task instruction format (real OpenClaw session, `train.jsonl`)** → `[Sat 2026-02-21 07:25 EST] I grant you read access to /Users/jimchen/Documents/openclaw/skills. Locate gog/skill.md ... add ten meetings to Google Calendar ...`
+
+**A.7 = "Part II Implicit Preference Rules"**。
+
+#### 逐条比对：我们跑的是 Part II
+
+| 特征 | 论文归属 | 我们跑的 `benchmark/data/metaclaw-bench` |
+|---|---|---|
+| MC 作答格式 | Part II：`\bbox{X} or \bbox{X,Y}` | `Answer using \bbox{X} or \bbox{X,Y} format.` **逐字相同** |
+| FC 判分脚本 | Part II：`check_iso8601.py` | 224 道 FC 里大量 `check_iso8601.py` |
+| FC 反馈文案 | Part II：ISO 8601 + 时区 | `All time-related fields must use a full datetime format with tim…` |
+| workspace 身份文件 | Part II（A.2）：IDENTITY.md / USER.md | `_copy_workspace_for_test` 明确复制 AGENTS.md / USER.md / SOUL.md |
+| `preference_tags` | Part II（A.7 标题即"Part II Implicit Preference Rules"） | `all_tests.json` 里有：output_format 30 / file_naming 25 / field_completeness 20 / workflow 15 / completion_log 10 |
+| 工具集 | **Part I：只有一个 `run_command`** | OpenClaw 原生全套 read/write/edit/exec |
+| Part I 的数据在哪 | `train.jsonl` | **`MetaClaw-official/examples/train.jsonl`**（72 条），第一条与 A.3 的 Part I 模板**逐字相同**，且在 `examples/` 下、不在 `benchmark/data/` 里 |
+
+**结论：`benchmark/data/metaclaw-bench` 是 Part II 形态的题集；Part I 是 `examples/train.jsonl` 那 72 条真实 OpenClaw 会话，只有一个 `run_command` 工具，我们从来没跑过。**
+
+#### 用对列之后，异常消失
+
+| | Acc. (%) | Compl. (%) |
+|---|---|---|
+| **我们 K=0 按天（day01–17，仍在跑）** | **49.9** | **36.3** |
+| GPT-5.2 Baseline（Part II） | 44.9 | **58.4** |
+| Kimi-K2.5 Baseline（Part II） | 21.1 | **18.2** |
+| Kimi-K2.5 MetaClaw (Skills)（Part II） | 26.9 | 33.8 |
+| Kimi-K2.5 MetaClaw (Full)（Part II） | 39.6 | 51.9 |
+
+**Compl 36.3% 落在 Kimi 的 18.2% 和 GPT-5.2 的 58.4% 之间、明显低于 GPT-5.2——排序正常了。**此前"4B 打平/超过 GPT-5.2"这个持续一周的异常，**根源就是对错了列**。
+
+Acc 49.9% 仍高于 GPT-5.2 的 44.9%，但两点缓解：论文明确"Task difficulty increases monotonically with day index"，day01–17 是容易的那一半；而按题隔离那趟跑满 30 天最终是 34.4%。全程跑完大概率落到 GPT-5.2 之下。
+
+#### 但即便换成 Part II 这一列，也不是严格可比
+
+| | 天数 | 题数 | MC | FC |
+|---|---|---|---|---|
+| 论文 Part II | 14 | 588（42/天） | 434（74%） | 154（26%） |
+| **我们跑的公开题集** | **30** | **346** | **122（35%）** | **224（65%）** |
+
+天数、题量、MC/FC 配比全都不同（论文 Part II 是 MC 为主，我们的是 FC 为主）。而 30 天 / 346 题恰好是论文 **Part I 的规模**——**公开仓库放出来的这份题集，跟论文任何一个 Part 都不是同一份数据**。
+
+**所以 Table 1 里没有任何一格是对我们 like-for-like 的对照。**这反过来证实了 09-04 已经定下的口径：**训练效果一律以我们自己的 K=0 为基准，Table 1 只能作量级参照，不能作对照锚点。**
+
+#### 需要作废/更正的既有结论
+
+- 09-03 起"4B 零训练贴着 GPT-5.2 的 Compl（14.7%）"——**对错了列，作废**
+- 由此展开的整条"我们的 harness 把题变简单了"排查线——**追的是幻影**。该线上得到的真实产出仍然有效且值得保留（反馈加料移回训练侧、分母修正、空 agent 0/224、压缩三方对比、session scope 开关），但它们的**动机前提是错的**
+- 08-14 起"跟论文 Table 1 方法学对齐"的表述——**需要限定为"指标定义对齐"，不是"题集对齐"**
+
+#### 仍然成立、不受影响的
+
+- 定版基线 17.8%/0% 因 OpenClaw session-key 缺陷而失真（那是独立问题）
+- K=6 ≈ K=0，训练增益接近 0（同 harness 内部对照，与论文无关）
+- `check_filename.py --dir` 不验内容、当天累积、min_count 阶梯（客观事实，但它是 Part II 题集自身的设计）
+
+---
+
 ### 查证记录（十）：压缩到底什么时候触发、不打补丁会怎样（2026-09-07）
 
 跑 `scope=day` 之前必须先搞清楚这一条：**按题隔离时 transcript 很短、压缩几乎不触发，所以我们和官方在压缩上的差异一直被掩盖着；一旦按天共用，压缩就成了主角，会直接污染那趟对照。**
