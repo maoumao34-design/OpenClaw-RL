@@ -222,7 +222,13 @@ Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18�
 
 ### 查证记录（十一）：我们跑的是 Part II 的题，却一直在对 Part I 的那一列（2026-09-07）
 
-**这条推翻本项目自 08-14 以来所有"跟论文 Table 1 比"的结论。**
+> ## ⛔ 本条已于同日（2026-09-07）被硬数据证伪并整条撤回，**不要采信任何结论**
+>
+> 核心论断"`benchmark/data/metaclaw-bench` 是 Part II 形态的题集"**是错的**。它建立在附录例子的 Part 标签、以及 `\bbox{X,Y}` / `check_iso8601.py` 两处字符串"逐字相同"上；实测证明那两处**是两个 Part 共用的样板**，不构成同一份数据的证据。
+>
+> **正确结论见下面的查证记录（十二）：这份公开题集就是 Part I，Table 1 的 Part I 那一列对我们是可比的，"4B 打平 GPT-5.2"的异常依然存在、依然未解释。**
+>
+> 本条全文保留仅为记录当时的推理链条和它是怎么错的。
 
 #### 起因
 
@@ -296,6 +302,371 @@ Acc 49.9% 仍高于 GPT-5.2 的 44.9%，但两点缓解：论文明确"Task diff
 - 定版基线 17.8%/0% 因 OpenClaw session-key 缺陷而失真（那是独立问题）
 - K=6 ≈ K=0，训练增益接近 0（同 harness 内部对照，与论文无关）
 - `check_filename.py --dir` 不验内容、当天累积、min_count 阶梯（客观事实，但它是 Part II 题集自身的设计）
+
+---
+
+### 查证记录（十二）：公开题集就是 Part I，附录的 Part 标签不可信（2026-09-07）
+
+**本条推翻上面的查证记录（十一），并恢复"异常未解释"的状态。**
+
+#### 起因
+
+（十一）用"我们跑的是 Part II"把"4B 零训练贴平 GPT-5.2"的异常解释掉了。用户提出反向验证：**先确认 Part II 是什么，再倒推 Part I**——因为 Table 1 两个 Part 的数字差异明显不是同一套方法产生的。这个思路把问题从"读标签"变成了"点数据"，于是可判定了。
+
+#### 一、Part II 能确认——确认的方式是它不是我们这份
+
+论文 Part II：14 天 / 588 题 / 每天 42 题 / MC 占 74%。实测公开题集（`benchmark/data/metaclaw-bench/eval/day*/questions.json`）：
+
+```
+days: 30   total: 346   MC: 122 (35%)   FC: 224 (65%)
+每天题数: 10~15
+```
+
+**四项可数特征全部与 Part II 不符，全部与正文 §4.1 的 Part I 定义相符。**
+
+#### 二、附录引的两个"Part II"例子根本不在这份数据里
+
+（十一）判成 Part II 的直接依据是 A.3 两条标着 "Part II, Day 01" 的例子。逐条去数据里找：
+
+| 附录例子 | 公开题集实况 | 结论 |
+|---|---|---|
+| Part II, **Day 01 / r1** 是 **multi-choice** | day01/r1 是 **file_check**（把 `standup_raw.txt` 整理成 `standup.json`）| 不是同一题 |
+| Part II, **Day 01 / r21** → `day01/decision_log_r21.json` | **day01 只有 r1~r10**；全库 `grep decision_log` **0 命中**；**全库最大轮次号 = 15，不存在任何 r21** | 该题不在本数据集内 |
+
+Part II 每天 42 轮，r21 在那边合理。**所以附录那两条确实取自 Part II，而 Part II 的数据官方没有发布。**
+
+（十一）里所谓"逐字相同"实际只有两样：作答格式串 `\bbox{X} or \bbox{X,Y}`，和 checker `check_iso8601.py`。**这两样是两个 Part 共用的 harness 样板，不是同一份数据的证据。**
+
+#### 三、附录的 Part 标签至少错了三处，不能再当证据
+
+> **⚠️ 本小节已于同日按查证记录（十三）收窄。**下表"实际是什么"一列的推断过强：§4.1 全文**没有**描述任何一个 Part 的工具集，因此**正文并未反驳 A.1**；真正与 A.1 冲突的是**公开 benchmark 自己的配置**（`openclaw_cfg/openclaw.json` 用 `profile: coding` 全套工具）。收窄后的正确陈述见（十三）第三节。A.2 那一行也需修正：论文全文从未出现 USER.md / AGENTS.md / TOOLS.md，A.2 只讲 IDENTITY.md 和 SOUL.md。
+
+| 附录条目 | 标签 | 实际是什么 |
+|---|---|---|
+| A.1（`run_command` 单工具 system prompt） | 标 "Part I" | **RL 训练环境**：`metaclaw/openclaw_env_rollout.py`，仅被 `metaclaw/trainer.py` 引用，**自带文档写明 no `env.evaluate()` / reward=0**，吃 `examples/train.jsonl` |
+| A.2（IDENTITY.md / USER.md） | 标 "Part II" | **随 Part I 数据一起发布**：`benchmark/data/metaclaw-bench/workspaces/shared/` 下逐字存在（IDENTITY.md/USER.md/AGENTS.md/SOUL.md）|
+| A.3 第三段（`train.jsonl` 真实会话） | 标 "Part I task instruction format" | 同 A.1，是训练数据，不是 346 题 benchmark |
+
+**判定原则改为：只采信正文 §4.1 的定义 + 可数事实（天数/题数/题型配比/轮次号），附录的 Part 标签一律不作为证据。**
+
+#### 四、由此得到的自洽版本
+
+| | 是什么 | 我们有吗 |
+|---|---|---|
+| **Table 1 Part I** | 公开的 346 题 / 30 天 / 10~15 题每天 | ✅ **就是我们跑的这份** |
+| **Table 1 Part II** | 14 天 / 588 题 / MC 为主 / 有 r21+ | ❌ 未发布 |
+| A.1 + A.3 的 `run_command` 那套 | RL 训练 rollout 环境，无评分 | 有代码，从未跑过（也不该拿它对 Table 1）|
+
+**这同时结掉了上一轮那个悬案**——"A.1 只有 `run_command`，评测怎么打分"：它压根不是评测器，是 trainer，没有评分逻辑是设计如此。**Table 1 的 Part I 是 `benchmark/scripts/baseline_run.py`（自述 "plain openclaw agent"）跑出来的，跟我们同一条路径。**
+
+#### 五、代价：异常回来了
+
+（十一）的"用对列之后异常消失"**作废**。事实回到：
+
+**同一份 346 题、同一套 checker、同一类 agent 配置，我们的 4B 零训练在 `scope=day` 下 day01–17 打出 Acc 49.9% / Compl 36.3%，论文 GPT-5.2 Baseline 是 41.1% / 14.7%。**
+
+已排除的解释（各自有证据，见前文）：反馈加料、Compl 定义、题目自带白送分（空 workspace 0/224）、会话长度/context 溢出、按题隔离、题集搞错、`--agent` 过度帮助、刷文件数。**目前无成立假设。**
+
+#### 六、（十一）里哪些子结论仍然有效
+
+- "Table 1 只能作量级参照、训练效果一律以我们自己的 K=0 为基准"这条口径**继续有效**——但理由变了：不再是"题集不同"，而是"同题集下我们的绝对分异常偏高、原因未知"。
+- `check_filename.py --dir` 不验内容 / 当天累积 / min_count 阶梯——**客观事实仍成立**，但它是 **Part I** 题集自身的设计（原文误写为 Part II）。
+- 08-14 起"跟论文 Table 1 对齐"的表述——**恢复为题集确实对齐**；（十一）加的"仅指标定义对齐"限定作废。
+
+---
+
+### 查证记录（十三）：§4.1 / 附录逐字复核 + 官方配置实证，公开题集是"Part I 骨架 + Part II 机制"（2026-09-07）
+
+**收窄（十二）的第三节；不推翻（十二）的核心结论（题集规模 = Part I）。**
+
+#### 起因
+
+用户要求：不要只从数据集入手，去 §4.1 实验建立部分查**两个 Part 的方法差异**；并指出附录呈现的是 Part I = System Prompt + `run_command` Tool Schema、Part II = IDENTITY.md + SOUL.md，追问"**这是全部区别吗，还是有没在附录里表现出来的**"。
+
+#### 零、先纠正一次抓取污染
+
+首次抓取 HTML 全文时，摘要模型返回"§4.1 说 Part I 只有单个 `run_command` 工具"。**复核后证伪**：定向检索 `run_command` 字符串，**全文四次出现全部在附录 A.1，§4.1 不含此词**。摘要模型把 A.1 并进了 §4.1。该句已丢弃。**教训：对全文抓取的转述必须做定向字符串复核，不能直接采信。**
+
+#### 一、§4.1 原文（逐字）
+
+> **Part I** structures evaluation as a 30-workday simulation (346 questions, days 01–30, 10–15 per day). The workspace state (files, configs, project records) persists across rounds within each day, and each question includes the evaluation outcome of the previous round as corrective feedback context. Questions fall into two types: *file-check* tasks … and *multi-choice* tasks … Task difficulty increases monotonically with day index, with days 25–30 requiring sophisticated multi-step reasoning.
+
+> **Part II** extends the evaluation to a 14-workday simulation (588 questions, 42 per day: 434 multi-choice and 154 file-check).
+
+> Part II introduces five implicit preference rules progressively across 14 days. These rules are **not** stated in the agent's system prompt; they must be inferred from task feedback.
+
+> Part I's file-check tasks are **heavily execution-oriented, with many interdependent side effects**, providing a conservative measure of end-to-end completion.
+> Part II's file-check tasks are **rule-based transformations** where compliance with behavioral heuristics (e.g., schema conventions, timestamp formats) is the primary bottleneck, making them more amenable to skill distillation.
+
+论文给 Part II 的代号是 **CALMB-14**（见 A.2 原文 "Part II (CALMB-14) injects…"）。
+
+#### 二、§4.1 给出的方法差异，以及**全文都没给的空白**
+
+| | Part I | Part II（CALMB-14）|
+|---|---|---|
+| 规模 | 30 天 / 346 题 / 10–15 每天 | 14 天 / 588 题 / 42 每天 |
+| MC : FC | §4.1 **未给** | 434 : 154（MC 74%）|
+| FC 任务性质 | 执行导向、大量互相依赖的副作用 | 规则化转换，瓶颈是遵守行为规范 |
+| 隐含偏好规则 | §4.1 **未提** | 5 条 P1–P5 渐进激活，不写进 system prompt，只能从反馈推断 |
+| 指标 | 两 Part 相同（accuracy + file-check completion）| 同 |
+
+**附录只覆盖"提示/上下文"一层，且不对称**：A.1 只有 Part I 的 system prompt + `run_command` schema；A.2 只有 Part II 的 IDENTITY.md / SOUL.md 注入；A.7 只有 Part II 的 5 条规则。
+
+**回答用户的问题——附录那两项不是全部区别，而且真正的空白在别处：**
+
+1. **Part II 的 system prompt 和工具集，论文全文从未给出**（附录无 "Part II System Prompt" 条目）→ "Part II 用什么工具"完全未知
+2. **Part I 是否也注入 workspace 上下文，从未说明**（A.2 只讲 Part II）
+3. **会话粒度（一天一 session vs 一题一 session），两个 Part 都没写**
+4. 论文全文**从未出现 USER.md / AGENTS.md / TOOLS.md**
+
+**易误用的一句**：§4.1 的 "All conditions use identical prompts and tool sets" 约束的是 **conditions（Baseline / Skills / Full）**，**不是**两个 Part 之间，不能用它推出两 Part 工具集相同。
+
+#### 三、官方配置实证：公开 benchmark 用的是全套工具，不是单 `run_command`
+
+`benchmark/data/metaclaw-bench/openclaw_cfg/openclaw.json`：
+
+```json
+"tools": { "sessions": {"visibility": "self"},
+           "profile": "coding",
+           "deny": ["group:memory"] }
+```
+
+**`profile: coding` = OpenClaw 原生全套（read/write/edit/exec/glob/grep），只禁 memory 组；全仓库没有任何地方把工具限制为单个 `run_command`。**
+
+旁证：
+- 数据集内 **`TOOLS.md`** 列出 `exec / read / write / exec(ls) / exec(glob) / exec(grep)`，且被 `benchmark/src/check/workspace_integrity.py` 列为**必需文件**（`REQUIRED_WORKSPACE_FILES = ["AGENTS.md","IDENTITY.md","SOUL.md","TOOLS.md","USER.md"]`）
+- `run_command` 作为 **agent 工具**在全仓库只出现于 `metaclaw/openclaw_env_rollout.py`；`benchmark/scripts/*.py` 里的 `run_command` 只是 subprocess 的 Python 函数名，无关
+- **我们的 driver 用的就是这份官方 `openclaw_cfg/openclaw.json`** → **工具集这一项我们与官方 benchmark 对齐**
+
+**（十二）第三节"正文反驳了 A.1"的说法据此收窄为**：§4.1 根本没描述任何 Part 的工具集，正文未反驳 A.1；**与 A.1 冲突的是公开 benchmark 的配置**。
+
+#### 四、新发现：公开题集同时带着 Part II 的机制
+
+数据集自称 **`"name": "MetaClaw-Evolution-Bench"`**（不叫 Part I）。`all_tests.json` 的 30 条 test 逐天带 `preference_tags` 和 `desc`：
+
+```
+day01-05 arc=A  output_format                                          (day01 desc: "P1 first introduction")
+day06-10 arc=B  +file_naming                                           P2
+day11-15 arc=C  +field_completeness                                    P3
+day16-20 arc=D  +workflow                                              P4
+day21-25 arc=E  +completion_log                                        P5
+day26-30 arc=F  五条全开，混合复现
+```
+
+**这正是 §4.1 归给 Part II 的"5 条隐含偏好规则渐进激活"，一条不差**，且确实是隐含的：day01/r1 题面只要求 `meeting_time / attendees / action_items` 三个字段，**ISO 8601 + 时区要求只出现在 `feedback.incorrect` 里**。
+
+加上 A.2 归给 Part II 的 IDENTITY.md / SOUL.md 也在这份数据里且为必需文件。
+
+**结论：公开发布的这份 = Part I 的骨架（30 天 / 346 题 / 10–15 每天，与 §4.1 逐字吻合）＋ Part II 的适应机制（P1–P5 隐含规则 + 身份文件）。它不干净地等于任何一个 Part。**
+
+#### 五、三种可能，暂不定论
+
+| | 说法 | 支持 | 反对 |
+|---|---|---|---|
+| **A** | 公开这份就是 Part I，论文对 Part I 描述不全（隐含规则/身份注入其实两 Part 都有，只写在 Part II 名下）| 30/346/10–15 逐字吻合；配置就是 coding profile | 那 A.1 的 `run_command` 是什么 |
+| **B** | 公开的是作者后来重整的合并版，Table 1 的 Part I 不是这个 artifact 跑的 | 名字是 Evolution-Bench；带 Part II 机制 | 无直接证据 |
+| **C** | Part I 评测真的用 A.1 的单工具 agent，公开 harness 是另一套 | A.1 写得很具体 | 公开 harness 无此路径；TOOLS.md + coding profile 反证 |
+
+**若为 C，异常即有解释**（单 `run_command` 靠 shell heredoc 写文件，file-check 完成率远低于原生 `write`，GPT-5.2 的 14.7% 说得通）；**但目前无证据支持 C，且有两条硬证据反对。**
+
+**本条不宣布"异常已解释"。**Part I/II 判断此前已三次改口（详见 work_log 2026-09-07 续三/续四），下一步先读 §4.3 分析部分，看能否从分析口径反推两个 Part 各自用的方法。
+
+---
+
+### 查证记录（十四）：checker 实测证明公开题集与论文对 Part I 的描述矛盾（2026-09-07）
+
+> **本条标题与结论已于同日下调。**初版题为"§4.3 + checker 实测——公开题集用的是 Part II 的方法"，有两处过强，用户追问 "§4.3 具体说了什么，怎么就能判断更偏向 Part II" 后修正：
+> 1. **§4.3 几乎没有贡献**，判据实际来自 **§4.1.1**（已定向核验，见下）。初版把 §4.3 抬得过高。
+> 2. **"更偏向 Part II"是正面结论，需要"§4.1.1 对 Part I 的描述准确"这个前提**——而本项目刚两次栽在轻信论文对自身组件的描述上（A.1 的 `run_command`、A.2 的 Part 标签）。该正面结论**降级为待定**；**站得住的是否定形式**（见"结论"节）。
+
+#### 判据的真实出处：§4.1.1，不是 §4.3
+
+定向核验结果：
+- "Part I's file-check tasks are heavily execution-oriented, with many **interdependent side effects**, providing a conservative measure of end-to-end completion." → **§4.1.1**
+- "Part II's file-check tasks are **rule-based transformations** where compliance with behavioral heuristics (e.g., schema conventions, timestamp formats) is the primary bottleneck, making them more amenable to skill distillation." → **§4.1.1**
+- 直接字符串检验：§4.1 含 "interdependent side effects" = **YES**；含 "rule-based transformations" = **YES**
+
+**这条判据的价值在于它不是标签而是可量的内容特征**——正是前两轮栽在"读标签"之后所需要的东西。
+
+#### §4.3 实际说了什么（逐字），以及它的有限贡献
+
+小节：Per-day accuracy trends / Task-type breakdown / RL training dynamics / Skill library analysis / Cross-domain skill transfer to AutoResearchClaw / Case studies。**全程不提工具、system prompt、会话粒度**（只在附录 A），故无法裁决工具集问题。
+
+> **Task-type breakdown.** Figure 3 decomposes performance by task type, revealing that the two MetaClaw components address fundamentally different bottlenecks. Skills-only adaptation lifts multi-choice pass rates for both models while leaving file-check completion flat, as procedural knowledge helps reasoning but not execution. MetaClaw (Full) reverses this: Kimi-K2.5's file-check completion rate jumps to match GPT-5.2's baseline, while multi-choice accuracy slightly decreases as the policy shifts toward file-execution behavior during training.
+
+**这段完全没有出现 Part I / Part II**（拆的是 MC vs FC）。初版引给 §4.3 的两句 "On Part I, MetaClaw (Skills) leaves…" / "On Part II, where file-check tasks are rule-based…" **无法确认真在 §4.3**（逐字复现的 Task-type 段不含它们，可能来自 §4.2 或系摘要模型改写），**已不作为证据**。
+
+**§4.3 唯一的贡献**：它把 file-check 的成败反复归因于 rule / execution 这条轴（"helps reasoning but not execution"），佐证该轴是作者自己的分析框架，不是我们强加的。
+
+#### 用这个判据实测公开题集：结果与 Part I 的描述完全相反
+
+**1. checker 分布（224 道 file_check）**
+
+```
+ 70  31.2%  check_filename.py
+ 65  29.0%  check_metadata.py
+ 42  18.8%  check_iso8601.py
+ 40  17.9%  check_backup.py
+  7   3.1%  内联 python 一行断言
+```
+
+**96.9% 集中在四个通用规则脚本**，全部是单条格式/命名断言。`check_metadata.py` 的 docstring 逐字写着 **"validate P3 metadata completeness"**——**checker 直接按 P1–P5 偏好规则命名**。`check_done_log.py`（P5 completion_log）只在 day21–30（arc E/F）出现，与 P5 的激活时点吻合。
+
+五个 checker ↔ 五条规则一一对应：iso8601→P1 output_format、filename→P2 file_naming、metadata→P3 field_completeness、backup→P4 workflow、done_log→P5 completion_log。
+
+**2. 互相依赖：0 / 224**
+
+脚本化检测"某道 file_check 的 checker 是否检查了本日更早轮次产出的文件"：**0 / 224**。每道题的 checker 只看该题自己要求产出的文件。
+
+#### 比对结论
+
+| §4.1 对 Part I 的描述 | 公开题集实测 |
+|---|---|
+| "heavily execution-oriented" | ❌ 96.9% 是单条格式/命名断言 |
+| "many **interdependent** side effects" | ❌ **0/224 跨轮依赖** |
+| "conservative measure of end-to-end completion" | ❌ 判的是规则合规，不是端到端完成 |
+
+| §4.1 对 Part II 的描述 | 公开题集实测 |
+|---|---|
+| "**rule-based transformations**" | ✅ 四个通用规则脚本 |
+| "compliance with **behavioral heuristics** … is the primary bottleneck" | ✅ 反馈里才给规则，题面不给 |
+| "e.g. **schema conventions, timestamp formats**" | ✅ `check_metadata`（schema）/ `check_iso8601`（timestamp）|
+| 五条隐含偏好规则渐进激活 | ✅ arc A–F，P1→P5 |
+| IDENTITY.md / SOUL.md 注入（A.2）| ✅ 且为必需文件 |
+
+#### 结论：区分"只靠测量"和"还需要信任论文"
+
+**（A）只靠测量、不依赖任何信任——确定成立：**
+
+> **公开题集的 file-check 内容，与论文自己在 §4.1.1 对 Part I 的描述直接矛盾**（执行导向 ✗、互相依赖 **0/224** ✗、端到端完成度 ✗）。
+
+**（B）需要额外假设、降级为待定：**
+
+"公开题集在方法层面对应 Part II"——**该结论的前提是"§4.1.1 对 Part I 的描述是准确的"**。本项目已两次栽在轻信论文对自身组件的描述上（A.1 的 `run_command`、A.2 的 Part 标签），同类假设不再直接采信。故此结论**待定，不作为决策依据**。
+
+#### （A）已足以废掉 14.7% 的对照——两条出路同归
+
+| 若 | 则 |
+|---|---|
+| §4.1.1 对 Part I 的描述准确 | 这份数据不是 Part I → **14.7% 不可比** |
+| §4.1.1 对 Part I 的描述不准 | 我们不知道 14.7% 是在什么题上测的 → **仍不可比** |
+
+**无论哪条，"4B 打平/超过 GPT-5.2 的 14.7%"这个说法都失去依据。这一步不依赖对论文描述的信任，是本条真正的载荷结论。**
+
+#### 对"异常"的影响：削掉最尖锐的那一形态，但不宣布解决
+
+**成立的部分**：把我们的 Compl 36.3% 去对 Part I 的 14.7%，**从一开始就不是同类比较**——那 14.7% 是在"执行导向 + 互相依赖"的题上测的，而这份公开题集里那种题**一道都没有**。"4B 打平/超过 GPT-5.2"这个说法**失去依据**。
+
+**不能顺势宣布的部分**：这**不**意味着该去对 Part II 那一列。Part II 是 14 天 / 588 题 / 42 每天 / MC 占 74%，我们是 30 天 / 346 题 / MC 占 35%，规模与配比同样不可比。**结论仍是"Table 1 没有任何一格 like-for-like"**，与 09-04 定下的口径（一律以我们自己的 K=0 为基准）一致。
+
+#### 与（十一）（十二）的关系，避免被误读为又转回去
+
+- （十一）说"**我们跑的就是 Part II 的题集**"——**仍然是错的**：Part II 是 14 天 / 588 题，有 r21、有 `decision_log`，公开库里没有。
+- （十二）说"**公开题集就是 Part I**"——**只在规模维度成立**，在方法维度被本条否定。
+- 本条的载荷结论是**否定式**的：这份数据**不符合论文对 Part I 的描述**。至于"它是不是 Part II 的方法"（（十一）的方向）**仍待定**——见上面（B）。（十一）当初的直觉方向可能对，但它给的证据（`\bbox` 格式串、`check_iso8601` 文件名）是两 Part 共用样板，不足以支撑；本条改用**任务性质 + 依赖结构 + checker 命名**三条独立测量，强度高得多，但**正面归属仍未坐实**。
+
+#### 残留未知
+
+为什么这份 artifact 是 Part II 的方法配 Part I 的日历，无法从公开材料判定（可能是作者后来重整合并、也可能论文对 Part I 的描述不准）。**不再就此推测。**
+
+---
+
+## 计划（2026-09-07）：官方代码路径 + 只修文件落地，重打一次真基线
+
+### 目的
+
+现有两个基线都不能回答"**完全按官方代码库的方法跑，基线是多少**"：
+
+- **17.8% / 0%（定版基线）**：走官方 `metaclaw-bench run`，但 `--agent` 补丁**没打通**（见下），文件落进 `workspace-main/`，`Compl` 恒 0 → 官方方法 + 已知缺陷
+- **34.4% / 12.1%（K=0）**：文件落地正确，但走的是**我们的 driver**（按题隔离、自建反馈链） → 我们的方法
+
+**缺的正是中间那一格：官方方法 + 文件落地正确。**这一格拿到之后，才谈得上"我们相对官方代码库偏高了多少"。
+
+### 一、不需要回退训练代码
+
+这条基线走官方 `metaclaw-bench run`，**`metaclaw_rollout_driver.py` 完全不参与**。所以不存在"回退到某个 commit"的问题，只需要三件事：官方 `infer_cmd.py` + `--agent` 补丁、OpenClaw 系统补丁 2–6、`rl-training-headers` 关闭。
+
+### 二、`--agent` 是一条**四处**断链，缺任一处整条静默失效
+
+> **⚠ 更正（2026-09-07）**：本节初版写成"L3（`_run_group` → `_run_question`）上游本来就是对的"，**是错的**。我把 `infer_cmd.py:915` 的 `agent_id=agent_id` 当成了那个调用，实际它属于**同一函数内的 `_execute_update(...)`**——按行号匹配而没看它属于哪个调用。据此写的补丁脚本 `prepare_patched_metaclaw_baseline_agentfix.sh` 只补 L1/L2/L4，**落到干净上游会因 L3 断链而完全无效**（正是它自己警告的那个失效模式）。该脚本已删除，改为下面的"只校验不打补丁"。
+
+| 层 | 位置 | 干净上游状态 |
+|---|---|---|
+| L1 | `_run_openclaw_agent` 的 argv | **没有 `--agent`** ❌ |
+| L2 | `_run_question` → `_run_openclaw_agent` | 不传 `agent_id` ❌ |
+| L3 | `_run_group` → `_run_question` | **不传 `agent_id`** ❌（初版误判为 ✅）|
+| L4 | `_run_group` → `_run_openclaw_agent`（末轮 standalone feedback）| 不传 `agent_id` ❌ |
+
+**缺任何一处，`agent_id` 一路默认成 `None`，argv 里的 `--agent` 消失，行为与完全没修逐字节相同。**这就是"号称打了 agentfix 却仍 `Compl=0`"最可能的成因。
+
+### 二之二、服务器上已有完整修复，不需要打补丁
+
+2026-09-07 查看 `MetaClaw-official` 工作区（`git status` 显示 `M benchmark/src/infer/infer_cmd.py`），diff 内容为**四处齐全的正确修复**（L1 用 `cmd` 列表 + `if agent_id: cmd.extend(["--agent", agent_id])`，L2/L3/L4 各补 `agent_id=agent_id`），**比本项目原先设计的补丁更完整**。另含一处独立改动：
+
+- `_wait_for_gateway` 的 `timeout` **10.0 → 30.0**。这**不是** `--agent` 的一部分，是等网关启动的容错。**决定保留**——它不触及任何评分逻辑，去掉反而会在服务器负载高时引入假失败；但必须记进 manifest，"完全按官方代码库"这个表述要相应打折。
+
+注：该 checkout 是浅克隆（`922caf3 (grafted)`），历史被截断，**查不到这处修复是何时引入的**，因此无法判定定版基线 17.8%/0% 当时是否已有完整修复。不再推测。
+
+### 二之三、改为"只校验不打补丁"
+
+启动脚本 `scripts/metaclaw/run_official_baseline_modelfactory.sh` 内置校验器，**四处缺一即 FATAL 退出**，不自动补——自动补会在上游变动后悄悄补歪，而"悄悄补歪"正是这次要消除的失效模式。
+
+校验器按 **caller + callee 配对**判断，不看行号，因此不会被同函数内的 `_execute_update(agent_id=agent_id, ...)` 迷惑（即上面那个把我带偏的坑）。
+
+**本地验证（三个方向全过）**：
+- 干净上游 → FATAL，四处全部列出，exit 1
+- 复现服务器版（四处齐全）→ `ok`，exit 0
+- **单点回归：仅移除 L3** → FATAL 且**精确只指出 L3**，exit 1
+
+### 三、压缩 / 50000 —— 用户提出的风险点
+
+**配置事实**（`benchmark/data/metaclaw-bench/openclaw_cfg/openclaw.json`）：
+
+```
+contextWindow: 50000    maxTokens: 50000    agents.defaults.compaction.mode: "safeguard"
+```
+
+`reserveTokens` 未覆盖，取 OpenClaw 默认下限 **16384** → 压缩应在 transcript 逼近 `50000 − 16384 ≈ 33.6k` 时触发，**距硬墙还有约 16k 缓冲**，正常情况下不会"压缩之前就报错"。
+
+**那一次的实测**：seed 465485731 的 context overflow = **4.6%**（另两个 seed 17.9% / 5.5%）。且 **cli-compaction 补丁当时就在**（补丁 2–6 含 `cli-compaction`），即"压缩失败 → 抛错杀回合"已被降级为 skip-and-continue。**所以那一次绝大多数轮次是压缩正常工作、不是压缩前报错。**
+
+**但这不能直接外推到修复后的这一次**：文件落地正确 → checker 通过 → 反馈文案由 incorrect 变 correct，且 agent 可能回读文件核对，token 走向不可预测（两个方向都有可能）。**必须实测，不靠推断。**
+
+**前置冒烟（必做，先于全量）**：单独跑 **day30**（15 轮，全库最长的一天，且难度随 day 单调上升 → context 最坏情况）。day30 零 overflow 则全量安全。
+
+**三个计数（冒烟和全量都要抓）**：
+
+```bash
+grep -c "openclaw-rl-cli-compaction-patch" <log>   # 压缩失败被跳过的次数
+grep -ci "context overflow\|context_length\|exceeds"  <log>
+grep -c "Exit code\|Timeout after"                 <log>   # infra 失败
+```
+
+判读：三个数都小 → 结果可直接归因；任一显著 → 该次 `Compl` 混了压缩/溢出效应，**只能当上界**。
+
+### 四、`-w` / `-n`：采用官方默认，理由已查证
+
+官方 `benchmark/scripts/baseline_run.py` 的默认是 `BENCH_WORKERS = 15`、`BENCH_COUNT = 3`；我们定版基线用的是 `-w 1 -n 0`。
+
+- **`-n 3` 采用**。查过 `_run_question` 的重试逻辑：`for attempt in range(retry+1): rc,… = await _run_openclaw_agent(…); if rc == 0: break`——**只在 `rc != 0`（进程失败/超时）时重试，不会拿错答案重摇**。所以它不抬分，反而减少"infra 失败被记 0"的污染，既忠实于代码库又更干净。
+- **`-w` 与分数无关**（每个 test 独立 work copy + 独立 gateway + 独立 session），只影响墙钟和超时风险。15 个并发 OpenClaw 打同一个 SGLang（每个 50k 上下文）容易触发超时，**建议按服务器实测能力定，先取 4**；确认吞吐充裕再往上加。**`-w` 取值需记进 manifest**，否则后续对照说不清。
+
+### 五、必须保持不动的
+
+- `rl-training-headers` **关闭**
+- OpenClaw 系统补丁 **2–6 全开**（`sglang` / `embedded-agent` / `system-prompt` / `cli-compaction` / `silent-reply`）——与定版基线同状态
+- **我们后来的 metaclaw 补丁一律不进**（round-group、opd-hint、step-judge、verdict-* 等全部不加载）
+- SGLang seed 固定 **465485731**，与 17.8% 那次直接可比
+
+### 六、预期判读
+
+| 结果形态 | 含义 |
+|---|---|
+| Acc ≈ 17–18%，Compl 由 0 变非 0 | `Compl=0` 纯是文件落地问题，Acc 不受影响——最干净的情形 |
+| Acc 同步大涨 | 落地修复连带改变了反馈链，影响面比预期广，需重新评估此前所有 Acc 结论 |
+| overflow / 压缩计数显著升高 | 落地正确让会话变长，该次只能当上界，需考虑调 `reserveTokens` 或分析压缩时机 |
+
+**额外价值**：这一格与我们 driver 的 `scope=day` K=0（day01–17 为 49.9% / 36.3%）是**同为按天会话**的两个数，差值直接量化"我们的 driver vs 官方 harness"的结构差——这是目前对那个异常的第二个独立抓手。
 
 ---
 
@@ -405,6 +776,8 @@ grep -c "infra failure -- scored 0" <log>          # 崩掉的轮次（2026-09-0
 | 会话长度 / context 溢出 | **排除** | 论文 Part II 每天 42 题（Part I 约 11.5），**长得多却两个模型都好得多**（GPT-5.2 58.4% vs 14.7%，Kimi 18.2% vs 2.0%）——若代价来自长度，应该反过来 |
 
 #### 剩下的假设，以及它为什么恰好只在 Part I 显现
+
+> **⛔ 本小节的假设已被它自己的对照实验证伪（2026-09-07）。** 假设预测"按天共用会有毒历史、分数应更低"，实测 `scope=day` 的 day01–17 是 **49.9% / 36.3%**，反而**高于**按题隔离的 41.4% / 21.0%——方向相反。下面这套 Part I/II 不对称的解释**不再成立**，Kimi 2.0% 是"塌陷不是能力下限"的推论同样作废。**开关本身有效并已用于对照，保留；只有这段动机作废。**当前假设清单见查证记录（十二）。
 
 论文自己写 Part I 的 file_check 是 **"heavily execution-oriented, with many interdependent side effects"**，Part II 则是 "rule-based transformations"。把这条跟"按天共用会话"放在一起就自洽了：
 
