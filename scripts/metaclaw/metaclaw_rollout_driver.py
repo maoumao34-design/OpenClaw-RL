@@ -304,6 +304,34 @@ VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 # completed by a prior crashed run (METACLAW_RESUME) is bucketed by this
 # same day_index regardless of whether IT was trained originally --
 # resume/freeze are orthogonal.
+# Session granularity (2026-09-05). "round" (default) = one session per round,
+# the behaviour since 2026-08-19c. "day" = one session shared by the whole day,
+# which is what MetaClaw-official actually does: infer_cmd.py:1022 takes
+# session_id = test["session"] (one per day -- all_tests.json has 30 tests and
+# 30 distinct session ids), :864 prepares it once before the round loop, and
+# :927 passes that same id on every round.
+#
+# This exists to settle one question, not as a tunable: our zero-training K=0
+# scores Compl 12.1% with a 4B, level with the paper's GPT-5.2 baseline (14.7%)
+# and far above its Kimi-K2.5 baseline (2.0%). Everything else we suspected has
+# been ruled out -- the feedback augmentations (measured: -0.5 Acc / -1.3 Compl
+# once moved to the training side), the Compl definition (verified identical to
+# the paper's), free credit from the task data (measured: 0/224 file_check pass
+# on an untouched workspace), and session LENGTH (the paper's Part II runs 42
+# rounds per day against Part I's ~11.5, yet both models score far better on
+# Part II).
+#
+# What is left is that Part I's file_check tasks have "many interdependent side
+# effects" (paper, Section 4.1): an early failure poisons the rest of the day,
+# and under one shared transcript the agent reads that poisoned history while
+# doing every later round. Per-round sessions delete it. Set this to "day" to
+# measure what that is worth.
+METACLAW_SESSION_SCOPE = os.environ.get("METACLAW_SESSION_SCOPE", "round").strip().lower()
+if METACLAW_SESSION_SCOPE not in ("round", "day"):
+    raise RuntimeError(
+        f"METACLAW_SESSION_SCOPE must be 'round' or 'day', got {METACLAW_SESSION_SCOPE!r}"
+    )
+
 _TRAIN_UNTIL_DAY_RAW = os.environ.get("METACLAW_TRAIN_UNTIL_DAY", "")
 TRAIN_UNTIL_DAY: int | None = int(_TRAIN_UNTIL_DAY_RAW) if _TRAIN_UNTIL_DAY_RAW.strip() else None
 
@@ -1748,6 +1776,7 @@ async def run_day(
                 prev_answer_text: str = ""
 
                 for idx, round_record in enumerate(rounds):
+                    is_last_round = idx == len(rounds) - 1
                     # One session PER ROUND (2026-08-19c), not one session
                     # per day. Was: session_id = f"{_SESSION_ID_PREFIX}{test_id}"
                     # shared across every round in the day, matching
@@ -1806,10 +1835,14 @@ async def run_day(
                     # sent unconditionally below, not just on the day's last
                     # round), there is no longer a "same session" for a later
                     # round to leak into.
-                    round_session_id = (
-                        f"{_SESSION_ID_PREFIX}{test_id}-{group.get('id', 'unknown')}-"
-                        f"{round_record['id']}"
-                    )
+                    if METACLAW_SESSION_SCOPE == "day":
+                        # Official: one session for the whole day.
+                        round_session_id = f"{_SESSION_ID_PREFIX}{test_id}"
+                    else:
+                        round_session_id = (
+                            f"{_SESSION_ID_PREFIX}{test_id}-{group.get('id', 'unknown')}-"
+                            f"{round_record['id']}"
+                        )
                     _prepare_session(work_openclaw_state_dir, agent_id, round_session_id)
 
                     question_text = round_record["question"]
@@ -1912,7 +1945,13 @@ async def run_day(
                         # below), not just the day's last round.
                         await _send_verdict_turn(
                             client, round_session_id, eval_score, hint,
-                            session_done=True, retry=VERDICT_RETRY,
+                            # Under one-session-per-day the day's session must
+                            # stay open until its last round, or the proxy would
+                            # force-drop turns the next round still needs.
+                            session_done=(
+                                True if METACLAW_SESSION_SCOPE == "round" else is_last_round
+                            ),
+                            retry=VERDICT_RETRY,
                         )
                     else:
                         # Infrastructure failure, not a real task attempt -- do NOT
@@ -1930,9 +1969,17 @@ async def run_day(
                         # proxy's per-session state forever instead of being
                         # force-dropped, which is strictly worse than the old
                         # behavior, not just a no-op.
-                        await _send_session_close_only(
-                            client, round_session_id, retry=VERDICT_RETRY,
-                        )
+                        # Under one-session-per-day this must only fire on the
+                        # day's last round: mid-day it would force-drop the
+                        # session's pending turns while later rounds are still
+                        # going to use that same session. Under one-session-per-
+                        # round it fires every time (2026-08-19c) -- there is no
+                        # "next message in the same session" ever coming, so
+                        # skipping it would strand the pending turn forever.
+                        if METACLAW_SESSION_SCOPE == "round" or is_last_round:
+                            await _send_session_close_only(
+                                client, round_session_id, retry=VERDICT_RETRY,
+                            )
 
                     prev_inline_score = inline_score
                     prev_round_record = round_record

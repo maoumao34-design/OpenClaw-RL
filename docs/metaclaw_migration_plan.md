@@ -220,6 +220,79 @@ Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐
 
 Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23）——这部分是被 `rl-training-headers` 标记污染拖累过的，`--agent` 修复后的新基线证实**这两次结果都被大量 Context overflow（49.1%）严重拉低**，不是"4B 模型在 file_check 上一题都做不对"这么简单的能力上限结论——旧结论里"关键结论"那部分已被推翻，不再采信。
 
+### 已实现（2026-09-05）：`METACLAW_SESSION_SCOPE` 会话粒度对照开关
+
+#### 前情：环境侧修复跑完了，加料确实不是主因
+
+`metaclaw_migration_20260905_182753`（commit `3415572`，`train_until_day=0`，训练步 0，日志里 316 条 `[Previous Feedback]` 中 DIR_NOTE / FAIL stdout / MC snippet 各 0 条，确认加料已不进 agent 可见文本）：
+
+| | Acc | Compl |
+|---|---|---|
+| 新 K=0（官方环境反馈） | 34.4% | 12.1% |
+| 旧 K=0（带三项加料，已作废） | 34.9% | 13.4% |
+| 论文 GPT-5.2 Baseline | 41.1% | 14.7% |
+| 论文 Kimi-K2.5 Baseline | 21.4% | 2.0% |
+
+**去掉环境加料只掉 −0.5 Acc / −1.3 Compl**，跟 CLI 之前的逐题统计一致：三项加料不是主因，这条实测结案。
+
+#### 已经排掉的其它嫌疑
+
+| 假设 | 结论 | 依据 |
+|---|---|---|
+| 题面本身送分 | **排除** | 本地实测：按 `_copy_workspace_for_test` + `_copy_eval_scripts` 复现工作区，agent 什么都不做跑全部 checker，**0 / 224 通过** |
+| 反馈加料 | **排除** | 上表实测 −0.5 / −1.3 |
+| Compl 口径不同 | **排除** | 论文原文 "fraction of file-check outputs passing all automated checker assertions simultaneously"，官方 `_score_file_check` 二值 1.0/0.0，与我们的 `_aggregate_acc_compl` 一致 |
+| 论文 Baseline 另有条件 | **排除** | 论文原文："Baseline: the base model served without any adaptation mechanism"，"All conditions use identical prompts and tool sets" |
+| 会话长度 / context 溢出 | **排除** | 论文 Part II 每天 42 题（Part I 约 11.5），**长得多却两个模型都好得多**（GPT-5.2 58.4% vs 14.7%，Kimi 18.2% vs 2.0%）——若代价来自长度，应该反过来 |
+
+#### 剩下的假设，以及它为什么恰好只在 Part I 显现
+
+论文自己写 Part I 的 file_check 是 **"heavily execution-oriented, with many interdependent side effects"**，Part II 则是 "rule-based transformations"。把这条跟"按天共用会话"放在一起就自洽了：
+
+- **Part I 题目互相依赖** → 早期一题写失败，后面依赖它的题也跟着失败 → 当天的共享 transcript 里堆满**互相牵连的失败历史**
+- 模型读着这段历史做后面每一道题，被误导/锚定在错误状态
+- **Part II 题目彼此独立**，失败只是孤立记录，污染性小 → 所以即便每天 42 题也不塌
+
+**而我们按题隔离，等于把这段有毒历史整个删掉**——每题从空 transcript 开始，只带一句上一轮反馈，可以干净重做。
+
+这同时解释了 Kimi 的 2.0%：它在 Part II 能拿 18.2%，说明会写文件，**Part I 的 2.0% 是塌陷不是能力下限**。
+
+#### 开关本身
+
+`METACLAW_SESSION_SCOPE`，默认 `round`（现状），设 `day` 复现官方行为。**不是可调参数，是为了回答上面这一个问题而存在**；非法值在 import 时直接抛错，不静默回退——一个拼写错误会让整个对照实验失效而无人察觉。
+
+**三处必须一起改**，少一处这趟就不是官方协议、也就不是干净的单变量对照：
+
+| 位置 | round（现状） | day（官方） |
+|---|---|---|
+| session id | `metaclaw-{test}-{group}-{round}` | `metaclaw-{test}`（对齐官方 `test["session"]`） |
+| verdict 的 `session_done` | 恒 `True` | 仅当天最后一轮 |
+| infra 失败时的 `_send_session_close_only` | 每轮都发 | 仅当天最后一轮 |
+
+后两处的理由是对称的：**按天共用时中途关会话，会把同一 session 后面轮次还要用的 pending turn 强制丢掉**；而按题隔离时不关反而会让那个 pending turn 永远卡在代理的 per-session 状态里（2026-08-19c 的原始理由）。
+
+代理侧不用改：按题成组的 fold 逻辑读的是 `_pending_turn_data[session_id]` 里 `≤ turn_num` 的轮次，而每一轮的 verdict 都会把该轮的 turn 弹出，所以按天共用时第 r 轮的 verdict 只会折叠第 r 轮自己的 turn。（这次是 K=0、不提交样本，用不到，但行为是对的。）
+
+#### 验证（2026-09-05，本地）
+
+`py_compile` + `bash -n` 通过；新增 `scripts/tests/test_metaclaw_session_scope.py`，15 项断言：开关取值解析、非法值必须抛错、三处站点确实一起改、`_send_session_close_only` 确实在 scope 守卫**内部**（不只是"附近"）、启动脚本四处接线（默认值 / RUN_MANIFEST 落盘 / 启动打印 / 显式传给 driver 而不是靠继承）、以及不设变量时默认仍是 `round`（现有跑法不受影响）。
+
+**非空洞性双向验证**：把 verdict 的 `session_done` 改回恒 `True` → 挂在"仅当天最后一轮"；去掉非法值校验 → 挂在"非法值必须抛错"。均已还原。
+
+#### 怎么跑这次对照
+
+```bash
+METACLAW_TRAIN_UNTIL_DAY=0 METACLAW_SESSION_SCOPE=day \
+  bash scripts/metaclaw/run_metaclaw_migration_modelfactory.sh
+```
+
+与 `20260905_182753`（同 commit、同零训练、仅 scope=round）逐项对比。**判读**：
+
+- Compl 掉到个位数、接近 Kimi 的 2.0% → **按题隔离坐实为主因**，我们此前所有分数都因此不可与论文比，需要决定长期是否改回按天
+- 基本不动 → 这条也排除，说明还有未发现的差异，继续查
+
+---
+
 ### 已实现（2026-09-04）：把环境侧恢复成论文一致，加料全部移进 OPD
 
 承接"口径重大更正（2026-09-03）"。K=0 跑出 34.9% / 13.4% 之后，对照刚从论文原文核实的 Table 1（Part I，30 天 346 题，跟我们同一套题）：

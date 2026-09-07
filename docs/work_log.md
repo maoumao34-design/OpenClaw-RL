@@ -2022,3 +2022,27 @@
 - `scripts/metaclaw/metaclaw_rollout_driver.py`：`_build_next_round_feedback` 恢复官方原样；三项加料移入 `_build_opd_hint`；infra 失败轮记 0 分进分母
 - `scripts/tests/test_metaclaw_env_fidelity.py`（新增，24 项）
 - `docs/metaclaw_migration_plan.md`：新增"已实现（2026-09-04）"一节，含论文 Table 1 转录
+
+## 2026-09-05
+
+**目标：** 环境侧修复后重测零训练基线，确认加料不是主因；把剩下的唯一嫌疑（会话粒度）做成开关并准备对照实验。
+
+**完成内容：**
+- **环境侧修复后的新 K=0 跑完**（`20260905_182753`，commit `3415572`，训练步 0；日志 316 条 `[Previous Feedback]` 中 DIR_NOTE / FAIL stdout / MC snippet 各 0 条，确认加料已不进 agent 可见文本）：**Acc 34.4% / Compl 12.1%**，相比带加料的旧 K=0（34.9% / 13.4%）**只掉 −0.5 / −1.3**。跟 CLI 之前的逐题统计一致——**三项加料不是主因，这条结案**
+- **本地实测排掉"题面送分"**：按 `_copy_workspace_for_test` + `_copy_eval_scripts` 复现工作区，agent 什么都不做跑全部 224 个 checker，**0 / 224 通过**。那 12.1% 是真的靠写文件挣的
+- **核实论文 Baseline 的定义**，排掉"论文另有条件"：原文 "Baseline: the base model served without any adaptation mechanism"、"All conditions use identical prompts and tool sets"，跟我们 K=0 的意图一致
+- **用论文自己的数据排掉"会话长度/context 溢出"**：Part II 每天 42 题（Part I 约 11.5），**长得多却两个模型都好得多**（GPT-5.2 58.4% vs 14.7%、Kimi 18.2% vs 2.0%）——若代价来自长度应该反过来。**我此前拿 context/overflow 解释这件事的思路作废**
+- **剩下的假设收敛到"按题隔离切断了有毒历史"，并且能解释 Part I/II 的不对称**：论文说 Part I 的 file_check 是 "many interdependent side effects"——早期失败会牵连后面的题，按天共用时模型每一轮都在读这段互相牵连的失败历史；Part II 题目独立，失败只是孤立记录，所以每天 42 题也不塌。这同时说明 **Kimi 的 2.0% 是塌陷不是能力下限**（它 Part II 有 18.2%）
+- **实现 `METACLAW_SESSION_SCOPE` 开关**（默认 `round` 保持现状，`day` 复现官方）。**三处必须一起改**：session id、verdict 的 `session_done`、infra 失败时的 `_send_session_close_only`——后两处理由对称（按天共用时中途关会话会强制丢掉同 session 后面轮次还要用的 pending turn；按题隔离时不关则会让 pending turn 永远卡住，即 08-19c 的原始理由）。**非法值在 import 时直接抛错不静默回退**——一个拼写错误会让整个对照失效而无人察觉
+- **验证**：`py_compile` + `bash -n`；新增 `scripts/tests/test_metaclaw_session_scope.py` 15 项断言（取值解析、非法值抛错、三处站点一起改、close 确实在 scope 守卫**内部**而非"附近"、启动脚本四处接线、不设变量时默认仍是 round）。**非空洞性双向验证**：verdict 的 `session_done` 改回恒 True → 挂在"仅当天最后一轮"；去掉非法值校验 → 挂在"非法值必须抛错"。均已还原
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"已实现（2026-09-05）：`METACLAW_SESSION_SCOPE` 会话粒度对照开关"
+
+**主要问题：**
+- **"4B 零训练 Compl 12.1% 贴着 GPT-5.2 的 14.7%"仍未解释** → 已收敛到单一假设，待 `scope=day` 的对照实验裁决
+- 若对照证实按题隔离是主因，则**此前所有分数都不可与论文比**，需要决定长期是否改回按天（改回会跟 K=6/day22 全部不可比，且压缩会打断按题成组之外的其它假设，届时重新评估）
+
+**产出：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：`METACLAW_SESSION_SCOPE` 开关 + 三处站点
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：声明 / 落盘 / 打印 / 显式传参
+- `scripts/tests/test_metaclaw_session_scope.py`（新增，15 项）
+- `docs/metaclaw_migration_plan.md`：新增 2026-09-05 一节
