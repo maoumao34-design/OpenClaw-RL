@@ -220,7 +220,87 @@ Acc./Compl. 现在**唯一**的、跟论文 Table 1（Full 档）方法学对齐
 
 Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18，部分正确题数 19→23）——这部分是被 `rl-training-headers` 标记污染拖累过的，`--agent` 修复后的新基线证实**这两次结果都被大量 Context overflow（49.1%）严重拉低**，不是"4B 模型在 file_check 上一题都做不对"这么简单的能力上限结论——旧结论里"关键结论"那部分已被推翻，不再采信。
 
-### 已实现（2026-09-05）：`METACLAW_SESSION_SCOPE` 会话粒度对照开关
+### 查证记录（十）：压缩到底什么时候触发、不打补丁会怎样（2026-09-07）
+
+跑 `scope=day` 之前必须先搞清楚这一条：**按题隔离时 transcript 很短、压缩几乎不触发，所以我们和官方在压缩上的差异一直被掩盖着；一旦按天共用，压缩就成了主角，会直接污染那趟对照。**
+
+#### 一、"压过一次就不再压"是误解
+
+守卫的条件只有一行（`openclaw/packages/agent-core/src/harness/compaction/compaction.ts:637`）：
+
+```ts
+if (pathEntries.length === 0 || pathEntries[pathEntries.length - 1].type === "compaction") {
+    return ok(undefined);   // 上层据此报 "Already compacted"
+}
+```
+
+**唯一条件是"最后一条 entry 是压缩记录"，也就是上次压缩之后一条新内容都没追加。**不是计数器、不是时间窗、不是"这个 session 压过了"。
+
+而且紧接着几行明确支持重复压缩：
+
+```ts
+previousSummary = prevCompaction.summary;
+boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+```
+
+**旧摘要被折进新摘要，只对上次压缩点之后的内容重新总结**——重复压缩是一等公民路径，设计上就是要反复压。
+
+所以真正撞上这个守卫的场景只有一个：**刚压完、还没有任何新内容，就又有人立刻要求压一次**（"一次压不干净"），而不是"涨回去了却不给压"。
+
+#### 二、manual / auto 两种模式对同一情况的处理完全不同
+
+`openclaw/src/agents/sessions/agent-session.ts:1921-1932`：
+
+```ts
+if (!preparation) {
+  if (isManual) {
+    throw new Error(lastEntry?.type === "compaction" ? "Already compacted" : "Nothing to compact ...");
+  }
+  return { status: "skipped" };     // auto：静默跳过
+}
+```
+
+- **auto（`safeguard` 自动压缩）**：`skipped`，**本来就是优雅降级**
+- **manual**：抛错
+
+而 `cli-compaction.ts:623` 的 `cli_budget` 路径拿到 `failureReason` 后**无条件 `throw`**，把整个回合打成 internal error。
+
+#### 三、三方对比
+
+| | `cli_budget` 预压缩 | 撞上守卫时 |
+|---|---|---|
+| **三月版（论文，若工作假设成立）** | **整个文件都不存在**（已考古确认，见 2026-07-21 条目：`git show march_2026_3_8:...cli-compaction.ts` 路径不存在、`git grep cli_budget march_2026_3_8` 零匹配） | 只有 auto 路径 → **静默跳过**，下一轮追加内容后重新有资格压 |
+| **stock 2026.6.9** | 存在 | **抛错 → 整个回合死掉** |
+| **我们（打了 `prepare_patched_cli_compaction.sh`）** | 存在 | **跳过继续** |
+
+#### 四、更正我在上一轮讨论里说反的一句
+
+我曾说"三种行为都不一样，我们那条可能比论文**更容易失败**、会让 day 那趟的 Compl 被额外压低"。**说反了。**
+
+我们的补丁把 `throw` 改成"记 warn + 跳过继续"，**在失败语义上恰恰是把 6.9 拉回到 auto 路径、也就是三月版本来的行为**。它不是第三种任意行为，是在还原；不打补丁（直接抛错杀回合）才是更容易失败的那个。
+
+**剩下的真实差异只有一条**：6.9 多了 `cli_budget` 这个额外的压缩触发点，所以压缩的**时机/频率**跟三月版不同——但"压不成时怎么办"这一条已经对齐。
+
+（`reserveTokens = 16384` 是 OpenClaw 官方默认值 `DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR`，官方 `openclaw.json` 未覆盖、我们也没有；脚本里那处 `openclaw config set ... 16384` 是把机器上被改成 20000 的值**改回**官方默认。这一项无偏差。）
+
+#### 五、`scope=day` 结果的判读规则
+
+跑完在 `metaclaw_rollout.log` / `training.log` 里统计：
+
+```bash
+grep -c "openclaw-rl-cli-compaction-patch" <log>   # 该压没压（跳过）的次数
+grep -ci "context overflow" <log>
+grep -c "infra failure -- scored 0" <log>          # 崩掉的轮次（2026-09-04 新增的日志）
+```
+
+- **计数很小** → `cli_budget` 那个额外触发点基本没生效，day 那趟约等于三月版行为，**结果可以直接归因给 session 粒度**
+- **计数很大** → "该压没压"频繁发生、上下文一路涨，那趟的 Compl 里混着压缩时机差异，**只能当 session 粒度效应的上界**
+
+同一批数在 `scope=round` 那趟（`20260905_182753`）里应当接近 0，可作对照——若 round 那趟也不为 0，说明压缩在按题隔离下也在触发，结论还要再调整。
+
+---
+
+### 已实现（2026-09-07）：`METACLAW_SESSION_SCOPE` 会话粒度对照开关
 
 #### 前情：环境侧修复跑完了，加料确实不是主因
 
@@ -273,7 +353,7 @@ Acc. 从 5.7%→8.1% 的提升全部来自 multi_choice（满分题数 12→18�
 
 代理侧不用改：按题成组的 fold 逻辑读的是 `_pending_turn_data[session_id]` 里 `≤ turn_num` 的轮次，而每一轮的 verdict 都会把该轮的 turn 弹出，所以按天共用时第 r 轮的 verdict 只会折叠第 r 轮自己的 turn。（这次是 K=0、不提交样本，用不到，但行为是对的。）
 
-#### 验证（2026-09-05，本地）
+#### 验证（2026-09-07，本地）
 
 `py_compile` + `bash -n` 通过；新增 `scripts/tests/test_metaclaw_session_scope.py`，15 项断言：开关取值解析、非法值必须抛错、三处站点确实一起改、`_send_session_close_only` 确实在 scope 守卫**内部**（不只是"附近"）、启动脚本四处接线（默认值 / RUN_MANIFEST 落盘 / 启动打印 / 显式传给 driver 而不是靠继承）、以及不设变量时默认仍是 `round`（现有跑法不受影响）。
 

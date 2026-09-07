@@ -151,7 +151,7 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
-# 会话粒度对照开关（2026-09-05）。round（默认）= 每题一个 session（本项目
+# 会话粒度对照开关（2026-09-07）。round（默认）= 每题一个 session（本项目
 # 2026-08-19c 起的行为）；day = 整天共用一个 session，也就是 MetaClaw 官方
 # 的真实做法（infer_cmd.py:1022 取 test["session"]，all_tests.json 里 30 个
 # test 对应 30 个不同 session id）。

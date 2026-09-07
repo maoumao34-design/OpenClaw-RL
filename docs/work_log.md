@@ -2023,9 +2023,11 @@
 - `scripts/tests/test_metaclaw_env_fidelity.py`（新增，24 项）
 - `docs/metaclaw_migration_plan.md`：新增"已实现（2026-09-04）"一节，含论文 Table 1 转录
 
-## 2026-09-05
+## 2026-09-07
 
-**目标：** 环境侧修复后重测零训练基线，确认加料不是主因；把剩下的唯一嫌疑（会话粒度）做成开关并准备对照实验。
+**目标：** 环境侧修复后重测零训练基线，确认加料不是主因；把剩下的唯一嫌疑（会话粒度）做成开关并准备对照实验；跑对照之前先查清压缩行为跟论文是否一致。
+
+> **日期更正**：本条最初写成 `## 2026-09-05`，那是 K=0 那趟**训练运行**的日期（`20260905_182753`）；**本条记录的开发工作实际提交于 2026-09-07**（`caabcc5` 10:58），按格式规范"日期以真实提交时间为准"已改正。（同一个坑此前已踩过三次：08-20/21、08-21/25、08-25/26。）
 
 **完成内容：**
 - **环境侧修复后的新 K=0 跑完**（`20260905_182753`，commit `3415572`，训练步 0；日志 316 条 `[Previous Feedback]` 中 DIR_NOTE / FAIL stdout / MC snippet 各 0 条，确认加料已不进 agent 可见文本）：**Acc 34.4% / Compl 12.1%**，相比带加料的旧 K=0（34.9% / 13.4%）**只掉 −0.5 / −1.3**。跟 CLI 之前的逐题统计一致——**三项加料不是主因，这条结案**
@@ -2046,3 +2048,16 @@
 - `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：声明 / 落盘 / 打印 / 显式传参
 - `scripts/tests/test_metaclaw_session_scope.py`（新增，15 项）
 - `docs/metaclaw_migration_plan.md`：新增 2026-09-05 一节
+
+**完成内容（续，同一天）——跑 `scope=day` 前先查清压缩行为：**
+- **"压过一次就不再压"是误解。** 守卫条件只有一行（`agent-core/.../compaction.ts:637`）：`pathEntries[last].type === "compaction"`，即**上次压缩之后一条新内容都没追加**；不是计数器/时间窗/"这个 session 压过了"。紧接着几行还明确把旧摘要折进新摘要（`previousSummary`）、只重新总结上次压缩点之后的内容——**重复压缩是一等公民路径**。真正撞守卫的只有"刚压完还没新内容就又要求压一次"（一次压不干净）
+- **查清 manual/auto 对同一情况处理完全不同**（`agent-session.ts:1921-1932`）：auto（`safeguard`）返回 `skipped` **本来就是优雅降级**；manual 才抛 `"Already compacted"`。而 `cli-compaction.ts:623` 的 `cli_budget` 路径拿到 `failureReason` 后**无条件 throw**，把整个回合打成 internal error
+- **三方对比**：三月版（论文，若工作假设成立）**整个 `cli-compaction.ts` 都不存在**（2026-07-21 已考古确认）→ 只有 auto 路径、静默跳过；stock 2026.6.9 → 抛错杀回合；我们（打了补丁）→ 跳过继续
+- **更正我在讨论里说反的一句**：我曾说"三种行为都不一样，我们那条可能**更容易失败**、会额外压低 day 那趟的 Compl"——**说反了**。我们的补丁把 throw 改成"跳过继续"，**在失败语义上恰恰是把 6.9 拉回 auto 路径、也就是三月版本来的行为**，是在还原而不是第三种任意行为；不打补丁才是更容易死的那个。剩下的真实差异只有"6.9 多了 `cli_budget` 这个额外触发点"，即压缩的**时机/频率**不同，"压不成怎么办"已对齐
+- **`reserveTokens` 无偏差**：16384 是 OpenClaw 官方默认 `DEFAULT_AGENT_COMPACTION_RESERVE_TOKENS_FLOOR`，官方 `openclaw.json` 未覆盖、我们也没有；脚本里那处 `openclaw config set ... 16384` 是把机器上被改成 20000 的值**改回**官方默认
+- **写死 `scope=day` 的判读规则**：统计 `openclaw-rl-cli-compaction-patch` / context overflow / infra 失败三个计数——计数小则可直接归因给 session 粒度，计数大则那趟 Compl 混着压缩时机差异、**只能当效应上界**。同一批数在 `scope=round` 那趟应接近 0，可作对照
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"查证记录（十）"
+
+**产出（续）：**
+- `docs/metaclaw_migration_plan.md`：新增查证记录（十）；三处 2026-09-05 标注改正为 2026-09-07
+- 三个脚本内的 `2026-09-05` 注释同步改正

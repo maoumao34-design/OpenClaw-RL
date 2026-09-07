@@ -1,4 +1,4 @@
-"""Regression assertions for METACLAW_SESSION_SCOPE (2026-09-05).
+"""Regression assertions for METACLAW_SESSION_SCOPE (2026-09-07).
 
 The switch exists to settle one question: our zero-training K=0 scores Compl
 12.1% with a 4B, level with the paper's GPT-5.2 baseline (14.7%) and far above

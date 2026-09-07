@@ -304,7 +304,7 @@ VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 # completed by a prior crashed run (METACLAW_RESUME) is bucketed by this
 # same day_index regardless of whether IT was trained originally --
 # resume/freeze are orthogonal.
-# Session granularity (2026-09-05). "round" (default) = one session per round,
+# Session granularity (2026-09-07). "round" (default) = one session per round,
 # the behaviour since 2026-08-19c. "day" = one session shared by the whole day,
 # which is what MetaClaw-official actually does: infer_cmd.py:1022 takes
 # session_id = test["session"] (one per day -- all_tests.json has 30 tests and
