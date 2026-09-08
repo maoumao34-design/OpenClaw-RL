@@ -106,6 +106,64 @@ proc = await asyncio.create_subprocess_shell(
 
 ---
 
+## 🎯 定版基线（2026-09-07）：按天 K=0 = **Acc 41.1% / Compl 26.3%**
+
+**这是本项目当前唯一采信的训练前基准。**取代按题 K=0（34.4% / 12.1%，已随按题模式一同作废）。
+
+| 字段 | 值 |
+|---|---|
+| Run | `metaclaw_migration_20260907_112320` |
+| Commit | `caabcc5`（**已验证与 HEAD 等价**，见下）|
+| Model | Qwen3-4B-Thinking-2507，base，零训练 |
+| 设置 | `METACLAW_TRAIN_UNTIL_DAY=0`，按天会话，全 30 天 frozen |
+| 报告 | `logs/metaclaw_migration_20260907_112320/report/report.{json,md}` |
+| **Acc** | **41.1%**（142.04 / 346）|
+| **Compl** | **26.3%**（59 / 224 file_check）|
+
+⚠️ `report.json` 里的 `metrics.passed = 17.1%` 是**全题平均，不是 Compl**；Compl 只看 file_check 那 224 题。
+
+### commit 等价性已验证
+
+该趟跑在 `caabcc5`（`METACLAW_SESSION_SCOPE` 刚引入那版，运行时设为 `day`），而 HEAD 已把开关删除、写死按天。用 `ast.unparse` 做 AST 层比对（丢弃全部注释）：**除模块 docstring 外，可执行差异仅四处，全部是 scope 相关**，且在 `SCOPE='day'` 下逐语句等价：
+
+| `caabcc5` 求值（SCOPE='day'）| HEAD |
+|---|---|
+| `round_session_id = f'{PREFIX}{test_id}'` | 同 |
+| `session_done = True if 'day'=='round' else is_last_round` → `is_last_round` | `session_done=is_last_round` |
+| `elif 'day'=='round' or is_last_round:` → `elif is_last_round:` | `elif is_last_round:` |
+
+**→ 无需重跑。**
+
+### Acc=0 的三天：查清了，不是 08-20 式构建缺陷
+
+按 09-07 写死的三条判读规则查，**全为 0**：`openclaw-rl-cli-compaction-patch` 0 次、context overflow 0 次、`infra failure -- scored 0` 0 次；`agent_succeeded=False` 0 次（346 轮全 True）。
+
+**day26 / 27 / 30 的 Acc 恰好 0.00 的真实成因是 MCQ 答案格式漂移**：这三天的 MCQ 全部写成 `(bbox{A,B,D})`——**`bbox` 前少了反斜杠**。官方抽取正则（`infer_cmd.py:665`）是 `\\(?:bbox|boxed)\{([^}]*)\}`，本地实测：
+
+```
+'(bbox{A,B,D})'      -> NO MATCH      <- 这三天
+'\bbox{B}'         -> B             ← day28，同一趟，正常得 0.667
+'\(\bbox{A,B}\)'   -> A,B           ← 连 LaTeX 包裹都能匹配
+```
+
+**问题精确地是缺反斜杠，不是括号。**day28 同期正常得分**证明反斜杠没有在管线中丢失**——这是模型真实的格式失败，不是 harness 缺陷。FC 侧同样是真实的合规失败（文件确实写了，命名/规则不合规），不是落错工作区。
+
+**→ 基线有效，予以定版。不做"去掉 day26/27/30 得 46.1%"这种处理——那是删数据，不是修正。**
+
+### ⚠️ 由此得到的一条训练期必跟指标：MCQ 抽取成功率
+
+全 run "未含 `\bbox`" 类反馈约 **46 次**，集中在 day03/07/12/26/27/30。
+
+**格式合规是表层行为，RL 极可能在很少的更新步内就学会。**这意味着训练后 Acc 的提升**可能大部分来自"学会写反斜杠"，而非推理能力提升**。
+
+**因此训练结果必须把 Acc 拆成两栏报**：
+1. **MCQ 抽取成功率**（有多少道题产出了可抽取的答案）
+2. **抽取成功者之中的正确率**
+
+只报总 Acc 会把"修好了格式"误当成"方法有效"。这是本项目此前反复栽过的同一类错误（把构建产物当能力上限），方向相反但性质相同。
+
+---
+
 ## 📑 如何阅读本文档（2026-09-07 加）
 
 本文档 3000+ 行、按时间追加，**其中若干节已被后续证据推翻或下调，均已就地加横幅**。按结论现状分类如下，避免误引已作废的内容。
