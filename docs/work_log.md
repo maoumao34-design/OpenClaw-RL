@@ -61,11 +61,12 @@
 - `report/` 下汇报 PPT 产物未提交，待决定
 
 ### 下一步
+0. **【已做 09-07】全面改按天，按题模式整体删除**（见本日「续九」）。**两个前置依赖未解**：① 按天 K=0（`20260907_112320`）跑完出最终数——**在此之前项目没有可用基线**（旧的 34.4%/12.1% 是按题的，已不可比）；② **开训前必须统计每轮 prompt token 分布**确认 `--max-tokens-per-gpu 32768` 够不够
 1. **OpenClaw-RL 复现**：同 08-17
-2. **跑官方代码路径基线**（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——Part 归属澄清后其意义为：官方 harness vs 我们的 driver，**同题集、同工具、同为按天会话**，差值即纯粹的 driver 结构差
-3. **取 `scope=day` K=0（`20260907_112320`）跑满 30 天的最终数**
-4. **主线**：round-group + 1/N 训练 vs 我们自己的 K=0
-5. **【待讨论】** Part II 方法 vs 单 shell 工具变体
+2. **跑官方代码路径基线**（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——官方 harness vs 我们的 driver，**同题集、同工具、同为按天会话**，差值即纯粹的 driver 结构差
+3. **取按天 K=0（`20260907_112320`）跑满 30 天的最终数**（现在是唯一基线，优先级升高）
+4. **主线**：round-group + 1/N 训练 vs 按天 K=0
+5. **【已定】继续 Part II 方法**——"改回 Part I"不可行：Part I 的评测 harness、346 题、打分能力**三样都未发布**（查证记录十七）
 
 ### 未验证
 - [ ] **`metaclaw-bench run` 路径上 `--agent` 是否真生效**——driver 路径已由 K=0 的非零 Compl 证实，bench 路径（多一层 per-test gateway）从未在真实跑动中验证。冒烟闸门即为此设
@@ -1997,6 +1998,26 @@
 - **对外汇报已经用过"相对基线提升明显"的说法**（本周周报里也有）→ 需要主动更正，这一条比技术本身要紧
 - **"我们比论文宽松多少"目前只有定性清单、没有量化** → 需要逐项关掉自己的加料做对照实验
 - **MetaClaw 论文 Table 1 未核实** → 阻塞"跟论文比"这一整类结论
+
+**完成内容（续九，同一天）——全面改按天，按题模式整体删除：**
+- **用户判断成立**：MetaClaw 全程按天隔离，天内靠压缩兜上下文；按题隔离纯粹是迁移 OpenClaw-RL 方法时带进来的产物
+- **08-19c 引入按题的原始理由已被自己的 A/B 证伪**：理由是"共享 transcript 会让早轮超长回复撑爆后续轮次的上下文"，实测按天反而更高（day01–17：**49.9%/36.3%** vs 按题 **41.4%/21.0%**）——OpenClaw 自己的压缩吸收掉了
+- **删除**（`METACLAW_SESSION_SCOPE` 开关连同 round 分支整体移除，一个 stale 环境变量也无法复活它）：session id 的 `-{group}-{round}` 后缀 → 一天一个 `metaclaw-{test_id}`；verdict 的 `session_done` 恒 True → `is_last_round`；infra 失败每轮发 close → 仅最后一轮。**三处必须一致**——中途关会强制丢掉同 session 后续轮次还要用的 pending turn
+- **⚠️ 更正用户的一个假设：min-count 的问题按天不会消失。**工作区是 per-test（每天一份），与 session 粒度无关；checker 数的是当天目录**累计**合规文件数，早轮少写一个后面永远追不平。按天只是**缓解**（共享 transcript 让命名风格一致、落后概率低），**结构性不公平仍在**。且该问题**从未打过补丁**，没有可删的东西
+- **三个刻意保留项**（已加代码注释 + 测试守护，防后续清理误删）：`metaclaw-` session 前缀（代理靠 `_METACLAW_SESSION_RE` 做 round-mode 分派，删了**分派就断**，不只是命名）；`_FC_DIR_MODE_NOTE`（讲文件名**格式**——别照抄示例日期，与会话粒度正交）；按题成组 + 1/N（折叠是 `t < turn_num` + 每轮弹出，本就 scope 无关）
+- **验证**：`py_compile` + `bash -n`；删除 `test_metaclaw_session_scope.py`，新增 `test_metaclaw_day_scope.py` **13 项断言**；**非空洞性双向**——`session_done` 改回恒 True → 挂在"仅最后一轮"；`_FC_DIR_MODE_NOTE` 改名 → 挂在保留项检查。均已还原
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「✅ 已决定并实施（2026-09-07）：全面改为按天」
+
+**主要问题（续九）：**
+- **现有 K=0 基线（34.4%/12.1%）是按题跑的，已失去可比性**。新基准必须是按天 K=0（`20260907_112320`），**该趟尚未跑完**——在它出最终数之前，项目**没有可用基线**
+- **`--max-tokens-per-gpu 32768` 未确认**：按天后 prompt 显著变长，rollout 侧已是 65536 而训练侧仍是 32768。**开训前必须先统计 prompt token 分布（P50/P90/max）**——单条序列超预算是直接报错或丢样本，不是变慢
+- 所有按题历史跑分**无法用新代码复现**（本已因口径更正作废，此处仅作记录）
+
+**产出（续九）：**
+- `scripts/metaclaw/metaclaw_rollout_driver.py`：删 scope 开关 + 三处站点改按天 + `_FC_DIR_MODE_NOTE` 防误删注释
+- `scripts/metaclaw/run_metaclaw_migration_modelfactory.sh`：移除开关的声明/落盘/打印/传参
+- `scripts/tests/test_metaclaw_day_scope.py`（新增 13 项）；删除 `test_metaclaw_session_scope.py`
+- `docs/metaclaw_migration_plan.md`：新增「✅ 已决定并实施」一节
 
 **产出（续八）：**
 - `docs/metaclaw_migration_plan.md`：新增"口径重大更正（2026-09-03）"一节；定版基线与 K=6 两处加作废/撤回标注
