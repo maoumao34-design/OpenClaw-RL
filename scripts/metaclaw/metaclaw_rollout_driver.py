@@ -1771,64 +1771,26 @@ async def run_day(
 
                 for idx, round_record in enumerate(rounds):
                     is_last_round = idx == len(rounds) - 1
-                    # One session PER ROUND (2026-08-19c), not one session
-                    # per day. Was: session_id = f"{_SESSION_ID_PREFIX}{test_id}"
-                    # shared across every round in the day, matching
-                    # MetaClaw-official's own _run_group. Changed because that
-                    # sharing is exactly what let one file_check round's very
-                    # long response (transcript growth confirmed via
-                    # metaclaw_migration_20260819_153518/173654 logs -- CLI
-                    # cross-check: day07 r5 alone ~17k chars) balloon the SAME
-                    # session's context for every later round THAT DAY,
-                    # including unrelated multi_choice rounds that were
-                    # otherwise answered fine (day01-06 MC steady at
-                    # 85-97%) -- once a day's transcript got long enough,
-                    # everything after it, file_check and multi_choice alike,
-                    # died to context overflow / empty responses (day07 r6
-                    # onward, day08 r10 onward, day09 r8 onward, day10 r10
-                    # onward, all confirmed via real log review). Per-round
-                    # session_id gives each round a fresh, empty transcript
-                    # (_prepare_session just touches a new .jsonl -- verified
-                    # via direct read of MetaClaw-official's infer_cmd.py,
-                    # no other persistence mechanism exists) while leaving the
-                    # day's WORKSPACE untouched (same workspace_copy/
-                    # gateway_port/openclaw_json_path for the whole day,
-                    # unchanged below) -- a later round can still see files an
-                    # earlier round actually wrote, it just no longer inherits
-                    # the earlier round's raw chat transcript. Cross-round
-                    # continuity for "what went wrong last time" is carried by
-                    # the explicit [Previous Feedback] text (query/
-                    # with_feedback below, unaffected by this change), not by
-                    # shared conversation history. This does NOT fix a
-                    # file_check round writing an overlong response or
-                    # scoring 0 -- only stops that from dragging down every
-                    # later round in the same day. A deliberate divergence
-                    # from MetaClaw-official's own eval harness (_run_group
-                    # shares one session across a day) -- acceptable because
-                    # MetaClaw's own scorer never reads the transcript, and
-                    # this migration was never aligned with MetaClaw's own
-                    # training-mode code (openclaw_env_rollout.py) either,
-                    # which uses a completely different one-session-per-task
-                    # model with no day/round/feedback structure at all (see
-                    # docs/metaclaw_migration_plan.md "三方对照"). The
-                    # "{group_id}-" component is redundant in every real
-                    # all_tests.json (group["id"] always == test_id for
-                    # QuestionsJsonQueryReader-format data, confirmed via a
-                    # full 346-round scan across all 30 days' questions.json,
-                    # all round ids are plain r1..r15, alphanumeric only) but
-                    # kept anyway as a defensive guard against
-                    # EvalFlowQueryReader's legacy format, which CAN produce
-                    # multiple groups per day -- costs nothing, protects
-                    # against an assumption this code does not actually rely
-                    # on holding forever. Also structurally closes the
-                    # previously-deferred "跨 round 污染" risk (see
-                    # docs/metaclaw_migration_plan.md 下一步工程任务 第 1 项):
-                    # that bug required a crashed round's orphaned pending
-                    # turn to be picked up by the SAME session's next message;
-                    # with every round now its own session (and session_done
-                    # sent unconditionally below, not just on the day's last
-                    # round), there is no longer a "same session" for a later
-                    # round to leak into.
+                    # One session for the WHOLE DAY, matching
+                    # MetaClaw-official's _run_group. Per-round sessions
+                    # (2026-08-19c .. 2026-09-07) were removed: they were
+                    # introduced because one shared transcript let an early
+                    # round's overlong response balloon context for every
+                    # later round that day, but a single-variable A/B
+                    # refuted that -- the same zero-training model scored
+                    # HIGHER under day scope (41.1% Acc / 26.3% Compl over
+                    # all 30 days) than under round scope (34.4% / 12.1%).
+                    # OpenClaw's own compaction absorbs the growth, which
+                    # is how MetaClaw holds a long day under the context
+                    # limit in the first place.
+                    #
+                    # The day's WORKSPACE was never affected by session
+                    # granularity either way: workspace_copy/gateway_port/
+                    # openclaw_json_path are per-DAY (see above), so a later
+                    # round has always been able to see files an earlier one
+                    # wrote. What changed back is that it once again inherits
+                    # the earlier round's chat transcript, on top of the
+                    # explicit [Previous Feedback] text (unchanged).
                     # Official: one session for the whole day.
                     round_session_id = f"{_SESSION_ID_PREFIX}{test_id}"
                     _prepare_session(work_openclaw_state_dir, agent_id, round_session_id)
