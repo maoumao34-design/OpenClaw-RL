@@ -55,7 +55,7 @@ proc = await asyncio.create_subprocess_shell(
 | 工作区 | **无** | 每个 test 一个隔离副本（`_copy_workspace_for_test` + `_patch_agent_workspace`）|
 | 命令 cwd | 进程当前目录 | agent workspace |
 | 评分 | **无**（`reward=0.0` 恒定，交 proxy 的 PRM）| checker，`cwd=workspace_path` |
-| 任务数据 | `examples/train.jsonl` 72 条 `{"task_id","instruction"}` | 30 天 / 346 题 |
+| 任务数据 | **未发布**（`examples/train.jsonl` 是产品 RL 通路的演示对话，**不是 Part I 题集**，见查证记录（十七））| 30 天 / 346 题 |
 
 ### ⏳ 待讨论的决策：后续怎么走
 
@@ -92,7 +92,8 @@ proc = await asyncio.create_subprocess_shell(
 | 查证记录（十三）| §4.1 逐字复核 + 官方配置实证 | ✅ 成立；但其中"（B）降级为待定"已由（十五）升回 |
 | 查证记录（十四）| checker 实测与 Part I 描述矛盾 | ✅ 成立（标题已下调，§4.3 贡献有限）|
 | 查证记录（十五）| **仓库里是两套独立 agent 栈，我们跑 Part II 那套** | ✅ **成立**，三条独立证据 |
-| 查证记录（十六）| 目录归属精确化、train.jsonl 降级、A.3 对称性 | ✅ **成立**，含尚未消解的结 |
+| 查证记录（十六）| 目录归属精确化、train.jsonl 降级、A.3 对称性 | ✅ 成立；其"尚未消解的结"已由（十七）解开 |
+| 查证记录（十七）| **`train.jsonl` 不是数据集，是一整段真实对话** | ✅ **成立**；撤回"Part I 数据在 train.jsonl" |
 
 **只想知道结论**：看本文档最上面的「🔴 当前结论」。**想知道推理怎么错的**：按上表顺序读。
 
@@ -702,7 +703,7 @@ grep -rn "system_prompt|SYSTEM_PROMPT" --include=*.py benchmark/src/
 | 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` |
 | system prompt | **A.1 逐字自带**（"The single tool exposed to the agent is `run_command`"，含 schema 与 `openclaw status` / `openclaw agents add` 示例）| **一个都没有** → 用 OpenClaw 原生 |
 | 工具集 | 单 `run_command` | `openclaw_cfg/openclaw.json` 的 `profile: coding`（全套 read/write/edit/exec/glob/grep）|
-| 任务数据 | `examples/train.jsonl`（72 条真实 OpenClaw CLI 会话；**A.3 的 Part I 示例内容在其第 1 条里逐字存在**——注意是内容匹配，论文是否点名该文件名无法确认，见查证记录（十六））| `benchmark/data/metaclaw-bench/` |
+| 任务数据 | **Part I 的题集未发布**。`examples/train.jsonl` 是**一整段真实对话的演示数据**（72 条连续用户消息），A.3 只是引其第 1 条示范"Part I 的用户指令长什么样"，**它不是数据集**——见查证记录（十七）| `benchmark/data/metaclaw-bench/` |
 | 身份注入 | 无 | IDENTITY.md / SOUL.md（A.2）|
 | 隐含规则 | 无 | P1–P5 渐进激活（A.7）|
 
@@ -799,19 +800,87 @@ instruction: [Sat 2026-02-21 07:25 EST] I grant you read access to
 
 **同一方法、同一标准，结论相反：仓库发布了 Part I 的任务数据，未发布 Part II 的题集。**不是双重标准。
 
-#### 尚未消解的结（如实记录，不强行收口）
+#### 「两份 Part I 数据」这个结——已于同日由查证记录（十七）解开
 
-若 `train.jsonl` 是 Part I 的数据，而 346 题按可数结构（7/7）**也**是 Part I，则存在两份 Part I 数据。
-
-**冲突最少的读法**：两者角色不同——`train.jsonl` 是 Part I 的 **RL 训练任务**（72 条自由指令，由 `metaclaw/trainer.py` 消费），346 题是 **评测题集**（§4.1 定义 Part I 时描述的正是它）；A.3 该示例的标题也是 "task **instruction** format"，是在展示"Part I 的任务指令长什么样"，并未声称它就是 Part I 的评测集。
-
-**该读法自洽但无直接证据，仅冲突最少。不再推测。**
+> **⛔ 本小节的前提已被证伪。**当时写道"若 `train.jsonl` 是 Part I 的数据、346 题也是 Part I，则存在两份 Part I 数据"，并给出"前者是 RL 训练任务、后者是评测题集"这一冲突最少的读法。
+>
+> **实际是：`train.jsonl` 根本不是数据集**（72 条是同一天两小时内的一整段连续对话，含 "Retry." / "Confirm." 这类单独无意义的消息，无标准答案、无 checker、无天/轮结构）。**从来只有一份数据，另一份是误认。**详见查证记录（十七）。
 
 #### 结论（当前工作假设）
 
 **那 346 题是 Part I 的题集**（可数结构 7/7 精确命中；Part II 题集经 A.3 对称性测试证明确实缺席），**但随附的 agent 配置——全套工具 + 身份文件——是 Part II 式的，且打包在数据集目录内。**
 
 **→「用 Part II 的方法跑了 Part I 的数据集」成立；成因不是选错方法，而是数据集自带 Part II 式配置。2026-09-07 暂按此推进，若出现反证再复核。**
+
+---
+
+### 查证记录（十七）：`examples/train.jsonl` 不是数据集，是一整段真实对话（2026-09-07）
+
+**用户问"论文的 Part I 到底怎么做的，代码库里那 72 个例子是什么、有什么用"，据此实测，推翻本项目此前多处引用的一个说法。**
+
+#### 实测：72 条是同一段对话，不是 72 个任务
+
+```
+task_id:  user_msg_001 … user_msg_072      连续编号
+时间戳:   Sat 2026-02-21 07:25 → 09:25 EST  同一天，两小时
+字段:     只有 {task_id, instruction}
+```
+
+| # | instruction |
+|---|---|
+| 002 | `Retry.` |
+| 006 | `For the first meeting, the meeting content is below.` |
+| 021 | `Confirm.` |
+| 046 | `check whether should be included in existing project?` |
+| 072 | `list all meeting date` |
+
+**"Retry."、"Confirm." 这类消息单独拿出来毫无意义**——72 条是一个人连续跟 agent 说的 72 句话。第 1 条（A.3 引用的那条）是开场白（授权读 skills 目录 → 找 `gog/skill.md` → 往 Google Calendar 加十个会议），其余 71 条都是这件事的往下推进。
+
+#### 它的用途
+
+位于 `examples/`，同目录另有 `run_conversation_opd.py` / `run_conversation_rl.py` / `run_conversation_replay.py` 三个演示脚本。`metaclaw/trainer.py` **仅在显式配置 `openclaw_env_data_dir` 时才读取**（可选，默认不读）。全库唯一的非 benchmark jsonl。
+
+**结论：它是产品 RL 通路的演示数据**——正对应论文主张"just talk to your agent，每段真实对话都变成学习信号"。
+
+#### ⛔ 撤回："Part I 的数据在 `examples/train.jsonl`"
+
+本项目此前多处这样写过，**是错的**。它**没有标准答案、没有 checker、没有天/轮结构，无法从中算出任何 Acc 或 Compl**——不具备数据集的任何要件。
+
+A.3 引其第 1 条，是**举例说明"Part I 的用户指令长什么样"**（caption 为 "Part I **User Instruction Template**"，是格式模板），并非声明数据集。
+
+**副作用（好的）：查证记录（十六）遗留的"两份 Part I 数据"之结自动解开——从来只有一份，另一份是误认。**
+
+#### Part I 到底怎么做的：已知 vs 未发布
+
+| 已知 | 来源 |
+|---|---|
+| 30 个工作日 / 346 题 / 每天 10–15 | §4.1 |
+| 题型 file_check + multi_choice | §4.1 |
+| 指标 accuracy + file-check completion rate | §4.1 |
+| agent 只有一个 `run_command` 工具 | A.1 |
+| agent 角色是"**controlling an OpenClaw installation**" | A.1 |
+| 用户指令为真实对话式消息 | A.3 |
+
+**拼出的画面**：agent 通过 shell 命令操作一个 OpenClaw 安装，由组织成 30 个工作日的真实用户消息驱动，用 checker + 多选打分。
+
+**未发布（三样都没有）：**
+- Part I 的**评测 harness**（天/轮组织、checker 接线、工作区处理）
+- Part I 的 **346 道题**
+- Part I 的**打分能力**——`openclaw_env_rollout.py` 有 A.1 的提示词与 schema，但 `reward=0.0`，评分交给 proxy 的 PRM
+
+**→ 仓库里只有 Part I 的 agent 长相，没有 Part I 的跑法。**
+
+#### 对"用 Part I 方法做基线"这一意图的影响
+
+**"复现 Part I 基线"不可行**——不是保守，是评测那一半根本不存在于公开材料中。
+
+**可做的只有受控消融**，且本条使其定位需再收紧一格：Part I 的 agent 是**操作 OpenClaw 安装**（对话式运维请求），而我们要喂给它的是"把 `standup_raw.txt` 整理成 `day01/standup.json`、字段须 ISO 8601 带时区"这类**文档产出题**，**任务域不同**。
+
+因此该消融的结论只能表述为：
+
+> **在我们这套题上，把工具集从全套缩到单 shell，Compl 变化了多少。**
+
+**不得**表述为"论文 Part I 基线是多少"——**该问题公开材料无法回答，本项目不再尝试。**
 
 ---
 

@@ -103,7 +103,7 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 | 任务域 | **操作/配置一个 OpenClaw 安装**（CLI 运维）| **在工作区里产出文件**（文档产出）|
 | 工作区 | **无**（`_exec_command` 是裸 shell，不传 `cwd`）| 每个 test 一个隔离副本 |
 | 评分 | **无**（`reward=0.0`，交产品的 PRM）| checker，`cwd=workspace_path` |
-| 任务数据 | `examples/train.jsonl`（72 条）| `benchmark/data/metaclaw-bench/`（30 天/346 题）|
+| 任务数据 | **未发布**⚠️ | `benchmark/data/metaclaw-bench/`（30 天/346 题）|
 
 ## ❌ 千万别以为"用了官方数据集 = 用了对应 Part 的方法"
 
@@ -114,6 +114,14 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 3. 而这份数据集的规模（30 天 / 346 题 / 10–15 每天）与论文 **Part I** 定义 7/7 吻合
 
 **→ 结果就是「用 Part II 的方法跑 Part I 的数据集」，分数与 Table 1 任何一列都对不上。**多日的"4B 零训练贴平 GPT-5.2"异常根源在此，不是模型问题、不是 harness bug、也不是评测口径。
+
+## ❌ `examples/train.jsonl` 不是 Part I 的数据集
+
+**本项目误认过很久。**它是**一整段真实对话**——`user_msg_001…072`，时间戳全在 `Sat 2026-02-21 07:25→09:25 EST` 同一天两小时内，内容如 `Retry.` / `Confirm.`，单条无意义。**没有标准答案、没有 checker、没有天/轮结构，算不出 Acc 或 Compl。**
+
+它是 `examples/` 下产品 RL 通路的演示数据（`trainer.py` 仅在配置 `openclaw_env_data_dir` 时才读）。附录 A.3 引其第 1 条只是示范"Part I 的用户指令长什么样"（caption：Part I **User Instruction Template**）。
+
+**Part I 的跑法三样都没发布**：评测 harness、346 道题、打分能力。**仓库里只有 Part I 的 agent 长相（A.1 的提示词 + schema，但 `reward=0`），没有 Part I 的跑法。→「复现 Part I 基线」不可行。**
 
 ## ❌ 论文附录的 Part 标签不可靠，不要当证据
 

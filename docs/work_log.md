@@ -2092,14 +2092,22 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 | 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` ← **我们跑的** |
 | system prompt | A.1 逐字自带（单 `run_command` + schema）| 无，用 OpenClaw 原生 |
 | 工具 | 单 `run_command` | `profile: coding` 全套 |
-| 任务数据 | `examples/train.jsonl` 72 条 | `benchmark/data/metaclaw-bench/` |
+| 任务数据 | **未发布**（`train.jsonl` 不是数据集，见第七轮）| `benchmark/data/metaclaw-bench/` |
 
 **第六轮（用户追问目录归属 / train.jsonl 证据强度 / A.3 对称性）——三点全部成立：**
 
 - **(a) 目录图此前漏了要害**：`benchmark/src/` 是**中立机器**（无 system prompt、无工具配置）；**A.2 的 IDENTITY.md / SOUL.md 和 `openclaw_cfg/openclaw.json`（`profile: coding`）都打包在 `benchmark/data/metaclaw-bench/` 数据集目录里**。→ **"我们用了 Part II 的方法"不是选错，是这份数据集自带 Part II 式配置**，README 的 Quick Start 也是这条唯一默认路径。另注 `metaclaw/` 是产品本体，**Part I 用产品自己的 RL rollout 评，Part II 才有专门的 `benchmark/` 包**——这解释了 Part I 那套为何没有评分
 - **(b) 「论文点名了 train.jsonl」撤回**：该括注无法确认是论文原文还是本项目批注（抓取工具回答自相矛盾，且此前已编造过一次）。**站得住的只有内容匹配**——`examples/train.jsonl` 第 1 条（`task_id: user_msg_001`）与 A.3 的 Part I 示例逐字一致，72 条
 - **(c) A.3 对称性测试成立，且是全程最干净的一条证据**（此前未凸显）：同一把尺子量两个方向——Part I 示例 ✅ 在 `train.jsonl` 里逐字存在；Part II 的两个示例 ❌ 均不存在（本库 day01/r1 是 file_check、day01 只到 r10、全库无 `decision_log`）。**同一方法同一标准，结论相反：仓库发布了 Part I 的任务数据，未发布 Part II 的题集**
-- **尚未消解的结**：若 train.jsonl 是 Part I 数据、346 题按可数结构也是 Part I，则有两份 Part I 数据。冲突最少的读法是二者角色不同（前者是 RL **训练**任务、由 `trainer.py` 消费；后者是**评测**题集、正是 §4.1 定义 Part I 时描述的）。**自洽但无直接证据，不再推测**
+- **~~尚未消解的结~~**：当时以为"若 train.jsonl 是 Part I 数据、346 题也是，则有两份 Part I 数据"。**该前提已于第七轮证伪**（train.jsonl 根本不是数据集），结自动解开
+
+**第七轮（用户问"论文 Part I 到底怎么做的，那 72 个例子是什么"）——推翻本项目一个长期说法：**
+
+- **实测：72 条是同一段对话，不是 72 个任务**。`user_msg_001…072` 连续编号，时间戳全在 `Sat 2026-02-21 07:25→09:25 EST`（同一天两小时），字段只有 `{task_id, instruction}`。内容如 `Retry.` / `Confirm.` / `list all meeting date`——**单独拿出来毫无意义**，是一个人连着说的 72 句话；第 1 条（A.3 引的那条）是开场白，其余 71 条是它的往下推进
+- **用途**：位于 `examples/`，同目录是三个演示脚本（`run_conversation_opd/rl/replay.py`）；`trainer.py` **仅在显式配置 `openclaw_env_data_dir` 时才读**（可选）。**是产品 RL 通路的演示数据**，对应论文主张"每段真实对话都变成学习信号"
+- **⛔ 撤回"Part I 的数据在 `examples/train.jsonl`"**：它没有标准答案、没有 checker、没有天/轮结构，**算不出任何 Acc 或 Compl**。A.3 引它只是示范"Part I 的用户指令长什么样"（caption 是 "Part I **User Instruction Template**"）
+- **Part I 的跑法：三样都没发布**——评测 harness、346 道题、打分能力（`openclaw_env_rollout.py` 有 A.1 的提示词与 schema，但 `reward=0.0`，评分交 proxy 的 PRM）。**仓库里只有 Part I 的 agent 长相，没有 Part I 的跑法**
+- **对"用 Part I 方法做基线"的影响**：**"复现 Part I 基线"不可行**（评测那一半不存在）；可做的只有受控消融，且定位需再收紧——Part I 的 agent 是操作 OpenClaw 安装的对话式运维，我们的题是文档产出，**任务域不同**。结论只能表述为"在我们这套题上，工具集从全套缩到单 shell，Compl 变化多少"
 | 身份注入 / 隐含规则 | 无 | IDENTITY+SOUL（A.2）/ P1–P5（A.7）|
 
 **我的关键误判**：（十三）把 `profile: coding` 当成"公开 benchmark 反驳了 A.1"。**它不反驳 A.1，它只说明这份配置属于 Part II**——A.1 描述的是另一套东西，那套也在仓库里，只是我们从未跑过。正确解读是：**Part I 的 agent 定义随代码发布了，Part I 的评测 harness 没有发布。**
