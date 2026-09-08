@@ -31,18 +31,47 @@
 
 **→ 09-04 定的口径继续有效：训练效果一律以我们自己的 K=0 为基准，Table 1 只作量级参照。**
 
-### ⏳ 待讨论的决策：后续改回 Part I 方法，还是继续用 Part II 方法
+### 关键补充（2026-09-07）：两个 Part 不只是工具集不同，是**任务域不同**
 
-**尚未决定，需要专门讨论。**两条路的大致轮廓：
+用户追问"Part II 的方法在这个数据集的工作区里跑，Part I 的方法反而不在工作区里？"——查证后**成立，而且比工具集差异严重得多**。
 
-| | 改回 Part I 方法 | 继续 Part II 方法 |
+`metaclaw/openclaw_env_rollout.py::_exec_command`：
+
+```python
+proc = await asyncio.create_subprocess_shell(
+    cmd,                    # ← 没有 cwd 参数
+    stdout=..., stderr=...)
+```
+
+全文件 `grep` 确认：**没有 `cwd`、没有 `chdir`、没有 `tempfile`/`mkdtemp`、没有任何工作区搭建**，命令跑在训练进程自己的当前目录里。
+
+| | **Part I**（`metaclaw/openclaw_env_rollout.py`）| **Part II**（`benchmark/`，我们跑的）|
 |---|---|---|
-| 要做什么 | 换成单 `run_command` agent（A.1 的 system prompt + schema 已在 `openclaw_env_rollout.py`），但**Part I 的评测 harness 官方没发布**，需自建 | 保持现状，不动 |
-| 能对上什么 | 方法与 Part I 一致，但数据集仍是这份 30 天题集，**仍非 Table 1 的 Part I** | 方法与 Part II 一致，但数据集仍非 Part II |
-| 已有资产 | K=0 / K=6 / scope A/B 全部作废重来 | 全部保留可用 |
-| 主要风险 | 工作量大，且做完仍不 like-for-like | 与论文任何一列都对不上这一点不变 |
+| 任务域 | **操作/配置一个 OpenClaw 安装**（CLI 运维类）| **在工作区里产出/改写文件**（文档产出类）|
+| 工作区 | **无** | 每个 test 一个隔离副本（`_copy_workspace_for_test` + `_patch_agent_workspace`）|
+| 命令 cwd | 进程当前目录 | agent workspace |
+| 评分 | **无**（`reward=0.0` 恒定，交 proxy 的 PRM）| checker，`cwd=workspace_path` |
+| 任务数据 | `examples/train.jsonl` 72 条 `{"task_id","instruction"}` | 30 天 / 346 题 |
 
-**注意：两条路都无法做到与 Table 1 任何一格 like-for-like**，因为公开仓库里根本没有"Part I 方法 + Part I 数据集"或"Part II 方法 + Part II 数据集"的完整组合。决策依据应是"哪条更利于本项目的迁移目标"，而不是"哪条能对上论文数字"。
+### ⏳ 待讨论的决策：后续怎么走
+
+**"改回 Part I 方法"这条路已被上述结构差异基本排除**——不是工作量问题，是**在这个数据集上结构上跑不了**：
+
+1. 题目写 `Save as day01/standup.json` 是**相对路径**，需要 workspace 当 cwd —— Part I 没有
+2. checker 以 `cwd=workspace_path` 执行 —— Part I 的写入**根本不会落到那里**
+3. Part I 的 env **没有评分能力**——它是训练 rollout，不是评测 harness
+
+技术上可以给它硬加一个 `cwd`，但那已不是"改回 Part I 方法"，**是造论文从未描述过的第三样东西**；而且加完之后与 Part II 的差别只剩"工具从全套缩成一个 shell"，任务域仍是 Part II 的。
+
+**因此实际可选项收敛为：**
+
+| | 继续 Part II 方法（现状）| 造"单 shell 工具 + Part II 工作区"的变体 |
+|---|---|---|
+| 与论文关系 | 方法=Part II，数据集=Part I | **论文没有的组合** |
+| 已有资产 | 全部保留 | K=0 / K=6 / scope A/B 全部作废重来 |
+| 能回答什么 | 迁移方法在这份题集上是否有效 | "工具集是不是我们分数偏高的原因" |
+
+**两条都做不到与 Table 1 任何一格 like-for-like**（公开库里没有任一 Part 的"方法+数据集"完整组合）。**决策依据应是"哪条更利于本项目的迁移目标"，而不是"哪条能对上论文数字"——后者两条都对不上。尚未决定，需专门讨论。**
 
 ---
 
