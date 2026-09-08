@@ -20,7 +20,11 @@
 2. 释出题目的 file-check 是 rule-based、**跨轮依赖 0/224**——符合 §4.1 对 Part II 的描述，矛盾于对 Part I 的描述
 3. IDENTITY.md / SOUL.md 注入（A.2）+ P1–P5 渐进激活（A.7），均为 Part II 特征
 
-**数据集侧证据**：30 天 / 346 题 / 每天 10–15，与 §4.1 的 Part I 定义逐项吻合；而 Part II 的真实题集（14 天 / 588 题，含 r21、`decision_log`）**确实不在公开仓库里**。
+**数据集侧证据**：30 天 / 346 题 / 每天 10–15，与 §4.1 的 Part I 定义逐项吻合（7/7）；而 Part II 的真实题集（14 天 / 588 题，含 r21、`decision_log`）**确实不在公开仓库里**。
+
+**成因不是"我们选错了方法"——是这个数据集自带 Part II 式配置**（查证记录（十六））：`benchmark/src/` 是中立机器（无 system prompt、无工具配置），而 **`benchmark/data/metaclaw-bench/` 目录里同时打包了 `openclaw_cfg/openclaw.json`（`profile: coding` 全套工具）和 `workspaces/shared/`（IDENTITY.md / SOUL.md / USER.md / AGENTS.md / TOOLS.md）**。用这份数据集就等于接受这套配置，我们没有做过选择。
+
+> **本结论为当前工作假设（2026-09-07 暂定）**，不是铁证。它冲突最少、可数证据最强，据此推进；若后续出现反证再复核。
 
 **一处仍未消解的张力（不因此推翻上表，但记录在案）**：这份"Part I 数据集"自身却带着 Part II 的机制（P1–P5、身份文件），且 FC 内容更像 Part II 的描述。可能是作者后来重整合并，也可能是论文对 Part I 的描述不准。**公开材料判不了，不再推测。**
 
@@ -661,7 +665,7 @@ grep -rn "system_prompt|SYSTEM_PROMPT" --include=*.py benchmark/src/
 | 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` |
 | system prompt | **A.1 逐字自带**（"The single tool exposed to the agent is `run_command`"，含 schema 与 `openclaw status` / `openclaw agents add` 示例）| **一个都没有** → 用 OpenClaw 原生 |
 | 工具集 | 单 `run_command` | `openclaw_cfg/openclaw.json` 的 `profile: coding`（全套 read/write/edit/exec/glob/grep）|
-| 任务数据 | `examples/train.jsonl`（A.3 标 "Part I task instruction format"，72 条真实 OpenClaw CLI 会话）| `benchmark/data/metaclaw-bench/` |
+| 任务数据 | `examples/train.jsonl`（72 条真实 OpenClaw CLI 会话；**A.3 的 Part I 示例内容在其第 1 条里逐字存在**——注意是内容匹配，论文是否点名该文件名无法确认，见查证记录（十六））| `benchmark/data/metaclaw-bench/` |
 | 身份注入 | 无 | IDENTITY.md / SOUL.md（A.2）|
 | 隐含规则 | 无 | P1–P5 渐进激活（A.7）|
 
@@ -694,6 +698,83 @@ grep -rn "system_prompt|SYSTEM_PROMPT" --include=*.py benchmark/src/
 #### 与（十一）的关系
 
 （十一）的**方法侧直觉是对的**，其**题集侧论断是错的**，而它当时给的证据（`\bbox` 格式串、`check_iso8601` 文件名）两者都撑不住。本条用**工具栈 + 任务性质 + 适应机制**三条独立线重建了方法侧结论，题集侧维持否定。
+
+---
+
+### 查证记录（十六）：目录归属精确化、train.jsonl 证据降级、A.3 对称性测试（2026-09-07）
+
+用户追问三点：(a) Part II 的方法究竟在哪个目录、附录里的 IDENTITY.md/SOUL.md 被放在哪；(b) `train.jsonl` 确定是 Part I 的任务数据吗，A.3 给的只是示例；(c) 既然能用 A.3 的示例认定 train.jsonl，**同样也该能用 A.3 的 Part II 示例去认定数据集**——为什么两边待遇不同。三点全部成立，其中 (c) 指出了此前叙述的真实缺陷。
+
+#### (a) 精确目录归属——此前的目录图漏了要害
+
+```
+MetaClaw-official/
+├── metaclaw/                          ← Part I 方法（同时是产品本体）
+│   ├── openclaw_env_rollout.py        ← A.1 的单 run_command agent（自带 system prompt）
+│   ├── trainer.py / prm_scorer.py     ← RL 训练与打分
+│   └── api_server / calendar_client / idle_detector / launcher …
+├── examples/
+│   └── train.jsonl                    ← 72 条 {task_id, instruction}
+└── benchmark/                         ← Part II 方法
+    ├── src/                           ← 通用机器：infer/scoring/report/check/clean/run
+    │                                     **无 system prompt、无工具配置（中立）**
+    └── data/metaclaw-bench/           ← 数据集，**但同时打包了 agent 配置**
+        ├── all_tests.json             30 天索引 + preference_tags
+        ├── eval/day01..day30/         346 题 + checker 脚本
+        ├── workspaces/shared/         ← **IDENTITY.md / SOUL.md / USER.md / AGENTS.md / TOOLS.md**
+        ├── openclaw_cfg/openclaw.json ← **profile: coding（全套工具）**
+        └── openclaw_state/
+```
+
+**要点：附录 A.2 的 IDENTITY.md / SOUL.md 在数据集里，不在方法代码里；工具配置同样在数据集里。**
+
+**这改写了前因后果的一环**：harness（`benchmark/src/`）本身是中立的，所谓"Part II 特征"（身份注入 + 全套工具）**是随这份数据集一起发布的**。所以"我们用了 Part II 的方法"**不是我们选错了**——用这份数据集就等于接受它自带的 `openclaw_cfg`。README 的 Quick Start 也正是 `metaclaw-bench run -i benchmark/data/metaclaw-bench/all_tests.json`，这是目录结构决定的唯一默认路径。
+
+另注：`metaclaw/` 是**产品本体**（CLI、api_server、日历、空闲检测…），`openclaw_env_rollout.py` 只是其中一个文件。**Part I 用产品自己的 RL rollout 机制评，Part II 才有专门的 `benchmark/` 包**——这也解释了为何 Part I 那套没有评分（`reward=0`，交产品的 PRM）。
+
+#### (b) 「论文点名了 train.jsonl」——撤回
+
+此前记录里写的"（real OpenClaw session, **`train.jsonl`**）"这个括注，**无法确认是论文原文还是本项目自己的批注**。定向复核时抓取工具的回答自相矛盾（一处称含 "train.jsonl"，另一处给出的 caption 却是 "Part I User Instruction Template"），而该工具此前已编造过一次（把 A.1 并进 §4.1）。**"论文点名了该文件名"不再作为证据。**
+
+**仍然站得住的是内容匹配**（本地实测 `examples/train.jsonl` 第 1 条）：
+
+```
+task_id: user_msg_001
+instruction: [Sat 2026-02-21 07:25 EST] I grant you read access to
+             /Users/jimchen/Documents/openclaw/skills. Locate gog/skill.md ...
+```
+
+与 A.3 的 Part I 示例**逐字一致**，全文件 72 条。
+
+**准确表述**：A.3 的 Part I 示例内容在 `examples/train.jsonl` 里逐字存在——而非"论文声明 train.jsonl 是 Part I 的数据"。
+
+#### (c) A.3 对称性测试——同一把尺子，两个方向
+
+用户的质疑指向一个真问题：能用 A.3 示例认定 Part I 的数据，就该能用 A.3 示例去认定数据集是不是 Part II 的。**答案是能，而且这是全程最干净的一条证据，此前未被凸显。**
+
+同一测试：**拿 A.3 的示例内容去仓库里找。**
+
+| A.3 示例 | 仓库中是否存在 |
+|---|---|
+| Part I 示例（OpenClaw CLI 会话）| ✅ `examples/train.jsonl` 第 1 条，逐字 |
+| Part II 示例（Day 01 / r1，multi-choice）| ❌ 本库 day01/r1 是 **file_check** |
+| Part II 示例（Day 01 / r21 → `decision_log_r21.json`）| ❌ day01 只到 r10；全库无 `decision_log`；最大轮次号 15 |
+
+**同一方法、同一标准，结论相反：仓库发布了 Part I 的任务数据，未发布 Part II 的题集。**不是双重标准。
+
+#### 尚未消解的结（如实记录，不强行收口）
+
+若 `train.jsonl` 是 Part I 的数据，而 346 题按可数结构（7/7）**也**是 Part I，则存在两份 Part I 数据。
+
+**冲突最少的读法**：两者角色不同——`train.jsonl` 是 Part I 的 **RL 训练任务**（72 条自由指令，由 `metaclaw/trainer.py` 消费），346 题是 **评测题集**（§4.1 定义 Part I 时描述的正是它）；A.3 该示例的标题也是 "task **instruction** format"，是在展示"Part I 的任务指令长什么样"，并未声称它就是 Part I 的评测集。
+
+**该读法自洽但无直接证据，仅冲突最少。不再推测。**
+
+#### 结论（当前工作假设）
+
+**那 346 题是 Part I 的题集**（可数结构 7/7 精确命中；Part II 题集经 A.3 对称性测试证明确实缺席），**但随附的 agent 配置——全套工具 + 身份文件——是 Part II 式的，且打包在数据集目录内。**
+
+**→「用 Part II 的方法跑了 Part I 的数据集」成立；成因不是选错方法，而是数据集自带 Part II 式配置。2026-09-07 暂按此推进，若出现反证再复核。**
 
 ---
 
