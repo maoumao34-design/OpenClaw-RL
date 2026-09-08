@@ -2051,7 +2051,19 @@
 - **写死 `scope=day` 的判读规则**：统计 `openclaw-rl-cli-compaction-patch` / context overflow / infra 失败三个计数——计数小则可直接归因给 session 粒度，计数大则只能当效应上界
 → 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"查证记录（十）"
 
-### 三、Part I / Part II 归属：走了四轮才收敛，最终结论是否定式的
+### 三、Part I / Part II 归属：**我们一直在用 Part II 的方法跑 Part I 的数据集**
+
+> **本节结论（全天最重要的一条）**：多日来"4B 零训练 Compl 贴平甚至超过 GPT-5.2 的 Part I 基线"这个核心异常，**根源是方法与数据集来自不同的 Part**——不是模型、不是 harness bug、也不是评测口径。**分数怎么都对不上是必然的。**
+>
+> | | 我们的配置 | Part I | Part II |
+> |---|---|---|---|
+> | 方法（agent 栈）| **Part II** | 单 `run_command` | 全套工具 + 身份注入 |
+> | 数据集 | **Part I** | 30 天/346 题 | 14 天/588 题 |
+>
+> **Table 1 两列都不能直接对**：Part I 列方法不同，Part II 列数据集不同。**09-04 的 K=0 锚点口径继续有效。**
+>
+> **⏳ 后续改回 Part I 方法还是继续 Part II 方法——尚未决定，需专门讨论。**两条路都做不到与 Table 1 任何一格 like-for-like（公开库里没有任一 Part 的"方法+数据集"完整组合），决策依据应是迁移目标而非对齐论文数字。选项对比见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」。
+
 
 `scope=day` 对照跑到 day17 是 **Acc 49.9% / Compl 36.3%**，比按题隔离（41.4% / 21.0%）**更高**而非更低，4B 零训练的 Compl 变成 GPT-5.2 Part I 基线（14.7%）的 2.5 倍——异常不但没消失反而放大。由此展开对论文两个 Part 的查证。
 
@@ -2136,6 +2148,7 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 **未提交（另一条线，待你决定）：** `report/` 下的汇报 PPT 产物（源文件、两个 backup、`preview_work/`、`render_qa/`、`_build_page2.py`、`_render_com.py`）。
 
 **下一步：**
-1. 跑官方代码路径基线（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——它与 driver 的 `scope=day` K=0 同为按天会话，差值直接量化"我们的 driver vs 官方 harness"的结构差，是当前异常的**第二个独立抓手**
+0. **【待讨论】改回 Part I 方法还是继续 Part II 方法**——见上文第三节。这条决定后面几项的取舍：若改回 Part I，K=0 / K=6 / scope A/B 全部作废重来，且 Part I 的评测 harness 官方未发布需自建
+1. 跑官方代码路径基线（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——Part 归属澄清后它的意义更明确：`metaclaw-bench run`（官方 Part II harness）vs 我们的 driver，**同题集、同工具、同为按天会话**，差值就是纯粹的"driver vs 官方 harness"结构差
 2. 取 `scope=day` K=0（`20260907_112320`）跑满 30 天的最终数
 3. 主线：round-group + 1/N 训练 vs 我们自己的 K=0

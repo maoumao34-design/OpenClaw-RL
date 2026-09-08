@@ -6,6 +6,46 @@
 
 ---
 
+## 🔴 当前结论（2026-09-07）：我们一直在用 Part II 的方法跑 Part I 的数据集
+
+**这解释了为什么分数怎么都对不上。**此前多日的核心异常——"4B 零训练的 Compl 贴着甚至超过论文 GPT-5.2 的 Part I 基线"——根源在这里，不是模型、不是 harness bug、也不是评测口径。
+
+| | 我们的实际配置 | 论文的 Part I | 论文的 Part II |
+|---|---|---|---|
+| **方法（agent 栈）** | **Part II** ✅ | 单 `run_command`（A.1 自带 system prompt）| OpenClaw 原生全套 + 身份注入 |
+| **数据集** | **Part I** ✅ | 30 天 / 346 题 / 10–15 每天 | 14 天 / 588 题 / 42 每天 |
+
+**方法侧证据**（三条互相独立，详见查证记录（十五））：
+1. A.1 明确写死 Part I "The single tool exposed to the agent is `run_command`"，schema 也在附录；该 system prompt 全仓库**只存在于 `metaclaw/openclaw_env_rollout.py`**，而 `benchmark/src/`（我们跑的）**没有任何 system prompt**，用 OpenClaw 原生 + `profile: coding` 全套工具
+2. 释出题目的 file-check 是 rule-based、**跨轮依赖 0/224**——符合 §4.1 对 Part II 的描述，矛盾于对 Part I 的描述
+3. IDENTITY.md / SOUL.md 注入（A.2）+ P1–P5 渐进激活（A.7），均为 Part II 特征
+
+**数据集侧证据**：30 天 / 346 题 / 每天 10–15，与 §4.1 的 Part I 定义逐项吻合；而 Part II 的真实题集（14 天 / 588 题，含 r21、`decision_log`）**确实不在公开仓库里**。
+
+**一处仍未消解的张力（不因此推翻上表，但记录在案）**：这份"Part I 数据集"自身却带着 Part II 的机制（P1–P5、身份文件），且 FC 内容更像 Part II 的描述。可能是作者后来重整合并，也可能是论文对 Part I 的描述不准。**公开材料判不了，不再推测。**
+
+### 因此，Table 1 的两列我们都不能直接对
+
+- **不能对 Part I 列**（GPT-5.2 41.1 / 14.7）：方法不同——它是单 `run_command`，我们是全套工具
+- **不能对 Part II 列**（GPT-5.2 44.9 / 58.4）：数据集不同——14 天/588 题/MC 74% vs 我们 30 天/346 题/MC 35%，且难度随 day 单调上升
+
+**→ 09-04 定的口径继续有效：训练效果一律以我们自己的 K=0 为基准，Table 1 只作量级参照。**
+
+### ⏳ 待讨论的决策：后续改回 Part I 方法，还是继续用 Part II 方法
+
+**尚未决定，需要专门讨论。**两条路的大致轮廓：
+
+| | 改回 Part I 方法 | 继续 Part II 方法 |
+|---|---|---|
+| 要做什么 | 换成单 `run_command` agent（A.1 的 system prompt + schema 已在 `openclaw_env_rollout.py`），但**Part I 的评测 harness 官方没发布**，需自建 | 保持现状，不动 |
+| 能对上什么 | 方法与 Part I 一致，但数据集仍是这份 30 天题集，**仍非 Table 1 的 Part I** | 方法与 Part II 一致，但数据集仍非 Part II |
+| 已有资产 | K=0 / K=6 / scope A/B 全部作废重来 | 全部保留可用 |
+| 主要风险 | 工作量大，且做完仍不 like-for-like | 与论文任何一列都对不上这一点不变 |
+
+**注意：两条路都无法做到与 Table 1 任何一格 like-for-like**，因为公开仓库里根本没有"Part I 方法 + Part I 数据集"或"Part II 方法 + Part II 数据集"的完整组合。决策依据应是"哪条更利于本项目的迁移目标"，而不是"哪条能对上论文数字"。
+
+---
+
 ## 背景
 
 OpenClaw-RL 的 Separate（Student 单角色）Personal Agent Track 复现已大体完成（截至 2026-08-13，仍有一些工程问题待收尾，详见 [`work_log.md`](work_log.md) 08-13 条目及之前）。下一阶段计划：把复现出来的训练方法（Hybrid RL = GRPO + OPD topk-select，含本项目这几周校准出来的一整套奖励信号修正规则）迁移应用到 MetaClaw 这篇论文对应的场景/数据库上。
