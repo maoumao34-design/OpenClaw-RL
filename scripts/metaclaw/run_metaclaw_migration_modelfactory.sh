@@ -151,18 +151,6 @@ METACLAW_RESUME=${METACLAW_RESUME:-0}
 METACLAW_AGENT_RETRY=${METACLAW_AGENT_RETRY:-0}
 METACLAW_VERDICT_RETRY=${METACLAW_VERDICT_RETRY:-0}
 
-# 会话粒度对照开关（2026-09-07）。round（默认）= 每题一个 session（本项目
-# 2026-08-19c 起的行为）；day = 整天共用一个 session，也就是 MetaClaw 官方
-# 的真实做法（infer_cmd.py:1022 取 test["session"]，all_tests.json 里 30 个
-# test 对应 30 个不同 session id）。
-# 存在的唯一目的是回答一个问题、不是可调参数：我们 4B 零训练的 Compl 12.1%
-# 贴着论文 GPT-5.2 基线的 14.7%、远高于 Kimi-K2.5 基线的 2.0%，而其它嫌疑
-# 都已排除（反馈加料实测 -0.5/-1.3、Compl 口径与论文一致、空 agent 下
-# 0/224 通过、会话长度被论文 Part II 每天 42 题却更好这一点否掉）。
-# 剩下的是 Part I 题目"many interdependent side effects"：早期失败会毒化
-# 当天剩下的题，而按天共用时模型每一轮都在读这段被毒化的历史。设成 day
-# 就是量这一条值多少分。
-METACLAW_SESSION_SCOPE=${METACLAW_SESSION_SCOPE:-round}
 
 
 # 训练前冒烟测试用：只跑前 N 天（默认空 = 跑全部 30 天）。第一次跑强烈
@@ -195,14 +183,14 @@ command: $0 $*
 metaclaw_root: ${METACLAW_ROOT}
 checkpoint start: base ${POLICY_TORCH_DIST}（非 Personal Agent Track checkpoint）
 sample_unit: per-turn samples, one group per round (1/N advantage scaling)
-metaclaw_session_scope: ${METACLAW_SESSION_SCOPE}
+session_scope: day（固定；按题模式已于 2026-09-07 移除）
 EOF
 
 echo "日志目录: ${LOGS_DIR}"
 echo "METACLAW_ROOT: ${METACLAW_ROOT}"
 echo "SAVE_CKPT（独立于 Personal Agent Track）: ${SAVE_CKPT}"
 echo "样本单位: 每 turn 一个样本，一个 round 一个 group（advantage 按 1/N 缩放）"
-echo "会话粒度 METACLAW_SESSION_SCOPE: ${METACLAW_SESSION_SCOPE}（round=每题一个 session；day=官方的整天共用）"
+echo "会话粒度: day（一天一个 session，与官方 infer_cmd 一致；按题模式已于 2026-09-07 移除）"
 
 # =====================================================================
 # 生成三个补丁代理目录（脚本本身跟 Personal Agent Track 共用，本轮已
@@ -411,7 +399,6 @@ METACLAW_ALL_TESTS_JSON="${METACLAW_ALL_TESTS_JSON}" \
   METACLAW_PROGRESS_DIR="${METACLAW_PROGRESS_DIR}" \
   METACLAW_REPORT_DIR="${METACLAW_REPORT_DIR}" \
   METACLAW_RESUME="${METACLAW_RESUME}" \
-  METACLAW_SESSION_SCOPE="${METACLAW_SESSION_SCOPE}" \
   BENCHMARK_BASE_URL="http://127.0.0.1:30000/v1" \
   BENCHMARK_API_KEY="${SGLANG_API_KEY}" \
   BENCHMARK_MODEL="${BENCHMARK_MODEL}" \

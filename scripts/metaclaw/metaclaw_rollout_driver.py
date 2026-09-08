@@ -12,23 +12,28 @@ Architecture summary (see the migration doc for the "why"):
     MetaClaw's own benchmark harness), NOT a self-controlled generation
     loop -- preserves the real OpenClaw "coding" tool profile MetaClaw-Bench
     tasks are authored against.
-  - Each ROUND is its own proxy session (2026-08-19c; was one session per
-    day before this), session_id = f"metaclaw-{test_id}-{group_id}-{round_id}"
-    (the "metaclaw-" prefix is load-bearing: prepare_patched_openclaw_opd.sh
-    pattern-matches it via _METACLAW_SESSION_RE to flag every turn in the
-    session as MetaClaw round mode -- intermediate tool-call turns cannot
-    carry a custom body field of their own, since OpenClaw's internal HTTP
-    client constructs those requests, not this driver). Deliberately
-    diverges from MetaClaw-official's own eval harness (_run_group shares
-    one session across a whole day) -- switched to per-round sessions
-    because sharing one transcript let an early round's overlong response
-    balloon the context for every later round that day, dragging down
-    otherwise-fine rounds (including multi_choice) via context overflow.
-    The day's WORKSPACE (files an agent actually writes) is untouched by
-    this -- only the raw chat transcript is no longer shared across rounds;
-    cross-round continuity is still carried explicitly via the
-    [Previous Feedback] text. See docs/metaclaw_migration_plan.md for the
-    full writeup.
+  - One session per DAY, session_id = f"metaclaw-{test_id}" -- matching
+    MetaClaw-official's own eval harness exactly (infer_cmd.py:1022 takes
+    session_id = test["session"], one per day; :864 prepares it once before
+    the round loop; :927 passes that same id on every round).
+    (The "metaclaw-" prefix is load-bearing and unrelated to scope:
+    prepare_patched_openclaw_opd.sh pattern-matches it via
+    _METACLAW_SESSION_RE to flag every turn in the session as MetaClaw round
+    mode -- intermediate tool-call turns cannot carry a custom body field of
+    their own, since OpenClaw's internal HTTP client constructs those
+    requests, not this driver.)
+
+    2026-09-07: per-round sessions (in place 2026-08-19c .. 2026-09-07) were
+    REMOVED. They rested on the theory that one shared transcript let an
+    early round's overlong response balloon the context for every later
+    round, dragging otherwise-fine rounds down via context overflow. A
+    single-variable A/B refuted it: under day scope the same zero-training
+    model scored HIGHER (49.9% Acc / 36.3% Compl over day01-17) than under
+    round scope (41.4% / 21.0%). The feared overflow does not materialise,
+    because OpenClaw's own compaction absorbs it -- which is how MetaClaw
+    holds a long day under the context limit in the first place. Per-round
+    isolation was an artifact of porting OpenClaw-RL's method, not anything
+    MetaClaw does.
   - After each round finishes, the round's deterministic checker/multi-choice
     result (via the official _compute_inline_score/_build_feedback_text) is
     submitted to the proxy as a synthetic "next turn" message containing a
@@ -304,34 +309,10 @@ VERDICT_RETRY = int(os.environ.get("METACLAW_VERDICT_RETRY", "0"))
 # completed by a prior crashed run (METACLAW_RESUME) is bucketed by this
 # same day_index regardless of whether IT was trained originally --
 # resume/freeze are orthogonal.
-# Session granularity (2026-09-07). "round" (default) = one session per round,
-# the behaviour since 2026-08-19c. "day" = one session shared by the whole day,
-# which is what MetaClaw-official actually does: infer_cmd.py:1022 takes
-# session_id = test["session"] (one per day -- all_tests.json has 30 tests and
-# 30 distinct session ids), :864 prepares it once before the round loop, and
-# :927 passes that same id on every round.
-#
-# This exists to settle one question, not as a tunable: our zero-training K=0
-# scores Compl 12.1% with a 4B, level with the paper's GPT-5.2 baseline (14.7%)
-# and far above its Kimi-K2.5 baseline (2.0%). Everything else we suspected has
-# been ruled out -- the feedback augmentations (measured: -0.5 Acc / -1.3 Compl
-# once moved to the training side), the Compl definition (verified identical to
-# the paper's), free credit from the task data (measured: 0/224 file_check pass
-# on an untouched workspace), and session LENGTH (the paper's Part II runs 42
-# rounds per day against Part I's ~11.5, yet both models score far better on
-# Part II).
-#
-# What is left is that Part I's file_check tasks have "many interdependent side
-# effects" (paper, Section 4.1): an early failure poisons the rest of the day,
-# and under one shared transcript the agent reads that poisoned history while
-# doing every later round. Per-round sessions delete it. Set this to "day" to
-# measure what that is worth.
-METACLAW_SESSION_SCOPE = os.environ.get("METACLAW_SESSION_SCOPE", "round").strip().lower()
-if METACLAW_SESSION_SCOPE not in ("round", "day"):
-    raise RuntimeError(
-        f"METACLAW_SESSION_SCOPE must be 'round' or 'day', got {METACLAW_SESSION_SCOPE!r}"
-    )
-
+# Session granularity: one session per DAY, unconditionally (2026-09-07).
+# There is no switch any more -- see the module docstring for why per-round
+# was removed. MetaClaw is per-day everywhere; within a day the context is
+# held under the limit by compaction, not by cutting the transcript up.
 _TRAIN_UNTIL_DAY_RAW = os.environ.get("METACLAW_TRAIN_UNTIL_DAY", "")
 TRAIN_UNTIL_DAY: int | None = int(_TRAIN_UNTIL_DAY_RAW) if _TRAIN_UNTIL_DAY_RAW.strip() else None
 
@@ -1032,6 +1013,19 @@ def _filtered_checker_stdout(inline_score: dict[str, Any]) -> str:
 # from day11 onward the checker switches to an exact glob on the scenario
 # date (e.g. glob('day11/20260330_*.md')), where that date genuinely DOES
 # matter and generalizing it away would teach the wrong thing.
+# NOT session-scope machinery -- do not remove this alongside per-round
+# sessions. It addresses filename FORMAT (the model copying the example
+# date literally instead of generating its own valid 8-digit one), which
+# is orthogonal to whether a day shares one transcript. Checked by hand
+# on 2026-09-07 when round scope was deleted; guarded by
+# scripts/tests/test_metaclaw_day_scope.py.
+#
+# Related but separate, and deliberately NOT patched: check_filename.py
+# --dir --min-count counts the day directory CUMULATIVELY, so one early
+# miss is structurally unrecoverable for that file type that day. Day
+# scope only mitigates that (a shared transcript keeps naming consistent,
+# so the agent falls behind less often) -- it does not remove it, because
+# the workspace is per-day regardless of session granularity.
 _FC_DIR_MODE_NOTE = (
     " (Note: any valid 8-digit date + snake_case filename satisfies this "
     "check -- the exact date shown above is only an example, not a literal "
@@ -1835,14 +1829,8 @@ async def run_day(
                     # sent unconditionally below, not just on the day's last
                     # round), there is no longer a "same session" for a later
                     # round to leak into.
-                    if METACLAW_SESSION_SCOPE == "day":
-                        # Official: one session for the whole day.
-                        round_session_id = f"{_SESSION_ID_PREFIX}{test_id}"
-                    else:
-                        round_session_id = (
-                            f"{_SESSION_ID_PREFIX}{test_id}-{group.get('id', 'unknown')}-"
-                            f"{round_record['id']}"
-                        )
+                    # Official: one session for the whole day.
+                    round_session_id = f"{_SESSION_ID_PREFIX}{test_id}"
                     _prepare_session(work_openclaw_state_dir, agent_id, round_session_id)
 
                     question_text = round_record["question"]
@@ -1937,20 +1925,12 @@ async def run_day(
                         )
                         if hint:
                             print(f"  OPD hint (training-side only, the agent never sees it):\n{hint}\n")
-                        # session_done=True unconditionally (2026-08-19c) --
-                        # was `session_done=is_last_round` back when a whole
-                        # day was one session. Every round is now its own
-                        # complete session, so every round's verdict must
-                        # close it (same reasoning as _send_session_close_only
-                        # below), not just the day's last round.
                         await _send_verdict_turn(
                             client, round_session_id, eval_score, hint,
-                            # Under one-session-per-day the day's session must
-                            # stay open until its last round, or the proxy would
-                            # force-drop turns the next round still needs.
-                            session_done=(
-                                True if METACLAW_SESSION_SCOPE == "round" else is_last_round
-                            ),
+                            # The day's session must stay open until its last
+                            # round, or the proxy would force-drop turns that
+                            # later rounds of the SAME session still need.
+                            session_done=is_last_round,
                             retry=VERDICT_RETRY,
                         )
                     else:
@@ -1958,25 +1938,13 @@ async def run_day(
                         # submit a verdict (would fabricate a false -1 training
                         # signal). Mirrors toolcall-rl/swe-rl's Sample.Status.ABORTED
                         # early-return; see _send_session_close_only's docstring.
-                        # Unconditional (2026-08-19c), not `if is_last_round:` --
-                        # under one-session-per-day, a non-last-round failure's
-                        # orphaned pending turn was left to be picked up by the
-                        # same session's next real message (the very "跨 round
-                        # 污染" mechanism this change also closes off). Under
-                        # one-session-per-round there is no longer a "next
-                        # message in the same session" ever coming -- skipping
-                        # this close would leave that pending turn stuck in the
-                        # proxy's per-session state forever instead of being
-                        # force-dropped, which is strictly worse than the old
-                        # behavior, not just a no-op.
-                        # Under one-session-per-day this must only fire on the
-                        # day's last round: mid-day it would force-drop the
-                        # session's pending turns while later rounds are still
-                        # going to use that same session. Under one-session-per-
-                        # round it fires every time (2026-08-19c) -- there is no
-                        # "next message in the same session" ever coming, so
-                        # skipping it would strand the pending turn forever.
-                        if METACLAW_SESSION_SCOPE == "round" or is_last_round:
+                        # Only on the day's last round: mid-day this would
+                        # force-drop the session's pending turns while later
+                        # rounds of that same session still need them. A
+                        # non-last-round failure's orphaned pending turn is
+                        # instead picked up by the same session's next real
+                        # message.
+                        if is_last_round:
                             await _send_session_close_only(
                                 client, round_session_id, retry=VERDICT_RETRY,
                             )
