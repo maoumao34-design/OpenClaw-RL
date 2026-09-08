@@ -9,6 +9,46 @@
 
 ---
 
+## 历史状态（2026-09-03，已被 9/7 Part I/II 归属澄清取代）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+**MetaClaw 迁移**：[x] **「按题成组 + 1/N advantage 缩放」已实现**——每 turn 一个样本（各带真实 prompt/response，**零重建**）；一个 round 的全部 turn 共用 `group_index`、verdict 时一次性入队；advantage 除以该轮 turn 数；`--rollout-batch-size 8` + `--use-dynamic-global-batch-size` = **收满 8 道完整的题训练一次**。40 项断言与双向非空洞性本地通过，**真实训练未验证**。[x] **轨迹级方案已被真实训练证伪并删除**（约 96/120 个 round 因前缀重建失败整轮丢弃）：根因是 OpenClaw 重放历史时剥掉 reasoning（`dropReasoningFromHistory`，源码确认），**扁平序列表达不了"生成过、随后从上下文里消失"，每 turn 一样本是唯一忠实的表示法**。[x] **步骤判官已彻底停用**（奖励 = 本轮 checker 判定）；[x] **OPD hint 改贴本轮题目**（此前会贴到工具结果上）。[x] 09-03 上午的全面回退基线仍然成立：`scripts/` 曾逐字节回到 `40c5450`，本轮改动都是从那个干净起点长出来的。
+
+### 已知限制 / 未解决
+- **day22 那次为什么中途变差，至今没有答案。**原来的解释（thinking 膨胀经 loss_mask 训进去）依赖"reasoning 在 `response_ids` 里"这个**从未验证过**的前提，见下方未验证第一条。
+- **09-02/09-03 两次工具塌陷的机制已定位到代码层面，但没有修**（回退掉了触发它的三项改动，不等于修好了底层结构）。三层：① 空回复 turn 会变成 2~3 token 的样本（官方 `if not response_ids and not response_text.strip()` 守卫因 `response_text` 永远含 `<|im_end|>` 而形同虚设）；② slime 的 `sum_of_sample_mean` 每样本先取均值再求和，2 token 样本与 5000 token 样本等权；③ 批级基线放大稀有正样本。
+- **1/N 只压幅度、不改符号**：8 道题全失败时仍是全负批、仍是均匀打压（约 23% 的批次），只是强度降到 1/N。**`n_samples=1` 没有组内比较，这条要靠 `n_samples=8` 才解决。**
+- **更新次数 43 次 vs day22 那次约 96 次**（每次吃约 35 个样本而不是 16 个，总数据量一样）——读结果时要扣掉。
+- **`_drain_output_queue` 的 `any(... ABORTED ...)` 在按题成组后会让一个 turn abort 丢掉整道题**，预期影响为零（上游 `degraded-turn-drop` 已拦），但真实训练要确认。
+- **中间轮次的信号结构本身可疑**：MetaClaw 迁移用的是 toolcall-rl 式 step judge（开放式"好不好"，无事实锚点）且写死 `accepted: False`（无 hint、只剩拉回 base 的正则），而 Personal Agent 用的 `_build_prm_eval_prompt` 是**以 next_state 为证据**判定、且每个 turn 都能拿 OPD hint。中间轮次约占训练混合 72%。**这是下一步讨论的方向，尚未实现。**
+- `20260902_094458` / 09-03 两次的 checkpoint 均已污染，不能作为起点。
+- **round 轮数仍无上限**（186 轮空转的案例）。
+- **⚠ 基准口径已更正（2026-09-03）：定版基线 17.8%/0% 整体作废**（跑在带 session-key 兜底 bug 的 OpenClaw 构建上，文件写进 `workspace-main/`），**训练效果一律改用 K=0（34.9%/13.4%）作对照**。**K=6 的"正面训练效果"已被证伪**——K=0 零训练就有 34.9%/13.4%，与 K=6 的 37.3%/13.9% 基本重合，**训练增益接近 0**。此前所有"相对 17.8% 提升"的表述（含对外汇报）需要更正。
+- **环境侧已恢复成与论文一致（2026-09-04）**：三项反馈加料（含直接泄露 checker 判据的 `_FC_DIR_MODE_NOTE`）全部移进 OPD hint（模型看不见），`[Previous Feedback]` 恢复官方原文；`training_passed` 不再覆盖环境反馈；infra 失败轮记 0 分进分母。**所有现有跑分（含 K=0 的 34.9%/13.4%）随之作废，需要重跑基线。**
+- **论文 Table 1 已从原文核实并转录**（Part I：GPT-5.2 Baseline 41.1/14.7、Kimi-K2.5 Baseline 21.4/2.0、Kimi Full 40.6/≈16.5），**Compl 定义与我们一致**。**仍未解释：4B 零训练的 Compl 13.4% 贴着 GPT-5.2 的 14.7%**——三项加料已被逐题统计排除为主因，剩下的已知差异是按题隔离 session 与 context 65536，待单变量实验。
+- **MetaClaw 论文 Table 1 从未转录进本项目文档、本地也没有 PDF**，"论文 Baseline 约 21%/约 2%"是二手数字；且 `Compl.` 是本项目自定义的量。**核实前不能拿论文当锚点。**
+- **协议偏离（2026-09-03 查清）：官方 MetaClaw 按天共用一个 session- 其余同 09-02（历史状态）。
+
+### 下一步
+1. **OpenClaw-RL 复现**：同 08-17
+2. **MetaClaw 迁移**：**先跑 `METACLAW_TRAIN_UNTIL_DAY=0` 的按题隔离零训练基线**（零代码改动），它同时补上「K=6 vs 基线」一直缺的那一格（此前对照混着按题/按天的协议差）。基线拿到后再跑「按题成组 + 1/N」的训练：**跑满 30 天、不单独做冒烟**，内设检查点 A（day02，验管线）与检查点 B（day08–10，对标健康画像），不达标当场杀掉。**轨迹级方案已于 09-03 当天被 OpenClaw 的 `dropReasoningFromHistory` 行为推翻并删除**，见迁移文档"方案：按题成组 + 1/N advantage 缩放"。
+3. 其余同 08-17
+
+### 未验证
+- [ ] **reasoning 到底在不在被训练的 token 里**——`response_ids` 由 `apply_chat_template` 渲染 assistant 消息得到，Qwen3 模板会不会渲染 `reasoning_content` 本地无法确认。**这条决定"thinking 膨胀"这个叙事成不成立**，查法：`awk '/thinking=[0-9]+ chars/{t=$0} /MAIN session=.*response_tokens=/{print t" || "$0}' training.log`
+- [ ] **`METACLAW_*` 环境变量到底有没有传到训练后端进程**——从未验证过（代码注释里记过这个担心）；`judge` 是默认值，所以"模式看起来对"证明不了传播成功
+- [ ] **中间步骤判官正奖励是不是 thinking 膨胀的上游原因**——至今没有被干净地回答过（承接 09-01/09-02）
+- [ ] **Phase 1 在真实训练环境下的实际效果**——打分正确性已核实，训练效果层面未回答
+- [ ] **Traceback 泄漏修复在真实训练中是否生效**——合成测试通过，需确认真实 `[Previous Feedback]` 里 Traceback 归零
+- [ ] **`done.log` 非追加场景真实触发率**——监控已埋点，等真实训练观察
+- [ ] **`_AGENT_PAUSE_MARKERS` 扩展在真实暂停窗口下是否真的挽回了原本会丢的样本**
+- [ ] **K=6 冻结实验的结果用官方独立 `metaclaw-bench run` 重新核实**——目前走的是训练自己的 harness
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"这两个结论之间的矛盾（承接 08-18，仍未解开）
+- [ ] 官方 MetaClaw Compl. 非零的真实原因——开放问题，不阻塞
+- 其余同 09-02（历史状态，见 [`status_history.md`](status_history.md)）
+
+
 ## 历史状态（2026-09-02，已被 9/3 全面回退取代）
 
 ### 已就绪

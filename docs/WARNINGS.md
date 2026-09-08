@@ -84,3 +84,58 @@ openclaw-test/teacher_chat.py
 **论文 simulator 模型：Qwen3-32B**（Section 4.1 原文，非 GPT-4.1）
 
 **详细说明见：`docs/paper_reproduction_scope.md`**
+
+---
+
+# ⚠️ MetaClaw 迁移阶段的警示（arXiv:2603.17187，另一篇论文）
+
+> 以上全部是 **OpenClaw-RL（arXiv:2603.10165）** 的内容。下面这一节属于 **MetaClaw 迁移**阶段，两者是不同的论文和代码库，**不要混用**。
+
+## ❌ 最大的坑：Part I 和 Part II 是两套完全独立的东西
+
+MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两套独立的 agent 栈、两个任务域**。仓库里两套代码并存，极易误认。
+
+| | **Part I** | **Part II** |
+|---|---|---|
+| 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` |
+| system prompt | **附录 A.1 逐字自带**（"The single tool exposed to the agent is `run_command`"）| **一个都没有**，用 OpenClaw 原生 |
+| 工具集 | **单个 `run_command`** | `profile: coding` 全套 read/write/edit/exec |
+| 任务域 | **操作/配置一个 OpenClaw 安装**（CLI 运维）| **在工作区里产出文件**（文档产出）|
+| 工作区 | **无**（`_exec_command` 是裸 shell，不传 `cwd`）| 每个 test 一个隔离副本 |
+| 评分 | **无**（`reward=0.0`，交产品的 PRM）| checker，`cwd=workspace_path` |
+| 任务数据 | `examples/train.jsonl`（72 条）| `benchmark/data/metaclaw-bench/`（30 天/346 题）|
+
+## ❌ 千万别以为"用了官方数据集 = 用了对应 Part 的方法"
+
+**本项目在这上面栽了很久**（2026-08 中旬～09-07，多轮结论反复）：
+
+1. 公开数据集**物理上就嵌在 `benchmark/data/` 里**，用它只能走 `benchmark/src/` 这条 harness——**这不是一个选择，是目录结构决定的唯一默认路径**
+2. 更关键：**`benchmark/data/metaclaw-bench/` 目录里同时打包了 agent 配置**——`openclaw_cfg/openclaw.json`（`profile: coding` 全套工具）和 `workspaces/shared/`（IDENTITY.md / SOUL.md / USER.md / AGENTS.md / TOOLS.md）。**`benchmark/src/` 本身是中立的，"Part II 特征"是随数据集发的**
+3. 而这份数据集的规模（30 天 / 346 题 / 10–15 每天）与论文 **Part I** 定义 7/7 吻合
+
+**→ 结果就是「用 Part II 的方法跑 Part I 的数据集」，分数与 Table 1 任何一列都对不上。**多日的"4B 零训练贴平 GPT-5.2"异常根源在此，不是模型问题、不是 harness bug、也不是评测口径。
+
+## ❌ 论文附录的 Part 标签不可靠，不要当证据
+
+已证实附录至少三处 Part 归属存疑（A.2 的身份文件随 Part I 数据发布；A.3 的示例标签与实际数据对不上）。**判定归属时只采信可数事实**（天数 / 题数 / 每天题数 / 轮次号 / 题型配比），不要采信文字标签。
+
+有效的判定法（A.3 对称性测试）：**拿附录示例的内容去仓库里找**——Part I 示例在 `examples/train.jsonl` 第 1 条逐字存在；Part II 的两个示例（day01/r1 多选、day01/r21 `decision_log`）**在库里完全不存在**（本库 day01/r1 是 file_check、day01 只到 r10、全库无 `decision_log`、最大轮次号 15）。
+
+## ❌ 不要拿 Table 1 当锚点
+
+**两列都不 like-for-like**：Part I 列方法不同（单工具 vs 全套），Part II 列数据集不同（14 天/588 题/MC 74% vs 我们 30 天/346 题/MC 35%）。公开仓库里**没有任一 Part 的"方法 + 数据集"完整组合**。
+
+**→ 训练效果一律以我们自己的 K=0 为基准**（2026-09-04 定，09-07 复核仍有效）。
+
+## ❌ 已作废的基线，不要再引用
+
+- **17.8% / 0%（定版基线）**：跑在带 OpenClaw session-key 兜底 bug 的构建上，文件写进 `workspace-main/` 而非 checker 读的目录，`Compl=0` 是构建产物不是能力上限。且其 "agentfix" 很可能只补了 `--agent` 四层链条中的 L1、因 L2/L3 断链而**静默无效**
+- **K=6 的"正面训练效果"**：已被证伪（K=0 零训练即 34.9%/13.4%，与 K=6 的 37.3%/13.9% 基本重合，训练增益接近 0）
+
+## ⚠️ `--agent` 是一条四处断链，缺一处静默失效
+
+`_run_openclaw_agent` argv / `_run_question`→`_run_openclaw_agent` / `_run_group`→`_run_question` / `_run_group`→末轮 standalone feedback。**缺任何一处，`agent_id` 一路默认成 `None`，argv 里的 `--agent` 消失，行为与完全没修逐字节相同。**
+
+判断时**按 caller+callee 配对，不要按行号**——`infer_cmd.py` 里有一个长得极像的 `_execute_update(agent_id=agent_id, ...)` 就在同一个函数里，本项目已因此误判过一次。校验器见 `scripts/metaclaw/run_official_baseline_modelfactory.sh`。
+
+**详细说明见：[`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」与查证记录（十）～（十六）**
