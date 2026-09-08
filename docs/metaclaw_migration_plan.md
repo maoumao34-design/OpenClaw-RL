@@ -542,6 +542,8 @@ day26-30 arc=F  五条全开，混合复现
 
 **（B）需要额外假设、降级为待定：**
 
+> **⬆ 已于同日按查证记录（十五）升回成立。**（B）当初降级的理由是"它只有一条证据线，且需要相信 §4.1.1 对 Part I 的描述"。用户指出附录 A.1 明确写死了 Part I 的工具集，据此复核发现**仓库里是两套完全独立的 agent 栈**——这是一条**独立于 §4.1.1 的证据线**。三条独立证据同向后，本结论成立。详见（十五）。
+
 "公开题集在方法层面对应 Part II"——**该结论的前提是"§4.1.1 对 Part I 的描述是准确的"**。本项目已两次栽在轻信论文对自身组件的描述上（A.1 的 `run_command`、A.2 的 Part 标签），同类假设不再直接采信。故此结论**待定，不作为决策依据**。
 
 #### （A）已足以废掉 14.7% 的对照——两条出路同归
@@ -568,6 +570,61 @@ day26-30 arc=F  五条全开，混合复现
 #### 残留未知
 
 为什么这份 artifact 是 Part II 的方法配 Part I 的日历，无法从公开材料判定（可能是作者后来重整合并、也可能论文对 Part I 的描述不准）。**不再就此推测。**
+
+---
+
+### 查证记录（十五）：仓库里是两套独立的 agent 栈，我们跑的是 Part II 那套（2026-09-07）
+
+**用户读完论文实验与附录后指出：Part I 明确只能用 `run_command`（schema 就在附录里、Part I 的系统提示词也写死了这一点），能用 OpenClaw 全套工具的是 Part II。据此复核，成立，并解开了此前的关键误判。**
+
+#### 决定性证据：两套 agent 栈并存于同一仓库
+
+```
+grep -rln "expert CLI agent|controlling an OpenClaw installation|single tool exposed" --include=*.py .
+  → metaclaw/openclaw_env_rollout.py        （唯一命中）
+
+grep -rn "system_prompt|SYSTEM_PROMPT" --include=*.py benchmark/src/
+  → 空
+```
+
+| | **Part I** | **Part II** |
+|---|---|---|
+| 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` |
+| system prompt | **A.1 逐字自带**（"The single tool exposed to the agent is `run_command`"，含 schema 与 `openclaw status` / `openclaw agents add` 示例）| **一个都没有** → 用 OpenClaw 原生 |
+| 工具集 | 单 `run_command` | `openclaw_cfg/openclaw.json` 的 `profile: coding`（全套 read/write/edit/exec/glob/grep）|
+| 任务数据 | `examples/train.jsonl`（A.3 标 "Part I task instruction format"，72 条真实 OpenClaw CLI 会话）| `benchmark/data/metaclaw-bench/` |
+| 身份注入 | 无 | IDENTITY.md / SOUL.md（A.2）|
+| 隐含规则 | 无 | P1–P5 渐进激活（A.7）|
+
+**我们跑的是 `benchmark/` → 我们跑的是 Part II 的 agent 栈。**
+
+#### 我此前的关键误判
+
+（十三）把 `profile: coding` 当作"公开 benchmark 反驳了 A.1"的证据。**这是错的**——它不反驳 A.1，**它只是说明这份配置属于 Part II**。A.1 描述的是另一套东西，那套东西也在仓库里（`openclaw_env_rollout.py`），只是我们从未跑过。
+
+同样地，（十三）说"A.1 那套没有评分能力所以不是评测器"——事实仍对（它确实是 RL 训练环境、`reward=0`），但**不能据此推出"A.1 的 Part I 标签是错的"**。正确解读是：**Part I 的 agent 定义随代码发布了，Part I 的评测 harness 没有发布。**
+
+#### 现在三条独立证据线同向
+
+| 线 | 内容 | 独立性 |
+|---|---|---|
+| 1. 工具与提示词 | A.1 写死单 `run_command`；`benchmark/` 无 system prompt 且用 `profile: coding` | 来自附录 + 代码分布 |
+| 2. 任务性质 | 释出的 FC 是 rule-based、**跨轮依赖 0/224**，符合 §4.1 的 Part II、矛盾于 Part I | 来自 §4.1.1 + 实测 |
+| 3. 机制 | IDENTITY/SOUL 注入（A.2）+ P1–P5 渐进激活（A.7），均为 Part II 特征 | 来自 A.2/A.7 + 数据 |
+
+**唯一仍指向 Part I 的只剩日历规模（30 天 / 346 题 / 10–15 每天）这一项**，且 Part II 的题集（14 天 / 588 题，有 r21、有 `decision_log`）确实不在公开库里——（十一）的"我们跑的是 Part II 的**题集**"仍然是错的。
+
+**综合结论：公开的 `MetaClaw-Evolution-Bench` = Part II 的 agent 栈与适应机制，装在一个 30 天 / 346 题的日历上。**
+
+#### 对"异常"的影响
+
+**该对的是 Table 1 的 Part II 那一列**（GPT-5.2 Baseline 44.9 / **58.4**，Kimi-K2.5 Baseline 21.1 / **18.2**）。我们 `scope=day` K=0 的 day01–17 是 49.9% / **36.3%**，**落在 Kimi 与 GPT-5.2 之间且明显低于 GPT-5.2，排序正常**。"4B 打平/超过 GPT-5.2"这一持续多日的异常，**最尖锐的形态到此消解**。
+
+**但仍不构成 like-for-like，K=0 锚点不变**：Part II 是 14 天 / 588 题 / MC 占 74%，我们是 30 天 / 346 题 / MC 占 35%；题量、天数、MC/FC 配比全不同，且难度随 day 单调上升而我们只算到 day17。**09-04 定的"训练效果一律以我们自己的 K=0 为基准"继续有效**，理由回到"规模与配比不可比"。
+
+#### 与（十一）的关系
+
+（十一）的**方法侧直觉是对的**，其**题集侧论断是错的**，而它当时给的证据（`\bbox` 格式串、`check_iso8601` 文件名）两者都撑不住。本条用**工具栈 + 任务性质 + 适应机制**三条独立线重建了方法侧结论，题集侧维持否定。
 
 ---
 

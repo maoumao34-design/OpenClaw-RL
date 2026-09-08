@@ -2062,7 +2062,29 @@
 | 查证记录（十一）| 我们跑的是 **Part II 的题集** | **证伪**：Part II 是 14 天/588 题，有 r21、有 `decision_log`，公开库里都没有 |
 | 查证记录（十二）| 公开题集**就是 Part I** | **只在规模维度成立** |
 | 查证记录（十三）| §4.1 逐字复核 + 官方配置实证 | 成立 |
-| 查证记录（十四）| 方法上更偏 Part II | **正面结论降级为待定**；载荷结论改为否定式 |
+| 查证记录（十四）| 方法上更偏 Part II | 正面结论一度降级为待定；载荷结论为否定式 |
+| 查证记录（十五）| **我们跑的就是 Part II 的 agent 栈** | **成立**（三条独立证据线）|
+
+**第五轮（用户读完实验与附录后指出，决定性）：Part I 明确只能用 `run_command`，schema 与系统提示词都在附录里；能用 OpenClaw 全套工具的是 Part II。**复核后发现**仓库里是两套完全独立的 agent 栈**：
+
+```
+A.1 那段 system prompt  → 只在 metaclaw/openclaw_env_rollout.py 命中
+benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
+```
+
+| | Part I | Part II |
+|---|---|---|
+| 实现 | `metaclaw/openclaw_env_rollout.py` | `benchmark/` ← **我们跑的** |
+| system prompt | A.1 逐字自带（单 `run_command` + schema）| 无，用 OpenClaw 原生 |
+| 工具 | 单 `run_command` | `profile: coding` 全套 |
+| 任务数据 | `examples/train.jsonl`（A.3）| `benchmark/data/metaclaw-bench/` |
+| 身份注入 / 隐含规则 | 无 | IDENTITY+SOUL（A.2）/ P1–P5（A.7）|
+
+**我的关键误判**：（十三）把 `profile: coding` 当成"公开 benchmark 反驳了 A.1"。**它不反驳 A.1，它只说明这份配置属于 Part II**——A.1 描述的是另一套东西，那套也在仓库里，只是我们从未跑过。正确解读是：**Part I 的 agent 定义随代码发布了，Part I 的评测 harness 没有发布。**
+
+**三条独立证据线同向**：①工具与提示词（A.1 + 代码分布）②任务性质（§4.1 + 跨轮依赖 0/224 实测）③机制（A.2 身份注入 + A.7 的 P1–P5）。**唯一仍指向 Part I 的只剩日历规模（30 天/346 题）。**
+
+**对异常的影响**：该对的是 **Part II 那一列**（GPT-5.2 44.9/**58.4**，Kimi 21.1/**18.2**）。我们 `scope=day` K=0 的 day01–17 是 49.9%/**36.3%**，**落在两者之间且明显低于 GPT-5.2，排序正常**——"4B 打平/超过 GPT-5.2"这一持续多日的异常，**最尖锐的形态到此消解**。**但仍非 like-for-like**（Part II 是 14 天/588 题/MC 74%，我们 30 天/346 题/MC 35%，且难度随 day 上升而只算到 day17），**K=0 锚点不变**，理由改为"规模与配比不可比"。
 
 **关键测量（只靠数据、不依赖信任论文自述）：**
 - 公开题集实测 **30 天 / 346 题 / 每天 10~15 / MC 122(35%) + FC 224(65%)**——四项全部不符 Part II（14 天/588 题/42 每天/MC 74%）
@@ -2072,7 +2094,7 @@
 - `all_tests.json` 呈标准渐进激活：arc A(day01-05) P1 → B +P2 → C +P3 → D +P4 → E +P5 → F 五条全开；数据集自称 **`MetaClaw-Evolution-Bench`**
 - **官方配置实证**：`openclaw_cfg/openclaw.json` 是 `"tools": {"profile": "coding", "deny": ["group:memory"]}`——**原生全套工具**，全仓库无任何单 `run_command` 限制；数据集内 `TOOLS.md` 列的也是多工具且被 `workspace_integrity.py` 列为**必需文件**。**我们的 driver 用的就是这份官方配置 → 工具集与官方 benchmark 对齐**
 
-**载荷结论（只靠测量）：公开题集的 file-check 内容与 §4.1 对 Part I 的描述直接矛盾**（"heavily execution-oriented" ✗、"many interdependent side effects" 0/224 ✗）。**这已足以废掉 14.7% 的对照，两条出路同归**：描述准确 → 这不是 Part I → 不可比；描述不准 → 不知道 14.7% 测在什么题上 → 仍不可比。**"4B 打平/超过 GPT-5.2"无论如何都失去依据。**
+**载荷结论（第五轮后更新）：我们跑的是 Part II 的 agent 栈（见上表第五轮）。此前只靠测量得到的否定式结论仍然成立且更强——公开题集的 file-check 内容与 §4.1 对 Part I 的描述直接矛盾**（"heavily execution-oriented" ✗、"many interdependent side effects" 0/224 ✗）。**这已足以废掉 14.7% 的对照，两条出路同归**：描述准确 → 这不是 Part I → 不可比；描述不准 → 不知道 14.7% 测在什么题上 → 仍不可比。**"4B 打平/超过 GPT-5.2"无论如何都失去依据。**
 
 **回答"附录那两项是不是全部区别"：不是。**§4.1 另给了 FC 任务性质对比、MC/FC 配比、5 条隐含规则；而**真正的空白在别处**——(1) **Part II 的 system prompt 和工具集论文全文从未给出**；(2) Part I 是否也注入 workspace 上下文从未说明；(3) **会话粒度两个 Part 都没写**；(4) 全文从未出现 USER.md / AGENTS.md / TOOLS.md。另注意 "All conditions use identical prompts and tool sets" 约束的是 **conditions（Baseline/Skills/Full）而非两个 Part**，不能误用。
 → 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)"查证记录（十一）～（十四）"
