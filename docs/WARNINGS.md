@@ -146,4 +146,4 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 
 判断时**按 caller+callee 配对，不要按行号**——`infer_cmd.py` 里有一个长得极像的 `_execute_update(agent_id=agent_id, ...)` 就在同一个函数里，本项目已因此误判过一次。校验器见 `scripts/metaclaw/run_official_baseline_modelfactory.sh`。
 
-**详细说明见：[`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」与查证记录（十）～（十六）**
+**详细说明见：[`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」与查证记录（十）～（十七）**
