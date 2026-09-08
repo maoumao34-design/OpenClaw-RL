@@ -179,12 +179,19 @@ def main():
     print("\n[OPD hint anchors on the round task]")
     select = open(os.path.join(tmp, "openclaw_combine_select_api_server.py"),
                   encoding="utf-8").read()
-    ck("_mc_first_user = next(" in select,
-       "the verdict branch locates the round's first user message")
-    ck("_mc_msgs[: _mc_first_user + 1], _metaclaw_hint," in select,
-       "the hint is appended to the task, not to the last tool result")
-    ck("+ _mc_msgs[_mc_first_user + 1 :]" in select,
+    # 2026-09-07: anchoring moved from "the session's first user message"
+    # to "the message carrying this round's task_prefix". Under one session
+    # per day the first user message is day-round-1's question, so the old
+    # form attached every later round's feedback to the wrong task. See
+    # test_metaclaw_day_scope_fixes.py for the behavioural coverage.
+    ck("_mc_task_idx" in select,
+       "the verdict branch locates THIS round's task via task_prefix")
+    ck("_mc_msgs[: _mc_task_idx + 1], _metaclaw_hint," in select,
+       "the hint is appended to that task, not to the last tool result")
+    ck("+ _mc_msgs[_mc_task_idx + 1 :]" in select,
        "the rest of the conversation is spliced back unchanged")
+    ck("_mc_first_user" not in select,
+       "the day-unsafe first-user form is gone")
 
     print(f"\nall {n} assertions passed")
 

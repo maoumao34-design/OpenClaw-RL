@@ -103,6 +103,27 @@ import sys
 src_path, dest_path = sys.argv[1], sys.argv[2]
 text = open(src_path, encoding="utf-8").read()
 
+# The round-group membership filter below needs _flatten_message_content,
+# which the combine server does not import (the OPD server defines it).
+import_old = (
+    "from openclaw_opd_api_server import OpenClawOPDAPIServer, generate, reward_func  # noqa: F401\n"
+)
+import_new = (
+    "from openclaw_opd_api_server import (  # noqa: F401\n"
+    "    OpenClawOPDAPIServer,\n"
+    "    _flatten_message_content,\n"
+    "    generate,\n"
+    "    reward_func,\n"
+    ")\n"
+)
+if text.count(import_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 occurrence of the openclaw_opd_api_server "
+        f"import line in {src_path}, found {text.count(import_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+text = text.replace(import_old, import_new, 1)
+
 # ---------------------------------------------------------------------
 # Source of the 1/N advantage scaler, written out verbatim below. Kept as a
 # literal here (rather than a checked-in .py under scripts/) so the whole
@@ -535,11 +556,71 @@ round_dispatch_new = (
     '                # The held intermediate turns are still in `pending`: they\n'
     '                # have no PRM task, so the `task is None` branch above skips\n'
     '                # them without popping (force_drop is False on this path).\n'
-    '                _mc_turns = [\n'
-    '                    pending[t] for t in sorted(pending.keys()) if t < turn_num\n'
-    '                ]\n'
-    '                for _t in [t for t in list(pending.keys()) if t < turn_num]:\n'
+    '                # --- round boundary (2026-09-07) ---\n'
+    '                # `t < turn_num` alone silently assumes `pending` can only\n'
+    '                # ever hold THIS round\'s turns. That held for free while\n'
+    '                # every round had its own session; with one session per day\n'
+    '                # it holds only as long as every verdict dispatches. If one\n'
+    '                # does not (duplicate-retry drop, a network failure, the\n'
+    '                # has_valid_rl `continue` below), that round\'s turns stay\n'
+    '                # pending and the NEXT round would sweep them up, giving\n'
+    '                # them the next round\'s reward and inflating its 1/N\n'
+    '                # denominator. Bounding below by the previous verdict makes\n'
+    '                # the round boundary explicit instead of implied.\n'
+    '                _mc_bounds = getattr(self, "_metaclaw_last_verdict_turn", None)\n'
+    '                if _mc_bounds is None:\n'
+    '                    _mc_bounds = self._metaclaw_last_verdict_turn = {}\n'
+    '                _mc_lo = _mc_bounds.get(session_id, 0)\n'
+    '                _mc_orphans = [t for t in sorted(pending.keys()) if t <= _mc_lo]\n'
+    '                if _mc_orphans:\n'
+    '                    # Left behind by an earlier round whose verdict never\n'
+    '                    # dispatched. Dropping them is the honest option -- they\n'
+    '                    # belong to a round this verdict did not score.\n'
+    '                    logger.warning(\n'
+    '                        "[openclaw-rl-metaclaw-round-group] session=%s verdict "\n'
+    '                        "turn=%d found %d orphaned turn(s) %r from a round whose "\n'
+    '                        "verdict never dispatched -- dropping, NOT merging into "\n'
+    '                        "this round",\n'
+    '                        session_id, turn_num, len(_mc_orphans), _mc_orphans,\n'
+    '                    )\n'
+    '                    for _t in _mc_orphans:\n'
+    '                        pending.pop(_t, None)\n'
+    '                _mc_cand = [t for t in sorted(pending.keys()) if _mc_lo < t < turn_num]\n'
+    '\n'
+    '                # The turn-number bound alone is not enough. It only moves\n'
+    '                # forward when a verdict DISPATCHES, so a round whose verdict\n'
+    '                # was lost outright (the POST failed, and VERDICT_RETRY is 0\n'
+    '                # by default) leaves its turns inside the next round\'s window.\n'
+    '                # Membership is decided instead by the round\'s own task text:\n'
+    '                # a turn from round r carries tasks 1..r in its prompt, so it\n'
+    '                # contains round r\'s task while an earlier round\'s turn does\n'
+    '                # not. That needs no verdict bookkeeping to be correct.\n'
+    '                _mc_prefix = (opd_result.get("metaclaw_task_prefix") or "")[:120]\n'
+    '                if _mc_prefix:\n'
+    '                    _mc_mine, _mc_foreign = [], []\n'
+    '                    for _t in _mc_cand:\n'
+    '                        _hit = any(\n'
+    '                            isinstance(_m, dict) and _m.get("role") == "user"\n'
+    '                            and _mc_prefix in _flatten_message_content(_m.get("content"))\n'
+    '                            for _m in (pending[_t].get("messages") or [])\n'
+    '                        )\n'
+    '                        (_mc_mine if _hit else _mc_foreign).append(_t)\n'
+    '                    if _mc_foreign:\n'
+    '                        logger.warning(\n'
+    '                            "[openclaw-rl-metaclaw-round-group] session=%s verdict "\n'
+    '                            "turn=%d: %d turn(s) %r in this window do not carry "\n'
+    '                            "this round\'s task -- they belong to a round whose "\n'
+    '                            "verdict was lost; dropping, NOT merging",\n'
+    '                            session_id, turn_num, len(_mc_foreign), _mc_foreign,\n'
+    '                        )\n'
+    '                        for _t in _mc_foreign:\n'
+    '                            pending.pop(_t, None)\n'
+    '                    _mc_cand = _mc_mine\n'
+    '\n'
+    '                _mc_turns = [pending[t] for t in _mc_cand]\n'
+    '                for _t in _mc_cand:\n'
     '                    pending.pop(_t, None)\n'
+    '                _mc_bounds[session_id] = turn_num\n'
     '                if not has_valid_rl:\n'
     '                    # No usable outcome for this round, so there is nothing\n'
     '                    # for the held turns to inherit. Dropping is the only\n'

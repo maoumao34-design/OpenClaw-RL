@@ -798,12 +798,21 @@ async def _send_freeze_signal(client: httpx.AsyncClient, retry: int) -> None:
     )
 
 
+# How much of the round's task text travels in the verdict payload so the
+# proxy can locate that task inside the day's transcript. Long enough to be
+# unambiguous across a day's questions, short enough not to bloat the payload
+# (which becomes a real message in the proxy's view of the session).
+_VERDICT_TASK_PREFIX_CHARS = 300
+
+
 async def _send_verdict_turn(
     client: httpx.AsyncClient,
     session_id: str,
     eval_score: float,
     hint: str,
     session_done: bool,
+    round_id: str,
+    task_prefix: str,
     retry: int = 0,
 ) -> None:
     """POST a synthetic next-turn carrying the round's deterministic verdict.
@@ -838,8 +847,29 @@ async def _send_verdict_turn(
     real intermediate tool-call turn). See docs/metaclaw_migration_plan.md
     for the full investigation.
     """
+    # round_id and task_prefix both exist because the session is now shared
+    # by a whole day (2026-09-07); under one-session-per-round neither was
+    # needed and neither existed.
+    #
+    # round_id makes the payload unique per round. Without it two rounds of the
+    # same day that fail the same way produce a byte-identical verdict, and the
+    # proxy's duplicate-user-retry rule (which now sees the whole day, not one
+    # round) drops the second one -- taking that round's held turns with it and
+    # leaving them to be swept into the NEXT round's group with the NEXT
+    # round's reward.
+    #
+    # task_prefix lets the proxy find THIS round's task inside a day-long
+    # transcript. The OPD hint used to be anchored to "the first user message
+    # of the session", which was the round's task only while each round had its
+    # own session; in a day-long transcript it is day-round-1's task.
     verdict_payload = json.dumps(
-        {"metaclaw_verdict": True, "eval_score": eval_score, "hint": hint},
+        {
+            "metaclaw_verdict": True,
+            "eval_score": eval_score,
+            "hint": hint,
+            "round_id": round_id,
+            "task_prefix": task_prefix[:_VERDICT_TASK_PREFIX_CHARS],
+        },
         ensure_ascii=False,
     )
     await _post_with_retry(
@@ -1893,6 +1923,8 @@ async def run_day(
                             # round, or the proxy would force-drop turns that
                             # later rounds of the SAME session still need.
                             session_done=is_last_round,
+                            round_id=str(round_record.get("id", f"idx{idx}")),
+                            task_prefix=query,
                             retry=VERDICT_RETRY,
                         )
                     else:

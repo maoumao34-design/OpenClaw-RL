@@ -164,6 +164,59 @@ proc = await asyncio.create_subprocess_shell(
 
 ---
 
+## 🔧 按天改造的四个正确性修复（2026-09-07，训练前必须在位）
+
+改成按天之后完整复查训练链路，发现四处问题——**其中一处早于按天、已经躺了四天**。全部已修 + 回归测试。
+
+### D（最严重，早于按天）：按题成组 + 1/N **从来没执行过**
+
+`openclaw_combine_api_server.py` 用 `if opd_result.get("metaclaw_verdict"):` 作为整条 round-group 分支的开关，但 `_opd_evaluate`（select server）的返回字典是 `{accepted, teacher_tokens_candidates, hint, hints, votes, eval_score}`——**从来没有 `metaclaw_verdict` 这个键**。
+
+**所以自 2026-09-03 实现至今，该分支恒为假：held 的中间 turn 从未被收集成组，1/N 从未生效。**实际行为退化为"每轮只有最后一个 turn 成样本，中间 turn 全部 held 到天末丢弃"。
+
+未被发现是因为该机制**一直没在真实训练里跑过**。
+
+**修复**：verdict 分支的两个 return 都补上 `"metaclaw_verdict": True` 与 `"metaclaw_task_prefix"`。
+
+### A：OPD hint 挂到了错误轮次的题面上
+
+原逻辑把消息截到**本 session 的第一条 user 消息**再交给 `_append_hint_to_messages`（它向后找最后一条 user）。按题时第一条 user 就是本轮题目；**按天时它是当天第 1 轮的题目**，于是第 2~N 轮的 checker 反馈全贴错了题。
+
+**修复**：driver 在 verdict payload 里带 `task_prefix`（截 300 字符），代理**向后**搜索携带该前缀的 user 消息定位本轮题面；**找不到就抛错跳过 hint 并告警，绝不回退到第一条**——贴错比不贴更糟。
+
+### B：verdict payload 跨轮撞车 → 整轮被丢
+
+payload 原本是 `{metaclaw_verdict, eval_score, hint}`，**无轮次标识**。同一天两轮若失败方式相同（如都 `-1` 且 hint 为空），payload 逐字相同 → 触发 duplicate-user-retry 规则（其 `_seen` 按 session、现在是一整天）→ 第二个 verdict 被丢。
+
+**而 verdict 正是触发整轮打包的那一步。**
+
+**修复**：payload 加 `round_id`。
+
+### C：轮边界——两层，缺一不可
+
+原收集条件 `t < turn_num` 隐含"pending 里只可能有本轮的 turn"，按题时结构上必然成立，按天时只在"每个 verdict 都派发"时成立。
+
+**第一层（不够）**：加下界 `_mc_lo < t < turn_num`，`_mc_lo` = 上一个已派发 verdict 的 turn。**但测试当场证伪了它**——`_mc_lo` 只在 verdict **成功派发**时前进，verdict 整个丢失时下一轮仍会吞掉前一轮的 turn（实测收到 `[5,6,8,9]`）。
+
+**第二层（关键）**：按**本轮题面**判定归属——第 r 轮的 turn 其 prompt 含 tasks 1..r，故含第 r 轮题面；第 r-1 轮的 turn 不含。**这条不依赖任何 verdict 记账**。不属于本轮的 turn 被显式丢弃并告警，**不并入**。
+
+### 验证
+
+- 三个补丁脚本 `bash -n` + **端到端实跑生成产物并 `py_compile`**
+- 新增 `scripts/tests/test_metaclaw_day_scope_fixes.py`，**25 项断言**，含逻辑复刻场景（三轮正常 / 第 2 轮 verdict 丢失 / 无 task_prefix 回退 / hint 定位）
+- **非空洞性双向**：把 `metaclaw_verdict` 键改名 → 挂在 D；关掉成员过滤 → 第 3 轮收到 `[5,6,8,9]`，挂在 C
+- 四个测试套件全过（day_scope 13 / day_scope_fixes 25 / round_group 41 / env_fidelity 24）
+- 更新了 `test_metaclaw_round_group.py` 里断言旧 `_mc_first_user` 的三项
+
+### 仍未解决（不在本轮范围）
+
+- **`--dir --min-count` 累计阶梯**（70/224 = 31% 的 file_check）：早轮欠账让本轮做对也判 -1。**这是奖励本身错，不是归属错**，按天不解决，从未打过补丁。**下一轮专门讨论**
+- 共享 transcript 的信用分配（按天固有，论文同）
+- 三层工具塌陷（空回复样本 / `sum_of_sample_mean` 等权 / 批级基线放大）——已定位未修
+- 全负批（1/N 只压幅度不改符号，需 `n_samples>1`）
+
+---
+
 ## 📑 如何阅读本文档（2026-09-07 加）
 
 本文档 3000+ 行、按时间追加，**其中若干节已被后续证据推翻或下调，均已就地加横幅**。按结论现状分类如下，避免误引已作废的内容。
