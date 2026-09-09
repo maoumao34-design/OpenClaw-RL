@@ -46,7 +46,7 @@
 - [x] **「按题成组 + 1/N advantage 缩放」已实现**——每 turn 一个样本（各带真实 prompt/response，零重建）；一个 round 的全部 turn 共用 `group_index`、verdict 时一次性入队；advantage 除以该轮 turn 数；`--rollout-batch-size 8` + `--use-dynamic-global-batch-size`。40 项断言 + 双向非空洞性本地通过，**真实训练未验证**
 - [x] **环境侧已与官方一致**：三项反馈加料全部移进 OPD hint（模型看不见），`[Previous Feedback]` 恢复官方原文；infra 失败轮记 0 分进分母
 - [x] **`METACLAW_SESSION_SCOPE` 开关**（`round` 现状 / `day` 官方），三处站点一起改，非法值 import 时抛错；15 项断言
-- [x] **定版基线 = 按天 K=0：Acc 41.1% / Compl 26.3%**（`20260907_112320`，commit `caabcc5`，已 AST 验证与 HEAD 等价，无需重跑）。**取代按题 K=0（34.4% / 12.1%，随按题模式一同作废）**
+- [x] **定版基线 = 按天 K=0：Acc 41.1% / Compl 26.3%**（`20260907_112320`）。**2026-09-09 第二趟 K=0（`20260909_094645`）跑出 44.7% / 25.9%，两趟一致，基线确认**。由此得噪声下限：**Acc ±3.6pt / Compl ±0.4pt**——Acc 提升低于约 4pt 与噪声不可区分
 - [x] **官方代码路径基线一键脚本已交付**：`scripts/metaclaw/run_official_baseline_modelfactory.sh`——校验 `--agent` 四处 → 落盘 manifest+diff → day30 冒烟 → **双侧落地实证** → 全量 → 自算 Compl。**尚未跑**
 
 ### 已知限制 / 未解决
@@ -62,7 +62,8 @@
 - `report/` 下汇报 PPT 产物未提交，待决定
 
 ### 下一步
-0. **【已做 09-07】全面改按天 + 定版基线 + 确认显存预算**——三项前置全部解除：按天 K=0 = **41.1% / 26.3%**（已定版）；`--max-tokens-per-gpu 32768` **保持不动**（实测 max peak 29521，0/683 超标；且它是论文官方脚本自己的值）。**主线训练现在无阻塞**
+0. **【阻塞中】训练连续两趟在同一处 OOM**（09-08 `20260908_164130`、09-09 `20260909_114032`）：teacher `gather_at_indices` 要 ~19.76 GiB，成因是单条 response ~35k 的空转循环。**待 CLI 查证三项**（本趟 1/N 是否真生效、为何补 D 后仍 OOM、健康段 12pt 落差），再决定是否做 train-only 8192 clamp
+0b. **【已做 09-07】全面改按天 + 定版基线 + 确认显存预算**——三项前置全部解除：按天 K=0 = **41.1% / 26.3%**（已定版）；`--max-tokens-per-gpu 32768` **保持不动**（实测 max peak 29521，0/683 超标；且它是论文官方脚本自己的值）。**主线训练现在无阻塞**
 1. **OpenClaw-RL 复现**：同 08-17
 2. **跑官方代码路径基线**（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——官方 harness vs 我们的 driver，**同题集、同工具、同为按天会话**，差值即纯粹的 driver 结构差
 3. **取按天 K=0（`20260907_112320`）跑满 30 天的最终数**（现在是唯一基线，优先级升高）
@@ -2064,6 +2065,48 @@
 - `scripts/metaclaw/metaclaw_rollout_driver.py`：`_build_next_round_feedback` 恢复官方原样；三项加料移入 `_build_opd_hint`；infra 失败轮记 0 分进分母
 - `scripts/tests/test_metaclaw_env_fidelity.py`（新增，24 项）
 - `docs/metaclaw_migration_plan.md`：新增"已实现（2026-09-04）"一节，含论文 Table 1 转录
+
+## 2026-09-09
+
+**目标：** 用补齐 D 之后的代码（`e7979e1`）跑第一次完整按天训练；同时补一趟按天 K=0 复核基线稳定性。
+
+**完成内容：**
+- **按天 K=0 复核跑完**（`20260909_094645`）：**Acc 44.7% / Compl 25.9%**，对照钉住的 `20260907_112320`（41.1% / 26.3%）
+- **→ 定版基线确认为「按天 K=0：Acc 41.1% / Compl 26.3%」**，两趟结果一致，该基线可作为按天隔离的正式对照
+- **由此得到噪声下限（重要）**：同配置、同 30 题集、零训练的两趟之间 **Acc 差 3.6pt、Compl 差 0.4pt**。→ **Acc 提升低于约 4pt 与噪声不可区分；Compl 相当稳定，小幅变化即有意义。**已写入 [`training_config.md`](training_config.md) 评测口径一节
+
+**主要问题：**
+- **训练 `20260909_114032` 中途 OOM 挂掉，成绩作废**（commit `e7979e1`，`train_until_day=disabled` 全量训）：
+  - 11:40 起 → **13:48 Ray Job 因 CUDA OOM 失败**（约 2h），训练**只到约 step 10**
+  - **死因与 09-08 完全相同**：teacher `gather_at_indices` 要再分 **~19.76 GiB**，GPU7 只剩 ~7 GiB；`max_tokens_per_microbatch ≈ 47400`（**单条 response ~35k**），压不过 `max_tokens_per_gpu=32768`
+  - 之后 rollout 空跑 → day10–30 全是 network connection error（**246/246 infra**）
+  - 表面成绩 **Acc 16.2% / Compl 12.5%**（249 次 infra）→ **作废**
+  - **"跑完很快"不是训完了**，是 OOM 杀了后端 → agent 全失败 → 日志迅速刷完 30 天
+- **⚠️ 一个值得单独查的信号：健康段的分数明显低于前一趟和 K=0**
+
+  | | day01–08 Acc | infra |
+  |---|---|---|
+  | 按天 K=0（同窗）| **59.2%** | 0 |
+  | 09-08 训练（D 未补全）| **58.6%** | 0 |
+  | **09-09 训练（D 已补全）** | **47.2%**（42/89）| **0** |
+
+  三者都是干净窗口（infra=0），所以是可比的。**09-09 比 K=0 低约 12pt，远超 3.6pt 的噪声下限**，而它恰好是**第一次真正启用按题成组 + 1/N** 的一趟。是"1/N 生效后反而更差"，还是 step 数不同/其它因素，**需要 CLI 查证，不下结论**
+- **`--dir --min-count`、三层工具塌陷、CP=1 + teacher 单卡**等已知问题均未动
+
+**待 CLI 查证：**
+1. **本趟 `scaled by 1/turns` 与 `queued group=` 的计数**——D 的后半是否真的生效。这是解读上面那 12pt 的前提
+2. 为什么补了 D 之后仍在同一处 OOM（长 response 未受任何约束，`--rollout-max-response-len 8192` 对本路径不生效）
+3. 健康段 12pt 落差的成因
+
+**下一步：**
+- CLI 查证回来后再决定是否做 **train-only 的 8192 response clamp**（此前分析：截断后由现成的 `truncation-penalty` 判 -1，正好打空转循环；评测/K=0 路径不得共用该 clamp，否则与定版基线不可比）
+- min-count 的讨论继续挂起
+
+**产出：**
+- `docs/training_config.md`：评测口径一节新增噪声下限（Acc ±3.6pt / Compl ±0.4pt）
+- `docs/work_log.md`：本条
+
+---
 
 ## 2026-09-07
 
