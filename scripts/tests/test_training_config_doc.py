@@ -11,6 +11,13 @@ actually decides it. Change the configuration and this test tells you the doc
 is stale; edit the doc without changing anything and it tells you the doc is
 wrong.
 
+WHEN TO RUN: at snapshot time -- after an experiment has settled and the
+configuration it used is being written down. The doc is deliberately NOT a
+real-time mirror: syncing it on every intermediate edit is wasted work and
+trains people to ignore a test that is usually red. A failure while you are
+mid-iteration is expected and means "the doc has not been resnapped yet", not
+"something is broken". It has to be green when the snapshot is taken.
+
 What is deliberately NOT checked: prose, rationale, the known-unfixed list,
 and the log-grep recipes. Those cannot be derived from the scripts. Keep them
 current by hand.
