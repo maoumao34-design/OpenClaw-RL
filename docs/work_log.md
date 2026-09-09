@@ -9,6 +9,7 @@
 | 文档 | 写什么 |
 |------|--------|
 | **本文件** (`work_log.md`) | 顶部：唯一的「当前状态」；其下：按日的目标、完成摘要、下一步 |
+| **[`training_config.md`](training_config.md)** | **当前训练配置的唯一现状来源**（拓扑/数据流/样本形成/超参/补丁清单）。改配置必须同步改它，并让 `scripts/tests/test_training_config_doc.py` 通过 |
 | **[`status_history.md`](status_history.md)** | 已被后续结果取代的历史状态快照（倒序归档） |
 | **`issues_log.md`** | 单次失败/报错的现象、根因、修复（含日志原文） |
 

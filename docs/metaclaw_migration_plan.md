@@ -1,6 +1,8 @@
 # OpenClaw-RL → MetaClaw 方法迁移记录
 
-[← 工作记录](work_log.md)
+[← 工作记录](work_log.md) · [当前训练配置 →](training_config.md)
+
+> **想知道"现在跑起来会发生什么"，看 [`training_config.md`](training_config.md)**，那是唯一的现状来源且有机器校验。本文档记录的是决策过程与查证记录。
 
 本文档记录：把本项目复现的 OpenClaw-RL（论文 arXiv:2603.10165 v2，Personal Agent Track / Hybrid RL 方法）迁移到 MetaClaw（论文 arXiv:2603.17187，`D:\MAO\Paper\MetaClaw`）这一新阶段的方案讨论、决策和实现记录。
 
