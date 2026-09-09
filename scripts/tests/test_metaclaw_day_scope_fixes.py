@@ -128,8 +128,34 @@ def main():
             raise AssertionError(f"FAILED: {label}")
         print(f"  ok  {label}")
 
+    # ------------------------------------------------------------ D (part 2)
+    # Patching a method on the parent class is not enough when the subclass
+    # the server actually instantiates overrides it. This is the second time
+    # the same mistake landed: the --agent chain had a look-alike call in the
+    # same function, and here the hand-back was patched into
+    # openclaw_combine_api_server.py while OpenClawCombineSelectAPIServer
+    # overrides both _submit_* methods. Run 20260908_164130 held 98 turns and
+    # still queued "group=" 0 times.
+    print("[D part 2: the SUBCLASS's overrides hand samples back too]")
+    ck(select.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 1,
+       "the select patch installs the hand-back (it is applied twice at "
+       "generation time, once per overridden method)")
+    ck("select_submit_collect_old" in select
+       and "text.count(select_submit_collect_old) != 2" in select,
+       "the patch asserts BOTH overrides were rewritten, so an upstream change "
+       "that renames or drops one fails loudly instead of half-patching")
+    ck('"metaclaw_round_turns": turn_data["metaclaw_round_turns"],' in select,
+       "the subclass stamps the turn count the 1/N scaler reads")
+    ck("sample.group_index = turn_data[\"metaclaw_round_group_index\"]" in select,
+       "the subclass uses the round's shared group index, not its own")
+
+    # The parent keeps its copy: non-Select deployments still need it.
+    ck(combine.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 1,
+       "the parent's copy is still there for deployments that do not use "
+       "the select subclass")
+
     # ------------------------------------------------------------------- D
-    print("[D: the round-group branch can actually fire]")
+    print("\n[D: the round-group branch can actually fire]")
     ck(select.count('"metaclaw_verdict": True,') == 2,
        "both verdict-branch returns carry metaclaw_verdict -- the key the "
        "combine server gates the whole round-group branch on")

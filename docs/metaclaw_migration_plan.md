@@ -208,6 +208,29 @@ payload 原本是 `{metaclaw_verdict, eval_score, hint}`，**无轮次标识**�
 - 四个测试套件全过（day_scope 13 / day_scope_fixes 25 / round_group 41 / env_fidelity 24）
 - 更新了 `test_metaclaw_round_group.py` 里断言旧 `_mc_first_user` 的三项
 
+### 追加：D 只修了一半，第二刀（2026-09-08）
+
+2026-09-08 的第一次按天训练（`20260908_164130`，commit `1fd5f25`）证明 D 的修复**不完整**。
+
+**日志实锤**：中间 turn `held` **98 次**（父类的闸门确实开了），但 `queued group=` **0 次**、`scaled by 1/turns` **0 次**、`nothing queued` **105 次**，同时 `Select submitted RL sample` **145 次**。
+
+**根因**：`OpenClawCombineSelectAPIServer(OpenClawCombineAPIServer)` **覆写了** `_submit_turn_sample`（`:247`）和 `_submit_rl_turn_sample`（`:302`），而交还逻辑只打进了**父类** `openclaw_combine_api_server.py`。**运行时实例化的是 Select 子类，父类里改好的代码永远不会被调用。**
+
+**这是同一天第二次犯同类错误**——`--agent` 那次是把同函数内的 `_execute_update(agent_id=...)` 当成了 `_run_question` 调用，这次是改了被覆写的父类方法。**共同点：没核实实际执行的是哪个实现。**
+
+**训练侧的实际后果**（不是"样本没进训练"）：
+
+| | 设计 | 实际 |
+|---|---|---|
+| 一轮 N 个 turn 的权重 | 每个 ±1/N，整轮合计 ±1 | **每个都 ±1，整轮合计 ±N** |
+| `rollout_batch_size 8` | 8 道题 | Select 的 `put((group_index, [sample]))` 每条自成一组 → **8 个 turn** |
+
+**所以一个空转 20 轮的失败题，会用 20 条满权重的 -1 灌满整个 batch**——而 1/N 这个机制恰恰是为防止长轮次主导而设计的。
+
+**修复**：把同一段交还逻辑复制到 Select 的两个覆写上；补丁断言**必须命中 2 处**，上游改名或删除会硬失败而不是半打。
+
+**一条值得记下的旁证**：本项目观测到的每一次训练塌陷（day22、09-02、09-03、09-08）**都发生在 1/N 从未生效的条件下**——因为 D 从 2026-09-03 写下起就是坏的。这不构成证明（三层工具塌陷机制独立存在且未修），但**该共同因素从未被排除过，因为它从来没有被打开过**。下一趟因此是一个干净的判别实验。
+
 ### 仍未解决（不在本轮范围）
 
 - **`--dir --min-count` 累计阶梯**（70/224 = 31% 的 file_check）：早轮欠账让本轮做对也判 -1。**这是奖励本身错，不是归属错**，按天不解决，从未打过补丁。**下一轮专门讨论**

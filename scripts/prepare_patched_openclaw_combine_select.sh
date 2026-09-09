@@ -730,6 +730,41 @@ text = text.replace(return_accepted_old, return_accepted_new, 1)
 if "\nimport json\n" not in text:
     text = text.replace("import logging\n", "import json\nimport logging\n", 1)
 
+select_submit_collect_old = (
+    '        await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))\n'
+)
+select_submit_collect_new = (
+    '        # --- openclaw-rl-metaclaw-round-group (2026-09-08) ---\n'
+    '        # This class OVERRIDES the parent\'s _submit_* methods, so the\n'
+    '        # identical hand-back patched into openclaw_combine_api_server.py\n'
+    '        # never runs at runtime -- the Select subclass is what the server\n'
+    '        # actually instantiates. Without this copy the round-group gate\n'
+    '        # opens, turns are held, _metaclaw_submit_round is entered, and\n'
+    '        # then every sample is queued individually anyway: no group, and\n'
+    '        # no 1/N, so each turn of a round carries the FULL +-1 instead of\n'
+    '        # +-1/N. Confirmed in run 20260908_164130: held 98, but\n'
+    '        # "queued group=" 0 and "scaled by 1/turns" 0.\n'
+    '        _mc_collect = turn_data.get("metaclaw_round_collect")\n'
+    '        if _mc_collect is not None:\n'
+    '            sample.group_index = turn_data["metaclaw_round_group_index"]\n'
+    '            sample.metadata = {\n'
+    '                **(getattr(sample, "metadata", None) or {}),\n'
+    '                "metaclaw_round_id": session_id,\n'
+    '                "metaclaw_round_turns": turn_data["metaclaw_round_turns"],\n'
+    '            }\n'
+    '            _mc_collect.append(sample)\n'
+    '            return\n'
+    '        await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))\n'
+)
+if text.count(select_submit_collect_old) != 2:
+    raise SystemExit(
+        f"patch failed: expected exactly 2 occurrences of the output_queue.put "
+        f"tail (one per overridden _submit_* method) in {src_path}, found "
+        f"{text.count(select_submit_collect_old)} (official file may have "
+        "changed upstream -- update this patch)"
+    )
+text = text.replace(select_submit_collect_old, select_submit_collect_new, 2)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched -> {dest_path}")
