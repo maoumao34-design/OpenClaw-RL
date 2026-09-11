@@ -155,6 +155,29 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         echo "错误：--custom-reward-post-process-path 注入失败" >&2
         exit 1
     fi
+
+    # 2026-09-11：record 文件按 run 分路径。
+    #
+    # 官方脚本把它写死成 results/qwen3_4b_topk_select_record.jsonl，而
+    # 服务端启动时是 open(..., "w") 直接清空——**每开一趟训练就把上一趟的
+    # 抹掉**。代价在这天才显现：想回头量"轨迹级方案可不可行"，磁盘上只剩
+    # 20260909_114032 那趟的 day25–30、6 个 session、133 条，基线那趟和所有
+    # 健康段的 record 全没了，几个关键问题只能拿一份退化期的数据回答。
+    #
+    # 这份 record 是目前唯一能回答"模型到底读到了什么"的生产证据（每个 turn
+    # 的 messages / prompt_text / response_text 都在里面），比任何 mock 探针
+    # 都硬。不能再被覆盖。
+    if [ -n "${METACLAW_RUN_ID:-}" ]; then
+        sed -i -e "s|results/qwen3_4b_topk_select_record.jsonl|results/record_${METACLAW_RUN_ID}.jsonl|" "${PATCHED}"
+        if ! grep -q "results/record_${METACLAW_RUN_ID}.jsonl" "${PATCHED}"; then
+            echo "错误：record 文件按 run 分路径注入失败（METACLAW_RUN_ID=${METACLAW_RUN_ID}）" >&2
+            exit 1
+        fi
+        echo "[profile] record → results/record_${METACLAW_RUN_ID}.jsonl（不再覆盖上一趟）"
+    else
+        echo "[profile] 警告：未设置 METACLAW_RUN_ID，record 仍写死路径，" \
+             "本趟会覆盖上一趟的 record。" >&2
+    fi
 fi
 
 python3 - "${PATCHED}" "${REPO_ROOT}" <<'PY'
