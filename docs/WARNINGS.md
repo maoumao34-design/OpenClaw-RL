@@ -121,7 +121,11 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 
 它是 `examples/` 下产品 RL 通路的演示数据（`trainer.py` 仅在配置 `openclaw_env_data_dir` 时才读）。附录 A.3 引其第 1 条只是示范"Part I 的用户指令长什么样"（caption：Part I **User Instruction Template**）。
 
-**Part I 的跑法三样都没发布**：评测 harness、346 道题、打分能力。**仓库里只有 Part I 的 agent 长相（A.1 的提示词 + schema，但 `reward=0`），没有 Part I 的跑法。→「复现 Part I 基线」不可行。**
+**Part I 真正没发布的只有一样：它自己的那 346 道题。**（2026-09-11 逐条复核后收窄——原先写的"三样都没发布"里有两样说重了。）
+
+`metaclaw/openclaw_env_rollout.py` 作为 Part I 的 agent 是**完整的**：A.1 提示词（`:104`，那个 `records/system_prompt_cache.json` 覆盖文件实测不存在）、单 `run_command` schema、agent 循环、trainer 接线齐全。**唯一的硬缺口是"基于事实的评分"**——`reward: 0.0`（`:266`），评分交给 `prm_scorer.py` 的 **LLM 判官**（默认 `gpt-5.2`、m=3 多数票），那是训练 reward，**算不出 Acc/Compl**。天/轮结构与工作区隔离（`_exec_command` 无 `cwd=`）确实也没有，但那是补几十行代码的事。
+
+**→ 「把 Part I 的 agent 跑在 benchmark 那 346 道题上」是可行的**（评分借 `benchmark/` 的 checker，驱动用我们现成的 driver），**文件夹不在一起不构成障碍**。**但跑出来的数不能叫「论文 Part I 基线」**——题不是 Part I 的题。另注 A.1 提示词写的是"controlling an OpenClaw installation"，与这批 workspace 文档产出题**领域错位**，照搬会给消融混入第二个变量。
 
 ## ❌ 论文附录的 Part 标签不可靠，不要当证据
 

@@ -1304,7 +1304,29 @@ A.3 引其第 1 条，是**举例说明"Part I 的用户指令长什么样"**（
 
 **→ 仓库里只有 Part I 的 agent 长相，没有 Part I 的跑法。**
 
+> ## ⚠️ 上面这份"三样都没有"清单于 2026-09-11 逐条复核，**三格里有两格说重了**
+>
+> 用户指出："`metaclaw/` 不就是 Part I 的方法吗，缺了什么导致没法用？**在不在同一个文件夹又没关系。**"——**文件夹归属这一点完全成立**，下面按源码逐格重判。
+>
+> **`metaclaw/` 侧作为 Part I 的 agent 是完整的**（`openclaw_env_rollout.py` 全文读过）：A.1 系统提示词（`:104` 常量；`:119` 那个 `records/system_prompt_cache.json` 覆盖文件**实测不存在**，所以生效的就是 A.1 原文）、单 `run_command` schema（`:76`）、agent 循环、`{task_id, instruction}` 加载、trainer 接线（`trainer.py:443`）。
+>
+> | 原清单 | 复核结论 | 依据 |
+> |---|---|---|
+> | 缺**评测 harness**（天/轮、checker 接线、工作区）| ⚠️ **说重了**：缺的是"要写"，不是"不存在"。`rollout_loop` 确实没有天/轮（`random.choices(tasks, k=concurrency)` 无限循环、每 episode 全新 `session_id`），`_exec_command` 的 `create_subprocess_shell` 确实**没有 `cwd=`**（`:137`）所以没有工作区隔离——**但这两样都是补几十行代码的事，而且我们已经有一个现成的 `metaclaw_rollout_driver.py` 在干这件事** | 源码 `:137`/`:169`/`:331` |
+> | 缺 **346 道题** | ❌ **错**：346 道题就在 `benchmark/data/metaclaw-bench/eval/`，checker 也在。**跟 `metaclaw/` 不在同一个目录不构成障碍** | — |
+> | 缺**打分能力** | ✅ **成立，且这是唯一真正的硬缺口**：`reward: 0.0`（`:266`）、docstring 明写 "fully delegated to the PRM ... no `env.evaluate()`"。而这个 PRM 是 **LLM 判官**（`prm_scorer.py:184`，默认 `gpt-5.2`、`prm_m=3` 多数票、只拿 `response` + `instruction` 比对），**是训练用的 reward，不是基准指标**——它算不出 Acc/Compl | 源码 `:266`、`prm_scorer.py` |
+>
+> **→ 修正后的准确说法**：`metaclaw/` 缺的**只有"基于事实的评分"这一样**，而这一样可以直接借 `benchmark/` 的 checker。**"把 Part I 的 agent 跑在这 346 道题上"是可行的，是个工程活，不是不可能。** 我原来那句"不可行"说过头了。
+>
+> **真正没发布、也补不上的只剩一样：Part I 自己的那套题**（`examples/train.jsonl` 是一整段 72 句的对话，无标准答案——见查证记录（十七））。
+>
+> **所以下面"只能做受控消融"这个结论仍然成立，但理由要换**：不是"评测那一半不存在"，而是**题不是 Part I 的题**。跑出来的数只能叫"Part I 的 agent 配置 + 这 346 道题"，不能叫"论文 Part I 基线"。
+>
+> **另外多出一个必须先定的设计项**（原先没意识到）：A.1 的提示词逐字是 "You are an expert CLI agent **controlling an OpenClaw installation**"，示例命令是 `openclaw status` / `openclaw agents add --name bot1 --model gpt-4o`；而这 346 道题是 workspace 文档产出。**照搬 A.1 提示词 = 给模型一个领域错位的系统提示词，会把"工具集缩窄"这个自变量和"提示词文不对题"混在一起。** 消融要干净，得先决定：保留 A.1 原文（忠于 Part I，但混入第二个变量），还是只换工具集、提示词保持中立（变量干净，但不再是 A.1）。**这一项未决。**
+
 #### 对"用 Part I 方法做基线"这一意图的影响
+
+> ⚠️ **本小节的"不可行"已于 2026-09-11 更正为"可行但不是 Part I 基线"，见上方横幅。以下保留原文。**
 
 **"复现 Part I 基线"不可行**——不是保守，是评测那一半根本不存在于公开材料中。
 

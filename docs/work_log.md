@@ -2190,6 +2190,7 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 - **⛔ 撤回"Part I 的数据在 `examples/train.jsonl`"**：它没有标准答案、没有 checker、没有天/轮结构，**算不出任何 Acc 或 Compl**。A.3 引它只是示范"Part I 的用户指令长什么样"（caption 是 "Part I **User Instruction Template**"）
 - **Part I 的跑法：三样都没发布**——评测 harness、346 道题、打分能力（`openclaw_env_rollout.py` 有 A.1 的提示词与 schema，但 `reward=0.0`，评分交 proxy 的 PRM）。**仓库里只有 Part I 的 agent 长相，没有 Part I 的跑法**
 - **对"用 Part I 方法做基线"的影响**：**"复现 Part I 基线"不可行**（评测那一半不存在）；可做的只有受控消融，且定位需再收紧——Part I 的 agent 是操作 OpenClaw 安装的对话式运维，我们的题是文档产出，**任务域不同**。结论只能表述为"在我们这套题上，工具集从全套缩到单 shell，Compl 变化多少"
+  - > ⚠️ **「三样都没发布 / 不可行」已于 2026-09-11 逐条复核并收窄，见当日条目。**结论改为：缺的只有"基于事实的评分"一样（可借 benchmark 的 checker），**跑得起来，但不能叫 Part I 基线**
 | 身份注入 / 隐含规则 | 无 | IDENTITY+SOUL（A.2）/ P1–P5（A.7）|
 
 **我的关键误判**：（十三）把 `profile: coding` 当成"公开 benchmark 反驳了 A.1"。**它不反驳 A.1，它只说明这份配置属于 Part II**——A.1 描述的是另一套东西，那套也在仓库里，只是我们从未跑过。正确解读是：**Part I 的 agent 定义随代码发布了，Part I 的评测 harness 没有发布。**
@@ -2326,6 +2327,24 @@ VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
 - `docs/metaclaw_migration_plan.md`：新增第八节（官方中间步骤做法）、第九节（`dropReasoningFromHistory` 实测 + 三项新嫌疑）；「如何阅读本文档」表里「轨迹级样本」一行从 ⛔ 改为 ⚠️ 并写明"删除理由已被推翻、但成因未明不得照搬"
 - `docs/training_config.md`：四、样本怎么形成——更正轨迹级方案的删除理由
 - `docs/work_log.md`：本条
+
+### 四、复核「Part I 跑不起来」——三格里两格说重了（用户提出）
+
+用户指出："`metaclaw/` 不就是 Part I 的方法吗，缺了什么导致没法用？**在不在同一个文件夹又没关系。**"——**文件夹这一点完全成立**，逐条读源码复核：
+
+`metaclaw/openclaw_env_rollout.py` 作为 Part I 的 agent **是完整的**：A.1 提示词（`:104` 常量；`:119` 那个 `records/system_prompt_cache.json` 覆盖文件**实测不存在**，生效的就是 A.1 原文）、单 `run_command` schema（`:76`）、agent 循环、`{task_id, instruction}` 加载、`trainer.py:443` 接线。
+
+| 原清单「未发布」 | 复核 |
+|---|---|
+| 评测 harness（天/轮、工作区）| ⚠️ **说重了**：确实没有（`rollout_loop` 是 `random.choices` 无限循环、每 episode 全新 session；`_exec_command` 无 `cwd=`），**但这是写几十行的事，我们现成的 driver 就在干这个** |
+| 346 道题 | ❌ **错**：题和 checker 都在 `benchmark/data/metaclaw-bench/eval/`，**不同目录不构成障碍** |
+| 打分能力 | ✅ **成立，唯一的硬缺口**：`reward: 0.0`（`:266`），docstring 明写 "no `env.evaluate()`"；`prm_scorer.py:184` 是 **LLM 判官**（默认 `gpt-5.2`、m=3 多数票），是训练 reward，**算不出 Acc/Compl** |
+
+**→ 修正**：缺的只有"基于事实的评分"一样，而它可以直接借 `benchmark/` 的 checker。**"把 Part I 的 agent 跑在这 346 道题上"可行，是工程活。我原来那句"不可行"说过头了。**
+
+**真正补不上的只剩一样：Part I 自己的题**（`train.jsonl` 是一整段 72 句对话，无标准答案）。所以"只能做受控消融"的结论不变，**但理由要换**——不是"评测那一半不存在"，而是**题不是 Part I 的题**。
+
+**新暴露一个未决设计项**：A.1 提示词逐字是 "controlling an OpenClaw installation"、示例命令是 `openclaw status` / `openclaw agents add`，而这 346 道题是 workspace 文档产出。**照搬 A.1 = 把"工具集缩窄"和"提示词领域错位"两个变量混在一起。** 要么保留 A.1（忠于 Part I、混变量），要么只换工具集、提示词保持中立（变量干净、不再是 A.1）。**未决。**
 
 **下一步：**
 1. **在服务器上跑一次升级后的忠实回放 diff 探针**（CPU-only，不占 GPU）——直接回答 `tool_calls[].id` 会不会被重写
