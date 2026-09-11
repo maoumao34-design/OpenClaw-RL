@@ -9,9 +9,19 @@ Why this exists
 deleted on that basis -- roughly 96 of 120 rounds had been dropped because a
 flat sequence cannot honestly claim turn 2 saw turn 1's thinking.
 
-2026-09-10, first run of this probe: reasoning is PRESERVED. The marker planted
-in turn 1's reasoning_content came back intact in turn 2's replay. So the 09-03
-diagnosis was wrong, and the trajectory design was deleted for the wrong reason.
+2026-09-10, first run of this probe: reasoning came back intact. But that run
+only generated ONE turn and read it back, and turn 1 is the wrong place to
+look -- `shouldPreserveCurrentToolTurnReasoning` (thinking.ts:365) exempts the
+first assistant tool turn after the latest user message EVEN WHEN the drop
+policy is on. A one-turn probe therefore cannot tell the two policies apart.
+It now generates two turns: under "off" both keep their reasoning, under "on"
+turn 1 keeps it and turn 2 does not.
+
+Independent of the probe, the config settles it: `transcript-policy.ts:113`
+preserves whenever `model.reasoning === true`, and the official
+`openclaw_cfg/openclaw.json` declares exactly that for the `metaclaw-bench`
+provider. So the 09-03 diagnosis was wrong and the trajectory design was
+deleted for the wrong reason.
 
 But 96/120 rounds really were dropped. If reasoning was not the cause, the real
 one is still unidentified -- and rebuilding on an unexamined failure would just
@@ -33,8 +43,17 @@ Usage
 
 Point the agent's provider baseUrl at http://127.0.0.1:<port>/v1, fire ONE real
 request through the OpenClaw gateway, and read this process's stdout. A tool the
-agent is allowed to call must exist, or turn 2 never happens -- adjust
-TOOL_NAME/TOOL_ARGS if the agent under test exposes different tools.
+agent is allowed to call must exist, or the follow-up requests never happen --
+adjust TOOL_NAME/TOOL_ARGS if the agent under test exposes different tools.
+
+WHAT THIS DOES **NOT** COVER
+----------------------------
+This probe reads the JSON that OpenClaw puts on the wire. Whether the
+`reasoning_content` field then survives into the actual token sequence is a
+SECOND gate, decided by the serving side's chat template, not by OpenClaw.
+To answer that, look at a real recorded `prompt_text` from a later turn in
+the RL proxy's turn_data and check whether the earlier turns' thinking is in
+it. Only that second measurement describes what the model really saw.
 """
 import json
 import sys
@@ -43,14 +62,24 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 TOOL_NAME = "exec"
 TOOL_ARGS = {"command": "echo reasoning-replay-probe"}
 
-REASONING_MARKER = "PROBE_REASONING_MARKER_8f3a"
-CONTENT_MARKER = "PROBE_CONTENT_MARKER_1c7d"
-TOOL_CALL_ID = "call_probe_marker_5e21"
+# One marker set per generated turn. Two tool-calling turns are needed, not
+# one: even when dropReasoningFromHistory is ON, the FIRST assistant tool turn
+# after the latest user message is exempt (`shouldPreserveCurrentToolTurnReasoning`,
+# thinking.ts:365 -- it walks backwards and bails the moment it sees another
+# assistant). So a two-request probe reads the one message that survives under
+# either policy, and cannot tell the policies apart. Turn 2 is the discriminator:
+#   flag OFF -> turn 1 AND turn 2 both keep their reasoning
+#   flag ON  -> turn 1 keeps it, turn 2 is stripped
+REASONING_MARKERS = ["PROBE_REASONING_MARKER_8f3a", "PROBE_REASONING_MARKER_2b6e"]
+CONTENT_MARKERS = ["PROBE_CONTENT_MARKER_1c7d", "PROBE_CONTENT_MARKER_9d40"]
+TOOL_CALL_IDS = ["call_probe_marker_5e21", "call_probe_marker_7a13"]
 
-_state = {"turn": 0, "sent": None}
+GENERATED_TURNS = 2
+
+_state = {"request": 0, "sent": []}
 
 
-def _describe(msg):
+def _describe(msg, step):
     """Field-level shape of one message -- names only, no long bodies."""
     out = {"role": msg.get("role"), "keys": sorted(msg.keys())}
     c = msg.get("content")
@@ -63,13 +92,13 @@ def _describe(msg):
         out["content"] = type(c).__name__
     blob = json.dumps(c, ensure_ascii=False) if c is not None else ""
     out["content_has_think_tag"] = "<think>" in blob
-    out["content_has_marker"] = CONTENT_MARKER in blob
+    out["content_has_marker"] = CONTENT_MARKERS[step] in blob
     for f in ("reasoning_content", "reasoning", "thinking"):
         if f in msg:
             v = msg[f]
             out[f] = (f"present(len={len(v)})" if isinstance(v, str)
                       else f"present({type(v).__name__})")
-            if isinstance(v, str) and REASONING_MARKER in v:
+            if isinstance(v, str) and REASONING_MARKERS[step] in v:
                 out[f] += " CONTAINS_MARKER"
     tcs = msg.get("tool_calls")
     if tcs:
@@ -81,7 +110,7 @@ def _describe(msg):
     return out
 
 
-def _diff_replay(sent, got):
+def _diff_replay(sent, got, step):
     """What changed between the assistant message we sent and the one replayed.
 
     This is the property a flat-trajectory sample needs: the replayed turn must
@@ -94,9 +123,9 @@ def _diff_replay(sent, got):
     g_reason = got.get("reasoning_content") or ""
     if not isinstance(g_reason, str):
         g_reason = json.dumps(g_reason, ensure_ascii=False)
-    if REASONING_MARKER not in json.dumps(got, ensure_ascii=False):
+    if REASONING_MARKERS[step] not in json.dumps(got, ensure_ascii=False):
         diffs.append("reasoning: MARKER GONE (stripped)")
-    elif REASONING_MARKER not in g_reason:
+    elif REASONING_MARKERS[step] not in g_reason:
         # Still there, but no longer in reasoning_content -- folded into the
         # content as a <think> block or a thinking part. Survives, but the
         # token sequence is not the one that was generated.
@@ -108,7 +137,7 @@ def _diff_replay(sent, got):
     s_content = sent.get("content") or ""
     g_content = got.get("content")
     g_blob = json.dumps(g_content, ensure_ascii=False) if g_content is not None else ""
-    if CONTENT_MARKER not in g_blob:
+    if CONTENT_MARKERS[step] not in g_blob:
         diffs.append("content: MARKER GONE")
     if type(s_content) is not type(g_content):
         diffs.append(f"content: type changed {type(s_content).__name__} -> "
@@ -139,32 +168,35 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             parsed = {}
         messages = parsed.get("messages") or []
-        _state["turn"] += 1
-        turn = _state["turn"]
+        _state["request"] += 1
+        req = _state["request"]
 
         assistants = [m for m in messages
                       if isinstance(m, dict) and m.get("role") == "assistant"]
+        n_sent = len(_state["sent"])
 
         print("=" * 72)
-        print(f"[probe] REQUEST #{turn}  ({len(messages)} messages, "
+        print(f"[probe] REQUEST #{req}  ({len(messages)} messages, "
               f"{len(assistants)} assistant)")
 
-        if _state["sent"] is None:
+        if n_sent < GENERATED_TURNS:
+            step = n_sent
             reply = {
                 "role": "assistant",
-                "content": f"{CONTENT_MARKER}",
+                "content": CONTENT_MARKERS[step],
                 "reasoning_content": (
-                    f"{REASONING_MARKER} I will run one command to inspect the environment."
+                    f"{REASONING_MARKERS[step]} step {step + 1}: I will run one "
+                    "command to inspect the environment."
                 ),
                 "tool_calls": [{
-                    "id": TOOL_CALL_ID,
+                    "id": TOOL_CALL_IDS[step],
                     "type": "function",
                     "function": {"name": TOOL_NAME, "arguments": json.dumps(TOOL_ARGS)},
                 }],
             }
-            _state["sent"] = reply
-            print("[probe] turn 1 -- replying with reasoning + content + tool_call, "
-                  "all marked")
+            _state["sent"].append(reply)
+            print(f"[probe] generating turn {step + 1}/{GENERATED_TURNS} -- "
+                  "reasoning + content + tool_call, all marked")
             finish = "tool_calls"
 
         elif not assistants:
@@ -178,33 +210,52 @@ class Handler(BaseHTTPRequestHandler):
             finish = "stop"
 
         else:
-            sent = _state["sent"]
-            got = assistants[0]
-            print(f"[probe] turn {turn} -- inspecting the replayed assistant message")
-            print(f"    sent: {json.dumps(_describe(sent), ensure_ascii=False)}")
-            print(f"    got : {json.dumps(_describe(got), ensure_ascii=False)}")
+            print(f"[probe] inspecting the replay of {GENERATED_TURNS} generated turns")
+            all_diffs = []
+            for step, sent in enumerate(_state["sent"]):
+                got = assistants[step] if step < len(assistants) else None
+                if got is None:
+                    all_diffs.append((step, ["message MISSING from replay entirely"]))
+                    print(f"    turn {step + 1}: MISSING from replay")
+                    continue
+                print(f"    turn {step + 1} sent: "
+                      f"{json.dumps(_describe(sent, step), ensure_ascii=False)}")
+                print(f"    turn {step + 1} got : "
+                      f"{json.dumps(_describe(got, step), ensure_ascii=False)}")
+                d = _diff_replay(sent, got, step)
+                if d:
+                    all_diffs.append((step, d))
 
-            diffs = _diff_replay(sent, got)
             print()
-            if diffs:
-                print("[probe] VERDICT: replay is NOT faithful -- "
-                      f"{len(diffs)} difference(s):")
-                for d in diffs:
-                    print(f"           - {d}")
+            if not all_diffs:
+                print("[probe] VERDICT: replay is FAITHFUL for ALL "
+                      f"{GENERATED_TURNS} turns -- reasoning, content and "
+                      "tool_call ids all came back unchanged")
+                print("[probe]          dropReasoningFromHistory is OFF (under the "
+                      "drop policy, turn 2 would have lost its reasoning while "
+                      "turn 1 kept it)")
+            else:
+                print(f"[probe] VERDICT: replay is NOT faithful -- "
+                      f"{len(all_diffs)} of {GENERATED_TURNS} turns differ:")
+                for step, d in all_diffs:
+                    for one in d:
+                        print(f"           - turn {step + 1}: {one}")
+                only_later = all(step > 0 for step, _ in all_diffs)
+                if only_later and all(
+                    any("MARKER GONE" in x for x in d) for _, d in all_diffs
+                ):
+                    print("[probe]          turn 1 kept its reasoning and the later "
+                          "turn(s) did not -- this is exactly the "
+                          "dropReasoningFromHistory ON signature")
                 print("[probe]          a flat trajectory built from these turns "
                       "would not match what the model actually saw")
-            else:
-                print("[probe] VERDICT: replay is FAITHFUL -- reasoning, content and "
-                      "tool_call ids all came back unchanged")
-                print("[probe]          a flat trajectory over these turns is "
-                      "well-founded")
             reply = {"role": "assistant", "content": "probe done"}
             finish = "stop"
 
         print("=" * 72, flush=True)
 
         payload = json.dumps({
-            "id": f"probe-{turn}", "object": "chat.completion", "created": 0,
+            "id": f"probe-{req}", "object": "chat.completion", "created": 0,
             "model": parsed.get("model", "probe"),
             "choices": [{"index": 0, "message": reply, "finish_reason": finish}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},

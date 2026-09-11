@@ -2308,10 +2308,15 @@ VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
 
 **⛔ 因此 2026-09-03「轨迹级方案因 `dropReasoningFromHistory` 不可行」是误诊，那套实现是被错误的理由删掉的。** 已就地给计划文档与 [`training_config.md`](training_config.md) 的相关表述加更正。
 
+**09-03 错在哪（09-11 定位）**：`shouldPreserveReasoningContentReplay` **在两个文件里各有一个同名函数**。09-03 读的是 `openai-transport-stream.ts:4076` 那个四条件版本，而 `transcript-policy.ts:174` 实际调用的是**同文件 `:109` 的一行版**：`params.model?.reasoning === true || ...`。官方 `openclaw_cfg/openclaw.json` 的 `metaclaw-bench` 模型正声明 `"reasoning": true` → 第一个分支命中 → 不剥。**按 09-03 读的那个版本算结论也一样**（第三条 `shouldTrustReasoningContentReplayMetadata` 同样命中：`reasoning` 为真、provider 既非 `openai` 也非 `openrouter`）。**"四条全不命中"两个版本上都不成立。** 而 `issues_log.md:842` 早在 Personal Agent 时期就读对过，09-03 没回头对账。
+
 **主要问题：**
 
 - **但 96/120 轮的丢弃是真的，真正成因仍未查明**——不能据此把轨迹级方案原样搬回来，那等于在一个从未查清的故障上重建。同一段 policy fallback（`transcript-policy.ts:152-178`）里，对我们这种 strict-OpenAI-compatible provider **还有三项改写历史的开关也开着**：`sanitizeToolCallIds: true` + `toolCallIdMode: "strict"`（**头号嫌疑**：回放重写 tool_call id → 字节级前缀包含断裂，正是扁平轨迹所依赖的性质）、`applyAssistantFirstOrderingFix`、`validateGeminiTurns`/`validateAnthropicTurns`
-- **探针自身有缺陷**：09-10 那次 REQUEST #3 是 0 条 assistant 消息的独立 session/心跳（**不是回放**），探针却照样打印了判词，险些读成"被剥离"。**已修**
+- **探针自身有缺陷（两处，均已修）**：
+  - 09-10 那次 REQUEST #3 是 0 条 assistant 消息的独立 session/心跳（**不是回放**），探针却照样打印了判词，险些读成"被剥离"
+  - **更严重的一处**：`dropReasoningFromHistory` 即使开着也**豁免"最近一条 user 之后的第一条带 tool_call 的 assistant"**（`thinking.ts:365`）。**09-10 的探针只生成 1 个 turn、读的正是 `assistants[0]`——恰好是两种 policy 下都保留的那一条，构造上就分辨不出开和关。** 那句 `VERDICT: PRESERVED` 与两种情况都相容，**我当时把它当成了决定性证据**。已改成生成 2 个 turn（flag 关 → 两个都保留；flag 开 → turn 1 保留、turn 2 被剥）。**真正决定性的是配置+源码那条链，它独立于探针**
+- **⚠️ 第二道门完全没测**：探针看的是 OpenClaw 放到线上的 JSON；`reasoning_content` 会不会被服务端的 **chat template** 渲染进展平后的 token 序列，**是另一回事**。**模型真正看见的是 token 序列**，所以这一格才是对训练有意义的那一格。测法不需要新跑——proxy 的 `turn_data` 本来就记了 `prompt_text`，翻一条真实的 turn≥3 的看里面有没有前面几个 turn 的思考原文即可
 - **我在讨论中两次被用户当场纠正，两次都是只算了一半**：
   - 说"把整条轨迹拍平完全等价"——**只算了 RL 那一项，把 OPD 整个漏了**（拍平后 hint 会覆盖到每个 turn）
   - 提"per-turn OPD 用同一个 hint"——**hint 是轮级的**，贴到一个正在查数据的 turn 上，等于教模型跳过查数据，而那恰恰是 base 能找到 `response_ms` 的那一步

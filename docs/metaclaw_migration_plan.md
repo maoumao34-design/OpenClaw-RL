@@ -454,6 +454,45 @@ VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
 
 版本 2026.6.9 对得上；没有任何运行时插件声明 `metaclaw-bench`，所以走的是 `buildUnownedProviderTransportReplayFallback` 那条默认路径，而该路径把 `dropReasoningFromHistory` 置为 `!shouldPreserveReasoningContentReplay(params)`——我们的模型满足保留条件。
 
+#### 09-03 错在哪：读了同名的另一个函数（2026-09-11 定位）
+
+**`shouldPreserveReasoningContentReplay` 在两个文件里各有一个，签名不同。**
+
+| 文件 | 签名 | 09-03 |
+|---|---|---|
+| `openai-transport-stream.ts:4076` | `(model, compat)`，四个条件 | **读的是这个** |
+| **`transcript-policy.ts:109`** | **`(params)`，函数体只有一行** | ← `:174` 实际调用的是这个 |
+
+```ts
+// transcript-policy.ts:113 —— 真正决定 dropReasoningFromHistory 的那一行
+return params.model?.reasoning === true || requiresReasoningContentReplay(params.modelId);
+```
+
+官方配置 `benchmark/data/metaclaw-bench/openclaw_cfg/openclaw.json`：provider `metaclaw-bench`、`"api": "openai-completions"`、模型 **`"reasoning": true`** → 第一个分支直接命中 → `dropReasoningFromHistory = false`。
+
+**就算按 09-03 读的那个四条件版本算，结论也一样**：第三条 `shouldTrustReasoningContentReplayMetadata` 要求 `model.reasoning` 为真（✅）、provider 不是 `openai`（✅ 是 `metaclaw-bench`）、且不是 `anthropic/`|`x-ai/` 开头的 openrouter 模型（✅）→ 返回 true。**09-03 那句"四条全不命中"在两个版本上都不成立。**
+
+**本项目早先其实读对过**：`issues_log.md:842`（Personal Agent 时期查 Qwen3.x 跨轮失忆）写的是"`qwen3-4b` 已带 `reasoning: true`，按代码逻辑应该被正常保留传回"。**同一个判断前后被读出过两个相反结果，09-03 没回头对账。**
+
+#### 探针自身的证据强度：第一版被高估了（2026-09-11 更正）
+
+`dropReasoningFromHistory(messages)`（`thinking.ts:457`）即使**开着**也不是全剥——`shouldPreserveCurrentToolTurnReasoning`（`:365`）豁免"最近一条 user 之后的**第一条**带 tool_call 的 assistant"（`:379` 的倒序循环一遇到别的 assistant 就 `return false`）。
+
+> ⚠️ **而 09-10 那次探针只生成了 1 个 turn、读的正是 `assistants[0]`——恰好是两种 policy 下都会被保留的那一条。它在构造上就分辨不出"开"和"关"。** 那条 `VERDICT: PRESERVED` 与两种情况都相容，我当时把它当成了决定性证据。
+
+**真正决定性的是上面的配置+源码那条链，它独立于探针。** 探针已改成**生成 2 个 turn**，这才有鉴别力：
+
+| | turn 1 | turn 2 |
+|---|---|---|
+| flag **关** | 保留 | **保留** |
+| flag **开** | 保留（豁免）| **被剥** |
+
+#### 第二道门：chat template（**尚未测量**）
+
+探针看的是 **OpenClaw 放到线上的 JSON**。`reasoning_content` 是不是**非标准字段**、服务端把 messages 展平成 token 序列时会不会把它渲染进去，**是另一回事，由 chat template 决定，跟 OpenClaw 无关**。
+
+**模型真正看见的是展平后的 token 序列**，所以这一格才是对训练有意义的那一格。**测法不需要新跑**：RL proxy 的 `turn_data` 本来就记了每个 turn 的 `prompt_text`，直接翻一条真实的、turn≥3 的 `prompt_text`，看里面有没有前面几个 turn 的思考原文即可。
+
 > ⛔ **因此 2026-09-03「轨迹级方案因 `dropReasoningFromHistory` 不可行」是错的判断，那套实现是被错误的理由删掉的。**
 
 #### 但 96/120 轮的丢弃是真的，真正的原因仍未知
