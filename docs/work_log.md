@@ -2252,3 +2252,78 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 1. 跑官方代码路径基线（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——Part 归属澄清后它的意义更明确：`metaclaw-bench run`（官方 Part II harness）vs 我们的 driver，**同题集、同工具、同为按天会话**，差值就是纯粹的"driver vs 官方 harness"结构差
 2. 取 `scope=day` K=0（`20260907_112320`）跑满 30 天的最终数
 3. 主线：round-group + 1/N 训练 vs 我们自己的 K=0
+
+---
+
+> **📌 本文件的条目顺序当前不是严格时间序**（`## 2026-09-09` 被插在了 `## 2026-09-07` 前面）。尚未整理，查找时以标题日期为准，不要以位置推断先后。
+
+---
+
+## 2026-09-10
+
+**目标：** 查清"训练让模型越想越长"的机制成因；查 OpenClaw-RL 官方对中间步骤到底怎么处理；实测 `dropReasoningFromHistory` 能不能关。
+
+**完成内容：**
+
+### 一、长度退化的因果链（配对权重探针，决定性）
+
+同一批题、同一套配置，只换权重（base vs iter9）：
+
+| | base | iter9 |
+|---|---|---|
+| response 中位数 | 3,782 | **15,868**（4.2×）|
+| P90 | 4,933 | **50,000**（10.1×，撞上限）|
+| 最大值 | 5,843 | — |
+| 撞 50k 上限的比例 | 0 | **30%** |
+
+- **"策略变了"这条叙事就此死掉**：`p_EXEC` 两臂几乎相同（0.47 vs 0.53，χ²=0.27，不显著）
+- `p_READ` 从 0.37 掉到 0.07 **是长度的下游结果**，不是独立现象——OTHER 从 0.16 涨到 0.40，其中 0.30 是 `finish_reason=length`
+- **机制**：`sum_of_sample_mean`（`cp_utils.py:70`）让**一轮的梯度贡献恒为 ±1，与该轮的 turn 数 N、token 数 T 无关**；每 token 的压力 ∝ `A/(N·T)`。约 74% 的 file_check 轮次失败 → **稀释惩罚是最有效的自保，而"多想"是最便宜的稀释手段**
+- 与此同时 **OPD（唯一告诉模型"该怎么改"的信号）只覆盖 N 个 turn 里的 1 个 ⇒ 约 25%**；而退化会拉长轮次、进一步压低覆盖率——**自我强化的循环**
+- **已排除**：压缩（未观察到）、全负病态批（step 8 是 6 正 2 负）、READ 被惩罚（advantage +0.131）、策略漂移作为共因（09-08 那趟没有漂移）、`<|im_end|>` 被抑制（20 token 以下样本数为 0）、单次更新意外（09-09 的 grad_norm 在断崖前是 1.52→0.82→0.58）
+
+### 二、官方对中间步骤的两种做法（查证，见计划文档第八节）
+
+| | 样本切分 | 中间步骤的信号 |
+|---|---|---|
+| `toolcall-rl/generate_with_retool.py` | **一条轨迹一个样本**（模型 token `loss_mask=1`，observation `=0`）| `step_action_spans` + `metadata["step_wise"]` 每步 PRM 分 |
+| `openclaw-*` proxy | per-turn | `_fire_opd_task` **每个 turn 都开火** |
+| **我们现在** | per-turn | **❌ 无** |
+
+**对用户直觉的修正**：Personal Agent 时期"分出中间步骤"本身**是官方做法、不是病根**——那时每个中间 turn 都有判官。**病根是 2026-09-03 停用步骤判官后没有填上那个洞**：per-turn 的碎片化留着，信号却归零。
+
+**由此得到第三条路**：`toolcall-rl` 的答案是**不需要 turn 级 ground truth，把步级归属表达成同一样本内的 token 区间即可**——天然避开了"轮级 hint 错贴到中间 turn"的归属错误。
+
+### 三、`dropReasoningFromHistory` 实测：**是关的**
+
+写了 CPU-only 假 SGLang 探针（`scripts/mock_sglang_reasoning_replay_probe.py`），不需要 GPU、不需要真模型。CLI 实跑结果：
+
+```
+assistant[0]: {"keys":["content","reasoning_content","role","tool_calls"],
+               "reasoning_content": "present(len=78) CONTAINS_MARKER"}
+VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
+```
+
+版本 2026.6.9 对得上；无插件声明 `metaclaw-bench`，走默认 fallback，而我们的模型满足 `shouldPreserveReasoningContentReplay` 的保留条件。
+
+**⛔ 因此 2026-09-03「轨迹级方案因 `dropReasoningFromHistory` 不可行」是误诊，那套实现是被错误的理由删掉的。** 已就地给计划文档与 [`training_config.md`](training_config.md) 的相关表述加更正。
+
+**主要问题：**
+
+- **但 96/120 轮的丢弃是真的，真正成因仍未查明**——不能据此把轨迹级方案原样搬回来，那等于在一个从未查清的故障上重建。同一段 policy fallback（`transcript-policy.ts:152-178`）里，对我们这种 strict-OpenAI-compatible provider **还有三项改写历史的开关也开着**：`sanitizeToolCallIds: true` + `toolCallIdMode: "strict"`（**头号嫌疑**：回放重写 tool_call id → 字节级前缀包含断裂，正是扁平轨迹所依赖的性质）、`applyAssistantFirstOrderingFix`、`validateGeminiTurns`/`validateAnthropicTurns`
+- **探针自身有缺陷**：09-10 那次 REQUEST #3 是 0 条 assistant 消息的独立 session/心跳（**不是回放**），探针却照样打印了判词，险些读成"被剥离"。**已修**
+- **我在讨论中两次被用户当场纠正，两次都是只算了一半**：
+  - 说"把整条轨迹拍平完全等价"——**只算了 RL 那一项，把 OPD 整个漏了**（拍平后 hint 会覆盖到每个 turn）
+  - 提"per-turn OPD 用同一个 hint"——**hint 是轮级的**，贴到一个正在查数据的 turn 上，等于教模型跳过查数据，而那恰恰是 base 能找到 `response_ms` 的那一步
+
+**产出：**
+- `scripts/mock_sglang_reasoning_replay_probe.py`：升级为**忠实回放 diff 探针**（逐字段比对第 1 轮发出的原文与第 2 轮回放版本，逐项报差异，重点看 `tool_calls[].id` 是否原样）；补上"无前序 assistant 消息就不给结论"的守卫。本地双向自测：identical → 无差异；id 改写 / reasoning 被剥 / reasoning 换载体 / content 丢失，四种破坏各自被单独识别
+- `docs/metaclaw_migration_plan.md`：新增第八节（官方中间步骤做法）、第九节（`dropReasoningFromHistory` 实测 + 三项新嫌疑）；「如何阅读本文档」表里「轨迹级样本」一行从 ⛔ 改为 ⚠️ 并写明"删除理由已被推翻、但成因未明不得照搬"
+- `docs/training_config.md`：四、样本怎么形成——更正轨迹级方案的删除理由
+- `docs/work_log.md`：本条
+
+**下一步：**
+1. **在服务器上跑一次升级后的忠实回放 diff 探针**（CPU-only，不占 GPU）——直接回答 `tool_calls[].id` 会不会被重写
+2. 长度问题的修法二选一：`--custom-pg-loss-reducer-function-path`（切到 `sum_of_token`）vs `--calculate-per-token-loss`。**这条无前置依赖，是依赖链的第一步**
+3. `docs/training_config.md` 重新做快照（现钉在 `e7979e1`，此后已有多个 commit）
+4. 挂起中：day05@50000 双臂、`--save-interval 1` 的退化曲线（`run_degen_curve_save1.sh` 已就绪，需 8 张空卡）、min-count 讨论、官方代码路径基线

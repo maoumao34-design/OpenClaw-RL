@@ -438,9 +438,39 @@ if turn_type == "main":
 
 **这天然避开了 per-turn OPD 的归属错误问题**（见上一节第五点）。
 
-**唯一障碍仍是 `dropReasoningFromHistory`**——合成一条需要忠实序列。**下一步专查它能不能关、代价是什么。**
+**唯一障碍仍是 `dropReasoningFromHistory`**——合成一条需要忠实序列。**下一步专查它能不能关、代价是什么。**（→ 已查，见下一节：**它根本没开**。）
 
-### 九、待查
+### 九、实测 `dropReasoningFromHistory`：**它是关的**，09-03 那次诊断是误诊（2026-09-10）
+
+**查法**：写了一个 CPU-only 假 SGLang（`scripts/mock_sglang_reasoning_replay_probe.py`），把 provider 的 `baseUrl` 指过去，不需要 GPU、不需要真模型。第 1 个 turn 返回一段带唯一标记的 `reasoning_content` 外加一次 tool_call；第 2 个 turn 直接打印 OpenClaw 回放给模型的那条 assistant 消息长什么样。两种载体都检测（顶层 `reasoning_content` 字段、以及被折进 `content` 的 `thinking` 块）。
+
+**结果（CLI 实跑）：**
+
+```
+assistant[0]: {"keys": ["content","reasoning_content","role","tool_calls"],
+               "reasoning_content": "present(len=78) CONTAINS_MARKER"}
+VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
+```
+
+版本 2026.6.9 对得上；没有任何运行时插件声明 `metaclaw-bench`，所以走的是 `buildUnownedProviderTransportReplayFallback` 那条默认路径，而该路径把 `dropReasoningFromHistory` 置为 `!shouldPreserveReasoningContentReplay(params)`——我们的模型满足保留条件。
+
+> ⛔ **因此 2026-09-03「轨迹级方案因 `dropReasoningFromHistory` 不可行」是错的判断，那套实现是被错误的理由删掉的。**
+
+#### 但 96/120 轮的丢弃是真的，真正的原因仍未知
+
+**不能就此把轨迹级方案原样搬回来**——那等于在一个从未查清的故障上重建。同一段 policy fallback 里，对我们这种 strict-OpenAI-compatible provider **还有三项同样会改写历史的开关是开着的**（`transcript-policy.ts:152-178`）：
+
+| 开关 | 为什么可能致命 |
+|---|---|
+| **`sanitizeToolCallIds: true` + `toolCallIdMode: "strict"`** | **头号嫌疑**：回放时重写 tool_call id → 字节级前缀包含直接断裂，而扁平轨迹重建恰恰要求它 |
+| `applyAssistantFirstOrderingFix: true` | 重排消息顺序 |
+| `validateGeminiTurns` / `validateAnthropicTurns` | 校验失败时可能改写或丢弃 turn |
+
+**下一步**：把探针从"只问 reasoning 在不在"升级成**忠实回放 diff**——记下第 1 个 turn 发出去的原文，第 2 个 turn 逐字段比对回放版本，报告每一处差异（尤其 `tool_calls[].id` 是否原样）。这正是轨迹级样本所依赖的性质，仍然是 CPU-only。**已实现并本地自测（identical→无差异；id 改写 / reasoning 被剥 / reasoning 换载体 / content 丢失，四种破坏各自被单独识别），等服务器上跑一次。**
+
+**顺带修掉探针自身一个缺陷**：09-10 那次 REQUEST #3 是一个 0 条 assistant 消息的独立 session/心跳，**不是回放**，探针却照样打印了判词。现在改成显式打印 "NO VERDICT ... ignore it"——**没有前序 assistant 消息就不给结论**。
+
+### 十、待查
 
 ---
 
@@ -468,7 +498,7 @@ if turn_type == "main":
 |---|---|
 | 「剩下的假设，以及它为什么恰好只在 Part I 显现」 | ⛔ 被自己的对照实验证伪（预测 day 更低，实测更高）|
 | 「计划（2026-09-07）」第二节 `--agent` 分层 | ⚠️ L3 判断出错已更正；据此写的补丁脚本已删除 |
-| 「方案：轨迹级样本」 | ⛔ 已被真实训练证伪并删除实现（`dropReasoningFromHistory`）|
+| 「方案：轨迹级样本」 | ⚠️ **删除理由已被推翻**（2026-09-10 实测 `dropReasoningFromHistory` **是关的**，见第八节后的第九节）。**但 96/120 轮丢弃的真实成因仍未查明，方案不得原样搬回** |
 | 「定版基线 17.8%/0%」 | ⛔ 作废（session-key 兜底 bug）|
 | 「K=6 里程碑」 | ⛔ 训练增益已被 K=0 证伪 |
 

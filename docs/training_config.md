@@ -88,7 +88,7 @@ verdict turn ─────────→ _metaclaw_submit_round
 ```
 
 **每个 turn 一个样本，带自己那一刻真实的 prompt/response，零重建。**
-（轨迹级方案已于 2026-09-03 被真实训练证伪并删除：`dropReasoningFromHistory` 让扁平轨迹无法忠实构造。）
+（轨迹级方案已于 2026-09-03 删除实现。**⚠️ 当时给的理由「`dropReasoningFromHistory` 让扁平轨迹无法忠实构造」已于 2026-09-10 实测推翻——那个开关是关的，reasoning 会原样回放。**真实成因仍未查明，头号嫌疑是同一段 policy 里对我们这种 provider 同样开着的 `sanitizeToolCallIds`/`toolCallIdMode: strict`。详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md) 第九节。）
 
 **⚠️ 交还逻辑必须同时存在于父类和 Select 子类**——服务器实例化的是 `OpenClawCombineSelectAPIServer`，它覆写了两个 `_submit_*`。只打父类等于没打（2026-09-08 实测：held 98 次，`queued group=` 0 次）。
 
