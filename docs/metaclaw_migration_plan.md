@@ -364,9 +364,83 @@ OPD 占比 ≈ 失败率 / 平均 turn 数
 
 **当前建议：先只做第 1 步**——无依赖、成本低、直接压 OOM；做完才能判断 2–4 是否还必要（若长度回到 base 水平，退化本身可能就止住了）。
 
-### 八、待查
+### 八、查证：OpenClaw-RL 官方对中间步骤怎么处理（2026-09-10）
 
-**用户提出**：Personal Agent 阶段默认就把中间步骤拆开单独打分，当时的训崩可能同源。**需要查清 OpenClaw-RL 官方对中间步骤到底怎么处理**——这决定我们现在这套是不是从一开始就偏离了被复现的方法。
+**用户提出**：Personal Agent 阶段默认就把中间步骤拆开，当时训崩可能同源。**查证结果：官方有两套设计，我们两边都不是。**
+
+#### 设计一：`toolcall-rl`（自控生成循环）——正是"整条轨迹一个样本"
+
+`toolcall-rl/generate_with_retool.py`：
+
+```python
+for turn in range(TOOL_CONFIGS["max_turns"]):
+    response_token_ids += cur_response_token_ids   # 模型生成
+    loss_masks        += [1] * len(...)            #   计入 loss
+    step_action_spans.append({step_index, token_start, token_end})
+
+    response_token_ids += obs_tokens_ids           # 工具返回
+    loss_masks        += [0] * len(...)            #   不计入 loss
+```
+
+**一条轨迹 = 一个样本**，所有 turn 拼接，`loss_mask` 区分模型 token(1) 与观测(0)。
+
+**而且没有丢掉步级粒度**（`:828` 附近，注释逐字为 *"Save step-wise token spans and aligned PRM scores for downstream token-level training"*）：
+
+```python
+sample.metadata["step_wise"] = {
+    "step_token_spans": [[start, end], ...],
+    "step_scores":      [prm_score, ...],     # 每一步自己的 PRM 分
+}
+```
+
+**→ 中间步骤既不是独立样本、也不是没有信号——是同一个样本里的 token 区间，各自带分数。**
+
+#### 设计二：`openclaw-*` proxy 路径（Personal Agent / 我们这条）
+
+per-turn 样本，**这确实是官方的**，不是本项目发明。
+
+**但官方在这条路上，每个 turn 都会触发自己的判官**（`openclaw_opd_api_server.py:753-760`）：
+
+```python
+if turn_type == "main":
+    prev_turn_num = self._turn_counts.get(session_id, 0)
+    if prev_turn_num > 0 and messages:
+        self._fire_opd_task(session_id, prev_turn_num, prev_turn_data, messages[-1])
+```
+
+**拆成 per-turn 的代价，官方用"每 turn 一个判官"补上了。**
+
+#### 我们的偏离
+
+| | 样本切分 | 中间步骤的信号 |
+|---|---|---|
+| 官方 toolcall-rl | 一条轨迹一个样本 | **step 区间 + 每步 PRM 分** |
+| 官方 proxy 路径 | per-turn | **每 turn 一个判官** |
+| **我们现在** | **per-turn** | **❌ 无**（held，不判不打分）|
+
+**保留了 per-turn 的碎片化，却拿掉了补偿它的机制——两边的好处都没拿到。**
+
+#### 对用户直觉的修正
+
+"Personal Agent 分出中间步骤导致训崩"——**分出中间步骤本身是官方做法，不是病根**；那时每个中间 turn 都有判官，信号并不稀。
+
+**病根是 2026-09-03 停用步骤判官之后没有填上那个洞。**停用的理由成立（开放式判"这步好不好"、无事实锚点），**但停用后中间 turn 从"有信号（虽不可靠）"变成"零信号"，而 per-turn 的碎片化还留着**。这正是 25% OPD 覆盖率与"75% 样本只有无信息惩罚"的来源。
+
+#### 由此得到第三条路，绕开了之前的死结
+
+`toolcall-rl` 的答案是：**不需要每 turn 一个判官，也不需要发明 turn 级 ground truth——把步级归属表达成同一样本内的 token 区间即可。**
+
+```
+一轮 = 一个样本
+   ├─ 每个 turn 的 token 区间记下来（step_token_spans）
+   └─ 轮级 ±1 与 hint 作用于整体（归属正确，不会错贴到中间 turn）
+```
+
+**这天然避开了 per-turn OPD 的归属错误问题**（见上一节第五点）。
+
+**唯一障碍仍是 `dropReasoningFromHistory`**——合成一条需要忠实序列。**下一步专查它能不能关、代价是什么。**
+
+### 九、待查
 
 ---
 
