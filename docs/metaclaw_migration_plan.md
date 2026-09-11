@@ -537,7 +537,55 @@ return params.model?.reasoning === true || requiresReasoningContentReplay(params
 
 **顺带修掉探针自身一个缺陷**：09-10 那次 REQUEST #3 是一个 0 条 assistant 消息的独立 session/心跳，**不是回放**，探针却照样打印了判词。现在改成显式打印 "NO VERDICT ... ignore it"——**没有前序 assistant 消息就不给结论**。
 
-### 十、待查
+### 十、轨迹级方案的第二条路：**终轮 prompt 本身就是轨迹**，不需要前缀重建（2026-09-11）
+
+**09-03 之所以会丢 96/120 轮，是因为它选了"重建"这条路。它不是唯一的路。**
+
+#### 决定性的一条：proxy 存的 `prompt_text` 已经是全量历史
+
+`openclaw_opd_api_server.py:769`：
+
+```python
+prompt_text = self.tokenizer.apply_chat_template(
+    norm_msgs, tools=tools, tokenize=False, add_generation_prompt=True
+)
+```
+
+`norm_msgs` 是 **OpenClaw 这一次请求发来的完整 messages 数组**——系统提示词 + 题面 + 本轮之前所有 assistant turn + 所有工具返回。**所以本轮最后一个 turn 的 `prompt_ids + response_ids`，本身就是一条完整、忠实的轨迹 token 序列**，由真实 chat template 渲染，**零重建**。
+
+| | 路线 A（09-03 做的）| **路线 B（本节）** |
+|---|---|---|
+| 怎么得到轨迹 | 断言 turn N 的 prompt 逐字节包含 turn N-1 的 prompt+response，逐轮拼 | **直接取终轮 `prompt_ids + response_ids`** |
+| 依赖 | 字节级前缀包含 | **无** |
+| 历史被改写时（tool id 重写 / reasoning 被剥 / 压缩）| **整轮作废**（→ 96/120）| **序列照样忠实**（它就是模型读到的字节）|
+| 还需要做什么 | — | **只需标出哪些 token 段是模型自己生成的**（`loss_mask=1`）|
+
+#### loss_mask 怎么标，以及为什么它优雅降级
+
+对本轮每个更早的 turn `t`，我们手里有它的 `response_text`。在终轮 `prompt_text` 里搜这段文字：
+
+- **找到** → 该 span 的 token 置 `loss_mask=1`
+- **找不到**（被压缩摘要替换 / 被改写 / reasoning 被剥）→ **它本来就不在模型读到的序列里，什么都不用做，自然跳过**
+
+> **这正是路线 A 缺的那个性质**：路线 A 一处对不上就整轮丢弃；**路线 B 同样情况下只是少 mask 一段，轨迹依然成立、依然可训。** 96/120 那种灾难在结构上不会再发生。
+
+**mask 覆盖率本身是个该记录的指标**（"本轮 N 个 turn 里有几个在终轮 prompt 里找得到"）——它顺带把"OpenClaw 到底改写了多少历史"变成了训练时持续可观测的量，**比任何离线探针都直接**。
+
+#### hint 的归属自然就对了
+
+轮级 ±1 与 hint 作用于**整条轨迹**，teacher forward 跑整条序列。**不存在"轮级 hint 错贴到某个中间 turn"的问题**（那是 per-turn 方案的固有病，见第八节第五点）。这正是用户要的"hint 直接训练这条轨迹"。
+
+#### ⚠️ 必须先解决的三件事（按阻塞程度排序）
+
+| | 状态 |
+|---|---|
+| **1. 显存——这是硬阻塞** | 一条完整轨迹 = 终轮 prompt（可达 `contextWindow` 50000）+ response。而 teacher 在**单卡、`CP=1`、`max-tokens-per-gpu 32768`**。09-08 / 09-09 两次 OOM 的肇事者是 **34,885 token 的单条 response**（19.75 GiB 一次性分配），**完整轨迹只会更长**。**不先解决这个，轨迹方案一上来就 OOM。** 这跟长度退化的修法是两个问题（改 loss 归约不省显存），但共用同一个瓶颈 |
+| **2. token 边界对齐** | 每个 turn 的 `response_logprobs` 是当初**单独** tokenize 那段文字时得到的；终轮 prompt 是**整体**tokenize 的，**同一段文字在拼接处的 token 边界不保证一致**（合并/拆分）。错位会让 importance ratio 假性偏离 1。**纯 tokenizer 问题，CPU 可离线验**，但必须验 |
+| **3. 每轮样本数 N → 1** | `rollout-batch-size 8` 现在收 8 道题≈几十条样本；改轨迹后就是 **8 条**。梯度噪声显著变大，batch 可能要调。**不是错误，是要重新定的超参** |
+
+**另注**：本轮最后一个 turn 是 driver 发的 **verdict turn**（`max_tokens=0`，不生成）。要取的是**最后一个真实生成的 turn**，不是 verdict turn。
+
+### 十一、待查
 
 ---
 

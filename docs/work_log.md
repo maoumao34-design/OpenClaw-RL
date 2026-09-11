@@ -2364,6 +2364,29 @@ VERDICT: PRESERVED -- dropReasoningFromHistory is OFF
 - **产出优先级重排**：目前最接近"可主张"的是**长度退化那条机制链**（`sum_of_sample_mean` ⇒ 每 token 压力 ∝ `A/(N·T)` ⇒ 稀释惩罚最划算 ⇒ 多想是最便宜的稀释），因为它**机制 + 量化证据 + 竞争解释的反证 + 干预手段**四样齐全；其次是 round-group + 1/N（有实现缺对照）；第三条路（step token 区间）仅设计
 - **跑出高分仍是必要条件，但不再是唯一交付**——一个有机制解释、有量化证据的失效模式，可主张性不低于一个更高的分数
 
+### 六、轨迹级方案找到第二条路：终轮 prompt 本身就是轨迹（不需要前缀重建）
+
+用户定方向："准备做一道题作为轨迹，让 hint 直接训练这个轨迹。"查 proxy 实际存了什么，发现 **09-03 丢 96/120 轮是因为它选了"重建"这条路，而那不是唯一的路**。
+
+**决定性的一条**（`openclaw_opd_api_server.py:769`）：`prompt_text = apply_chat_template(norm_msgs, ...)`，而 `norm_msgs` 是 **OpenClaw 这次请求发来的完整 messages 数组**（系统提示词 + 题面 + 之前所有 assistant turn + 所有工具返回）。**所以本轮最后一个真实 turn 的 `prompt_ids + response_ids` 本身就是一条完整忠实的轨迹，由真实 chat template 渲染，零重建。**
+
+| | 路线 A（09-03）| **路线 B** |
+|---|---|---|
+| 依赖 | 字节级前缀包含 | **无** |
+| 历史被改写时 | **整轮作废**（→96/120）| **序列照样忠实**——它就是模型读到的字节 |
+| 还要做什么 | — | 只需标出哪些 token 段是模型生成的 |
+
+**loss_mask 的标法自带优雅降级**：拿每个更早 turn 的 `response_text` 去终轮 `prompt_text` 里搜——找到就 mask=1，**找不到说明它本来就不在模型读到的序列里，跳过即可**。路线 A 一处对不上整轮丢弃；路线 B 同样情况只是少 mask 一段。**96/120 那种灾难在结构上不会再发生。** 且 mask 覆盖率是个可持续观测的量，**比任何离线探针都直接地告诉我们 OpenClaw 改写了多少历史**。
+
+**hint 的归属自然就对了**：轮级 ±1 与 hint 作用于整条轨迹，不存在"轮级 hint 错贴到中间 turn"这个 per-turn 固有病。
+
+**⚠️ 必须先解决的三件事：**
+1. **显存——硬阻塞**。完整轨迹 = 终轮 prompt（可达 50000）+ response，而 teacher 单卡、`CP=1`、`max-tokens-per-gpu 32768`。09-08/09-09 两次 OOM 的肇事者是 34,885 token 的**单条 response**，完整轨迹只会更长。**不先解决，轨迹方案一上来就 OOM**
+2. **token 边界对齐**：每个 turn 的 `response_logprobs` 是单独 tokenize 得到的，终轮 prompt 是整体 tokenize 的，拼接处边界不保证一致。CPU 可离线验，但必须验
+3. **每轮样本数 N→1**：`rollout-batch-size 8` 从几十条样本变 8 条，梯度噪声变大，batch 要重定
+
+**另注**：本轮最后一个 turn 是 driver 的 verdict turn（`max_tokens=0` 不生成），要取的是**最后一个真实生成的 turn**。
+
 **下一步：**
 1. **在服务器上跑一次升级后的忠实回放 diff 探针**（CPU-only，不占 GPU）——直接回答 `tool_calls[].id` 会不会被重写
 2. 长度问题的修法二选一：`--custom-pg-loss-reducer-function-path`（切到 `sum_of_token`）vs `--calculate-per-token-loss`。**这条无前置依赖，是依赖链的第一步**
