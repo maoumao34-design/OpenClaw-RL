@@ -148,11 +148,14 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         echo "错误：--use-dynamic-global-batch-size 注入失败" >&2
         exit 1
     fi
-    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
-        sed -i -e 's|--disable-rewards-normalization|--disable-rewards-normalization\n   --custom-reward-post-process-path metaclaw_round_scale.metaclaw_round_scale|' "${PATCHED}"
-    fi
-    if ! grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
-        echo "错误：--custom-reward-post-process-path 注入失败" >&2
+    # 2026-09-14：1/N 缩放器已随轨迹级样本一起删除。
+    #
+    # 一个 round 现在是**一个**样本，N=1，advantage 就是本轮 checker 的 ±1，
+    # 没有可除的东西了。缩放器（metaclaw_round_scale）连同这里的注入一并撤掉，
+    # 而不是留着让它对 n_turns=1 做一次恒等运算——留着的代价是下一个读代码的人
+    # 要重新推一遍它到底还有没有作用。
+    if grep -q -- "--custom-reward-post-process-path" "${PATCHED}"; then
+        echo "错误：--custom-reward-post-process-path 仍在脚本里，但 1/N 缩放器已删除" >&2
         exit 1
     fi
 

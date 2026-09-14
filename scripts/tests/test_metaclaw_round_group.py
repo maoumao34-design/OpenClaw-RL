@@ -1,18 +1,23 @@
-"""Regression assertions for round-as-one-group + 1/N advantage scaling (2026-09-03).
+"""Wiring assertions for round-as-one-trajectory (2026-09-14).
 
-Two pieces, both exercised against the code the patch scripts actually emit
-from the real official source rather than a copy pasted here:
+Checked against the code the patch scripts actually emit from the real official
+source, never against a copy pasted here.
 
-  1. `metaclaw_round_scale` -- the --custom-reward-post-process-path hook that
-     divides each sample's advantage by the number of turns in its round.
-  2. The proxy-side wiring that makes a round arrive as ONE group of per-turn
-     samples, checked at the source level (it needs torch/slime to run).
+History worth keeping in view: from 2026-09-03 to 2026-09-14 a round was N
+per-turn samples whose advantages were divided by N by a
+`--custom-reward-post-process-path` hook (`metaclaw_round_scale`). That hook is
+gone: a round is now ONE sample, so N is 1 and there is nothing left to divide.
+Its own regression coverage was deleted with it rather than left passing
+against a file nobody loads.
+
+Behaviour of the trajectory builder itself lives in
+test_metaclaw_trajectory.py. This file covers the wiring around it, which
+needs torch/slime to import and so can only be checked at the source level.
 
 Usage (needs the official repo checked out):
     python scripts/tests/test_metaclaw_round_group.py [OFFICIAL_REPO_ROOT]
 """
 
-import importlib.util
 import os
 import subprocess
 import sys
@@ -20,37 +25,20 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS_DIR = os.path.dirname(HERE)
-DEFAULT_OFFICIAL = os.path.normpath(
-    os.path.join(SCRIPTS_DIR, "..", "..", "OpenClaw-RL-official")
-)
-
-
-class _S:
-    """Minimal stand-in for slime's Sample as the reward hook sees it."""
-
-    def __init__(self, score, turns=None, dummy=False, remove_sample=False):
-        self._score = score
-        self.remove_sample = remove_sample or dummy
-        self.metadata = {}
-        if dummy:
-            self.metadata["dummy_removed_sample"] = True
-        if turns is not None:
-            self.metadata["metaclaw_round_turns"] = turns
-            self.metadata["metaclaw_round_id"] = "metaclaw-day01-day01-r1"
-
-    def get_reward_value(self, args):
-        return self._score
-
-
-def _round(reward, turns):
-    """One round: `turns` per-turn samples all carrying the round's verdict."""
-    return [_S(reward, turns=turns) for _ in range(turns)]
+ROOT = os.path.dirname(SCRIPTS_DIR)
 
 
 def main():
-    official = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_OFFICIAL
+    official = (
+        sys.argv[1] if len(sys.argv) > 1
+        else os.environ.get(
+            "OPENCLAW_RL_OFFICIAL",
+            os.path.join(os.path.dirname(ROOT), "OpenClaw-RL-official"),
+        )
+    )
     if not os.path.isdir(official):
-        raise SystemExit(f"official repo not found: {official}")
+        print(f"  -- skipped: {official} not present (set OPENCLAW_RL_OFFICIAL)")
+        return
 
     tmp = tempfile.mkdtemp(prefix="mc_group_test_")
     for script in ("prepare_patched_openclaw_opd.sh",
@@ -58,14 +46,6 @@ def main():
                    "prepare_patched_openclaw_combine_select.sh"):
         subprocess.run(["bash", os.path.join(SCRIPTS_DIR, script), official, tmp],
                        check=True, stdout=subprocess.DEVNULL)
-
-    spec = importlib.util.spec_from_file_location(
-        "metaclaw_round_scale", os.path.join(tmp, "metaclaw_round_scale.py")
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    scale = mod.metaclaw_round_scale
-    args = None
 
     n = 0
 
@@ -76,114 +56,63 @@ def main():
             raise AssertionError(f"FAILED: {label}")
         print(f"  ok  {label}")
 
-    # -- the scaling itself ---------------------------------------------------
-    print("[1/N scaling]")
-    raw, adv = scale(args, _round(1.0, 4))
-    ck(raw == [1.0] * 4, "raw rewards pass through untouched")
-    ck(adv == [0.25] * 4, "a 4-turn round gives every one of its samples 1/4")
-    ck(abs(sum(adv) - 1.0) < 1e-9, "the round totals exactly one round's worth")
-
-    raw, adv = scale(args, _round(-1.0, 20))
-    ck(all(a == -0.05 for a in adv), "a 20-turn failed round gives each sample -1/20")
-    ck(abs(sum(adv) - (-1.0)) < 1e-9, "...and still totals exactly one round")
-
-    # The whole point: round total is independent of turn count.
-    print("\n[round weight is independent of how many turns it took]")
-    totals = []
-    for t in (1, 2, 5, 20, 186):
-        _, a = scale(args, _round(1.0, t))
-        totals.append(round(sum(a), 9))
-    ck(totals == [1.0] * 5,
-       "1, 2, 5, 20 and 186-turn rounds all contribute exactly 1.0 "
-       "(186 is the real day06-r7 round that dominated a batch in 20260902_094458)")
-
-    print("\n[a batch of several rounds]")
-    batch = _round(1.0, 2) + _round(-1.0, 10) + _round(1.0, 6)
-    raw, adv = scale(args, batch)
-    ck(len(adv) == 18, "advantage is returned for every sample")
-    ck(abs(sum(adv[:2]) - 1.0) < 1e-9, "round 1 (2 turns, passed) totals +1")
-    ck(abs(sum(adv[2:12]) - (-1.0)) < 1e-9, "round 2 (10 turns, failed) totals -1")
-    ck(abs(sum(adv[12:]) - 1.0) < 1e-9, "round 3 (6 turns, passed) totals +1")
-    ck(abs(sum(adv) - 1.0) < 1e-9,
-       "the batch is the sum over rounds (2 passed, 1 failed), not over turns -- "
-       "under the old per-sample weighting the 10-turn failure would have "
-       "outweighed both successes")
-    ck(max(abs(a) for a in adv) <= 1.0,
-       "|advantage| never exceeds the raw reward magnitude")
-
-    # -- pass-through and degenerate cases -----------------------------------
-    print("\n[non-MetaClaw samples and degenerate input]")
-    raw, adv = scale(args, [_S(1.0), _S(-1.0)])
-    ck(adv == [1.0, -1.0],
-       "samples without round metadata pass through unchanged -- this hook "
-       "short-circuits _post_process_rewards, so it must reproduce the default "
-       "--disable-rewards-normalization behaviour for the Personal Agent Track")
-
-    raw, adv = scale(args, _round(1.0, 3) + [_S(-1.0)])
-    ck(adv[:3] == [1.0 / 3] * 3 and adv[3] == -1.0,
-       "scaled and pass-through samples coexist in one batch")
-
-    raw, adv = scale(args, _round(1.0, 2) + [_S(0.0, dummy=True)])
-    ck(adv[2] == 0.0, "dummy samples get zero")
-    ck(adv[:2] == [0.5, 0.5], "dummies do not disturb the real samples")
-
-    raw, adv = scale(args, [_S(0.0, remove_sample=True)])
-    ck(adv == [0.0], "remove_sample without the metadata marker is also excluded")
-
-    raw, adv = scale(args, [])
-    ck(raw == [] and adv == [], "an empty batch does not crash")
-
-    for bad in (0, -3, "4", None, 2.5):
-        s = _S(1.0)
-        s.metadata = {"metaclaw_round_turns": bad}
-        _, a = scale(args, [s])
-        ck(a == [1.0], f"a malformed turn count ({bad!r}) falls back to no scaling")
-
-    for k in (1, 3, 18):
-        raw, adv = scale(args, _round(1.0, k))
-        ck(len(raw) == k and len(adv) == k,
-           f"both lists come back at full input length ({k}) -- slime asserts on this")
-
-    # -- proxy-side wiring (source-level: needs torch/slime to run) -----------
-    print("\n[proxy emits a round as one group]")
     combine = open(os.path.join(tmp, "openclaw_combine_api_server.py"),
                    encoding="utf-8").read()
-    ck("async def _metaclaw_submit_round(" in combine, "the round assembler exists")
-    ck(combine.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 2,
-       "both submission paths can hand a sample back instead of queueing it")
-    ck(combine.count(
-        "await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))") == 2,
-       "both paths still queue individually when no round is being assembled "
-       "(the Personal Agent Track path)")
-    ck("await asyncio.to_thread(self.output_queue.put, (group_index, collect))" in combine,
-       "the round is queued exactly once, as one group -- _drain_output_queue "
-       "overwrites on repeated group ids, so an incremental put would lose members")
-    ck('"metaclaw_round_turns": turn_data["metaclaw_round_turns"]' in combine,
-       "every sample carries its round's turn count for the hook to divide by")
-    ck('if opd_result.get("metaclaw_verdict"):' in combine,
-       "the verdict result takes over dispatch for the whole round")
-    ck("if not has_valid_rl:" in combine and "carries no valid outcome" in combine,
-       "a verdict with no usable outcome drops the round instead of inventing one")
-    ck(combine.index("if not has_valid_rl:") < combine.index("if opd_accepted and has_valid_rl:"),
-       "that drop is checked before the official per-turn dispatch branches")
-
-    print("\n[proxy holds intermediate turns]")
-    opd = open(os.path.join(tmp, "openclaw_opd_api_server.py"), encoding="utf-8").read()
-    ck("held (intermediate turn, no judge, no sample of its own)" in opd,
-       "intermediate MetaClaw turns fire no judge")
-    ck("_metaclaw_build_trajectory" not in opd,
-       "the reverted flat-trajectory assembler is gone")
-    ck("Most likely cause is OpenClaw compacting" not in opd,
-       "the wrong compaction diagnosis is gone (real cause: dropReasoningFromHistory)")
-
-    print("\n[OPD hint anchors on the round task]")
+    opd = open(os.path.join(tmp, "openclaw_opd_api_server.py"),
+               encoding="utf-8").read()
     select = open(os.path.join(tmp, "openclaw_combine_select_api_server.py"),
                   encoding="utf-8").read()
-    # 2026-09-07: anchoring moved from "the session's first user message"
-    # to "the message carrying this round's task_prefix". Under one session
-    # per day the first user message is day-round-1's question, so the old
-    # form attached every later round's feedback to the wrong task. See
-    # test_metaclaw_day_scope_fixes.py for the behavioural coverage.
+
+    print("[the 1/N scaler is gone, not merely unused]")
+    ck(not os.path.exists(os.path.join(tmp, "metaclaw_round_scale.py")),
+       "no metaclaw_round_scale.py is emitted any more")
+    profile = open(os.path.join(SCRIPTS_DIR,
+                                "run_openclaw_topk_select_modelfactory.sh"),
+                   encoding="utf-8").read()
+    ck("sed -i -e 's|--disable-rewards-normalization|" not in profile,
+       "the profile no longer injects --custom-reward-post-process-path")
+
+    print("\n[a round is assembled into one trajectory sample]")
+    ck("async def _metaclaw_submit_round(" in combine, "the round assembler exists")
+    ck("def _metaclaw_build_trajectory(" in combine, "the trajectory builder exists")
+    ck("await asyncio.to_thread(self.output_queue.put, (group_index, collect))" in combine,
+       "the round is queued exactly once -- _drain_output_queue overwrites on "
+       "repeated group ids, so an incremental put would lose members")
+    ck(combine.count("await self._submit_turn_sample(") == 1
+       and combine.count("await self._submit_rl_turn_sample(") == 1,
+       "exactly one sample is submitted per round, on one of the two paths")
+    ck("for _td in turns:" not in combine,
+       "the per-turn submission loop is gone, not left beside the new path")
+
+    print("\n[the mask reaches BOTH submit paths]")
+    # 2026-09-08 cost a whole run to this exact class of mistake: the hand-back
+    # went into the parent while the Select subclass overrode both methods.
+    for name, src in (("parent", combine), ("Select subclass", select)):
+        ck(src.count('_mc_mask = turn_data.get("metaclaw_loss_mask")') == 2,
+           f"{name}: both submit paths honour a caller-supplied loss_mask")
+        ck(src.count("sample.loss_mask = list(_mc_mask)") == 2,
+           f"{name}: both paths use it when its length matches")
+        ck(src.count("sample.loss_mask = [1] * len(response_ids)") == 2,
+           f"{name}: both paths still fall back to all-ones otherwise")
+    ck(combine.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 2
+       and select.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 2,
+       "the hand-back covers both submit paths in parent and subclass alike")
+
+    print("\n[teacher tokens stay aligned to the trajectory]")
+    ck('if turn_data.get("metaclaw_trajectory"):' in select,
+       "the OPD branch knows when it is looking at a trajectory")
+    ck("_enhanced_prompt_text, add_special_tokens=False," in select
+       and ')["input_ids"] + list(_mc_resp_ids)' in select,
+       "a trajectory's response ids are appended verbatim rather than "
+       "re-tokenised -- re-tokenising would misalign the teacher log-probs")
+
+    print("\n[proxy still holds intermediate turns]")
+    ck("held (intermediate turn, no judge, no sample of its own)" in opd,
+       "intermediate MetaClaw turns fire no judge of their own")
+    ck("Most likely cause is OpenClaw compacting" not in opd,
+       "the wrong compaction diagnosis is gone")
+
+    print("\n[OPD hint still anchors on the round task]")
     ck("_mc_task_idx" in select,
        "the verdict branch locates THIS round's task via task_prefix")
     ck("_mc_msgs[: _mc_task_idx + 1], _metaclaw_hint," in select,
@@ -192,6 +121,12 @@ def main():
        "the rest of the conversation is spliced back unchanged")
     ck("_mc_first_user" not in select,
        "the day-unsafe first-user form is gone")
+
+    print("\n[round membership is unchanged]")
+    ck("if not has_valid_rl:" in combine and "carries no valid outcome" in combine,
+       "a verdict with no usable outcome drops the round instead of inventing one")
+    ck('if opd_result.get("metaclaw_verdict"):' in combine,
+       "the verdict result takes over dispatch for the whole round")
 
     print(f"\nall {n} assertions passed")
 

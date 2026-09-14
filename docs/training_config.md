@@ -16,7 +16,7 @@
 >
 > 所以：**测试挂 ≠ 出错**。如果你正在迭代中间，挂是预期的；只有在快照时刻它必须是绿的。
 
-**快照对应：2026-09-08，commit `e7979e1`**（此后若有未同步的改动，以代码为准）
+**快照对应：2026-09-14，轨迹级样本落地这一版**（此后若有未同步的改动，以代码为准）
 
 ---
 
@@ -82,12 +82,24 @@ verdict turn ─────────→ _metaclaw_submit_round
                           │   ① _mc_lo < t < turn_num
                           │   ② turn 的 prompt 含本轮 task_prefix
                           │   不属于本轮 → 显式丢弃 + 告警，不并入
-                          ├ 全部 turn 共用一个 group_index
-                          ├ 每个 turn stamp metaclaw_round_turns = N
-                          └ 一次性 output_queue.put((group_index, collect))
+                          ├ _metaclaw_build_trajectory：整轮拼成**一条**序列
+                          └ 一次性 output_queue.put((group_index, [一个样本]))
 ```
 
-**每个 turn 一个样本，带自己那一刻真实的 prompt/response，零重建。**
+**一个 round = 一个样本（2026-09-14）。**轨迹以**终轮 prompt 为骨架**构造——它已经按模型真实读到的样子含有题面、全部历史动作和全部工具结果——再把每个更早 turn 的可见输出**换回它的完整 response（含思考）**：
+
+```
+序列      [题面][think₁+action₁][tool₁][think₂+action₂][tool₂][think_N+action_N]
+loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
+```
+
+**不是前后拼接**：`prompt_N ≠ prompt_{N-1} + response_{N-1}`（生产数据实测 0/127，OpenClaw 回放时会剥掉 assistant 的思考），链条不嵌套，没有可拼的东西。
+
+**某个 turn 在骨架里找不到 → 原样留着但不 mask**：它的 token 是模型真实读到的，只是不产生梯度。**降级一个 turn，而不是丢掉整轮**——2026-09-03 那次断言前缀包含、断言失败就整轮丢，代价是 120 轮里丢了 96 轮。
+
+样本形态（一个样本、生成段 mask=1、工具结果段 mask=0、`rollout_log_probs` 在未 mask 段补 0）**是 slime 自己的多轮写法**，见 `slime/examples/search-r1/generate_with_search.py`。
+
+
 （轨迹级方案已于 2026-09-03 删除实现。**⚠️ 当时给的理由「`dropReasoningFromHistory` 让扁平轨迹无法忠实构造」已于 2026-09-10 实测推翻——那个开关是关的，reasoning 会原样回放。**真实成因仍未查明，头号嫌疑是同一段 policy 里对我们这种 provider 同样开着的 `sanitizeToolCallIds`/`toolCallIdMode: strict`。详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md) 第九节。）
 
 **⚠️ 交还逻辑必须同时存在于父类和 Select 子类**——服务器实例化的是 `OpenClawCombineSelectAPIServer`，它覆写了两个 `_submit_*`。只打父类等于没打（2026-09-08 实测：held 98 次，`queued group=` 0 次）。
@@ -100,11 +112,11 @@ verdict turn ─────────→ _metaclaw_submit_round
 |---|---|
 | reward | **本轮 checker 判定 ±1**，整轮所有 turn 共享 |
 | 官方基线 | `--advantage-estimator grpo` + `--disable-rewards-normalization`（advantage = reward）|
-| **本项目钩子** | `metaclaw_round_scale` 接管 `_post_process_rewards`：**`advantage = reward / n_turns`** |
+| **本项目钩子** | **已删除**（2026-09-14）。一个 round 是一个样本，N=1，没有可除的东西 |
 | 非 MetaClaw 样本 | 原样透传（advantage = reward）|
-| OPD | hint 贴在**本轮题面**上 → teacher forward → `teacher_log_probs` 进样本 |
+| OPD | hint 贴在**本轮题面**上 → teacher 在**整条轨迹**上 forward → `teacher_log_probs` 进样本。2026-09-14 前只覆盖最后一个 turn |
 
-**1/N 直到 2026-09-08 的 `e7979e1` 才真正接通。**此前所有训练（含全部塌陷事件）都是每个 turn 拿完整 ±1。
+**1/N 从未被一趟跑完的训练验证过**（09-03 实现、09-09 才接通，而那趟 OOM），随轨迹级样本一起删除。见 [`change_ledger.md`](change_ledger.md)。
 
 ---
 
@@ -135,7 +147,7 @@ verdict turn ─────────→ _metaclaw_submit_round
 | `--save-interval` | **10** | MetaClaw profile 从 100 降低 |
 | `--use-dynamic-batch-size` | 开 | 官方 |
 | `--use-dynamic-global-batch-size` | 开 | MetaClaw profile 注入 |
-| `--custom-reward-post-process-path` | `metaclaw_round_scale.metaclaw_round_scale` | MetaClaw profile 注入 |
+
 
 生成上限由 MetaClaw benchmark 自己的配置决定：`openclaw_cfg/openclaw.json` 的 `contextWindow: 50000` / `maxTokens: 50000`。**官方 `--rollout-max-response-len 8192` 对本路径不生效**（它管 slime 自己的 rollout 引擎，而我们的生成由 openclaw agent 发起）。
 
@@ -176,9 +188,11 @@ verdict turn ─────────→ _metaclaw_submit_round
 ## 十、每趟跑必看的日志判据
 
 ```bash
-# 1/N 与成组是否真生效（e7979e1 之前恒为 0）
-grep -c "scaled by 1/turns" <LOGS_DIR>/training.log
-grep -c "queued group="     <LOGS_DIR>/training.log
+# 轨迹级样本是否真生效
+grep -c "queued group="                     <LOGS_DIR>/training.log   # ≈ 完成的轮数
+grep -c "scaled by 1/turns"                 <LOGS_DIR>/training.log   # 应为 0（1/N 已删）
+grep    "tokens masked"                     <LOGS_DIR>/training.log | tail -20
+grep -c "not found in the final prompt"     <LOGS_DIR>/training.log   # 降级计数，应很低
 
 # 归属过滤与 hint 定位（正常应为 0）
 grep -c "do not carry"                       <LOGS_DIR>/training.log
@@ -192,7 +206,7 @@ grep -c "infra failure -- scored 0"          <LOGS_DIR>/metaclaw_rollout.log
 grep -ci "out of memory"                     <LOGS_DIR>/training.log
 ```
 
-**前两条都非零，才说明这一趟是在设计意图下训练。**
+**`queued group=` 非零、且 `tokens masked` 的比值合理（工具结果不该占绝大多数），才说明这一趟是在设计意图下训练。**
 
 ---
 

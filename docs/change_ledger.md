@@ -43,8 +43,11 @@ head -1 /dfs/data/openclaw-rl-project/logs/metaclaw_migration_<RUN_ID>/RUN_MANIF
 | `1fd5f25` | 09-08 | 按天四个正确性修复 | 待核 | ❌ **从未** |
 | `e7979e1` | 09-09 | Select 子类覆写了 D 补丁的两个 submit | 是（`20260909_114032`）| ❌ **从未**——该趟 ~step 10 OOM，无分数 |
 | `9573e0d` | 09-11 | record 按 run 分路径 | 否 | — 不影响模型，只影响日志留存 |
+| **(a) 轨迹级样本** | 09-14 | 一个 round = 一个样本；OPD 覆盖整轮；**删除 1/N 缩放器** | 否 | ❌ **待验证** |
 
 **「待核」的格子用上面那条 `head -1 RUN_MANIFEST.txt` 就能填掉。**
+
+> **(a) 落地时同时删除的东西**：`metaclaw_round_scale.py` 及其 `--custom-reward-post-process-path` 注入。它从未被验证过，且在一个 round 只有一个样本之后 N 恒为 1，留着只会让下一个读代码的人重新推一遍它还有没有作用。**回撤 (a) 必须连它一起回撤**，否则per-turn 样本会退回到每个 turn 拿完整 ±1——那正是 09-03 之前所有塌陷事件的状态。
 
 ---
 

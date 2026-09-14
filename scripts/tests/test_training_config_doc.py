@@ -124,9 +124,14 @@ def main():
     ck("--use-dynamic-global-batch-size" in doc
        and "--use-dynamic-global-batch-size" in profile,
        "dynamic global batch size injected, and documented")
-    ck("metaclaw_round_scale.metaclaw_round_scale" in doc
-       and "metaclaw_round_scale.metaclaw_round_scale" in profile,
-       "custom reward post-process path injected, and documented")
+    # 2026-09-14: the 1/N hook is gone, so this checks its ABSENCE on both
+    # sides. An assertion that a thing exists cannot notice its deletion.
+    ck("metaclaw_round_scale.metaclaw_round_scale" not in profile,
+       "the profile no longer injects the 1/N reward hook")
+    ck("`metaclaw_round_scale` 接管" not in doc,
+       "the doc no longer describes the 1/N hook as live")
+    ck("_metaclaw_build_trajectory" in doc,
+       "the doc names the trajectory builder")
 
     print("\n[unchanged official hyperparameters]")
     if os.path.exists(OFFICIAL_SCRIPT):
@@ -170,12 +175,16 @@ def main():
               "(set OPENCLAW_RL_OFFICIAL to enable)")
 
     print("\n[sample formation]")
-    ck("零重建" in doc, "doc states samples carry their own real prompt/response")
-    ck("metaclaw_round_turns" in doc, "doc names the field the 1/N scaler reads")
-    ck("advantage = reward / n_turns" in doc.replace("`", "")
-       or "reward / n_turns" in doc, "doc states the 1/N formula")
-    ck("advantages.append(reward / n_turns)" in combine,
-       "the scaler really divides by the turn count")
+    ck("一个 round = 一个样本" in doc,
+       "doc states one sample per round")
+    ck("0/127" in doc,
+       "doc cites the measurement that rules out prefix concatenation")
+    ck("advantages.append(reward / n_turns)" not in combine,
+       "the 1/N scaler is really gone from the patch script")
+    ck("_metaclaw_build_trajectory" in combine,
+       "the patch script really emits the trajectory builder")
+    ck('_mc_mask = turn_data.get("metaclaw_loss_mask")' in combine,
+       "the patch script really wires a caller-supplied loss mask")
     ck(combine.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 1
        and select.count('_mc_collect = turn_data.get("metaclaw_round_collect")') == 1,
        "hand-back present in BOTH parent and subclass patches, as the doc warns")

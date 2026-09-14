@@ -115,6 +115,13 @@ import_new = (
     "    generate,\n"
     "    reward_func,\n"
     ")\n"
+    "\n"
+    "# --- openclaw-rl-metaclaw-trajectory ---\n"
+    "# Matches what OpenClaw strips out of an assistant turn before replaying\n"
+    "# it, so an earlier turn can be located inside a later prompt by the part\n"
+    "# of it that survived.\n"
+    "import re as _mc_re  # noqa: E402\n"
+    '_MC_THINK_RE = _mc_re.compile(r"<think>.*?</think>", _mc_re.DOTALL)\n'
 )
 if text.count(import_old) != 1:
     raise SystemExit(
@@ -125,121 +132,60 @@ if text.count(import_old) != 1:
 text = text.replace(import_old, import_new, 1)
 
 # ---------------------------------------------------------------------
-# Source of the 1/N advantage scaler, written out verbatim below. Kept as a
-# literal here (rather than a checked-in .py under scripts/) so the whole
-# proxy-side toolchain stays in one place and the file lands in DEST_DIR,
-# which the launcher already prepends to the training process's PYTHONPATH.
+# openclaw-rl-metaclaw-trajectory (2026-09-14)
+#
+# A round is ONE sample, not one per turn. The round's +/-1 and the round's
+# hint both act on the whole thing, which is what they are about: the hint
+# describes the artifact the round was supposed to produce, not any single
+# step.
+#
+# How the sequence is built, and why it is not built by concatenation:
+# turn N's prompt is NOT turn N-1's prompt plus its response (measured 0/127
+# on production records) -- OpenClaw strips the thinking out of an assistant
+# turn before replaying it, so the chain does not nest and there is nothing to
+# concatenate. Instead the LAST turn's prompt is used as the backbone, since
+# it already holds the task, every earlier action and every tool result in the
+# exact form the model read them, and each earlier turn's visible output is
+# swapped back out for its full response so the thinking is trained on too.
+#
+# A turn whose visible output cannot be located in the backbone is left as-is
+# and simply not masked: its tokens stay in the sequence (they are what the
+# model actually read) but contribute no gradient. That degrades one turn
+# rather than discarding the round, which is what the 2026-09-03 attempt did
+# when its prefix assertion failed -- it dropped 96 of 120 rounds.
+#
+# The shape -- one sample, loss_mask 1 on generated spans and 0 on tool
+# results, rollout_log_probs zero-filled on the unmasked spans -- is slime's
+# own multi-turn form; see slime/examples/search-r1/generate_with_search.py.
 # ---------------------------------------------------------------------
-ROUND_SCALE_SRC = '''"""Per-round advantage scaling for the MetaClaw migration.
-
-Registered via slime's --custom-reward-post-process-path, which short-circuits
-at the top of RolloutManager._post_process_rewards. Returns (raw_rewards,
-rewards); `rewards` is what becomes the advantage, `raw_rewards` is only logged.
-
-What it does
-------------
-Divides each sample's advantage by the number of turns in the round it came
-from (openclaw_combine_api_server.py stamps that onto sample.metadata as
-`metaclaw_round_turns`). Samples without that key are passed through unchanged,
-so the Personal Agent Track behaves exactly as it does today.
-
-Why
----
-slime's sum_of_sample_mean (backends/megatron_utils/cp_utils.py:70) averages
-within a sample and then sums ACROSS samples, so every sample weighs the same
-regardless of length. A MetaClaw round emits one sample per turn, so a round
-that took 20 turns contributes twenty times the gradient of a round answered in
-one -- verbosity earns a 20x bonus that has nothing to do with being right.
-That weighting is what let day06-r7 (186 turns) flush 186 negatives into a
-single batch in metaclaw_migration_20260902_094458 and dominate it.
-
-Dividing by N makes each round contribute exactly one round's worth. Combined
-with emitting a round as one group (so --rollout-batch-size counts complete
-rounds), a batch is now a clean average over that many rounds, and no single
-round can fill one on its own.
-
-What it does NOT do
--------------------
-It scales magnitude, not sign. With --disable-rewards-normalization and
-n_samples_per_prompt=1 there is still no within-group comparison, so a batch in
-which every round failed is still uniformly negative -- just at 1/N strength.
-Fixing that needs n_samples_per_prompt > 1, not this hook.
-"""
-
-import logging
-
-logger = logging.getLogger(__name__)
-
-
-def _is_dummy(sample):
-    """slime injects placeholder samples when a batch is smaller than dp_size.
-
-    They carry reward 0.0 and loss_mask [0], so they never contribute gradient,
-    but giving them an explicit zero keeps the logged counters honest.
-    _drop_removed_samples has already run by this point, so remove_sample can
-    only be true for these.
-    """
-    meta = getattr(sample, "metadata", None) or {}
-    return bool(meta.get("dummy_removed_sample")) or bool(
-        getattr(sample, "remove_sample", False)
+loss_mask_old = (
+    '        sample.loss_mask = [1] * len(response_ids)\n'
+)
+if text.count(loss_mask_old) != 2:
+    raise SystemExit(
+        f"patch failed: expected exactly 2 loss_mask assignments in {src_path} "
+        f"(_submit_turn_sample and _submit_rl_turn_sample), found "
+        f"{text.count(loss_mask_old)} (official file may have changed "
+        "upstream -- update this patch)"
     )
-
-
-def metaclaw_round_scale(args, samples, **kwargs):
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    advantages = []
-    scaled = 0
-    passthrough = 0
-    turn_counts = []
-
-    for sample, reward in zip(samples, raw_rewards):
-        if _is_dummy(sample):
-            advantages.append(0.0)
-            continue
-        meta = getattr(sample, "metadata", None) or {}
-        n_turns = meta.get("metaclaw_round_turns")
-        if isinstance(n_turns, int) and n_turns > 0:
-            advantages.append(reward / n_turns)
-            scaled += 1
-            turn_counts.append(n_turns)
-        else:
-            # Not a MetaClaw round sample. Pass through unchanged: this hook
-            # short-circuits _post_process_rewards entirely, so the fallback
-            # has to reproduce the default behaviour under
-            # --disable-rewards-normalization, which is advantage = reward.
-            advantages.append(reward)
-            passthrough += 1
-
-    if turn_counts:
-        distinct_rounds = len(set(turn_counts))
-        logger.info(
-            "[metaclaw-round-scale] %d/%d sample(s) scaled by 1/turns "
-            "(turns min=%d max=%d), %d passed through; "
-            "advantage min=%.4f max=%.4f",
-            scaled,
-            len(samples),
-            min(turn_counts),
-            max(turn_counts),
-            passthrough,
-            min(advantages),
-            max(advantages),
-        )
-        if distinct_rounds == 1 and scaled == len(turn_counts) and passthrough == 0:
-            logger.warning(
-                "[metaclaw-round-scale] every sample in this batch reports the "
-                "same turn count (%d) -- if that is one round filling the whole "
-                "batch, the round-as-one-group emission is not working",
-                turn_counts[0],
-            )
-    else:
-        logger.info(
-            "[metaclaw-round-scale] no MetaClaw round samples in this batch of "
-            "%d; all rewards passed through unchanged",
-            len(samples),
-        )
-
-    return raw_rewards, advantages
-'''
+loss_mask_new = (
+    '        # --- openclaw-rl-metaclaw-trajectory ---\n'
+    '        # A trajectory sample masks only the generated spans; tool results\n'
+    '        # sit in the same response segment and must earn no gradient.\n'
+    '        _mc_mask = turn_data.get("metaclaw_loss_mask")\n'
+    '        if _mc_mask is not None and len(_mc_mask) == len(response_ids):\n'
+    '            sample.loss_mask = list(_mc_mask)\n'
+    '        else:\n'
+    '            if _mc_mask is not None:\n'
+    '                logger.error(\n'
+    '                    "[openclaw-rl-metaclaw-trajectory] loss_mask length %d "\n'
+    '                    "!= response length %d -- falling back to all-ones, so "\n'
+    '                    "this sample would train on tool results",\n'
+    '                    len(_mc_mask), len(response_ids),\n'
+    '                )\n'
+    '            sample.loss_mask = [1] * len(response_ids)\n'
+)
+text = text.replace(loss_mask_old, loss_mask_new, 2)
 
 old_loop_head = (
     '        for turn_num in sorted(list(pending.keys())):\n'
@@ -483,53 +429,165 @@ if text.count(round_submit_anchor) != 1:
         "(official file may have changed upstream -- update this patch)"
     )
 round_submit_new = (
+    '    @staticmethod\n'
+    '    def _metaclaw_visible(text_in):\n'
+    '        """The part of a response that survives into the next prompt.\n'
+    '\n'
+    '        OpenClaw removes <think> blocks from an assistant turn before\n'
+    '        replaying it, so this is the form an earlier turn takes inside\n'
+    '        a later prompt -- and therefore what has to be searched for\n'
+    '        when putting the thinking back.\n'
+    '        """\n'
+    '        return _MC_THINK_RE.sub("", text_in or "").strip()\n'
+    '\n'
+    '    def _metaclaw_build_trajectory(self, session_id, turns):\n'
+    '        """Assemble the round into one sample: ids, mask, logprobs.\n'
+    '\n'
+    '        Returns a turn_data-shaped dict so the existing submit paths\n'
+    '        can build the Sample, or None when it cannot be assembled.\n'
+    '        """\n'
+    '        final = turns[-1]\n'
+    '        backbone = final.get("prompt_text") or ""\n'
+    '        if not backbone:\n'
+    '            return None\n'
+    '\n'
+    '        pieces = []\n'
+    '        cursor = 0\n'
+    '        missing = 0\n'
+    '        for _td in turns[:-1]:\n'
+    '            _vis = self._metaclaw_visible(_td.get("response_text"))\n'
+    '            if not _vis:\n'
+    '                missing += 1\n'
+    '                continue\n'
+    '            _at = backbone.find(_vis, cursor)\n'
+    '            if _at < 0:\n'
+    '                # Left in the backbone as OpenClaw rendered it, but not\n'
+    '                # masked: those tokens are real, they just earn no\n'
+    '                # gradient. Degrading one turn beats discarding the\n'
+    '                # round, which is what the 2026-09-03 attempt did.\n'
+    '                missing += 1\n'
+    '                logger.warning(\n'
+    '                    "[openclaw-rl-metaclaw-trajectory] session=%s a turn "\n'
+    '                    "was not found in the final prompt -- left unmasked",\n'
+    '                    session_id,\n'
+    '                )\n'
+    '                continue\n'
+    '            pieces.append((False, backbone[cursor:_at]))\n'
+    '            pieces.append((True, _td))\n'
+    '            cursor = _at + len(_vis)\n'
+    '        pieces.append((False, backbone[cursor:]))\n'
+    '        pieces.append((True, final))\n'
+    '\n'
+    '        # Everything before the first generated span is the prompt.\n'
+    '        first_gen = next(i for i, (g, _) in enumerate(pieces) if g)\n'
+    '        prompt_text = "".join(x for g, x in pieces[:first_gen] if not g)\n'
+    '        prompt_ids = self.tokenizer(\n'
+    '            prompt_text, add_special_tokens=False,\n'
+    '        )["input_ids"]\n'
+    '\n'
+    '        response_ids, loss_mask, logprobs = [], [], []\n'
+    '        text_parts = []\n'
+    '        for is_gen, item in pieces[first_gen:]:\n'
+    '            if is_gen:\n'
+    '                # Tokens the model produced, verbatim -- never re-tokenised.\n'
+    '                _ids = list(item["response_ids"])\n'
+    '                _lp = list(item.get("response_logprobs") or [])\n'
+    '                if len(_lp) > len(_ids):\n'
+    '                    _lp = _lp[: len(_ids)]\n'
+    '                elif len(_lp) < len(_ids):\n'
+    '                    _lp = _lp + [0.0] * (len(_ids) - len(_lp))\n'
+    '                response_ids += _ids\n'
+    '                loss_mask += [1] * len(_ids)\n'
+    '                logprobs += _lp\n'
+    '                text_parts.append(item.get("response_text") or "")\n'
+    '            else:\n'
+    '                if not item:\n'
+    '                    continue\n'
+    '                _ids = self.tokenizer(\n'
+    '                    item, add_special_tokens=False,\n'
+    '                )["input_ids"]\n'
+    '                response_ids += _ids\n'
+    '                loss_mask += [0] * len(_ids)\n'
+    '                logprobs += [0.0] * len(_ids)\n'
+    '                text_parts.append(item)\n'
+    '\n'
+    '        if not any(loss_mask):\n'
+    '            logger.warning(\n'
+    '                "[openclaw-rl-metaclaw-trajectory] session=%s assembled a "\n'
+    '                "trajectory with nothing masked -- dropping",\n'
+    '                session_id,\n'
+    '            )\n'
+    '            return None\n'
+    '\n'
+    '        return {\n'
+    '            "prompt_ids": prompt_ids,\n'
+    '            "response_ids": response_ids,\n'
+    '            "response_logprobs": logprobs,\n'
+    '            "prompt_text": prompt_text,\n'
+    '            "response_text": "".join(text_parts),\n'
+    '            "messages": final.get("messages"),\n'
+    '            "tools": final.get("tools"),\n'
+    '            "metaclaw_loss_mask": loss_mask,\n'
+    '            "metaclaw_trajectory": True,\n'
+    '            "metaclaw_missing_turns": missing,\n'
+    '        }\n'
+    '\n'
     '    async def _metaclaw_submit_round(\n'
     '        self, session_id: str, turns: list, verdict_td: dict,\n'
     '        opd_result: dict, reward: float,\n'
     '    ):\n'
-    '        """Submit one MetaClaw round as a single group of per-turn samples.\n'
+    '        """Submit one MetaClaw round as ONE trajectory sample.\n'
     '\n'
-    '        `turns` are the round\'s held intermediate turns (RL-only: they never\n'
-    '        got a judge, by design -- see the fire gate in\n'
-    '        prepare_patched_openclaw_opd.sh). `verdict_td` is the final turn,\n'
-    '        which additionally carries the OPD hint when one was accepted.\n'
-    '        Every sample gets the same reward: the round\'s checker verdict.\n'
+    '        `turns` are the held intermediate turns of the round, and\n'
+    '        `verdict_td` is the last real generating turn. The round-level\n'
+    '        +/-1 acts on the whole trajectory, and so does the OPD teacher\n'
+    '        signal when a hint was accepted -- not on any single step.\n'
     '        """\n'
-    '        collect: list = []\n'
-    '        group_index = next(self._group_counter)\n'
     '        all_tds = list(turns) + [verdict_td]\n'
     '        n_turns = len(all_tds)\n'
-    '        for _td in all_tds:\n'
-    '            _td["metaclaw_round_collect"] = collect\n'
-    '            _td["metaclaw_round_group_index"] = group_index\n'
-    '            _td["metaclaw_round_turns"] = n_turns\n'
-    '\n'
-    '        for _td in turns:\n'
-    '            await self._submit_rl_turn_sample(_td, session_id, reward)\n'
-    '        if opd_result.get("accepted"):\n'
-    '            await self._submit_turn_sample(\n'
-    '                verdict_td, session_id, opd_result, reward=reward,\n'
-    '            )\n'
-    '        else:\n'
-    '            await self._submit_rl_turn_sample(verdict_td, session_id, reward)\n'
-    '\n'
-    '        if not collect:\n'
+    '        traj = self._metaclaw_build_trajectory(session_id, all_tds)\n'
+    '        if traj is None:\n'
     '            logger.warning(\n'
-    '                "[openclaw-rl-metaclaw-round-group] session=%s produced no "\n'
-    '                "samples from %d turn(s) -- nothing queued",\n'
+    '                "[openclaw-rl-metaclaw-trajectory] session=%s could not "\n'
+    '                "assemble a trajectory from %d turn(s) -- nothing queued",\n'
     '                session_id, n_turns,\n'
     '            )\n'
     '            return\n'
+    '\n'
+    '        collect: list = []\n'
+    '        group_index = next(self._group_counter)\n'
+    '        traj["metaclaw_round_collect"] = collect\n'
+    '        traj["metaclaw_round_group_index"] = group_index\n'
+    '        traj["metaclaw_round_turns"] = n_turns\n'
+    '\n'
+    '        if opd_result.get("accepted"):\n'
+    '            await self._submit_turn_sample(\n'
+    '                traj, session_id, opd_result, reward=reward,\n'
+    '            )\n'
+    '        else:\n'
+    '            await self._submit_rl_turn_sample(traj, session_id, reward)\n'
+    '\n'
+    '        if not collect:\n'
+    '            logger.warning(\n'
+    '                "[openclaw-rl-metaclaw-trajectory] session=%s produced no "\n'
+    '                "sample from %d turn(s) -- nothing queued",\n'
+    '                session_id, n_turns,\n'
+    '            )\n'
+    '            return\n'
+    '        _masked = sum(traj["metaclaw_loss_mask"])\n'
     '        logger.info(\n'
-    '            "[openclaw-rl-metaclaw-round-group] session=%s queued group=%d "\n'
-    '            "with %d sample(s) from %d turn(s), reward=%.1f "\n'
-    '            "(advantage will be scaled by 1/%d downstream)",\n'
-    '            session_id, group_index, len(collect), n_turns, reward, n_turns,\n'
+    '            "[openclaw-rl-metaclaw-trajectory] session=%s queued group=%d "\n'
+    '            "trajectory from %d turn(s), reward=%.1f, %d/%d tokens masked, "\n'
+    '            "%d turn(s) not located, opd=%s",\n'
+    '            session_id, group_index, n_turns, reward, _masked,\n'
+    '            len(traj["metaclaw_loss_mask"]), traj["metaclaw_missing_turns"],\n'
+    '            bool(opd_result.get("accepted")),\n'
     '        )\n'
     '        await asyncio.to_thread(self.output_queue.put, (group_index, collect))\n'
     '\n'
     '    def _maybe_submit_ready_samples(\n'
 )
+
 text = text.replace(round_submit_anchor, round_submit_new, 1)
 
 # Dispatch: when the verdict resolves, take over the whole round instead of
@@ -643,12 +701,6 @@ round_dispatch_new = (
     '\n'
 )
 text = text.replace(round_dispatch_old, round_dispatch_new, 1)
-
-import os as _emit_os
-round_scale_path = _emit_os.path.join(_emit_os.path.dirname(dest_path), "metaclaw_round_scale.py")
-with open(round_scale_path, "w", encoding="utf-8") as f:
-    f.write(ROUND_SCALE_SRC)
-print(f"wrote per-round advantage scaler -> {round_scale_path}")
 
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)

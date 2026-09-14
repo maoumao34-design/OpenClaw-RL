@@ -266,10 +266,26 @@ opd_evaluate_head_new = (
     '                        tokenize=False,\n'
     '                        add_generation_prompt=True,\n'
     '                    )\n'
-    '                    _enhanced_full_text = _enhanced_prompt_text + turn_data["response_text"]\n'
-    '                    _enhanced_ids = self.tokenizer(\n'
-    '                        _enhanced_full_text, add_special_tokens=False,\n'
-    '                    )["input_ids"]\n'
+    '                    # --- openclaw-rl-metaclaw-trajectory ---\n'
+    '                    # A trajectory sample\'s response ids were assembled\n'
+    '                    # piecewise (the model\'s own tokens verbatim, tool\n'
+    '                    # results tokenised around them), so re-tokenising\n'
+    '                    # the joined text here would not reproduce them and\n'
+    '                    # the teacher log-probs would align to the wrong\n'
+    '                    # tokens. Keep the prompt tokenised and append the\n'
+    '                    # response ids unchanged.\n'
+    '                    _mc_resp_ids = turn_data.get("response_ids")\n'
+    '                    if turn_data.get("metaclaw_trajectory"):\n'
+    '                        _enhanced_ids = self.tokenizer(\n'
+    '                            _enhanced_prompt_text, add_special_tokens=False,\n'
+    '                        )["input_ids"] + list(_mc_resp_ids)\n'
+    '                    else:\n'
+    '                        _enhanced_full_text = (\n'
+    '                            _enhanced_prompt_text + turn_data["response_text"]\n'
+    '                        )\n'
+    '                        _enhanced_ids = self.tokenizer(\n'
+    '                            _enhanced_full_text, add_special_tokens=False,\n'
+    '                        )["input_ids"]\n'
     '                except Exception as e:\n'
     '                    logger.warning(\n'
     '                        "%s[openclaw-rl-metaclaw-verdict-opd-hint] session=%s "\n'
@@ -729,6 +745,44 @@ text = text.replace(return_accepted_old, return_accepted_new, 1)
 
 if "\nimport json\n" not in text:
     text = text.replace("import logging\n", "import json\nimport logging\n", 1)
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-trajectory (2026-09-14)
+#
+# The Select subclass has its own copies of both submit paths, so the
+# trajectory loss_mask has to be honoured here as well as in the parent.
+# Patching only the parent is the exact failure this project already paid
+# for once: on 2026-09-08 the hand-back went into the parent alone and the
+# run held 98 turns while queueing zero groups.
+# ---------------------------------------------------------------------
+select_loss_mask_old = (
+    '        sample.loss_mask = [1] * len(response_ids)\n'
+)
+if text.count(select_loss_mask_old) != 2:
+    raise SystemExit(
+        f"patch failed: expected exactly 2 loss_mask assignments in "
+        f"{src_path}, found {text.count(select_loss_mask_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+select_loss_mask_new = (
+    '        # --- openclaw-rl-metaclaw-trajectory ---\n'
+    '        # A trajectory sample masks only the generated spans; tool\n'
+    '        # results share the response segment and must earn no gradient.\n'
+    '        _mc_mask = turn_data.get("metaclaw_loss_mask")\n'
+    '        if _mc_mask is not None and len(_mc_mask) == len(response_ids):\n'
+    '            sample.loss_mask = list(_mc_mask)\n'
+    '        else:\n'
+    '            if _mc_mask is not None:\n'
+    '                logger.error(\n'
+    '                    "[openclaw-rl-metaclaw-trajectory] loss_mask length "\n'
+    '                    "%d != response length %d -- falling back to "\n'
+    '                    "all-ones, so this sample would train on tool "\n'
+    '                    "results",\n'
+    '                    len(_mc_mask), len(response_ids),\n'
+    '                )\n'
+    '            sample.loss_mask = [1] * len(response_ids)\n'
+)
+text = text.replace(select_loss_mask_old, select_loss_mask_new, 2)
 
 select_submit_collect_old = (
     '        await asyncio.to_thread(self.output_queue.put, (sample.group_index, [sample]))\n'
