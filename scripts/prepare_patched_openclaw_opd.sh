@@ -1159,6 +1159,64 @@ chat_completions_freeze_new = (
 )
 text = text.replace(chat_completions_freeze_old, chat_completions_freeze_new, 1)
 
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-record-archive (2026-09-14)
+#
+# purge_record_files() truncates the record on every pause_submission --
+# that is, on every train step. The live file therefore only ever holds
+# the rollout currently in flight, which is what the official code wants,
+# but it also means a finished run leaves no record at all.
+#
+# That cost a real diagnosis on 2026-09-14: the trajectory splice was
+# missing every earlier turn, and the bytes that would have shown why had
+# already been purged. The mechanism was only recovered because a snapshot
+# happened to be taken mid-run. The change ledger asks for every run to be
+# accounted for after the fact, and that rule cannot be followed against a
+# file that deletes itself while the run is still going.
+#
+# So: append to a cumulative archive beside the live file, THEN truncate.
+# The official behaviour of the live file is unchanged -- nothing reads the
+# archive during training -- and the archive is one file rather than one
+# per step, so the offline analysis scripts can point at it directly.
+# ---------------------------------------------------------------------
+record_purge_old = (
+    '                open(path, "w").close()\n'
+    '                logger.info("[OpenClaw-OPD] %s file purged: %s", label, path)\n'
+)
+if text.count(record_purge_old) != 1:
+    raise SystemExit(
+        f"patch failed: expected exactly 1 purge_record_files body in "
+        f"{src_path}, found {text.count(record_purge_old)} "
+        "(official file may have changed upstream -- update this patch)"
+    )
+record_purge_new = (
+    '                # --- openclaw-rl-metaclaw-record-archive ---\n'
+    '                # Keep the bytes before dropping them. A run that\n'
+    '                # finishes must still be auditable; see the change\n'
+    '                # ledger.\n'
+    '                try:\n'
+    '                    _base, _ext = os.path.splitext(path)\n'
+    '                    _archive = _base + "_archive" + _ext\n'
+    '                    with open(path, "r", encoding="utf-8") as _src:\n'
+    '                        _carried = _src.read()\n'
+    '                    if _carried:\n'
+    '                        with open(_archive, "a", encoding="utf-8") as _dst:\n'
+    '                            _dst.write(_carried)\n'
+    '                except OSError as _ae:\n'
+    '                    logger.warning(\n'
+    '                        "[OpenClaw-OPD] could not archive %s file before "\n'
+    '                        "purging (%s) -- purging anyway so training is "\n'
+    '                        "never blocked by bookkeeping",\n'
+    '                        label, _ae,\n'
+    '                    )\n'
+    '                open(path, "w").close()\n'
+    '                logger.info(\n'
+    '                    "[OpenClaw-OPD] %s file archived and purged: %s",\n'
+    '                    label, path,\n'
+    '                )\n'
+)
+text = text.replace(record_purge_old, record_purge_new, 1)
+
 with open(dest_path, "w", encoding="utf-8") as f:
     f.write(text)
 print(f"patched -> {dest_path}")
