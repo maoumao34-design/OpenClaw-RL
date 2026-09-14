@@ -1,23 +1,38 @@
 """Behavioural tests for the trajectory sample builder.
 
 These run against the code the patch script actually GENERATES, not against a
-copy of it: the two methods are pulled out of the patched server source and
-exec'd onto a stub. A test that re-implemented the algorithm would keep passing
-after the patch drifted, which is the failure mode this project has already
-paid for twice (a comment left describing per-round sessions after the code
-moved to per-day; a hand-back patched onto a parent whose subclass overrides
-the method).
+copy of it: the methods are pulled out of the patched server source and exec'd
+onto a stub.
 
-What matters here, and what each case pins down:
+THE FIXTURES ARE THE OTHER HALF, AND THEY ARE WHERE THIS FILE FAILED ONCE.
+The first version of this test passed all 19 of its assertions while the real
+thing scored zero splices in production, because the fixtures were written from
+an assumption instead of from a record: they wrapped thinking in
+`<think>...</think>`, whereas Qwen3-Thinking's template puts the opening tag in
+the GENERATION PROMPT, so a real response carries only the closer. Testing the
+generated code against an invented input shape is the same class of mistake as
+testing a copy of the code.
+
+So the shape below is taken from run 20260914_154812's record, and
+`assert_fixture_is_realistic` refuses any response that contains an opening
+`<think>` -- a fixture that drifts back toward the convenient shape fails
+before it can make anything else look green.
+
+    prompt_text ends: <|im_end|>\\n<|im_start|>assistant\\n<think>\\n
+    response_text:    <thinking prose></think>\\n<tool_call>\\n{...}\\n</tool_call><|im_end|>
+    backbone renders: <|im_start|>assistant\\n<tool_call>\\n{...}\\n</tool_call><|im_end|>
+
+What each case pins down:
 
   - the mask lands on generated spans and nowhere else. A trajectory carries
     tool results inside its response segment, so an off-by-anything mask
     trains the model on text it never wrote.
+  - a spliced turn gets its opening <think> back, unmasked. The backbone has
+    no opener, so without this the sequence carries a closing tag with nothing
+    to close -- a shape the model neither read nor produced.
   - a turn that cannot be located degrades to "not masked" rather than taking
     the round down with it. The 2026-09-03 attempt asserted prefix containment
     and dropped 96 of 120 rounds when the assertion failed.
-  - logprobs stay aligned to ids, with zeros on the unmasked spans, which is
-    the shape slime's own multi-turn example produces.
 
 Usage:
     OPENCLAW_RL_OFFICIAL=<path> python scripts/tests/test_metaclaw_trajectory.py
@@ -36,7 +51,10 @@ OFFICIAL = os.environ.get(
     "OPENCLAW_RL_OFFICIAL", os.path.join(os.path.dirname(ROOT), "OpenClaw-RL-official")
 )
 
-THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+THINK_CLOSE = "</think>"
+ASSISTANT_HDR = "<|im_start|>assistant"
+GEN_TAIL = "\n<think>\n"          # what the generation prompt appends
+IM_END = "<|im_end|>"
 
 
 class FakeTokenizer:
@@ -53,23 +71,19 @@ class StubServer:
 
 class StubLogger:
     def __init__(self):
-        self.warnings = []
+        self.messages = []
 
     def warning(self, fmt, *a):
-        self.warnings.append(fmt % a if a else fmt)
+        self.messages.append(fmt % a if a else fmt)
 
-    def error(self, fmt, *a):
-        self.warnings.append(fmt % a if a else fmt)
+    error = warning
 
     def info(self, *a, **k):
         pass
 
 
 def build_patched_server():
-    """Generate the patched server and return its source."""
-    src = os.path.join(
-        OFFICIAL, "openclaw-combine", "openclaw_combine_api_server.py"
-    )
+    src = os.path.join(OFFICIAL, "openclaw-combine", "openclaw_combine_api_server.py")
     if not os.path.exists(src):
         print(f"  -- skipped: {src} not present (set OPENCLAW_RL_OFFICIAL)")
         return None
@@ -84,36 +98,63 @@ def build_patched_server():
 
 
 def extract_methods(source):
-    """Pull the two trajectory methods out of the generated file and bind them."""
-    out = {}
-    for name in ("_metaclaw_visible", "_metaclaw_build_trajectory"):
+    wanted = ("_metaclaw_visible", "_metaclaw_generation_tail",
+              "_metaclaw_build_trajectory")
+    parts = []
+    for name in wanted:
         m = re.search(
             r"^(    (?:@staticmethod\n    )?def " + name + r"\(.*?)(?=^    (?:@|async |def ))",
             source, re.S | re.M,
         )
         if not m:
             raise AssertionError(f"could not find {name} in the generated server")
-        out[name] = m.group(1)
-
-    body = "class _S:\n" + out["_metaclaw_visible"] + "\n" + out["_metaclaw_build_trajectory"]
-    ns = {"_MC_THINK_RE": THINK_RE, "logger": StubLogger()}
-    exec(compile(body, "<generated>", "exec"), ns)
+        parts.append(m.group(1))
+    ns = {
+        "_MC_THINK_CLOSE": THINK_CLOSE,
+        "_MC_ASSISTANT_HDR": ASSISTANT_HDR,
+        "logger": StubLogger(),
+    }
+    exec(compile("class _S:\n" + "\n".join(parts), "<generated>", "exec"), ns)
     return ns["_S"], ns["logger"]
 
 
-def turn(response, prompt_text=None, logprobs=None):
-    ids = [ord(c) for c in response]
+# --------------------------------------------------------------------------
+# Fixtures in the production shape
+# --------------------------------------------------------------------------
+
+def response(thinking, action):
+    """A real response: thinking with no opener, then the closer, then the call."""
+    return f"{thinking}{THINK_CLOSE}\n{action}{IM_END}"
+
+
+def rendered(action):
+    """How the backbone renders that turn on replay: no thinking at all."""
+    return f"{ASSISTANT_HDR}\n{action}{IM_END}"
+
+
+def turn(resp, prompt_text=None, logprobs=None):
+    ids = [ord(c) for c in resp]
     return {
-        "response_text": response,
+        "response_text": resp,
         "response_ids": ids,
         "response_logprobs": logprobs if logprobs is not None else [-0.5] * len(ids),
-        "prompt_text": prompt_text or "",
+        "prompt_text": prompt_text if prompt_text is not None
+        else f"TASK{IM_END}{ASSISTANT_HDR}{GEN_TAIL}",
         "messages": [{"role": "user", "content": "task"}],
     }
 
 
-def visible(text):
-    return THINK_RE.sub("", text).strip()
+def assert_fixture_is_realistic(*turns):
+    for t in turns:
+        r = t["response_text"]
+        assert "<think>" not in r, (
+            "fixture drifted back to an opening <think>, which real responses "
+            "never carry -- that is exactly what hid this bug the first time"
+        )
+        if r:
+            assert THINK_CLOSE in r or "tool_call" not in r, (
+                "a fixture response with a tool call should carry the closing tag"
+            )
 
 
 def main():
@@ -124,6 +165,7 @@ def main():
 
     srv = StubServer()
     srv._metaclaw_visible = Cls._metaclaw_visible
+    srv._metaclaw_generation_tail = Cls._metaclaw_generation_tail
     srv._metaclaw_build_trajectory = Cls._metaclaw_build_trajectory.__get__(srv)
 
     n = 0
@@ -135,30 +177,69 @@ def main():
             raise AssertionError(f"FAILED: {label}")
         print(f"  ok  {label}")
 
-    TASK = "SYSTEM+TASK|"
-    TOOL = "|TOOLRESULT|"
+    print("[the fixtures match production, or nothing below means anything]")
+    A1 = '<tool_call>\n{"name": "write", "arguments": {"path": "day02/a.json"}}\n</tool_call>'
+    A2 = '<tool_call>\n{"name": "write", "arguments": {"path": "day02/b.json"}}\n</tool_call>'
+    r1 = response("Okay, let's tackle this. I will write the file.", A1)
+    rN = response("Now I confirm it landed.", "All done.")
+    assert_fixture_is_realistic(turn(r1), turn(rN))
+    ck("<think>" not in r1 and THINK_CLOSE in r1,
+       "a fixture response carries the closing tag and no opener, as real ones do")
 
-    print("[a normal two-turn round]")
-    r1 = "<think>thinking one</think>WRITE_CALL_1"
-    r2 = "<think>thinking two</think>DONE"
+    print("\n[_metaclaw_visible cuts at the closing tag]")
+    ck(srv._metaclaw_visible(r1) == A1 + IM_END,
+       "thinking is stripped even though there is no opening tag to pair with")
+    ck(srv._metaclaw_visible("no tags here") == "no tags here",
+       "a response with no thinking at all passes through")
+    ck(srv._metaclaw_visible(None) == "", "None is handled")
+
+    print("\n[_metaclaw_generation_tail reads the opener off the prompt]")
+    ck(srv._metaclaw_generation_tail(f"X{IM_END}{ASSISTANT_HDR}{GEN_TAIL}") == GEN_TAIL,
+       "the tail after the assistant header is returned verbatim")
+    ck(srv._metaclaw_generation_tail("no header at all") == "",
+       "a prompt with no assistant header yields nothing rather than guessing")
+
+    print("\n[a two-turn round splices, and restores the opener]")
+    TASK = "SYSTEM+TASK"
+    TOOL = f"{IM_END}\n<|im_start|>user\nTOOLRESULT{IM_END}"
+    backbone = TASK + IM_END + rendered(A1) + TOOL + ASSISTANT_HDR + GEN_TAIL
     t1 = turn(r1)
-    t2 = turn(r2, prompt_text=TASK + visible(r1) + TOOL)
-    traj = srv._metaclaw_build_trajectory("s", [t1, t2])
-    ck(traj is not None, "a locatable round assembles")
-    ck(traj["prompt_text"] == TASK, "prompt is everything before the first generation")
+    tN = turn(rN, prompt_text=backbone)
+    assert_fixture_is_realistic(t1, tN)
+    traj = srv._metaclaw_build_trajectory("s", [t1, tN])
+    ck(traj is not None, "the round assembles")
+    ck(traj["metaclaw_missing_turns"] == 0,
+       "the earlier turn IS located now -- before the fix this was 0 hits in "
+       "every multi-turn round of run 20260914_154812")
+
+    masked = "".join(chr(i) for i, m in
+                     zip(traj["response_ids"], traj["metaclaw_loss_mask"]) if m)
+    unmasked = "".join(chr(i) for i, m in
+                       zip(traj["response_ids"], traj["metaclaw_loss_mask"]) if not m)
+    ck(masked == r1 + rN,
+       "masked tokens are exactly the two full responses, thinking included")
+    ck(TOOL in unmasked, "the tool result is present but unmasked")
+    ck(masked != traj["response_text"],
+       "masked is a strict subset -- if it equalled the whole segment the "
+       "splice silently did nothing, which is how the first bug looked")
+
+    print("\n[the spliced thinking gets its opener back, unmasked]")
+    full = traj["prompt_text"] + traj["response_text"]
+    ck(f"{ASSISTANT_HDR}{GEN_TAIL}{r1}" in full,
+       "the reconstruction reads exactly as the turn's own prompt+response did")
+    ck(GEN_TAIL in unmasked,
+       "the opener is in the sequence but carries no gradient -- it was prompt")
+    # Counted over the whole sequence, not the response segment: the first
+    # turn's opener sits in the prompt segment, which is where the generation
+    # prompt put it.
+    ck(full.count(THINK_CLOSE) == full.count("<think>"),
+       "every closing tag in the sequence has an opener")
+
+    print("\n[alignment invariants]")
     ck(len(traj["metaclaw_loss_mask"]) == len(traj["response_ids"]),
        "mask length equals response length")
     ck(len(traj["response_logprobs"]) == len(traj["response_ids"]),
        "logprobs length equals response length")
-    ck(traj["metaclaw_missing_turns"] == 0, "no turn reported missing")
-
-    # The masked ids must be exactly the two responses, in order.
-    masked = [i for i, m in zip(traj["response_ids"], traj["metaclaw_loss_mask"]) if m]
-    ck(masked == [ord(c) for c in r1 + r2],
-       "masked tokens are exactly the two full responses, thinking included")
-    unmasked = [i for i, m in zip(traj["response_ids"], traj["metaclaw_loss_mask"]) if not m]
-    ck(unmasked == [ord(c) for c in TOOL],
-       "unmasked tokens are exactly the tool result")
     ck(all(lp == 0.0 for lp, m in zip(traj["response_logprobs"],
                                       traj["metaclaw_loss_mask"]) if not m),
        "logprobs are zero wherever the mask is zero")
@@ -166,46 +247,37 @@ def main():
                                       traj["metaclaw_loss_mask"]) if m),
        "logprobs are the real ones wherever the mask is one")
 
-    print("\n[a turn that cannot be located degrades, it does not drop the round]")
-    t1b = turn("<think>x</think>NOT_IN_THE_BACKBONE")
-    t2b = turn(r2, prompt_text=TASK + TOOL)
-    before = len(log.warnings)
-    traj_b = srv._metaclaw_build_trajectory("s", [t1b, t2b])
-    ck(traj_b is not None, "the round still assembles")
-    ck(traj_b["metaclaw_missing_turns"] == 1, "the unlocatable turn is counted")
-    ck(len(log.warnings) > before, "and it is warned about, not silently dropped")
-    masked_b = [i for i, m in zip(traj_b["response_ids"], traj_b["metaclaw_loss_mask"]) if m]
-    ck(masked_b == [ord(c) for c in r2],
-       "only the final response is masked; the missing turn contributes no gradient")
-
-    print("\n[non-vacuity: the mask really can be wrong]")
-    # If the builder ignored the tool result, masked would equal the whole
-    # response segment. Prove the two differ for this input.
-    ck(len(traj["response_ids"]) > len(masked),
-       "the response segment is strictly larger than the masked part")
-    ck(visible(r1) in t2["prompt_text"] and r1 not in t2["prompt_text"],
-       "the fixture really does strip thinking from the backbone, as production does")
-
-    print("\n[a round with nothing to mask is dropped]")
-    t_empty = turn("", prompt_text=TASK)
-    ck(srv._metaclaw_build_trajectory("s", [t_empty]) is None,
-       "a round whose only turn generated nothing returns None")
-
-    print("\n[no backbone at all]")
-    ck(srv._metaclaw_build_trajectory("s", [turn("abc", prompt_text="")]) is None,
-       "a round whose final turn has no prompt_text returns None")
-
-    print("\n[three turns, middle one unlocatable]")
-    m1 = "<think>a</think>ACT_ONE"
-    m2 = "<think>b</think>ACT_TWO_MISSING"
-    m3 = "<think>c</think>FINAL"
-    tt = [turn(m1), turn(m2),
-          turn(m3, prompt_text=TASK + visible(m1) + TOOL + TOOL)]
+    print("\n[three turns, all locatable]")
+    r2 = response("Second step, writing b.", A2)
+    backbone3 = (TASK + IM_END + rendered(A1) + TOOL + rendered(A2) + TOOL
+                 + ASSISTANT_HDR + GEN_TAIL)
+    tt = [turn(r1), turn(r2), turn(rN, prompt_text=backbone3)]
+    assert_fixture_is_realistic(*tt)
     tr = srv._metaclaw_build_trajectory("s", tt)
-    ck(tr["metaclaw_missing_turns"] == 1, "exactly one turn reported missing")
-    masked_c = [i for i, m in zip(tr["response_ids"], tr["metaclaw_loss_mask"]) if m]
-    ck(masked_c == [ord(c) for c in m1 + m3],
-       "the located turns are masked and the missing one is not")
+    ck(tr["metaclaw_missing_turns"] == 0, "both earlier turns are located")
+    m3 = "".join(chr(i) for i, m in zip(tr["response_ids"], tr["metaclaw_loss_mask"]) if m)
+    ck(m3 == r1 + r2 + rN, "all three responses are masked, in order")
+    ck(tr["response_text"].count(GEN_TAIL) == 2,
+       "an opener is restored for each spliced turn, and only for those")
+
+    print("\n[a turn that cannot be located degrades, it does not drop the round]")
+    lost = response("I did something not in the backbone.", "<tool_call>\nGHOST\n</tool_call>")
+    before = len(log.messages)
+    tb = [turn(lost), turn(rN, prompt_text=TASK + IM_END + TOOL + ASSISTANT_HDR + GEN_TAIL)]
+    assert_fixture_is_realistic(*tb)
+    trb = srv._metaclaw_build_trajectory("s", tb)
+    ck(trb is not None, "the round still assembles")
+    ck(trb["metaclaw_missing_turns"] == 1, "the unlocatable turn is counted")
+    ck(len(log.messages) > before, "and warned about, not silently dropped")
+    mb = "".join(chr(i) for i, m in zip(trb["response_ids"], trb["metaclaw_loss_mask"]) if m)
+    ck(mb == rN, "only the final response is masked")
+
+    print("\n[degenerate rounds]")
+    ck(srv._metaclaw_build_trajectory(
+        "s", [turn("", prompt_text=TASK)]) is None,
+       "a round whose only turn generated nothing returns None")
+    ck(srv._metaclaw_build_trajectory("s", [turn(rN, prompt_text="")]) is None,
+       "a round whose final turn has no prompt_text returns None")
 
     print(f"\nall {n} assertions passed")
 
