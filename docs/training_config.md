@@ -1,4 +1,4 @@
-[← 工作记录](work_log.md)
+[← 工作记录](work_log.md) · [改动验证台账 →](change_ledger.md)
 
 # MetaClaw 迁移：当前训练配置（唯一现状来源）
 
