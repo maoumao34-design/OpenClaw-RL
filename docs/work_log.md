@@ -2260,6 +2260,84 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 
 ---
 
+## 2026-09-14
+
+**目标：** 查清"一道题作为一条轨迹、hint 训练整条轨迹"能不能做。
+
+**结论：不能做成一条序列，原因是环境给的 prompt 链不嵌套。** 但沿途推翻了本项目四个说法，其中两个是我这两天自己刚立的。
+
+### 一、生产实测：历史思考不进模型读到的序列（用户早先的说法成立）
+
+CLI 在 record 上实测（`prompt_text` 是 `apply_chat_template` 之后的，就是喂进 SGLang 的那串）：
+
+| | 结果 |
+|---|---|
+| 更早 turn 的 `<think>` 块进终轮 prompt | **0 块** |
+| 更早 turn 的 `response_text` 含 `</think>` | **127/127**（当时确实想了）|
+| 整段 `response_text` 原样进终轮 prompt | **0/127** |
+| `prompt_N` 以 `prompt_{N-1}+response_{N-1}` 开头 | **0/127，破坏率 100%** |
+| 历史 assistant 的动作段 / tool_call | **高存活** |
+
+**→ 用户那句"同天只能看到实际做了什么"成立。09-03 的结论对，理由错。** 我 09-11 用"`reasoning: true` ⇒ 保留"推翻它的结论，**是错的**——我们的模型走的是内联 `<think>`，不走 `reasoning_content` 字段，头号嫌疑是 `embedded-agent-utils.ts:35` 的 `stripThinkingTagsFromText`（**只定位到函数，未证明在回放路径上被调用**）。
+
+### 二、为什么拼不成一条序列（这是硬结论）
+
+线性序列里任何位置的前缀由序列本身唯一决定。要让 turn t 训得忠实，它前面那段必须等于 `prompt_t`，即要求 `prompt_2 = prompt_1 + response_1 + 工具结果`——**实测不成立**。于是只有两种拼法，各坏一头：
+
+| | turn 1 | turn 2 |
+|---|---|---|
+| (a) 放 turn1 完整 response（含思考）| ✅ 就是它真实的样本 | ❌ 前缀多了 turn1 的思考，**该语境部署时从不出现** |
+| (b) 只放 turn1 的动作 | ❌ 前缀只有题面；**且思考整段被排除出 loss** | ✅ 正确 |
+
+**per-turn 是唯一两端都正确的表示**，代价是它不是一条序列。**部署时模型就是被调用 N 次、每次一个独立语境，所以 per-turn 与部署逐字一致。**
+
+**(a) 仍可实施**（09-03 不是撞上不可能，是它自己断言前缀包含、断言失败就整轮丢 96/120；去掉断言就能跑），代价是 turn≥2 训在不出现的语境上，**程度未测**。
+
+### 三、⛔ 撤回：我说"OPD 天然反事实、不需要忠实"
+
+读 `hint_opd_loss.py:309`：**OPD 也是对着 `ell_old` 的 PPO surrogate**，`ell_old` 进三处——IS 权重 `w_v = softmax(ell_old)`、advantage `diff_v = ell_T - ell_old`、ratio `ppo_kl = ell_old - ell_cur`。**RL 和 OPD 在忠实性要求上没有区别**，区别只在 advantage 来源（结果 ±1 vs 定向 `ell_T-ell_old`）。
+
+### 四、⛔ 再撤回：我说"`ell_old` 是生成时记下的、把前缀钉死"
+
+`slime/backends/megatron_utils/data.py:762`：`log_probs_key = "log_probs" if not args.use_rollout_logprobs else "rollout_log_probs"`，而 `--use-rollout-logprobs` **默认 False**、我们没设。**`ell_old` 是更新前由 actor 对递过去的序列重新前向算的。** 所以换前缀后 `ratio ≡ 1` 会自动成立——**但那是把绊线关掉，不是把偏差修掉**。真正的障碍是第二节的前缀不嵌套。
+
+### 五、OPD 靶子打错了 turn（实测）
+
+| | |
+|---|---|
+| 最后一次写操作距 OPD 靶子 offset 1 | **41/42（97.6%）** |
+| offset 0 | 1（day29，turn14/15 连续写、resp 18k+8k，**上限终止形状**）|
+| 终轮调了任何工具 | **1/69** |
+| 带可用 hint 的轮 | 57/69（82.6%）|
+| 无写操作的轮 | 27/69（39.1%），**全是 1 turn**，resp 2.5k–21.6k、无 tool、自然收尾 |
+| turns/round | **mean 1.93**（1:27 / 2:24 / 3:15 / 4:2 / 5:1）|
+
+**agent 循环只在模型停止调工具时结束，所以终轮按构造不带写操作** → OPD 现在在纠一句"我写好了"。
+
+**我给这个改动设的门槛（"终轮调工具必须是 0"）设错了**：决策要问的是"跟着 last write 有没有比跟着 last turn 更差的情形"，而**没有**——last write 在终轮时两者重合。是 dominance，不需要健康 record。
+
+### 六、⚠️ 这份 record 的出处不明，shape 统计不可引用
+
+record 里 `metaclaw-day25` turn12 时间是 **13:47:56**，同一分钟 training 还在 day09 入队，而 `concurrency=1` 的 driver 不可能同时在 day25。**这 69 轮不是本趟 driver 跑出的 day25–30。**
+
+→ **N≈1.93、39% 无写这两个数不能当"本趟退化尾段"**，我基于它们说的"稀释全在 T 不在 N"**撤回**（`A/(N·T)` 里两项各自多重要，目前未知）。待验猜想：09-09 还有一趟 K=0（`20260909_094645`）可能写了同一个写死路径 → 若成立这 69 轮是 base 行为。**record 按 run 分文件已修（`9573e0d`）。**
+
+另：`scaled by 1/turns`=12 是 batch 级日志行，**不是 group 数**；实际 96 group / 185 sample 全进了 scale，丢弃仅 6。"只有 12 个 group 进优化器"撤回。
+
+**产出：**
+- `scripts/analyze_round_trajectory_feasibility.py`、`analyze_opd_target_turn.py`、`analyze_round_shape.py`（离线，纯读 record）
+- `scripts/measure_opd_hint_attenuation.py`（**占 1 卡**，带错配 hint 对照且对照优先）
+- `scripts/check_chat_template_reasoning.py`、`mock_sglang_reasoning_replay_probe.py`（后者已改成生成 2 turn）
+- record 按 run 分路径（`run_openclaw_topk_select_modelfactory.sh` + launcher 传 `METACLAW_RUN_ID`）
+- 计划文档：第三节"OPD 覆盖率 25%"整节加撤回横幅
+
+**下一步：**
+1. **跑 `measure_opd_hint_attenuation.py`**（用户给 1 卡）。三种结果对应：CONTROL FAILED → 先查 OPD 定向信号本身；ATTENUATES → (a) 值得做；DOES NOT ATTENUATE → (a) 否掉、走"OPD 靶子挪到写文件那个 turn"
+2. **长度问题整体挂起**（用户 09-14 决定）——等这轮大调整落地后重测再决定要不要修。**注意：(a) 对长度的算术没有影响**（每 token 系数 `A/(N·T)` 两边相同），若长度由归一化驱动则 (a) 不会缓解；但"更多 token 拿到定向信号而非纯惩罚"是另一条可能起作用的路径，**未测**
+3. 挂起中：官方代码路径基线、min-count、`docs/training_config.md` 重新快照
+
+---
+
 ## 2026-09-10
 
 **目标：** 查清"训练让模型越想越长"的机制成因；查 OpenClaw-RL 官方对中间步骤到底怎么处理；实测 `dropReasoningFromHistory` 能不能关。
