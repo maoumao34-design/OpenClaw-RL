@@ -47,6 +47,8 @@ WRITE_TOOLS = {
 SHELL_TOOLS = {"exec", "bash", "shell", "run_command", "run", "terminal"}
 SHELL_WRITE_RE = re.compile(
     r">>?\s*\S|\btee\b|\bcp\b|\bmv\b|\btouch\b|\bmkdir\b|\bsed\s+-i\b|"
+    # Destructive ops count as writes as well -- see analyze_opd_target_turn.py.
+    r"\brm\b|\brmdir\b|\bunlink\b|\btruncate\b|\bshred\b|"
     r"\bopen\s*\([^)]*['\"][wa]|\bjson\.dump|\bwriteFile|\bprintf\b.*>",
 )
 

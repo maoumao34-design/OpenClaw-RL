@@ -42,6 +42,11 @@ WRITE_TOOLS = {
 SHELL_TOOLS = {"exec", "bash", "shell", "run_command", "run", "terminal"}
 SHELL_WRITE_RE = re.compile(
     r">>?\s*\S|\btee\b|\bcp\b|\bmv\b|\btouch\b|\bmkdir\b|\bsed\s+-i\b|"
+    # Destructive ops count as writes as well. A round can fail because a later
+    # turn deleted or clobbered what an earlier one produced, and then THAT
+    # turn is what the hint is about -- targeting the last write has to mean
+    # the last turn that CHANGED the workspace, not just the last one to create.
+    r"\brm\b|\brmdir\b|\bunlink\b|\btruncate\b|\bshred\b|"
     r"\bopen\s*\([^)]*['\"][wa]|\bjson\.dump|\bwriteFile|\bprintf\b.*>",
 )
 
