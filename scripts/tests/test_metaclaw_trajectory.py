@@ -112,6 +112,14 @@ def extract_methods(source):
     ns = {
         "_MC_THINK_CLOSE": THINK_CLOSE,
         "_MC_ASSISTANT_HDR": ASSISTANT_HDR,
+        # Read the real default out of the generated file rather than
+        # restating it, so a change to the cap cannot leave this test
+        # asserting against a number the server no longer uses.
+        "_MC_MAX_TRAJ_TOKENS": int(
+            re.search(r"_MC_MAX_TRAJ_TOKENS = int\(_mc_os\.getenv\("
+                      r"\"METACLAW_MAX_TRAJECTORY_TOKENS\", \"(\d+)\"\)\)",
+                      source).group(1)
+        ),
         "logger": StubLogger(),
     }
     exec(compile("class _S:\n" + "\n".join(parts), "<generated>", "exec"), ns)
@@ -278,6 +286,32 @@ def main():
        "a round whose only turn generated nothing returns None")
     ck(srv._metaclaw_build_trajectory("s", [turn(rN, prompt_text="")]) is None,
        "a round whose final turn has no prompt_text returns None")
+
+    print("\n[an oversized round is dropped, not allowed to kill the run]")
+    # 20260914_171937 died when gather_log_probs_at_indices was handed 71668
+    # index rows for a 21495-token chunk: one round, 17 turns. Losing that
+    # round is the cheap failure; losing the run is not.
+    big_action = "<tool_call>\n" + ("X" * 40000) + "\n</tool_call>"
+    big = response("thinking", big_action)
+    bb = TASK + IM_END + rendered(big_action) + TOOL + ASSISTANT_HDR + GEN_TAIL
+    tbig = [turn(big), turn(rN, prompt_text=bb)]
+    assert_fixture_is_realistic(*tbig)
+    before = len(log.messages)
+    ck(srv._metaclaw_build_trajectory("s", tbig) is None,
+       "a round past the cap returns None instead of producing the sample")
+    ck(any("DROPPED an oversized round" in m for m in log.messages[before:]),
+       "and says so loudly, with the numbers, so the run can be judged")
+    ck(any("round boundary" in m for m in log.messages[before:]),
+       "and points at the round boundary, since that is what a round this "
+       "large usually means")
+
+    print("\n[non-vacuity: the cap does not fire on a normal round]")
+    # Without this, a cap set absurdly low would pass every assertion above
+    # while silently discarding every round in production.
+    ck(srv._metaclaw_build_trajectory("s", [t1, tN]) is not None,
+       "the ordinary two-turn round from earlier still assembles")
+    ck(srv._metaclaw_build_trajectory("s", tt) is not None,
+       "so does the three-turn round")
 
     print(f"\nall {n} assertions passed")
 

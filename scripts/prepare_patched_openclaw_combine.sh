@@ -117,14 +117,21 @@ import_new = (
     ")\n"
     "\n"
     "# --- openclaw-rl-metaclaw-trajectory ---\n"
-    "# Matches what OpenClaw strips out of an assistant turn before replaying\n"
-    "# it, so an earlier turn can be located inside a later prompt by the part\n"
-    "# of it that survived.\n"
-    "import re as _mc_re  # noqa: E402\n"
-    "# The closing tag is what a response actually carries; the opener lives\n"
-    "# in the generation prompt (see _metaclaw_visible).\n"
+    "# An earlier turn is located inside a later prompt by the part of it\n"
+    "# that survived the replay. The closing tag is what a response actually\n"
+    "# carries; the opener lives in the generation prompt, so the cut is made\n"
+    "# on the closer alone -- see _metaclaw_visible.\n"
     '_MC_THINK_CLOSE = "</think>"\n'
     '_MC_ASSISTANT_HDR = "<|im_start|>assistant"\n'
+    "\n"
+    "# A single sample that cannot fit one microbatch takes the whole run\n"
+    "# down with it, so there is a cap. Three runs have now died to one\n"
+    "# oversized sample: 2026-09-08 and 09-09 to a teacher OOM, and\n"
+    "# 20260914_171937 to gather_log_probs_at_indices being handed 71668\n"
+    "# index rows for a 21495-token chunk. Default matches\n"
+    "# --max-tokens-per-gpu; 0 disables the cap.\n"
+    "import os as _mc_os  # noqa: E402\n"
+    '_MC_MAX_TRAJ_TOKENS = int(_mc_os.getenv("METACLAW_MAX_TRAJECTORY_TOKENS", "32768"))\n'
 )
 if text.count(import_old) != 1:
     raise SystemExit(
@@ -559,6 +566,28 @@ round_submit_new = (
     '                "[openclaw-rl-metaclaw-trajectory] session=%s assembled a "\n'
     '                "trajectory with nothing masked -- dropping",\n'
     '                session_id,\n'
+    '            )\n'
+    '            return None\n'
+    '\n'
+    '        _total = len(prompt_ids) + len(response_ids)\n'
+    '        if _MC_MAX_TRAJ_TOKENS > 0 and _total > _MC_MAX_TRAJ_TOKENS:\n'
+    '            # Dropped, never truncated: cutting a trajectory short would\n'
+    '            # leave the mask and the logprobs describing tokens that are\n'
+    '            # no longer there, which is a quieter kind of wrong. Losing\n'
+    '            # one round is the cheaper failure.\n'
+    '            #\n'
+    '            # Treat this as a SYMPTOM. A round is a handful of turns, so\n'
+    '            # a sample this large usually means the round boundary let in\n'
+    '            # turns that belong to other rounds -- look at the turn count\n'
+    '            # below against what the driver logged for that round.\n'
+    '            logger.error(\n'
+    '                "[openclaw-rl-metaclaw-trajectory] session=%s DROPPED an "\n'
+    '                "oversized round: %d turn(s), %d prompt + %d response = "\n'
+    '                "%d tokens > cap %d. Training continues; this round "\n'
+    '                "contributes nothing. If this fires at all, check the "\n'
+    '                "round boundary before trusting the run.",\n'
+    '                session_id, len(turns), len(prompt_ids),\n'
+    '                len(response_ids), _total, _MC_MAX_TRAJ_TOKENS,\n'
     '            )\n'
     '            return None\n'
     '\n'

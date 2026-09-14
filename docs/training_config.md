@@ -182,6 +182,7 @@ loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
 | 批级基线放大稀有正样本 | |
 | 全负批 | 1/N 只压幅度不改符号；要 `n_samples>1` 才有组内比较 |
 | **`CP=1` + teacher 单卡** | 长回复必 OOM。2026-09-08：34,885 token 的回复 → 34885×151936×4B = **19.75 GiB** 单次分配 |
+| **超长样本会杀掉整趟训练** | 已死过三趟：09-08 / 09-09 teacher OOM；`20260914_171937` 是 `gather_log_probs_at_indices` 拿到 71668 行 index 对 21495 token 的 chunk。**2026-09-14 加了熔断**（`METACLAW_MAX_TRAJECTORY_TOKENS`，默认 32768）：超限的轮次告警并丢弃，训练继续。**熔断一旦触发就要先查轮边界**——一个 round 只有几个 turn，样本这么大通常是别的轮次的 turn 混进来了 |
 
 ---
 
@@ -193,6 +194,7 @@ grep -c "queued group="                     <LOGS_DIR>/training.log   # ≈ 完�
 grep -c "scaled by 1/turns"                 <LOGS_DIR>/training.log   # 应为 0（1/N 已删）
 grep    "tokens masked"                     <LOGS_DIR>/training.log | tail -20
 grep -c "not found in the final prompt"     <LOGS_DIR>/training.log   # 降级计数，应很低
+grep -c "DROPPED an oversized round"        <LOGS_DIR>/training.log   # 熔断，应为 0
 
 # 归属过滤与 hint 定位（正常应为 0）
 grep -c "do not carry"                       <LOGS_DIR>/training.log
