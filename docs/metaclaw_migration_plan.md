@@ -270,91 +270,105 @@ payload 原本是 `{metaclaw_verdict, eval_score, hint}`，**无轮次标识**�
 
 ---
 
-## 🚪 准入控制（2026-09-15）：训练前不拦无效数据，是 OpenClaw-RL 方法的结构性缺口
+## 🚪 Support / Query 分离（2026-09-15）：我们训练的**全部是 support data**
 
-**用户提出，本项目当前的主张方向。**
+**用户提出方向，逐条查证 MetaClaw 代码 + 论文原文后重写。**
 
-> OPD+RL 是实时训练——agent 产出什么就训什么，**没有任何准入控制**。
-> MetaClaw 在训练前会先判定有效 / 无效 / 有害，无效和有害的不进训练。
+> ⚠️ **本节 09-15 上午写过一版，说 MetaClaw 的判据是「内容有效/无效/有害」。那版错了**——
+> 判据不是内容质量，是**出身（skill generation 版本）**。旧版已整体替换，不保留。
 
-### 证据：检测器已经在了，抓得也准，只是没被用来拦
+### MetaClaw 怎么"改变权重"：两个时间尺度，两样东西在动
 
-`20260914_181842`（第一次 (a) 真正跑通，day01–07 相对基线 **+7.1pt**，day08 起被超长 thinking 打穿）：
+| | 动什么 | 怎么动 | 何时生效 |
+|---|---|---|---|
+| **Skill 快适应**（§3.2）| **只动 `S`（技能库），`θ` 不变** | **无梯度**：LLM 分析失败轨迹合成行为指令<br>`S_{g+1} = S_g ∪ E(S_g, D^sup_g)` | **立即**，经 prompt 注入，零停机 |
+| **策略优化**（§3.3）| 动 `θ`（LoRA + GRPO）| 梯度 | 推迟到空闲窗口，且要攒够样本 |
 
-| | 数字 |
+论文原话：这是 **"gradient-free by design, not by approximation"**——技能库活在离散自然语言空间，梯度下降在那里没有定义。
+
+### 「这条轨迹要不要训」的判据：**出身，不是质量**
+
+§3.4 Skill Generation Versioning：
+
+```
+D^sup_g     ：在 S_g 下收集、其失败触发了 S_g → S_{g+1} 的轨迹
+              → 交给 skill evolver 消费，然后【从 RL buffer 丢弃】
+D^qry_{g+1} ：S_{g+1} 生效之后收集的轨迹
+              → 只有这些才有资格进梯度更新
+```
+
+Algorithm 1（p.6）更直接：
+
+```
+ 7: if ξi reveals failure then
+ 8:     Add (τi, ξi) to support set D^sup_g      ← 失败轨迹根本不进 RL buffer
+ 9: else
+10:     Add (τi, ξi, ri, g) to RL buffer B
+16: Flush all samples with version ≤ g from B    ← 技能进版即清空旧样本
+```
+
+**论文给的理由（这是对我们最要害的一句）：**
+
+> 若该轨迹进入 RL buffer，策略优化拿到的梯度就是**在惩罚 θ 犯了一个 skill 适应已经纠正过的错**，
+> 等于优化"适应前"而非"适应后"的表现，**违反元学习目标**。
+
+以及：**"policy optimization does not optimize θ for raw task performance, but for how well the agent performs _after_ skill adaptation."**
+
+代码对得上：`trainer.py:_maybe_evolve_skills` 技能进版后 `_pending_batch.clear()` + `rollout_worker.clear_output_queue()`，注释写着 **"enforces the MAML support/query set separation"**。
+
+### ⚠️ 一处 paper ↔ code 出入，只报告不裁决
+
+| | 失败轨迹的去向 |
 |---|---|
-| thinking ≥ 50k 的 turn | **191** |
-| 其中被 `is_invalid_tool_use` 抓到 | **168（88%）** |
-| 其中 `finish_reason=length` | 184/191 |
-| 一句话最多复读几次 | 168/191 ≥ **10 次**，最高两三千次 |
-| 100 字 shingle 重复率 | **0.879 / 0.949 / 0.880** |
+| **论文 Algorithm 1 第 7–8 行** | **根本不进 RL buffer** |
+| **代码 `metaclaw/api_server.py:2311`** | `exclude = not has_next_state or score == 0.0` —— 排除的是**判官弃权**；`score = -1` 照样进 |
 
-**规则 5（sentence-repeat）本来就是为这个失效模式写的，命中率 88%。信号一直都有。**
+代码里失败先进 buffer、参与 evolve，**只有真的触发技能进版时**才被 flush。**比论文松。**
+（本项目已因 paper/code 出入栽过一次：`--agent` L3。所以标出来，不下结论。）
 
-### 关键区别：现在是「罚」，不是「拦」——而「罚」可能就是锁死的机制
+### 我们的位置：没有快适应层 ⇒ 训练的全部是 support data
 
-`is_invalid_tool_use` **并非没接**：verdict 分支里它把 `eval_score` 强制成 `-1.0`。
-所以现状是**罚**。用户提的是**拦**。
+**我们没有 skill 层。** 失败轨迹直接带 −1 进梯度，而且**没有任何机制去纠正它**。
 
-**我判断「罚」比「不罚」更糟，机制是：**
+用论文的话说：**每一个 −1 都是"惩罚 θ 犯了一个尚未被纠正的错"**——而在我们这里它**永远不会被纠正**。
 
-```
-一条 15 万 token、88% 是同一句话的样本，带 advantage = -1 进优化器
-  → 同一小段 token 被反复推低几千次
-  → 这是在用模型自己的退化输出去塑造它的分布
-```
+与实测一致：`20260914_181842` 里模型在未纠正的失败模式上被反复推，最后锁进退化吸引子（step10 骤跳、88–96% 字面重复）。
 
-**训练在退化数据上，本身就是伤害，符号是负的也一样。**
-不是「罚得不够」，是**根本不该让它进优化器**。
-
-### 触发器仍未知——但「拦」的价值不依赖于知道
-
-```
-触发（未知，step10 前后） → 退化输出 → 退化输出进训练 → 更退化 → …
-                                          ↑
-                                      gate 切在这里
-```
-
-gate 不阻止扰动，它阻止扰动被自我放大锁死。**这给出一个可证伪的预测：**
-
-> **有 gate 时，step10 那种扰动应当自行恢复；无 gate 时锁死到 day21。**
-
-比「先搞清触发器」更容易做成对照实验，也更像一个可主张的机制。
-
-### 两件必须先查，都影响这个方向能否立住
-
-**① MetaClaw 到底做不做训练前筛选。** ⬜ **未核实**
-这是承重墙：若 MetaClaw 其实没有这个机制，「MetaClaw 有、OpenClaw-RL 没有」的对比就塌了，主张得换个立法。
-查 `MetaClaw-official/metaclaw/` 的 `trainer.py` / `data_formatter.py` / `memory/`，关键词 `filter` / `valid` / `harmful` / `skip` / `quality`，**要原文**；找不到也必须明确说找不到。
-
-**② 检测器在健康窗口的误报率。** ⬜ **未测**
-shadow 行 622 条里 301 条 `invalid=True`（**48%**）——但 shadow 是**有偏子集**（只有 repeat-thinking / TRUNCATED 两条路径能拿到 reasoning 全文）。要的是：
-
-> **step ≤ 9（day01–08，健康段）里 `is_invalid_tool_use=True` 的比例。**
-
-- 接近 0 → 检测器精确，gate 安全
-- ≥ 30% → gate 会饿死训练，得先把规则做准
-
-**这个数出来之前不要动手写 gate。**
-
-### 作为专利 / 论文主张的评估
-
-**强**：这是 OpenClaw-RL 方法里一个真实的结构性缺口——OPD+RL 对 agent 产出**没有准入控制**。有数据、有机制、有干净的对照（gate 开/关）。
-
-**需要收紧**：「训练前过滤脏数据」本身不新。可主张的新颖点必须落在更具体处，候选三个：
-
-| | 候选主张 | 评价 |
+| | MetaClaw | 我们这条路 |
 |---|---|---|
-| 1 | **在线 agentic RL 的准入控制**——判据只用 rollout 当场可得的信号（重复度、截断、工具有效性），不依赖离线标注 | 具体，可实现 |
-| 2 | **切断自我强化回路**，配「有 gate 自愈 / 无 gate 锁死」的对照 | 因果主张清晰，实验好设计 |
-| 3 | **「拦」≠「罚」**：负奖励不足以保护训练，退化样本必须排除而非扣分 | **最有价值**——反直觉、可测、直指现有方法盲区 |
+| 快适应层（无梯度纠错）| ✅ skill 库 | ❌ **无** |
+| 排除机制 | ✅ `loss_mask = 0` / flush buffer | ❌ `loss_mask` 恒为全 1 |
+| 排除判据 | **skill generation 版本** | — |
+| 失败轨迹 | 先纠正，再训纠正后的行为 | **直接扣分** |
+
+### 可主张的点（新颖性依次递减）
+
+| | 主张 | 评价 |
+|---|---|---|
+| **1** | **实证展示这个失效模式**：论文从元学习目标上论证"不该这么做"，我们有**带对照的实测**——不是学得慢，是**锁进退化吸引子整趟打穿** | **最有价值**：具体的坍塌过程未见有人展示 |
+| **2** | **「拦 ≠ 罚」**：MetaClaw 排除，OpenClaw-RL 扣分。**扣分是主动有害而非仅效率低** | 若能立住是新结论 |
+| **3** | 把 support/query 分离**移植到没有 skill 库的 benchmark 设定**——谁充当快适应层 | 工程性更强 |
+
+**第 3 条有个当下可实现的形态**：round N 失败 → 产生反馈 → round N+1 才看到它。
+于是 **round N 是 support（纠正前），round N+1 是 query（纠正后）**，**只训练"已拿到相关反馈之后的那次尝试"**。
+这正是 §3.4 在我们设定下的翻译，driver 里就能做。
+
+> ⚠️ **代价要先算**：file_check 约 74% 失败，照 Algorithm 1 严格做会丢掉绝大多数样本。
+> MetaClaw 代码里有"每 session 至少保一条"兜底（`api_server.py:2313`），可能正是为此。
+
+### 仍未做的查证
+
+| | |
+|---|---|
+| 检测器在健康窗口（step ≤9）的误报率 | ⬜ 需服务器日志。shadow 那 48% 来自有偏子集（只有 repeat-thinking / TRUNCATED 两条路径能拿到 reasoning 全文），不能用 |
+| step10 的触发器 | ⬜ 未知 |
 
 ### 顺带修正
 
-`training_config.md` 第八节把 `truncation-penalty（截断强制 -1）` 列为生效规则——**对 MetaClaw 这条路是错的**：
-`is_truncated → -1` 只存在于 step-judge 分支和 PRM 分支，两者都被 `_metaclaw_verdict is None` 挡着，MetaClaw 走 verdict 分支，**截断在我们这条路上不受任何惩罚**。
+`training_config.md` 第八节曾把 `truncation-penalty（截断强制 -1）` 列为生效规则——**对 MetaClaw 这条路是错的**：
+`is_truncated → -1` 只存在于 step-judge 分支和 PRM 分支，两者都被 `_metaclaw_verdict is None` 挡着，MetaClaw 走 verdict 分支，**截断不受任何惩罚**。（已改）
 
-另：`is_invalid_tool_use` 在 (a) 之下**只检查本轮最后一个真实 turn**。实测 108 个含超长 turn 的 round 里，约 **18 个**是更早 turn 已崩而最后一 turn `invalid=False` —— 只看最后一个 turn 会漏掉这些。
+另：`is_invalid_tool_use` 在 (a) 之下**只检查本轮最后一个真实 turn**。实测 108 个含超长 turn 的 round 里约 **18 个**是更早 turn 已崩而最后一 turn `invalid=False`。
 
 ---
 
@@ -380,7 +394,7 @@ shadow 行 622 条里 301 条 `invalid=True`（**48%**）——但 shadow 是**�
 >
 > **触发器（step10 前后发生了什么）至今未知。**
 >
-> → 取而代之的方向见 [「🚪 准入控制」](#-准入控制2026-09-15训练前不拦无效数据是-openclaw-rl-方法的结构性缺口)。
+> → 取而代之的方向见上方「🚪 Support / Query 分离」：**我们训练的全部是 support data**。
 
 
 **起点**：两趟训练均在 OOM 崩溃，根因是 thinking 复读把 response 撑到 35k。权重探针（匹配条件，n=30×2）确证：
@@ -776,6 +790,8 @@ OpenClaw-RL 的 Separate（Student 单角色）Personal Agent Track 复现已大
 ---
 
 ## MetaClaw 论文核心机制（阅读笔记）
+
+> 📌 **这一节从一开始就写对了 skill generation versioning。**2026-09-15 讨论「要不要训这条轨迹」时我没先查它，绕了一圈重新推导，结论一致但多花一轮。**下次先查本文档和 `paper_understanding.md`。**该机制对本项目的直接后果见上方「🚪 Support / Query 分离」。
 
 **Meta-model = (θ, S)**：θ 是基座 LLM 权重，S 是自然语言技能库，注入 system prompt。两条不同时间尺度的进化通路：
 

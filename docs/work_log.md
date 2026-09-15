@@ -2289,31 +2289,48 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 
 **还活着的只剩维持机制**：循环发生后，`sum_of_sample_mean` 把一个 -1 摊到十几万 token 上，推离的力很弱。**触发器（step10 前后）至今未知。**
 
-### 三、新方向：准入控制（用户提出）
+### 三、新方向：support / query 分离——我们训练的**全部是 support data**
 
-> OPD+RL 实时训练，agent 产出什么就训什么，**没有准入控制**。
+用户提出方向；查 MetaClaw 代码 + 论文原文后，**判据跟我上午记的不是一回事**。
 
-**证据**：thinking ≥50k 的 191 个 turn 里，**168 个（88%）已被 `is_invalid_tool_use` 抓到**。检测器一直在，抓得准，只是**它的输出被用来罚，不是用来拦**。
+**MetaClaw 有两个时间尺度**：skill 快适应（§3.2，**无梯度**，只动技能库 `S`，`θ` 不变，经 prompt 立即生效）+ 策略优化（§3.3，LoRA+GRPO 动 `θ`，推迟到空闲窗口）。
 
-**「罚」可能比「不罚」更糟**：一条 15 万 token、88% 是同一句话的样本带 advantage=−1 进优化器，等于把同一小段 token 反复推低几千次——**用模型自己的退化输出去塑造它的分布**。不是罚得不够，是不该进优化器。
+**"这条轨迹要不要训"的判据是出身，不是质量**（§3.4）：
 
-**可证伪的预测**：有 gate 时 step10 那种扰动应当自愈；无 gate 时锁死到 day21。
+```
+ 7: if ξi reveals failure then
+ 8:     Add (τi, ξi) to support set D^sup_g      ← 失败轨迹根本不进 RL buffer
+ 9: else
+10:     Add (τi, ξi, ri, g) to RL buffer B
+16: Flush all samples with version ≤ g from B    ← 技能进版即清空旧样本
+```
 
-**最有价值的主张候选是「拦 ≠ 罚」**——反直觉、可测、直指现有方法盲区。
+论文给的理由最要害：**若失败轨迹进 RL buffer，梯度就是在"惩罚 θ 犯了一个 skill 适应已经纠正过的错"，等于优化适应前而非适应后的表现，违反元学习目标。**
 
-→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🚪 准入控制」。
+**我们没有 skill 层** → 失败直接带 −1 进梯度，且**永远不会被纠正** → **每一个 −1 都是 support data**。与实测一致：模型在未纠正的失败模式上被反复推，锁进退化吸引子。
+
+**⚠️ paper ↔ code 有出入，只报告不裁决**：论文 Algorithm 1 说失败不进 buffer；代码 `api_server.py:2311` 排除的是**判官弃权**（`score == 0.0`），`score = -1` 照样进，只有真的触发技能进版才 flush。**代码比论文松。**
+
+**可主张的点**（新颖性递减）：① 实证展示这个失效模式——论文从元学习目标论证"不该做"，我们有带对照的实测，且不是学得慢而是**锁进退化吸引子整趟打穿**；② **「拦 ≠ 罚」**扣分是主动有害而非仅效率低；③ 移植到无 skill 库的设定。
+
+**当下可实现的形态**：round N 失败 → 反馈 → round N+1 才看到。则 round N 是 support、N+1 是 query，**只训"已拿到相关反馈之后的那次尝试"**。代价要先算：FC 约 74% 失败，严格做会丢掉绝大多数样本（MetaClaw 有"每 session 至少保一条"兜底，可能正为此）。
+
+→ 详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🚪 Support / Query 分离」。
 
 **主要问题：**
 - **`training_config.md` 把 `truncation-penalty` 列为生效规则是错的**：`is_truncated → -1` 只在 step-judge 分支和 PRM 分支，两者都被 `_metaclaw_verdict is None` 挡着，**MetaClaw 这条路上截断不受任何惩罚**
 - **`is_invalid_tool_use` 在 (a) 之下只看本轮最后一个 turn**：108 个含超长 turn 的 round 里约 18 个是更早 turn 已崩、最后一 turn `invalid=False`
 - 我在这一轮里第二次把机制叙事推得过远（上一次是 OPD 覆盖率 25%）。**两次都是"能解释得通"被当成了"就是它"**
+- **同一天内第三次**：上午把 MetaClaw 的准入判据记成「内容有效/无效/有害」，下午读代码+论文发现是**版本/出身**。原因是我只读了 `trainer.py` 就下结论，而门在 `api_server.py` 的样本构造处、机制在论文 §3.4。**那一节已整体重写，错的版本不保留**
+- **而且这个机制本来就在我们自己的笔记里**：`metaclaw_migration_plan.md`「MetaClaw 论文核心机制（阅读笔记）」一节**从一开始就写对了 skill generation versioning**，我没先查就自己推了一遍。结论一致，但多花一轮。**下次先查本文档和 `paper_understanding.md`**
 
-**待查（两件都没做，gate 不能先写）：**
-1. **MetaClaw 到底做不做训练前筛选**——承重墙，没核实过。查 `metaclaw/` 的 `trainer.py`/`data_formatter.py`/`memory/`，要原文，找不到也要明说
-2. **检测器在健康窗口（step ≤9）的误报率**——shadow 那 48% 是有偏子集算出来的，不能用。接近 0 才安全，≥30% 会饿死训练
+**待查：**
+1. ~~MetaClaw 到底做不做训练前筛选~~ → **已查清**：做，机制是 skill generation 版本化，见第三节
+2. **检测器在健康窗口（step ≤9）的误报率**——⬜ 需服务器日志，shadow 那 48% 是有偏子集算出来的，不能用
+3. **step10 的触发器**——⬜ 未知。接近 0 才安全，≥30% 会饿死训练
 
 **产出：**
-- `docs/metaclaw_migration_plan.md`：「🔬 因果分析」整节加撤回横幅；新增「🚪 准入控制」
+- `docs/metaclaw_migration_plan.md`：「🔬 因果分析」整节加撤回横幅；新增「🚪 Support / Query 分离」（当日上午那版「准入控制」判据记错，已整体重写）
 - `docs/change_ledger.md`：`20260914_181842` 的结果
 - `docs/work_log.md`：本条
 
