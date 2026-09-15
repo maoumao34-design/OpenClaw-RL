@@ -166,7 +166,14 @@ loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
 **OpenClaw 系统侧 6 个**（改本机安装的 dist）：
 `rl-training-headers`、`sglang-execution-bias`、`embedded-agent-overflow-recovery`、`system-prompt-output-directives`、`cli-compaction`、`silent-reply-policy`
 
-**训练侧规则**：truncation-penalty（截断强制 -1、不丢样本）、tool-error-penalty、duplicate-user-retry（丢弃）、degraded-turn-drop、invalid-tool-use-penalty、skip-forced-negative-override
+**训练侧规则**：tool-error-penalty、duplicate-user-retry（丢弃）、degraded-turn-drop、invalid-tool-use-penalty、skip-forced-negative-override
+
+> ⚠️ **`truncation-penalty` 在 MetaClaw 这条路上不生效**（2026-09-15 查明，此前本表把它列为生效规则是错的）。
+> `is_truncated → -1` 只存在于 **step-judge 分支**和 **PRM 分支**，两者都被 `_metaclaw_verdict is None` 挡着，
+> 而 MetaClaw 走的是 verdict 分支。**截断目前不受任何惩罚。**
+>
+> 另：`invalid-tool-use-penalty` 虽然接在 verdict 分支上，但 **(a) 之下它只检查本轮最后一个真实 turn**。
+> 实测 108 个含超长 turn 的 round 里约 **18 个**是更早 turn 已崩、最后一 turn `invalid=False`。
 
 **环境侧（2026-09-04 起与官方一致）**：三项反馈加料全部移入 OPD hint（**模型看不见**）；`[Previous Feedback]` 用官方原文；infra 失败轮记 0 分**进分母**。
 
@@ -178,7 +185,7 @@ loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
 |---|---|
 | **`--dir --min-count` 累计阶梯** | **31% 的 FC 轮次**（70/224）：早轮欠账 → 本轮做对也判 -1。**奖励本身错，不是归属错** |
 | 空回复 turn 变 2~3 token 样本 | 官方守卫因 `response_text` 恒含 `<\|im_end\|>` 形同虚设 |
-| `sum_of_sample_mean` 每样本等权 | 2 token 与 5000 token 同权重 |
+| `sum_of_sample_mean` 每样本等权 | 2 token 与 5000 token 同权重。**⚠️ 2026-09-15：「这导致模型倾向长回复」已被推翻**——退化是 88–96% 字面重复的循环、且在 step10 骤跳，不是稀释压力推出来的缓慢爬升。它至多是循环发生后的**维持**机制 |
 | 批级基线放大稀有正样本 | |
 | 全负批 | 1/N 只压幅度不改符号；要 `n_samples>1` 才有组内比较 |
 | **`CP=1` + teacher 单卡** | 长回复必 OOM。2026-09-08：34,885 token 的回复 → 34885×151936×4B = **19.75 GiB** 单次分配 |
