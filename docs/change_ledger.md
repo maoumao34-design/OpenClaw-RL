@@ -44,7 +44,7 @@ head -1 /dfs/data/openclaw-rl-project/logs/metaclaw_migration_<RUN_ID>/RUN_MANIF
 | `e7979e1` | 09-09 | Select 子类覆写了 D 补丁的两个 submit | 是（`20260909_114032`）| ❌ **从未**——该趟 ~step 10 OOM，无分数 |
 | `9573e0d` | 09-11 | record 按 run 分路径 | 否 | — 不影响模型，只影响日志留存 |
 | **(a) 轨迹级样本** | 09-14 | 一个 round = 一个样本；OPD 覆盖整轮；**删除 1/N 缩放器** | `20260914_154812`（**带 bug，拼接 0 命中**）| ❌ **待验证**——该趟等价于「per-turn 终轮样本 + 删 1/N」，已停 |
-| `6a9b1db` | 09-14 | 修 `_metaclaw_visible`：response 只带 `</think>`，无 opener；拼接补回 generation tail | `20260914_181842` | ⚠️ **机制已验证，效果未定**——拼接命中、`not located`=0；day01–07 相对基线 **+7.1pt**，但只有约 1/4 题量，且 day08 起被超长 thinking 打穿，**需要一趟无污染的完整跑** |
+| `6a9b1db` | 09-14 | 修 `_metaclaw_visible`：response 只带 `</think>`，无 opener；拼接补回 generation tail | `20260914_181842` | ⚠️ **机制已验证，效果未确立**——拼接命中、`not located`=0。**但 09-17 更正：day01–07 的 +7.1pt 逐日拆开是 5 天 ≤0 + 两个离群日（+29.2 / +46.7）撑起来的，Compl 精确为 0**；且 checker 会给零写入的超时轮白送 +1，**奖励信号本身被污染**。见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「⛔ 更正（2026-09-17）」 |
 | `record-archive` | 09-14 | purge 前先归档到 `*_archive.jsonl` | 否 | — 不影响模型；**台账那条「跑完更新」的规则靠它才成立** |
 | `d57c3b8` | 09-14 | 超长轮次熔断（丢弃而非崩） | `20260914_181842` | ✅ **已验证**——该趟走到 step 15 没有再 gather 崩 |
 
@@ -63,7 +63,7 @@ head -1 /dfs/data/openclaw-rl-project/logs/metaclaw_migration_<RUN_ID>/RUN_MANIF
 09-09  20260909_114032  → GPU7 OOM @ ~step 10
 09-14  20260914_154812  → 0 OOM，但拼接 0 命中（response 无 <think> opener），手动停
 09-14  20260914_171937  → 拼接修好，但一条 17-turn/71k 样本把 gather 打崩（day03）
-09-14  20260914_181842  → 熔断生效，跑到 step15/day21；前半 +7.1pt，后半被退化循环+timeout 打穿
+09-14  20260914_181842  → 熔断生效，跑到 step15/day21。**效果未确立**（+7.1pt 是两个离群日、Compl 为 0）；后半被退化循环+timeout 打穿，且 checker 白送 +1 污染了奖励
   ↓
 至今    「按题成组 + 1/N」这套东西一次都没有真正训完过
 ```
