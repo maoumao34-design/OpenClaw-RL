@@ -2260,6 +2260,70 @@ benchmark/src/ 的 system prompt → 一个都没有（用 OpenClaw 原生）
 
 ---
 
+## 2026-09-18
+
+**目标：** 跑 OPD/RL 消融，确定退化由哪一项造成。**本条只记事实，分析等臂 A（纯 RL）跑完再做。**
+
+### 臂 B（纯 OPD，`OPENCLAW_TOPK_W_RL=0`）：run `...163256`
+
+**时间线**
+
+| 阶段 | 时间 | 现象 |
+|---|---|---|
+| day01–03 | ~16:41–17:13 | **正常**：`copies` 很低、无 `length`、0 timeout。Acc **68% / 71% / 83%** |
+| day04 中段 | 17:20 | **第一次 `copies ≥ 12`**（`copies=17`，仍是 `tool_calls`）|
+| day04 | 17:25 | **第一次 `finish_reason=length`**（thinking ≈9 万字符，`copies=138`）|
+| day04 末 | r9、r10 | **第一次 `idle timeout`** |
+| day05 | 17:35 起 | **全面爆发**：几乎每 turn 都是 `length` + 高 `copies`，timeout 连片 |
+
+**三个 onset 都在 day04：**
+
+```
+复读 onset      day04 ~17:20
+顶格/超长 onset  day04 ~17:25
+超时 onset      day04 r9
+```
+
+**day05 是"已经系统性全是复读 + timeout"，不是起点。**
+
+**day05 的规模**（14 个 MAIN turn 全部）：`finish_reason=length` 14/14、
+thinking 8–15 万字符、`max_sentence_copies` 59–969。rollout 侧最终只有 `idle timeout`，`score=0`。
+
+**复读长什么样**（17:35:14）：开头正常——
+
+```
+Okay, let's see. The user wants me to process a JSON file...
+normalize the "standup_time" fields ... save as day05/weekly_data_normalized.json
+```
+
+中段起同一套意思换皮空转，同句级重复几十到几百次：
+
+```
+The user's tool "edit" is the correct tool. The user's task is to replace the "standup_time" fields ... with "09:30"...
+The user's tool "edit" is the correct tool. The user's task is to "normalize" the time to the standard format...
+The user's tool "edit" is the correct tool. The user's task is to "fill in the standup time as 09:30"...
+```
+
+该 turn：`thinking_chars=117100`、同类段落最高 ×44、`copies=311`、`finish_reason=length`。
+**卡点是一个决策**——"到底用不用 `edit` / 写成 09:30"。
+
+### 与对照的时点对比
+
+| | 起病 |
+|---|---|
+| 对照（RL + OPD，`20260914_181842`）| **day09 / step10** |
+| **臂 B（纯 OPD）** | **day04** |
+
+### ⬜ 待办
+
+- **核对臂 B 的开关真生效**：step 0 的 `'train/w_rl': 0.0, 'train/w_opd': 1.0`。
+  day04 vs day09 的差异是间接证据，直接证据还没看。
+- **跑臂 A**（`OPENCLAW_TOPK_W_OPD=0`，纯 RL）。
+- **分析推迟到臂 A 之后。** 目前"纯 OPD 更早崩"至少有两种读法
+  （OPD 是驱动者 / RL 原本在约束），本趟分不开。
+
+---
+
 ## 2026-09-17
 
 **目标：** 核实 `20260914_181842` 的真实成绩——为什么 day09 超时了分数反而比基线高。

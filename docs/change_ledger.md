@@ -47,6 +47,7 @@ head -1 /dfs/data/openclaw-rl-project/logs/metaclaw_migration_<RUN_ID>/RUN_MANIF
 | `6a9b1db` | 09-14 | 修 `_metaclaw_visible`：response 只带 `</think>`，无 opener；拼接补回 generation tail | `20260914_181842` | ⚠️ **机制已验证，效果未确立**——拼接命中、`not located`=0。**但 09-17 更正：day01–07 的 +7.1pt 逐日拆开是 5 天 ≤0 + 两个离群日（+29.2 / +46.7）撑起来的，Compl 精确为 0**；且 checker 会给零写入的超时轮白送 +1，**奖励信号本身被污染**。见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「⛔ 更正（2026-09-17）」 |
 | `record-archive` | 09-14 | purge 前先归档到 `*_archive.jsonl` | 否 | — 不影响模型；**台账那条「跑完更新」的规则靠它才成立** |
 | `d57c3b8` | 09-14 | 超长轮次熔断（丢弃而非崩） | `20260914_181842` | ✅ **已验证**——该趟走到 step 15 没有再 gather 崩 |
+| **消融臂 B** | 09-18 | `OPENCLAW_TOPK_W_RL=0`（纯 OPD），**无代码改动** | `...163256` | ⬜ **只记事实，判别未完成**——**day04 起病**（复读 17:20 / 顶格 17:25 / 超时 r9），day05 已系统性爆发；对照是 day09。day01–03 正常，Acc 68/71/83%。**分析待臂 A**。⚠️ 开关生效的直接证据（step0 的 `w_rl/w_opd`）尚未核对 |
 
 **「待核」的格子用上面那条 `head -1 RUN_MANIFEST.txt` 就能填掉。**
 
