@@ -9,6 +9,52 @@
 
 ---
 
+## 历史状态（2026-09-07，已被 9/18 三臂消融结果取代）
+
+### 已就绪
+**OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
+
+**MetaClaw 迁移**：
+- [x] **「按题成组 + 1/N advantage 缩放」已实现**——每 turn 一个样本（各带真实 prompt/response，零重建）；一个 round 的全部 turn 共用 `group_index`、verdict 时一次性入队；advantage 除以该轮 turn 数；`--rollout-batch-size 8` + `--use-dynamic-global-batch-size`。40 项断言 + 双向非空洞性本地通过，**真实训练未验证**
+- [x] **环境侧已与官方一致**：三项反馈加料全部移进 OPD hint（模型看不见），`[Previous Feedback]` 恢复官方原文；infra 失败轮记 0 分进分母
+- [x] **`METACLAW_SESSION_SCOPE` 开关**（`round` 现状 / `day` 官方），三处站点一起改，非法值 import 时抛错；15 项断言
+- [x] **定版基线 = 按天 K=0：Acc 41.1% / Compl 26.3%**（`20260907_112320`）。**2026-09-09 第二趟 K=0（`20260909_094645`）跑出 44.7% / 25.9%，两趟一致，基线确认**。由此得噪声下限：**Acc ±3.6pt / Compl ±0.4pt**——Acc 提升低于约 4pt 与噪声不可区分
+- [x] **官方代码路径基线一键脚本已交付**：`scripts/metaclaw/run_official_baseline_modelfactory.sh`——校验 `--agent` 四处 → 落盘 manifest+diff → day30 冒烟 → **双侧落地实证** → 全量 → 自算 Compl。**尚未跑**
+
+### 已知限制 / 未解决
+- **【核心异常已定位，2026-09-07】我们用 Part II 的方法跑 Part I 的数据集**——`benchmark/data/metaclaw-bench/` 自带 `openclaw_cfg`（`profile: coding` 全套工具）与 `workspaces/shared/`（IDENTITY/SOUL），而论文 Part I 是单 `run_command`。**这解释了"分数怎么都对不上"**。当前工作假设，非铁证，详见 [`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」
+- **Table 1 两列都不 like-for-like**：Part I 列方法不同（单工具 vs 全套），Part II 列数据集不同（14 天/588 题/MC 74% vs 30 天/346 题/MC 35%）。→ **训练效果一律以我们自己的 K=0 为基准**
+- **⏳ 待讨论决策**：继续 Part II 方法（现状，资产全保留）vs 造"单 shell 工具 + Part II 工作区"变体（检验工具集假设，但 K=0/K=6/scope A/B 全废）。**两条都到不了 like-for-like**
+- **定版基线 17.8%/0% 作废**（session-key 兜底 bug，文件落进 `workspace-main/`）；且其 "agentfix" 很可能只补了 L1、因 L3 断链而静默无效
+- **day22 那次为什么中途变差，至今没有答案**
+- **09-02/09-03 两次工具塌陷的机制已定位到代码层面，但没有修**：① 空回复 turn 变成 2~3 token 样本（官方守卫因 `response_text` 永远含 `<|im_end|>` 形同虚设）；② `sum_of_sample_mean` 每样本等权；③ 批级基线放大稀有正样本
+- **1/N 只压幅度、不改符号**：全失败批仍是均匀打压，需 `n_samples=8` 才解决
+- **round 轮数仍无上限**（186 轮空转的案例）
+- checkpoint `20260902_094458` / 09-03 两次均已污染，不能作起点
+- `report/` 下汇报 PPT 产物未提交，待决定
+
+### 下一步
+0. **【阻塞中】训练连续两趟在同一处 OOM**（09-08 `20260908_164130`、09-09 `20260909_114032`）：teacher `gather_at_indices` 要 ~19.76 GiB，成因是单条 response ~35k 的空转循环。**待 CLI 查证三项**（本趟 1/N 是否真生效、为何补 D 后仍 OOM、健康段 12pt 落差），再决定是否做 train-only 8192 clamp
+0b. **【已做 09-07】全面改按天 + 定版基线 + 确认显存预算**——三项前置全部解除：按天 K=0 = **41.1% / 26.3%**（已定版）；`--max-tokens-per-gpu 32768` **保持不动**（实测 max peak 29521，0/683 超标；且它是论文官方脚本自己的值）。**主线训练现在无阻塞**
+1. **OpenClaw-RL 复现**：同 08-17
+2. **跑官方代码路径基线**（先 `BASELINE_SMOKE_ONLY=1` 过冒烟闸门）——官方 harness vs 我们的 driver，**同题集、同工具、同为按天会话**，差值即纯粹的 driver 结构差
+3. **取按天 K=0（`20260907_112320`）跑满 30 天的最终数**（现在是唯一基线，优先级升高）
+4. **主线**：round-group + 1/N 训练 vs 按天 K=0
+5. **【已定】继续 Part II 方法**——"改回 Part I"不可行：Part I 的评测 harness、346 题、打分能力**三样都未发布**（查证记录十七）
+
+### 未验证
+- [ ] **`metaclaw-bench run` 路径上 `--agent` 是否真生效**——driver 路径已由 K=0 的非零 Compl 证实，bench 路径（多一层 per-test gateway）从未在真实跑动中验证。冒烟闸门即为此设
+- [ ] **落地修复后压缩/溢出计数是否升高**——定版基线 overflow 4.6%，但反馈由 incorrect 变 correct 后 token 走向不可预测
+- [ ] **自算 Compl 的判别式**（`metrics.passed` 存在即 file_check）——按 `_score_file_check` 源码推出，未在真实 `scoring.json` 产物上验证
+- [ ] **reasoning 到底在不在被训练的 token 里**——决定"thinking 膨胀"叙事成不成立
+- [ ] **`METACLAW_*` 环境变量是否真传到训练后端进程**
+- [ ] **`_drain_output_queue` 的 `any(... ABORTED ...)` 在按题成组后是否会丢整道题**——预期为零，真实训练需确认
+- [ ] "对齐/不对齐基线 Acc. 差异" vs "`plugins.allow` 无条件排除插件"两个结论的矛盾（承接 08-18）
+- [ ] 官方 MetaClaw Compl. 非零的真实原因——开放问题，不阻塞
+- 其余同 09-03（历史状态，见 [`status_history.md`](status_history.md)）
+
+---
+
 ## 历史状态（2026-09-03，已被 9/7 Part I/II 归属澄清取代）
 
 ### 已就绪

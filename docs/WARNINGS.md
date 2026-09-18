@@ -144,6 +144,51 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 - **17.8% / 0%（定版基线）**：跑在带 OpenClaw session-key 兜底 bug 的构建上，文件写进 `workspace-main/` 而非 checker 读的目录，`Compl=0` 是构建产物不是能力上限。且其 "agentfix" 很可能只补了 `--agent` 四层链条中的 L1、因 L2/L3 断链而**静默无效**
 - **K=6 的"正面训练效果"**：已被证伪（K=0 零训练即 34.9%/13.4%，与 K=6 的 37.3%/13.9% 基本重合，训练增益接近 0）
 
+## ❌ checker 会给**零写入**的轮次白送 +1
+
+`benchmark/src/infer/infer_cmd.py:608` 的 `_run_file_check` 在 workspace 里跑 checker，
+**只数目录里已有的合规文件，完全不看最终回复**。按天共享 workspace ⇒ 计数跨轮累计。
+
+**实证**（`20260914_181842` day09 r8）：最终回复只有 `idle timeout`、本轮零写入，
+判分是 `--dir day09/ --ext json --min-count 4`，而**本轮写入之前目录里已有 4 个合规 json**
+（全来自更早轮次）→ `official_score = 1.0`。
+
+> **这不只是评测虚高，是把错的 +1 喂进优化器——被强化的正是退化行为。**
+> 且污染**不对称**：超时轮越多的跑次白拿越多。
+>
+> `agent_succeeded=True` 只表示 CLI 进程没崩，**不等于这轮答完了**。
+
+`--dir --min-count` 的**负方向**（早轮欠账 → 本轮做对也判 −1，31% 的 FC 轮次）此前已记，
+**正方向 2026-09-17 才发现**。两个方向都错，从未打过补丁。
+
+## ❌ 别拿 rollout 的 `passed=True` 计数当 Acc
+
+`report.md` 的 Acc **含部分分**：基线 day02 是 `Correct 8.8 / 11` → **80.3%**，
+而 rollout 里 `passed=True` 的离散数是 8/11 ≈ **72.7%**。**两者差 7.6pt，混用会得出相反结论。**
+
+**闸门/对照一律对齐 report Acc。** K=0 定版基线 `20260907_112320` 的前三天是
+**68.3% / 80.3% / 33.3%**——注意 **day03 本来就只有 33.3%**，用错基线会把"正常"判成"崩了"。
+
+## ⚠️ 训练必崩，而零训练基线不崩
+
+截至 2026-09-18：
+
+| | 结果 |
+|---|---|
+| **零训练基线 K=0** | 跑完 30 天，超长轮次熔断计数 **0** |
+| **纯 RL / 纯 OPD / 混合** | **三臂全部退化成复读，无一跑完** |
+
+**退化完全是训练造成的，不是题集的性质。** 三臂的崩法还不一样：
+纯 OPD 是**复读 thinking → idle timeout**；纯 RL 是**复读 write → transcript 撑爆 →
+`Compaction timed out`（180s 预算）→ rc=1 无训练样本**。
+
+**起病原因至今未知**——批次构成、优化器标量、OPD 强度三条独立线索全阴性。
+
+## ⚠️ 09-03 以来的训练侧改动，没有一个被一趟跑完的训练验证过
+
+**「跑过」不等于「已验证」。** 一趟在 step 10 OOM 的训练，其中的改动只是跑过。
+逐条状态见 [`change_ledger.md`](change_ledger.md)——**引用任何训练侧改动的效果之前先查它。**
+
 ## ⚠️ `--agent` 是一条四处断链，缺一处静默失效
 
 `_run_openclaw_agent` argv / `_run_question`→`_run_openclaw_agent` / `_run_group`→`_run_question` / `_run_group`→末轮 standalone feedback。**缺任何一处，`agent_id` 一路默认成 `None`，argv 里的 `--agent` 消失，行为与完全没修逐字节相同。**
