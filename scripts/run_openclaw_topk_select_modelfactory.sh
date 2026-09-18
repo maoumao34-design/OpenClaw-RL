@@ -159,6 +159,30 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         exit 1
     fi
 
+    # 2026-09-18：熵正则系数可调（默认仍是官方的 0.00，不改变默认行为）。
+    #
+    # 官方把 --entropy-coef 硬编码成 0.00，且 --kl-loss-coef 也是 0.0 ——
+    # 也就是说没有任何东西把策略拉住，既不拉向高熵也不拉向 base，跑的是纯奖励
+    # 最大化。这套值是给 Personal Agent Track（GSM8K 式短对话）调的。
+    #
+    # 三趟消融的事实：零训练基线跑完 30 天、DROPPED=0；而三个训练臂（纯 RL /
+    # 纯 OPD / 混合）全部退化成复读，无一跑完。复读按定义就是低熵行为，且
+    # 「基线不崩、训练臂全崩」指向的是训练过程本身缺乏正则，而不是某一个 loss
+    # 项特有的毛病。见 docs/work_log.md 2026-09-18。
+    #
+    # 非零时 openclaw_topk_select_loss.py 会走 need_entropy_for_loss 分支，
+    # 自动打开 with_entropy 计算——不需要改 loss 代码。副作用是真实熵终于会
+    # 进日志（train/entropy_loss），而这条曲线我们至今没看到过。
+    METACLAW_ENTROPY_COEF=${METACLAW_ENTROPY_COEF:-0.00}
+    if [ "${METACLAW_ENTROPY_COEF}" != "0.00" ]; then
+        sed -i -e "s/--entropy-coef 0.00/--entropy-coef ${METACLAW_ENTROPY_COEF}/" "${PATCHED}"
+        if ! grep -q -- "--entropy-coef ${METACLAW_ENTROPY_COEF}" "${PATCHED}"; then
+            echo "错误：--entropy-coef 覆盖失败（官方脚本可能已改动那一行）" >&2
+            exit 1
+        fi
+        echo "[profile] --entropy-coef 0.00 -> ${METACLAW_ENTROPY_COEF}"
+    fi
+
     # 2026-09-11：record 文件按 run 分路径。
     #
     # 官方脚本把它写死成 results/qwen3_4b_topk_select_record.jsonl，而

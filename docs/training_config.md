@@ -139,7 +139,7 @@ loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
 |---|---|---|
 | `--lr` | 1e-5，constant | 官方，未改 |
 | `--kl-loss-coef` | **0.0**（等于不加 KL）| 官方，未改 |
-| `--entropy-coef` | 0.00 | 官方，未改 |
+| `--entropy-coef` | **默认 0.00（官方值），可由 `METACLAW_ENTROPY_COEF` 覆盖** | 2026-09-18 加覆盖口。非零时 `openclaw_topk_select_loss.py` 走 `need_entropy_for_loss` 分支自动开 `with_entropy`，**不需要改 loss 代码**，副作用是真实熵终于进日志（`train/entropy_loss`）|
 | `--max-tokens-per-gpu` | 32768 | 官方，未改 |
 | `--rollout-max-context-len` | **65536** | MetaClaw profile 从 32768 提高 |
 | `--sglang-context-length` | **65536** | 同上 |
@@ -188,6 +188,7 @@ loss_mask        1111111111111   0000   1111111111111   0000   1111111111111
 | `sum_of_sample_mean` 每样本等权 | 2 token 与 5000 token 同权重。**⚠️ 2026-09-15：「这导致模型倾向长回复」已被推翻**——退化是 88–96% 字面重复的循环、且在 step10 骤跳，不是稀释压力推出来的缓慢爬升。它至多是循环发生后的**维持**机制 |
 | 批级基线放大稀有正样本 | |
 | 全负批 | 1/N 只压幅度不改符号；要 `n_samples>1` 才有组内比较 |
+| **没有任何正则把策略拉住** | `--entropy-coef 0.00` **且** `--kl-loss-coef 0.0` —— 既不拉向高熵也不拉向 base，跑的是纯奖励最大化。**2026-09-18 三臂消融**：零训练基线跑完 30 天且 `DROPPED=0`，而纯 RL / 纯 OPD / 混合**三个训练臂全部退化成复读、无一跑完**。复读按定义即低熵行为。熵系数已可调（见第七节），KL 仍为 0 |
 | **`CP=1` + teacher 单卡** | 长回复必 OOM。2026-09-08：34,885 token 的回复 → 34885×151936×4B = **19.75 GiB** 单次分配 |
 | **超长样本会杀掉整趟训练** | 已死过三趟：09-08 / 09-09 teacher OOM；`20260914_171937` 是 `gather_log_probs_at_indices` 拿到 71668 行 index 对 21495 token 的 chunk。**2026-09-14 加了熔断**（`METACLAW_MAX_TRAJECTORY_TOKENS`，默认 32768）：超限的轮次告警并丢弃，训练继续。**熔断一旦触发就要先查轮边界**——一个 round 只有几个 turn，样本这么大通常是别的轮次的 turn 混进来了 |
 
