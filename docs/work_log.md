@@ -2314,7 +2314,87 @@ The user's tool "edit" is the correct tool. The user's task is to "fill in the s
 | 对照（RL + OPD，`20260914_181842`）| **day09 / step10** |
 | **臂 B（纯 OPD）** | **day04** |
 
+### 臂 A（纯 RL，`OPENCLAW_TOPK_W_OPD=0`）：`metaclaw_migration_20260917_180600`
+
+**崩法完全不同：不是 idle timeout，是 `Compaction timed out` 的 infra 挂死。**
+
+**时间线**
+
+| 阶段 | 时间（09-17）| 现象 |
+|---|---|---|
+| 行为起病 | **day13 起 ~19:50** | **MAIN turn 数爆炸**（day13 max=141 → day16=441）|
+| 首次 summarization | 20:29:05（约 day14 末）| 上下文开始主动压缩 |
+| write 刷屏高峰 | day16–18 | 同文件反复 write（day16 `api_docs.md` ×438；day18 `prod_config.py` ×499）|
+| **首个 Compaction TO** | **day18 r3，约 22:38** | 此前 r1/r2 仍 `agent_succeeded=True` |
+
+day18+ 累计 **84 轮** unique Compaction TO（day18–22、25–28 为主；23/24 无 TO，但仍 Acc=0 且有长 write loop）。
+
+**day18 解剖**
+
+| 轮次 | 情况 |
+|---|---|
+| r1 | 22:03:19→22:34:53，**501 次 MAIN**，`prompt_tokens` 12k→**41.9k**；**499 次几乎相同的 `write prod_config.py`**；debug 打出 498 条 repeated `tool_call=('write',...)`；最终仍回复 "Successfully updated…"，`agent_succeeded=True`、**score=0**（缺 `.bak`）|
+| r2 | `[GENERATE-FAIL]`（"couldn't generate"），仍算跑完，score=0 |
+| r3 | **首个 Compaction TO**：`AGENT FAILED (rc=1) + Compaction timed out`，`agent_succeeded=False`，**无训练样本** |
+
+**机制（超时预算，已查源码）**
+
+`EMBEDDED_COMPACTION_TIMEOUT_MS = 180000`（180 秒），可被
+`agents.defaults.compaction.timeoutSeconds` 覆盖，**本 run 未覆盖**。
+safeguard 模式约 33.6k tokens 触发压缩；压缩自身要调 context summarization assistant，
+大 transcript 上多段 summarization 很容易顶满 180s。
+
+**时间对得上**：r1 结束后 22:35:07 起 summarization，成对间隔约 135s + 46s ≈ **181s**，与默认预算吻合。
+
+**根因链**
+
+```
+策略崩（同文件反复 write / repeat tool_call）
+  → session transcript 膨胀（turn 几百、prompt ~40k+）
+  → safeguard 触发 context summarization
+  → compact() 在 180s 内做不完
+  → "Compaction timed out" → CLI throw → Gateway rc=1
+  → infra failure（official_score=N/A，不提交训练样本，仍按 0 进分母）
+```
+
+**不是压缩逻辑坏了**，是 write 死循环把 transcript 撑到压缩做不完。
+
+### 两臂对照：**都会崩，但崩法不同**
+
+| | 臂 B（纯 OPD，`163256`）| 臂 A（纯 RL，`180600`）|
+|---|---|---|
+| **崩法** | **复读 thinking** → 无有效 tool → idle timeout | **复读 write** → context 爆 → Compaction timed out |
+| 行为起病 | **day04** | **day13** |
+| 成片失效 | day05 | day18 r3 |
+| 训练影响 | 超时轮次无有效轨迹 | day18+ 大量轮次**直接无样本** |
+
+**起病时点排序**（用行为起病，不是 infra 起病）：
+
+```
+纯 OPD  day04   <   RL+OPD  day09   <   纯 RL  day13
+```
+
+**两者各自都足以致崩**，所以不是"某一项是唯一病因"。
+但**加 OPD 会把起病提前，加 RL 会把起病推后**——这个方向是一致的。
+
+### ⚠️ 三个必须标出的限制
+
+**① 三条曲线的"起病"用的不是同一把尺子。** 对照趟量的是 `dup_frac` 逐 step；
+臂 B 记的是 `copies`/`finish_reason=length`；臂 A 记的是 MAIN turn 数爆炸。
+**要严格排序，得对三趟跑同一个指标。**
+
+**② 臂 A 的 day01–12 没有被检查过低水平复读。** day13 是"变得显眼"的时点，
+不一定是起病点——臂 B 的 day04 正是靠细看才发现的（day05 才显眼）。
+
+**③ 臂 A 的失效是 infra 层的**（rc=1、无样本），这意味着 **day18 之后训练实际上已经没有输入**，
+和臂 B"有样本但样本是垃圾"不是同一种破坏。
+
 ### ⬜ 待办
+
+- **核对两臂的开关都真生效**：step 0 的 `'train/w_rl': ..., 'train/w_opd': ...`
+- **对三趟统一跑 `dup_frac` 逐 step/逐 day**，才能严格比起病时点
+- **查臂 A 里超长轮次熔断（`DROPPED an oversized round`）触发了多少次**
+  ——r1 有 501 个 turn，远超熔断阈值，那一轮应该被丢了
 
 - **核对臂 B 的开关真生效**：step 0 的 `'train/w_rl': 0.0, 'train/w_opd': 1.0`。
   day04 vs day09 的差异是间接证据，直接证据还没看。

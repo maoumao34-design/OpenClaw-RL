@@ -48,6 +48,7 @@ head -1 /dfs/data/openclaw-rl-project/logs/metaclaw_migration_<RUN_ID>/RUN_MANIF
 | `record-archive` | 09-14 | purge 前先归档到 `*_archive.jsonl` | 否 | — 不影响模型；**台账那条「跑完更新」的规则靠它才成立** |
 | `d57c3b8` | 09-14 | 超长轮次熔断（丢弃而非崩） | `20260914_181842` | ✅ **已验证**——该趟走到 step 15 没有再 gather 崩 |
 | **消融臂 B** | 09-18 | `OPENCLAW_TOPK_W_RL=0`（纯 OPD），**无代码改动** | `...163256` | ⬜ **只记事实，判别未完成**——**day04 起病**（复读 17:20 / 顶格 17:25 / 超时 r9），day05 已系统性爆发；对照是 day09。day01–03 正常，Acc 68/71/83%。**分析待臂 A**。⚠️ 开关生效的直接证据（step0 的 `w_rl/w_opd`）尚未核对 |
+| **消融臂 A** | 09-18 | `OPENCLAW_TOPK_W_OPD=0`（纯 RL），**无代码改动** | `20260917_180600` | ⬜ **事实已记**——**行为起病 day13**（MAIN turn 爆炸），**首个 `Compaction timed out` 在 day18 r3**，day18+ 累计 84 轮 infra 挂死。**崩法与臂 B 不同**：复读 write → transcript 撑爆 → 压缩超 180s 预算 → rc=1、无训练样本。⚠️ 三臂的起病用的不是同一把尺子，严格排序需统一指标 |
 
 **「待核」的格子用上面那条 `head -1 RUN_MANIFEST.txt` 就能填掉。**
 
