@@ -229,3 +229,4 @@ grep -ci "out of memory"                     <LOGS_DIR>/training.log
 | 对照方式 | 一律与该基线比，**不与论文 Table 1 比**（两列都不可比，见计划文档「🔴 当前结论」）|
 | **训练后必须拆两栏报 Acc** | ① MCQ 抽取成功率 ② 抽取成功者中的正确率。格式合规是表层行为，RL 几步就能学会，只报总 Acc 会把"学会写反斜杠"误当成"方法有效" |
 | Compl 定义 | 仅 file_check 的 224 题；`report.json` 的 `metrics.passed` 是全题平均，**不是 Compl** |
+| **Acc 口径：用 report Acc，不要用 rollout 的 `passed=True` 计数** | `report.md` 的 Acc **含部分分**（基线 day02 = `Correct 8.8 / 11` → 80.3%），而 rollout 里 `passed=True` 的离散数是 8/11 ≈ 72.7%。**两者差 7.6pt**，混用会得出相反结论。2026-09-18 险些据此误判一趟标定跑 |
