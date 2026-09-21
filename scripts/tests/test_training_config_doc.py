@@ -133,12 +133,46 @@ def main():
     ck("_metaclaw_build_trajectory" in doc,
        "the doc names the trajectory builder")
 
+    # 2026-09-21: the KL anchor coefficient override. Asserted in BOTH
+    # directions -- a test that only checks the sed exists would stay green
+    # if the guard that makes the default a no-op were deleted, and a run
+    # that silently anchors when it should not is exactly as bad as one that
+    # silently does not.
+    print("\n[KL anchor coefficient override]")
+    ck("METACLAW_KL_LOSS_COEF" in doc,
+       "doc names the METACLAW_KL_LOSS_COEF override")
+    ck("METACLAW_KL_LOSS_COEF=${METACLAW_KL_LOSS_COEF:-0.0}" in profile,
+       "profile defaults METACLAW_KL_LOSS_COEF to the official 0.0")
+    ck('[ "${METACLAW_KL_LOSS_COEF}" != "0.0" ]' in profile,
+       "the override is gated, so the default leaves the official value alone")
+    ck("s/--kl-loss-coef 0.0/--kl-loss-coef ${METACLAW_KL_LOSS_COEF}/" in profile,
+       "profile seds --kl-loss-coef when the override is set")
+    # Both guards: without --use-kl-loss the coefficient is inert, and with
+    # --ref-update-interval the anchor drifts to the current policy, which
+    # silently turns "anchored to the initial model" into something else.
+    ck('grep -q -- "--use-kl-loss"' in profile,
+       "profile asserts --use-kl-loss is present before relying on it")
+    ck('grep -q -- "--ref-update-interval"' in profile,
+       "profile asserts the ref model is never refreshed")
+    # The comment block mentions --kl-loss-type by name deliberately, so this
+    # has to look for a sed rather than the bare string.
+    ck("s/--kl-loss-type" not in profile,
+       "the profile does not override --kl-loss-type (one knob at a time)")
+    if os.path.exists(OFFICIAL_SCRIPT):
+        off = read(OFFICIAL_SCRIPT)
+        ck("--use-kl-loss" in off,
+           "official script carries --use-kl-loss, so the coefficient bites")
+        ck("--ref-load" in off,
+           "official script sets --ref-load, so an anchor model exists")
+        ck("--ref-update-interval" not in off,
+           "official script never refreshes the ref model")
+
     print("\n[unchanged official hyperparameters]")
     if os.path.exists(OFFICIAL_SCRIPT):
         official = read(OFFICIAL_SCRIPT)
         for doc_val, off_frag, label in [
             ("1e-5", "--lr 1e-5", "lr"),
-            ("**0.0**", "--kl-loss-coef 0.0", "kl-loss-coef"),
+            ("默认 0.0（官方值）", "--kl-loss-coef 0.0", "kl-loss-coef"),
             ("0.00", "--entropy-coef 0.00", "entropy-coef"),
             ("32768", "--max-tokens-per-gpu 32768", "max-tokens-per-gpu"),
             ("--n-samples-per-prompt 1", "--n-samples-per-prompt 1", "n-samples-per-prompt"),
@@ -156,9 +190,11 @@ def main():
         start = profile.index("METACLAW_MIGRATION_PROFILE")
         end = profile.index("\nfi", start)
         mc_branch = profile[start:end]
+        # 2026-09-21: --kl-loss-coef left this list when it became overridable
+        # via METACLAW_KL_LOSS_COEF (same treatment --entropy-coef got on
+        # 09-18). Its override is asserted positively below instead.
         for frag, label in [("--max-tokens-per-gpu", "max-tokens-per-gpu"),
                             ("--lr ", "lr"),
-                            ("--kl-loss-coef", "kl-loss-coef"),
                             ("--n-samples-per-prompt", "n-samples-per-prompt")]:
             ck(f"s/{frag}" not in mc_branch,
                f"the MetaClaw branch does not override {label} "

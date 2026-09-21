@@ -183,6 +183,45 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         echo "[profile] --entropy-coef 0.00 -> ${METACLAW_ENTROPY_COEF}"
     fi
 
+    # 2026-09-21：KL 锚系数可调。和上面熵系数完全同构——官方脚本已经带着
+    # --use-kl-loss，只是把 --kl-loss-coef 钉死在 0.0，所以这里只改系数，
+    # 不碰 loss 代码、不碰 --kl-loss-type（官方显式设为 low_var_kl，低方差
+    # 且恒非负的估计量；注意它不是 slime argparse 的默认值 k1）。
+    #
+    # 为什么是 KL 而不是继续加正则：熵那一趟已经证伪了"熵塌了所以崩"——
+    # 系数 0.1 把熵从 0.157 抬到 0.638（+305%）而崩得更早更狠。token 级熵
+    # 和序列级复读本来就是解耦的，熵是观测错了量。KL 直接度量"离初始模型
+    # 多远"，而初始模型（K=0 基线）恰恰是唯一跑完 30 天且 DROPPED=0 的配置。
+    # 见 docs/work_log.md 2026-09-21。
+    #
+    # 三件已查实、决定了这个改动为什么这么小：
+    #   1. openclaw_topk_select_loss.py:452-460 已实现 KL 项，条件是
+    #      use_kl_loss && ref_log_probs && kl_loss_coef != 0 —— 只差系数。
+    #   2. placement_group.py:182 的 with_ref = (kl_coef != 0 or use_kl_loss)
+    #      已经为真，**ref 模型现有每一趟都已在加载、ref_log_probs 已在算**，
+    #      所以开 KL 不新增显存（09-09 那次 OOM 是这条的顾虑来源）。
+    #   3. reported["kl_loss"] 会进日志，和熵一样几步内就能判系数够不够。
+    METACLAW_KL_LOSS_COEF=${METACLAW_KL_LOSS_COEF:-0.0}
+    if [ "${METACLAW_KL_LOSS_COEF}" != "0.0" ]; then
+        # 目标行必须在，否则 sed 静默失效、白跑一趟。
+        if ! grep -q -- "--use-kl-loss" "${PATCHED}"; then
+            echo "错误：官方脚本里找不到 --use-kl-loss，KL 项不会生效" >&2
+            exit 1
+        fi
+        # ref 一旦被周期性刷新成当前 policy，锚就跟着漂走，"锚到原模型"
+        # 这个语义就没了。官方默认 None（不刷新），这里确认没人加过。
+        if grep -q -- "--ref-update-interval" "${PATCHED}"; then
+            echo "错误：出现了 --ref-update-interval，ref 会被刷新，锚点不再是初始模型" >&2
+            exit 1
+        fi
+        sed -i -e "s/--kl-loss-coef 0.0/--kl-loss-coef ${METACLAW_KL_LOSS_COEF}/" "${PATCHED}"
+        if ! grep -q -- "--kl-loss-coef ${METACLAW_KL_LOSS_COEF}" "${PATCHED}"; then
+            echo "错误：--kl-loss-coef 覆盖失败（官方脚本可能已改动那一行）" >&2
+            exit 1
+        fi
+        echo "[profile] --kl-loss-coef 0.0 -> ${METACLAW_KL_LOSS_COEF}（锚 = --ref-load 的初始权重）"
+    fi
+
     # 2026-09-11：record 文件按 run 分路径。
     #
     # 官方脚本把它写死成 results/qwen3_4b_topk_select_record.jsonl，而
