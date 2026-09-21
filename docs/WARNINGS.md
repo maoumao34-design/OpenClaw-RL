@@ -196,3 +196,78 @@ MetaClaw-Bench 分 Part I / Part II，**它们不只是两份题集，而是两�
 判断时**按 caller+callee 配对，不要按行号**——`infer_cmd.py` 里有一个长得极像的 `_execute_update(agent_id=agent_id, ...)` 就在同一个函数里，本项目已因此误判过一次。校验器见 `scripts/metaclaw/run_official_baseline_modelfactory.sh`。
 
 **详细说明见：[`metaclaw_migration_plan.md`](metaclaw_migration_plan.md)「🔴 当前结论」与查证记录（十）～（十七）**
+
+## ❌ 别用 submit 日志去测「退化样本是否被奖励」
+
+**这个方法本身不成立，不是结果阴性。**
+
+超长轮次在**成为训练样本之前**就被熔断器（`METACLAW_MAX_TRAJECTORY_TOKENS=32768`）
+整轮丢弃，**所以想测的那群样本结构性地不出现在 submit 日志里**。
+
+2026-09-20 实测（臂 A `20260917_180600`，起病窗 day08–13，按 `response_len` 分桶）：
+
+| 桶 | n | mean | frac_pos |
+|---|---|---|---|
+| short (<4k) | 64 | −0.375 | 0.312 |
+| mid | 2 | 0.000 | 0.500 |
+| **long (≥8k)** | **1** | −1.000 | 0.000 |
+
+`long` 只有 **1 条**——不是"没有退化轮"，是它们被丢掉了。而且窗口本身被挤掉：
+day08 那一声是瞬态、随后回落四天；day13+ 退化爆发时 `DROPPED×16` 同步开始。
+**可测的窗口和有信号的窗口是错开的。**
+
+> 要测必须换数据源：`record_*_archive.jsonl`（**含被丢弃的轮次**）。
+> ⚠️ **但有一个未验证的前提**：被熔断器丢弃的轮次**是否仍被打了分**。
+> 若丢弃发生在 scoring 之前，这些轮次根本没有分可查，**这个问题就是不改代码
+> 不可测的**。动手之前先验证这一条。
+
+## ⚠️ MetaClaw 路径 `K_i ≡ 1`——`--hint-m` / `--hint-selection` 是死参数
+
+**这是迁移的设计后果，不是配置缺陷，别当 bug 去"修"。**
+
+`prepare_patched_openclaw_combine_select.sh` 的 verdict 分支（2026-08-19 起）直接返回：
+
+```python
+"teacher_tokens_candidates": [_enhanced_ids],
+"hints": [_metaclaw_hint],
+"votes": [],
+```
+
+hint 来源已从**PRM 三票判官**换成 **checker 自己的 stdout / 错选项反馈**，
+这种 hint 对一个轮次**天然只有一条**，从不进入官方那条
+`seen_hints` 去重 → `MAX_CAND` 截断的链路。
+
+实测四趟（A/B/H0/E01）accepted 共 **323 条，K_i 全部 = 1，无一 ≥2**。
+
+**后果**（读日志和改配置时都要记得）：
+
+| 参数 | 名义值 | 实际 |
+|---|---|---|
+| `--hint-m` | 3 | **死参数**，候选恒为 1 |
+| `--hint-selection` | `sequence_optimal` | **从未执行**——`_select_k_star_per_token` 在 `if K == 1` 就短路返回全零 |
+| `sel_k_star_mean` | — | **恒为精确 0.0，是 K==1 短路的签名，不是"总选中 0 号候选"** |
+
+> 论文主方法是 k=4 **m=3** 多候选（见本文档「关键事实速查」）。
+> **"我们跑的不是论文的多候选版本"是事实**；要不要恢复多候选是**方法选择**，
+> 不是缺陷修复——checker 反馈本来就只有一条。
+
+## ⚠️ advantage **没有 baseline**，是裸 ±1——而且这是官方设定
+
+`run_qwen3_4b_openclaw_topk_select.sh:153,180,181`（**官方脚本自带，不是我们加的**）：
+
+```
+--n-samples-per-prompt 1
+--advantage-estimator grpo
+--disable-rewards-normalization
+```
+
+组大小 = 1 且关掉归一化 ⇒ **advantage = 原始奖励 ±1，没有减任何均值**。
+项目早前独立验证过的恒等式 `grpo_pg_loss = (n_neg − n_pos)/8`
+（每个样本恰好贡献 ∓1）本身就是证据。
+
+> **推论一：不存在"组内对比"。** 任何写着"同一组里退化候选 vs 干净候选"的
+> 分析都是空的——每组只有一个样本。本项目 2026-09-20 在这上面推演过一整轮。
+>
+> **推论二：「白拿 +1」不会被任何 baseline 抵消**，拿到 +1 的样本被无条件推高。
+>
+> **推论三：这三个 flag 是官方设定，擅自改动即偏离复现基线。**
