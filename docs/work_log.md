@@ -37,7 +37,7 @@
 
 ---
 
-## 当前状态（2026-09-28）
+## 当前状态（2026-09-28；09-29 更正 OPD 表述、更新下一步）
 
 ### 已就绪
 **OpenClaw-RL Separate/Personal Agent Track**（同 08-13，未变）。
@@ -54,7 +54,7 @@
 ### 已知限制 / 未解决
 - **🔴 核心未解：训练为什么往复读方向漂。**这是现在唯一要解决的问题，其余都是它的表现或旁支
 - **复读 thinking 只出现在开了 OPD 的趟里**（五趟一致：纯 OPD / 熵 0.1 / 混合 / 混合+KL 都有，**纯 RL 没有，thinking 反而从 4k 缩到 2.4k**）。纯 RL 的崩法是另一种（反复 write → transcript 撑爆）
-- **OPD 只在答错的轮次上起作用**（`metaclaw_rollout_driver.py:1914`：`hint = "" if training_passed else …`）。**当前主假设 H-e**：hint 条件下的 teacher 压低学生的收尾动作，模型学会"不收尾"→ thinking 变长 → 反复核对 → idle timeout。**未验证**，检验脚本见 2026-09-28 条目
+- **只有答错的轮次带 hint**（`metaclaw_rollout_driver.py:1914`：`hint = "" if training_passed else …`）。答对的轮次也有 OPD，但 teacher 不带 hint、就是初始模型本身，只把模型拉回初始水平（09-29 更正）。**当前主假设 H-e**：hint 条件下的 teacher 压低学生的收尾动作，模型学会"不收尾"→ thinking 变长 → 反复核对 → idle timeout。**未验证**，检验脚本见 2026-09-28 条目
 - **不加正则 / 熵 0.1 / KL 0.1 全部退化成复读**；零训练基线不退化。熵加速了崩溃，KL 只能延缓
 - **没有 k1 阈值**：上午据两趟写的「k1≈0.5」同日被五趟数据证伪（纯 OPD 在 k1=−0.136 就复读）
 - **成批复读之后不可恢复**：超时/超长被丢 → 凑不齐 8 条 → 训练停。KL 趟 day19–21 零更新，step 23 就是最终模型。**干预必须在成批复读之前起作用**
@@ -65,8 +65,10 @@
 - 挂起：`report/` 产物未跟踪；专利搁置（09-18）
 
 ### 下一步
-1. **跑 H-e 检验**（`scripts/probe_opd_commit_direction.py`，只用初始模型，一张卡）：在答错轮次上，OPD 推动方向在 `</think>` / 收尾动作上是否明显比 thinking 更负
-2. H-e 成立 → 针对"OPD 只在失败时出现"这个结构设计解决方案；不成立 → 回到 H-c（teacher 照抄上下文重复）
+**验证 H-e，两步都已实现（09-29），待服务器上跑：**
+1. **机制检验**（不重跑训练，一张卡）：`scripts/probe_opd_commit_direction.py`，KL 趟健康期 day01–16。主指标 `stop_cand`：在 `</think>` 位于学生 top-4 的位置上，加了失败 hint 的 teacher 相对学生对"停止思考"的对数概率差。回答"第 0 步时 OPD 是否在压低停止"
+2. **因果检验**（重跑一次，约 1–2 小时）：纯 OPD 到 day08，`METACLAW_OPD_MASK_COMMIT=1` 让 OPD 不碰"停止/行动"，其余不变。对照臂 B（day04 起病、day05 全部复读）
+3. 两步的判据都已在跑之前写定，见 2026-09-29 条目
 
 ### 未验证
 - [ ] **H-e：OPD 是否压低收尾 token**——待检验脚本结果
@@ -3349,7 +3351,7 @@ H-a（正样本自我锐化）与 H-b（负样本挤压）都预测 k1 上升；
 
 ### 🔴 新主假设 H-e：OPD 只在答错时出现，所以它教的是"迟疑"
 
-**代码事实**（`metaclaw_rollout_driver.py:1914`）：`hint = "" if training_passed else (training_hint or _build_opd_hint(...))`。**答对的轮次没有 hint，也就没有 OPD。**OPD 的每一次梯度都来自一个"知道你答错了"的 teacher。
+**代码事实**（`metaclaw_rollout_driver.py:1914`）：`hint = "" if training_passed else (training_hint or _build_opd_hint(...))`。**答对的轮次没有 hint。**~~也就没有 OPD。~~ ⛔ **09-29 更正**：`openclaw_topk_select_loss.py:448` 对批次里每条样本都算 OPD，答对的轮次 teacher 是不带 hint 的原序列即初始模型本身，OPD 在这些轮次上只把模型拉回初始水平。H-e 的核心不变：**没有任何信号把收尾倾向推到初始水平以上**，只有答错的轮次把它往下压。OPD 的每一次梯度都来自一个"知道你答错了"的 teacher。
 
 **推断（未验证）**：这样的 teacher 会压低学生原本的收尾动作——结束思考、给出答案、调用 write。纯 OPD 里没有任何信号奖励"收尾"，模型学会不收尾 → thinking 越拉越长 → 反复核对 → idle timeout。
 
@@ -3387,5 +3389,90 @@ d < 0 = teacher 比学生更不愿意写这个 token = OPD 在压低它。在健
 **验证**：`scripts/tests/test_probe_opd_commit_direction.py` 40 条断言，其中 hint 插入结果与从官方 `openclaw_opd_api_server.py` 里抽出的 `_append_hint_to_messages` 按训练方式使用时**逐字节一致**。反向验证：故意改坏 9 处关键逻辑（不跳过工具返回、去掉 `.strip()`、同题跨天错配、保留 logger 行、同位置归属给前一轮、报告混进 hint、≤10 字符 hint 当作有 OPD、think_tail 错一位、act_head 带空白 token），**9/9 都被测试抓到**。本地没有 torch，GPU 部分没法在本地跑；脚本正式计算前会先做一次**对齐自检**：用 HF 模型自带的 `labels` loss（它内部自己做错位，与脚本的取位写法独立）核对响应部分的平均 NLL，对不上就中止，不输出任何数字。
 
 **建议跑两趟做重复**：臂 B 纯 OPD（`…_163256`）和 KL 趟（`metaclaw_migration_20260927_040725`），都取 day01–03，并加 `--neutral-control`。先 `--dry-run` 看解析和归属的计数，再正式跑。
+
+---
+
+## 2026-09-29
+
+**目标：** 把 H-e 的两步验证实现到可以直接在服务器上跑。途中顺带查清了训练和生成用的温度。
+
+### 我们在做什么（防止在细节里迷路）
+
+```
+总目标   MetaClaw 迁移：跑出一趟 30 天、分数超过零训练基线的训练
+卡在     每一趟训练都会退化成复读 thinking 然后崩掉
+当前     查清为什么往复读方向漂。已知：只有开了 OPD 才出现复读 thinking
+主假设   H-e：只有答错的轮次带 hint，"知道你错了"的 teacher 压低"停止思考、开始行动"
+下一步   ① 用已有数据测机制方向  ② 重跑纯 OPD、遮住 OPD 对停止/行动的作用，看还复读不复读
+```
+
+### ⛔ 更正 H-e 的表述：答对的轮次也有 OPD
+
+`openclaw_topk_select_loss.py:448` 是 `loss = w_rl * grpo_pg_loss + w_opd * opd_loss`，OPD 对批次里**每一条**样本都算。答对的轮次 teacher 是不带 hint 的原序列，即初始模型本身，所以 OPD 在这些轮次上只把模型**拉回初始水平**。09-28 写的"答对的轮次没有 hint，也就没有 OPD"不准确，已在原处标注更正。
+
+**H-e 的核心不变**：答对的轮次把"收尾倾向"拉回初始水平，答错的轮次把它往下压，**没有任何信号把它推到初始水平以上**。
+
+### 温度：训练和生成都是 0.6，但靠的是默认值碰巧对上
+
+| 位置 | 温度 | 来源 |
+|---|---|---|
+| 论文 Personal Agent（p.10、p.21） | **未写** | — |
+| 论文 Table 6（General Agent） | rollout 1.0，PRM 0.6 | 与我们的配置无关 |
+| 官方 Personal Agent 脚本 | `--rollout-temperature 0.6` | 训练时学生与 teacher 都把 logits 除以 0.6（`loss.py:166`，teacher 走同一个 `get_responses`） |
+| **实际生成** | **0.6** | 请求不带温度（`openclaw.json` 没有该字段，OpenClaw 只在配置了才写）→ sglang `sampling_defaults=model` → 模型 `generation_config.json` 的 0.6 |
+
+**决定：保持 0.6**（用户确认）。改成 1.0 并不会更贴近论文——1.0 是 General Agent 的参数，我们跑的是 Personal Agent 的方法（lr 1e-5、C=1、k=4），而且会让之前所有训练和两趟基线都失去可比性。
+
+`paper_understanding.md` 第十二节原把 General Agent 的 rollout 温度也写成 0.6，已改为论文 Table 6 的 1.0，Personal Agent 那格注明"官方脚本，论文未写"。
+
+**两点记录，不需要处理**：一致性没有任何代码保证（见 `WARNINGS.md`）；`generation_config` 的 `top_p 0.95` / `top_k 20` 也在生成时生效，训练算概率用的却是完整词表——从官方原样继承，对 OPD（只看学生 top-4）和检验脚本都没有影响。
+
+### 第一步：机制检验脚本升级（`scripts/probe_opd_commit_direction.py`）
+
+原脚本只看**实际写出的 token**，漏掉了 H-e 最主要的通道：OPD 在每个位置作用于学生的 top-4，只要 `</think>` 是候选之一，OPD 就直接调整"此刻停止思考"的概率。
+
+| 指标 | 定义 |
+|---|---|
+| **stop_cand**（主指标） | `</think>` 在学生 top-4 的位置上，`log P_T(</think>) − log P_S(</think>)` 的平均 |
+| a_stop | 同样的位置，`clamp(差值, ±1) × w`（w = `</think>` 在学生 top-4 内的 softmax 权重）：第 0 步 OPD 施加在停止 token 上的实际 advantage |
+| stop_all | 所有 thinking 位置上的同一差值，作参照 |
+
+温度默认 0.6，与训练一致；对齐自检仍在温度 1 下用 HF 自带 loss 做。`--days` 支持 `01-16` 这种范围写法。
+
+**判据（跑之前定死，取代 09-28 版）**：在**所有答错轮次的 turn** 上，`stop_cand` 的 95% 置信区间整体 < 0，**并且**"失败 hint − 中性 hint"的区间也整体 < 0 ⇒ 第 0 步时 OPD 在压低停止。没有中性对照时结论不能判为成立（多出来的任何一段文字都可能让模型不那么想停）。原来只看写出 token 的对比降为次要指标。改看所有 turn：每个 turn 都有"何时停止思考"的决策，训练时同一轮的所有 turn 带同一个 hint。
+
+**抽样**：KL 趟 `metaclaw_migration_20260927_040725` 的 day01–16（复读检测器 day16 中位数仍是 1–2，day17 才起病）。09-28 dry-run 显示只取 day01–03 时每轮最后一个 turn 仅 11 条，太少——n=11 时"置信区间跨 0"分不清是没有效应还是样本不够。**这是在看到任何效应数据之前做的抽样调整。**
+
+### 第二步：因果检验（临时诊断补丁，读完结果后删除）
+
+`METACLAW_OPD_MASK_COMMIT=1` 时，OPD 不作用于：每个 `</think>` 到该轮 `<|im_end|>`（停止决策与随后的动作），以及 `</think>` 在学生 top-K 里的位置。thinking 内容上的 OPD 保留——**所以这个实验同时能区分 H-e 和 H-c**（teacher 照抄上下文重复）。被遮住的位置只把 OPD 项清零、不改分母，剩下位置的权重不变。
+
+**改动**：
+- `prepare_patched_openclaw_combine_select.sh` 末尾新增一段，把官方 `openclaw_topk_select_loss.py` 复制到同一 patched 目录后打补丁（PYTHONPATH 本来就把这个目录排在官方前面）。**只新增 57 行，不删改官方任何一行**；变量不设时行为与官方一致
+- `run_openclaw_topk_select_modelfactory.sh`：把 `METACLAW_OPD_MASK_COMMIT`（默认 0）以及 `</think>` / `<|im_end|>` 的 id（默认 Qwen3 的 151668 / 151645）**显式**写进 `RUNTIME_ENV_JSON`，不依赖 Ray worker 继承环境；设为 1 时 profile 打印一行确认
+- 新增日志项 `train/opd_commit_keep_frac`：OPD 仍在作用的可训练位置占比
+
+**启动**：`METACLAW_OPD_MASK_COMMIT=1 OPENCLAW_TOPK_W_RL=0 METACLAW_MAX_DAYS=8`。配置与臂 B 相同，只多了遮罩（臂 B 之后加的熵、KL 系数默认关闭）。
+
+**判据（跑之前定死）**，对照臂 B（day04 起病、day05 全部复读）：
+
+| 结果 | 结论 |
+|---|---|
+| day04–08 每天 copies≥8 比例都 < 25% | **H-e 成立** |
+| 到 day05 copies≥8 比例 ≥ 50% | **H-e 不成立**，H-c 嫌疑上升 |
+| 介于两者之间 | 不下结论，原样重跑臂 B 看 day04 起病能否重复 |
+
+**有效性前提**：每一步 `opd_commit_keep_frac` 须 **≥ 0.8 且 < 1.0**。低于 0.8 说明遮得太多，"不复读"可能只是 OPD 变弱了，需补一个随机遮掉同比例 thinking 位置的对照；等于 1.0 说明一个位置都没遮到，多半是 token id 不对。
+
+### 验证
+
+| 对象 | 情况 |
+|---|---|
+| 检验脚本 | `test_probe_opd_commit_direction.py` **52 条**；故意改坏 13 处（含新加的：停止指标漏掉写出 `</think>` 的位置、a_stop 不截断、无中性对照也判成立、天数范围少一天）**13/13 被抓到** |
+| 损失补丁 | `test_metaclaw_opd_mask_commit.py`：与官方文件逐行比对只增不删；把启动脚本补丁真正跑在官方启动脚本上，在 bash 里展开 `RUNTIME_ENV_JSON` 并按 JSON 解析，变量不设 → 0、设 → 1，W_RL 等照常传递。本地 **11 条**通过 |
+| **需要服务器跑的** | 遮罩逐位置正确性（两 turn 轨迹、中间夹工具返回），测试自带两个反面对照（把 `<|im_end|>` 当作已结束、忽略 top-K 候选）必须给出不同的遮罩。本地无 torch，**启动前须在服务器上跑** |
+| 全套回归 | 其余 7 个测试全部通过 |
+
+**本地环境备注**：本机 `python3` 是应用商店占位程序，本地跑 prepare 脚本需在 PATH 前放一个指向真实解释器的 `python3`；启动脚本补丁里的 `read_text()` 不指定编码，本地要 `PYTHONUTF8=1`（服务器是 UTF-8，不受影响）。
 
 ---

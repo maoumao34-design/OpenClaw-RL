@@ -4,29 +4,50 @@
 Background (docs/work_log.md, 2026-09-28):
   * Repeated thinking appears in every run that has OPD switched on, and in
     none without it -- pure RL's thinking actually shrinks from ~4k to ~2.4k.
-  * OPD only ever fires on FAILED rounds. metaclaw_rollout_driver.py builds
-    `hint = "" if training_passed else (...)`, and an empty hint means the
-    round is trained RL-only, with no teacher at all.
+  * Only FAILED rounds carry a hint. metaclaw_rollout_driver.py builds
+    `hint = "" if training_passed else (...)`. Passed rounds still get OPD,
+    but their teacher is the un-hinted sequence, i.e. the initial model
+    itself, so for them OPD only pulls back toward the initial model
+    (openclaw_topk_select_loss.py computes OPD for every sample).
   * H-e: a teacher that has been told "you got this wrong" is less willing
-    than the student to close its thinking and act. Nothing in OPD ever
-    rewards closing, so OPD teaches hesitation -> longer thinking -> loops.
+    than the student to stop thinking and act. Failed rounds push that
+    propensity down, passed rounds only pull it back to the initial level,
+    and nothing pushes it above -- so OPD teaches hesitation -> longer
+    thinking -> loops.
 
 What this measures
 ------------------
 At training step 0 the student IS the initial model, and the teacher is the
-initial model with the hint appended to this round's task message. So the
-direction OPD pushes each realised response token is, exactly,
+initial model with the hint appended to this round's task message. So what
+OPD does at step 0 is computable with the initial checkpoint alone.
 
-    d(t) = log P0(tok_t | prompt_with_hint, resp_<t)
-         - log P0(tok_t | prompt,           resp_<t)
+PRIMARY -- the stop decision. OPD acts on the student's top-4 at every
+position (S_t in openclaw_topk_select_loss.py). Wherever </think> is among
+those four, OPD directly moves the probability of stopping right there,
+toward the teacher's. So at each thinking position:
 
-d < 0 means the teacher is less willing than the student to write tok_t, so
-OPD pushes it down. Only the initial checkpoint is needed.
+    d_stop(t) = log P_T(</think> | ...) - log P_S(</think> | ...)
 
-This is the realised-token view. The loss itself works over the student's
-top-4 at each position (openclaw_topk_select_loss.py); the realised token is
-the student's own choice and is almost always in that top-4, which is why it
-is the readable proxy for "which way is this token being pushed".
+    stop_cand  mean d_stop over positions where </think> is in the student's
+               top-4 -- where OPD actually targets it
+    a_stop     the same positions, clamp(d_stop, +-1) * w, where w is
+               </think>'s weight within the student's top-4: the advantage
+               OPD applies to the stop token (1.0 = the official
+               OPENCLAW_TOPK_ADV_DIFF_CLIP)
+    stop_all   mean d_stop over every thinking position, for context
+
+SECONDARY -- the realised token at each position,
+
+    d(t) = log P_T(tok_t | ...) - log P_S(tok_t | ...)
+
+compared across the categories below.
+
+All log-probabilities are taken at temperature 0.6 by default: training
+divides logits by --rollout-temperature (0.6 in the official script) for the
+student and, through the same get_responses, for the teacher
+(slime/backends/megatron_utils/loss.py). Generation also runs at 0.6 here:
+the requests carry no temperature and sglang (sampling_defaults=model) takes
+it from the model's generation_config.json.
 
 Token categories in each response (response = thinking + </think> + action + <|im_end|>)
     think      every thinking token, the reference level
@@ -38,12 +59,18 @@ Token categories in each response (response = thinking + </think> + action + <|i
     all        the whole response (its mean is the per-turn analogue of the
                negative k1 seen in the pure-OPD run)
 
-Pre-registered verdict (docs/work_log.md 2026-09-28, fixed before running)
-    H-e supported  <=>  on the LAST turn of each failed round, the 95% CI of
-                        (close - think) or of (act_head - think) lies entirely
-                        below 0, AND with --neutral-control the failure hint's
-                        value is more negative than the neutral hint's.
-    A CI that spans 0, or lies above 0, means H-e is not supported.
+Pre-registered verdict (docs/work_log.md 2026-09-29, fixed before running;
+supersedes the 09-28 version, which only had the realised-token view)
+    PRIMARY, over all turns of failed rounds (every turn has a stop decision,
+    and in training every turn of the round carries the same hint):
+        mechanism present  <=>  the 95% CI of stop_cand lies entirely below 0
+                                AND the 95% CI of (fail - neutral) stop_cand
+                                lies entirely below 0 (--neutral-control).
+        A CI that spans 0, or lies above 0, means it is not present.
+    SECONDARY: on the last turn of each failed round, (close - think) and
+    (act_head - think) of the realised-token d, as before.
+    This shows what OPD does to stopping at step 0. Whether that is what
+    causes the loops is the separate causal test (METACLAW_OPD_MASK_COMMIT).
 
 Log parsing caveat: the driver's stdout is block-buffered into the pipe
 while its stderr is not, so a logger line can land inside a printed line at
@@ -72,16 +99,21 @@ Known approximation
     earlier turns keep their thinking. That changes the context, not the
     question of which way the hint pushes a closing token.
 
-Usage (modelfactory, one GPU):
-    python scripts/probe_opd_commit_direction.py \\
+Usage (modelfactory, one GPU; the system python3 has no transformers):
+    /dfs/data/envs/openclaw-rl/bin/python scripts/probe_opd_commit_direction.py \\
         --rollout-log  <LOGS_DIR>/metaclaw_rollout.log \\
         --training-log <LOGS_DIR>/training.log \\
-        --records <RESULTS>/record_<RUN_ID>.jsonl <RESULTS>/record_<RUN_ID>_archive.jsonl \\
+        --records <OFFICIAL>/openclaw-combine/results/record_<RUN_ID>.jsonl \\
+                  <OFFICIAL>/openclaw-combine/results/record_<RUN_ID>_archive.jsonl \\
         --model <Qwen3-4B-Thinking-2507 HF dir> \\
-        --days 01,02,03 --neutral-control --out probe_he_<RUN_ID>.json
+        --days 01-16 --neutral-control --out probe_he_<RUN_ID>.json
 
+    The records live in the official checkout's openclaw-combine/results/,
+    not in the run's log directory. Take only days before the run's repeated
+    thinking set in (a looping turn has no meaningful stop decision).
     Add --dry-run first: it parses, assigns turns to rounds, splices the hint
-    and categorises tokens without loading the model, and prints what it found.
+    and categorises tokens without running the model, and with --model it
+    also prints the </think> and <|im_end|> ids the loss patch relies on.
 """
 
 from __future__ import annotations
@@ -104,6 +136,9 @@ TASK_PROBE_CHARS = 120    # _mc_probe = _metaclaw_task_prefix[:120] in the combi
 MIN_HINT_CHARS = 10       # the proxy only distils when len(hint) > 10
 THINK_TAIL = 64
 ACT_HEAD = 8
+STUDENT_TOPK = 4          # OPENCLAW_TOPK_K: the S_t that OPD acts on
+OPD_DIFF_CLIP = 1.0       # OPENCLAW_TOPK_ADV_DIFF_CLIP in the official script
+TEMPERATURE = 0.6         # --rollout-temperature in the official script
 
 # ---------------------------------------------------------------------------
 # metaclaw_rollout.log parsing
@@ -206,6 +241,25 @@ def parse_rollout_log(text: str) -> list[RoundInfo]:
             buf.append(line)
     close_section()
     return rounds
+
+
+def expand_days(spec: str) -> list[str]:
+    """"01-16,20" -> ["01", ..., "16", "20"]. Anything that is not a numeric
+    range is kept as given, so an exact test_id still works."""
+    out: list[str] = []
+    for part in (p.strip() for p in spec.split(",")):
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)-(\d+)", part)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                raise ValueError(f"empty day range: {part}")
+            width = len(m.group(1))
+            out.extend(str(d).zfill(width) for d in range(lo, hi + 1))
+        else:
+            out.append(part)
+    return out
 
 
 def day_matches(day: str, wanted: Iterable[str]) -> bool:
@@ -319,6 +373,29 @@ def cat_means(d: list[float], cats: dict[str, list[int]]) -> dict[str, float]:
     return {k: (sum(d[i] for i in idx) / len(idx) if idx else float("nan")) for k, idx in cats.items()}
 
 
+def stop_metrics(close_s: list[float], close_t: list[float], in_topk: list[bool],
+                 w_close: list[float], c: int, clip: float = OPD_DIFF_CLIP) -> dict[str, float]:
+    """What OPD does to "stop thinking now" over one turn's thinking.
+
+    Positions 0..c inclusive, c being where </think> was written -- that
+    position is itself a stop decision. close_s / close_t are log P(</think>)
+    under student and teacher; in_topk and w_close come from the STUDENT,
+    because S_t is the student's top-K and w is softmax(ell_old | S_t).
+    """
+    nan = float("nan")
+    pos = range(0, c + 1)
+    d = [close_t[i] - close_s[i] for i in pos]
+    cand = [i for i in pos if in_topk[i]]
+    dc = [close_t[i] - close_s[i] for i in cand]
+    return {
+        "stop_all": sum(d) / len(d) if d else nan,
+        "stop_cand": sum(dc) / len(dc) if dc else nan,
+        "a_stop": (sum(max(-clip, min(clip, close_t[i] - close_s[i])) * w_close[i] for i in cand)
+                   / len(cand)) if cand else nan,
+        "n_cand": float(len(cand)),
+    }
+
+
 def contrasts(m: dict[str, float]) -> dict[str, float]:
     return {
         "close_minus_think": m["close"] - m["think"],
@@ -351,6 +428,41 @@ def summarize(values: list[float], n_boot: int = 2000, seed: int = 0) -> dict:
     }
 
 
+PRIMARY_KEYS = ["stop_cand", "a_stop", "stop_all", "n_cand"]
+SECONDARY_KEYS = ["close_minus_think", "act_head_minus_think", "end_minus_think",
+                  "close_minus_think_tail", "all_mean"]
+
+
+def summarize_rows(rows: list[dict], neutral: bool) -> dict:
+    keys = PRIMARY_KEYS + SECONDARY_KEYS
+    out = {}
+    for subset, sel in (("all_turns", lambda r: True), ("last_turn_of_round", lambda r: r["last"])):
+        rs = [r for r in rows if sel(r)]
+        s = {"fail": {k: summarize([r["fail"][k] for r in rs]) for k in keys}}
+        if neutral:
+            s["neutral"] = {k: summarize([r["neutral"][k] for r in rs]) for k in keys}
+            s["fail_minus_neutral"] = {k: summarize([r["fail"][k] - r["neutral"][k] for r in rs])
+                                       for k in keys if k != "n_cand"}
+        out[subset] = s
+    return out
+
+
+def primary_verdict(summary: dict, neutral: bool) -> dict:
+    """The pre-registered primary test on stop_cand over all failed-round
+    turns. below_neutral is None when no neutral control was run, and then
+    `present` cannot be True: without the control a negative stop_cand could
+    just be "any appended text makes the model less ready to stop"."""
+    a = summary["all_turns"]
+    f = a["fail"]["stop_cand"]
+    below_zero = bool(f.get("n")) and f["ci95"][1] < 0
+    below_neutral = None
+    if neutral:
+        g = a["fail_minus_neutral"]["stop_cand"]
+        below_neutral = bool(g.get("n")) and g["ci95"][1] < 0
+    return {"below_zero": below_zero, "below_neutral": below_neutral,
+            "present": below_zero and below_neutral is True}
+
+
 # ---------------------------------------------------------------------------
 # model side (imported lazily so --dry-run and the tests need no torch)
 # ---------------------------------------------------------------------------
@@ -365,10 +477,16 @@ def load_model(path: str, dtype: str, attn: str):
     return tok, model
 
 
-def response_logprobs(model, prompt_ids: list[int], resp_ids: list[int], chunk: int = 1024):
-    """log P(resp_t | prompt, resp_<t) for every response token. Runs the
-    decoder once, then the LM head only over the response span, in chunks --
-    full-vocabulary logits over a 30k-token prompt would not fit."""
+def response_logprobs(model, prompt_ids: list[int], resp_ids: list[int], close_id: int | None = None,
+                      temperature: float = 1.0, chunk: int = 1024) -> dict[str, list]:
+    """Per response position, at the given temperature (training divides
+    logits by --rollout-temperature before log_softmax):
+        real     log P(resp_t | prompt, resp_<t)
+        close    log P(</think>)                          (if close_id given)
+        in_topk  </think> is in the top-STUDENT_TOPK      (if close_id given)
+        w_close  its softmax weight within that top-K     (if close_id given)
+    Runs the decoder once, then the LM head only over the response span, in
+    chunks -- full-vocabulary logits over a 30k-token prompt would not fit."""
     import torch
     with torch.no_grad():
         dev = next(model.parameters()).device
@@ -378,11 +496,24 @@ def response_logprobs(model, prompt_ids: list[int], resp_ids: list[int], chunk: 
         h = hidden[0, p - 1:p + r - 1]
         tgt = ids[0, p:p + r]
         head = model.get_output_embeddings()
-        out = torch.empty(r, dtype=torch.float32, device=dev)
+        real = torch.empty(r, dtype=torch.float32, device=dev)
+        close = torch.empty(r, dtype=torch.float32, device=dev)
+        in_topk = torch.zeros(r, dtype=torch.bool, device=dev)
+        w_close = torch.zeros(r, dtype=torch.float32, device=dev)
         for s in range(0, r, chunk):
-            logits = head(h[s:s + chunk]).float()
-            out[s:s + chunk] = logits.log_softmax(-1).gather(-1, tgt[s:s + chunk, None]).squeeze(-1)
-        return out.cpu().tolist()
+            lp = (head(h[s:s + chunk]).float() / temperature).log_softmax(-1)
+            real[s:s + chunk] = lp.gather(-1, tgt[s:s + chunk, None]).squeeze(-1)
+            if close_id is not None:
+                close[s:s + chunk] = lp[:, close_id]
+                top_lp, top_idx = lp.topk(STUDENT_TOPK, dim=-1)
+                hit = top_idx == close_id
+                in_topk[s:s + chunk] = hit.any(-1)
+                w_close[s:s + chunk] = (top_lp.softmax(-1) * hit).sum(-1)
+        out = {"real": real.cpu().tolist()}
+        if close_id is not None:
+            out.update(close=close.cpu().tolist(), in_topk=in_topk.cpu().tolist(),
+                       w_close=w_close.cpu().tolist())
+        return out
 
 
 def alignment_check(model, prompt_ids: list[int], resp_ids: list[int], tol: float = 2e-3):
@@ -393,7 +524,7 @@ def alignment_check(model, prompt_ids: list[int], resp_ids: list[int], tol: floa
     response: HF shifts logits and labels internally, independently of the
     slicing above. Mean NLL over the response must agree."""
     import torch
-    lp = response_logprobs(model, prompt_ids, resp_ids)
+    lp = response_logprobs(model, prompt_ids, resp_ids, temperature=1.0)["real"]
     mine = -sum(lp) / len(lp)
     with torch.no_grad():
         dev = next(model.parameters()).device
@@ -494,16 +625,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--records", nargs="+", required=True)
     ap.add_argument("--training-log")
     ap.add_argument("--model")
-    ap.add_argument("--days", default="01,02,03")
+    ap.add_argument("--days", default="01-03", help='e.g. "01-16" or "01,02,05-08"')
     ap.add_argument("--max-turns", type=int, default=400)
     ap.add_argument("--max-tokens", type=int, default=32768)
+    ap.add_argument("--temperature", type=float, default=TEMPERATURE)
     ap.add_argument("--neutral-control", action="store_true")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--attn", default="sdpa")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out")
     args = ap.parse_args(argv)
-    days = [d.strip() for d in args.days.split(",") if d.strip()]
+    days = expand_days(args.days)
     counts: Counter = Counter()
 
     rounds = parse_rollout_log(Path(args.rollout_log).read_text(encoding="utf-8", errors="replace"))
@@ -541,6 +673,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.model:
             from transformers import AutoTokenizer
             tok = AutoTokenizer.from_pretrained(args.model)
+            # The loss patch (METACLAW_OPD_MASK_COMMIT) defaults to these two
+            # ids; if they differ, pass METACLAW_THINK_CLOSE_ID / _IM_END_ID.
+            print(f"[ids] </think>={tok.convert_tokens_to_ids('</think>')} "
+                  f"<|im_end|>={tok.convert_tokens_to_ids('<|im_end|>')} "
+                  f"(loss patch defaults: 151668 / 151645)")
         for t in turns[:3]:
             sp = splice_hint(t.prompt_text, t.rnd.probe, t.rnd.hint)
             print("-" * 72)
@@ -596,53 +733,47 @@ def main(argv: list[str] | None = None) -> int:
         if max(len(s_ids), len(t_ids)) + len(resp) > args.max_tokens:
             counts["skip_too_long"] += 1
             continue
-        lp_s = response_logprobs(model, s_ids, resp)
-        lp_t = response_logprobs(model, t_ids, resp)
-        d = [a - b for a, b in zip(lp_t, lp_s)]
+        T = args.temperature
+        out_s = response_logprobs(model, s_ids, resp, close_id, T)
+        out_t = response_logprobs(model, t_ids, resp, close_id, T)
+        c = cats["close"][0]
+
+        def measure(out_x):
+            d = [a - b for a, b in zip(out_x["real"], out_s["real"])]
+            m = contrasts(cat_means(d, cats))
+            # in_topk / w_close from the STUDENT pass: S_t is the student's top-K.
+            m.update(stop_metrics(out_s["close"], out_x["close"], out_s["in_topk"], out_s["w_close"], c))
+            return m
+
         row = {"day": t.rnd.day, "round": t.rnd.round_id, "turn": t.turn, "last": t.is_last,
-               "n_think": len(cats["think"]), "n_resp": len(resp),
-               "fail": contrasts(cat_means(d, cats))}
-        row["fail_means"] = cat_means(d, cats)
+               "n_think": len(cats["think"]), "n_resp": len(resp), "fail": measure(out_t)}
         if args.neutral_control:
             n_pt = splice_hint(t.prompt_text, t.rnd.probe, NEUTRAL_HINT)
             n_ids = tok(n_pt, add_special_tokens=False)["input_ids"]
-            lp_n = response_logprobs(model, n_ids, resp)
-            dn = [a - b for a, b in zip(lp_n, lp_s)]
-            row["neutral"] = contrasts(cat_means(dn, cats))
+            row["neutral"] = measure(response_logprobs(model, n_ids, resp, close_id, T))
         rows.append(row)
         if n % 20 == 0:
             print(f"[run] {n}/{len(turns)} done")
 
-    keys = ["close_minus_think", "act_head_minus_think", "end_minus_think",
-            "close_minus_think_tail", "all_mean"]
-    summary = {}
-    for subset, sel in (("last_turn_of_round", lambda r: r["last"]), ("all_turns", lambda r: True)):
-        rs = [r for r in rows if sel(r)]
-        s = {"fail": {k: summarize([r["fail"][k] for r in rs]) for k in keys}}
-        if args.neutral_control:
-            s["neutral"] = {k: summarize([r["neutral"][k] for r in rs]) for k in keys}
-            s["fail_minus_neutral"] = {k: summarize([r["fail"][k] - r["neutral"][k] for r in rs]) for k in keys}
-        summary[subset] = s
-
+    summary = summarize_rows(rows, args.neutral_control)
     print("=" * 72)
     for subset, s in summary.items():
         print(f"[{subset}]")
         for block, stats in s.items():
-            for k in keys:
-                st = stats[k]
+            for k, st in stats.items():
                 if st.get("n"):
                     print(f"  {block:18s} {k:24s} n={st['n']:4d} mean={st['mean']:+.4f} "
                           f"median={st['median']:+.4f} neg={st['frac_neg']:.0%} "
                           f"ci95=[{st['ci95'][0]:+.4f}, {st['ci95'][1]:+.4f}]")
-    lt = summary["last_turn_of_round"]
-    below = [k for k in ("close_minus_think", "act_head_minus_think")
-             if lt["fail"][k].get("n") and lt["fail"][k]["ci95"][1] < 0]
+    v = primary_verdict(summary, args.neutral_control)
     print("-" * 72)
-    print(f"pre-registered test, last turn of round: CI entirely below 0 for {below or 'neither'}")
-    if args.neutral_control:
-        more_neg = [k for k in below if lt["fail_minus_neutral"][k].get("n")
-                    and lt["fail_minus_neutral"][k]["ci95"][1] < 0]
-        print(f"  ...and more negative than the neutral hint for {more_neg or 'neither'}")
+    print(f"PRIMARY (all failed-round turns, stop_cand): CI entirely below 0 = {v['below_zero']}; "
+          f"more negative than neutral = {v['below_neutral']}")
+    print(f"  => OPD suppresses stopping at step 0: {v['present']}")
+    lt = summary["last_turn_of_round"]["fail"]
+    below = [k for k in ("close_minus_think", "act_head_minus_think")
+             if lt[k].get("n") and lt[k]["ci95"][1] < 0]
+    print(f"SECONDARY (last turn, realised token): CI entirely below 0 for {below or 'neither'}")
     print(f"counts: {dict(counts)}")
 
     if args.out:

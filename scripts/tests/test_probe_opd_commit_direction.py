@@ -296,6 +296,52 @@ def main():
     ck(math.isnan(P.contrasts(P.cat_means([0.0] * 4, c2))["end_minus_think"]),
        "a missing category gives NaN, not a fake zero")
 
+    # ---------------- the stop decision (primary metric) ----------------
+    print("\n[stop metric]")
+    # 6 thinking positions, </think> written at c=5, then 2 action positions.
+    # </think> is in the student's top-4 at positions 3, 4 and 5 only.
+    close_s = [-9.0, -9.0, -9.0, -3.0, -2.0, -0.5, -9.0, -9.0]
+    close_t = [-9.5, -9.5, -9.5, -4.0, -3.0, -2.5, 0.0, 0.0]   # teacher less ready to stop
+    in_topk = [False, False, False, True, True, True, True, True]
+    w_close = [0.0, 0.0, 0.0, 0.2, 0.3, 0.9, 0.5, 0.5]
+    sm = P.stop_metrics(close_s, close_t, in_topk, w_close, c=5)
+    ck(sm["n_cand"] == 3.0, "only positions where </think> is in the student's top-K count as candidates")
+    ck(abs(sm["stop_cand"] - (-1.0 - 1.0 - 2.0) / 3) < 1e-12,
+       "stop_cand = mean teacher-minus-student log P(</think>) over candidates, the written </think> included")
+    ck(abs(sm["stop_all"] - (-0.5 * 3 - 1.0 - 1.0 - 2.0) / 6) < 1e-12,
+       "stop_all covers every thinking position 0..c and nothing after it")
+    ck(abs(sm["a_stop"] - (-1.0 * 0.2 - 1.0 * 0.3 - 1.0 * 0.9) / 3) < 1e-12,
+       "a_stop clamps the gap at the official OPD clip (1.0) and weights it by w")
+    ck(math.isnan(P.stop_metrics([-1.0] * 3, [-1.0] * 3, [False] * 3, [0.0] * 3, c=2)["stop_cand"]),
+       "no candidate position -> NaN, not a fake zero")
+
+    print("\n[day ranges and the verdict rule]")
+    ck(P.expand_days("01-03,07") == ["01", "02", "03", "07"], "a range and a single day")
+    ck(P.expand_days("01-16")[-1] == "16" and len(P.expand_days("01-16")) == 16, "01-16 is 16 days")
+    ck(P.expand_days("day05") == ["day05"], "an exact test_id is kept as given")
+
+    def rows_with(fail_vals, neutral_vals):
+        base = {k: 0.0 for k in P.SECONDARY_KEYS}
+        return [{"last": i % 2 == 0,
+                 "fail": dict(base, stop_cand=f, a_stop=f, stop_all=f, n_cand=3.0),
+                 "neutral": dict(base, stop_cand=g, a_stop=g, stop_all=g, n_cand=3.0)}
+                for i, (f, g) in enumerate(zip(fail_vals, neutral_vals))]
+
+    strong = rows_with([-0.8, -0.9, -1.0, -0.7] * 5, [-0.1, 0.0, -0.05, 0.05] * 5)
+    v = P.primary_verdict(P.summarize_rows(strong, True), True)
+    ck(v == {"below_zero": True, "below_neutral": True, "present": True},
+       "clearly negative and clearly below the neutral hint -> present")
+    same = rows_with([-0.8, -0.9, -1.0, -0.7] * 5, [-0.8, -0.9, -1.0, -0.7] * 5)
+    v = P.primary_verdict(P.summarize_rows(same, True), True)
+    ck(v["below_zero"] and not v["present"],
+       "negative but no different from the neutral hint -> NOT present (any appended text does it)")
+    v = P.primary_verdict(P.summarize_rows(strong, False), False)
+    ck(v["below_neutral"] is None and v["present"] is False,
+       "without the neutral control the verdict can never read present")
+    mixed = rows_with([-1.0, 1.0] * 10, [0.0] * 20)
+    ck(not P.primary_verdict(P.summarize_rows(mixed, True), True)["below_zero"],
+       "a CI spanning 0 is not below zero")
+
     # ---------------- statistics ----------------
     print("\n[summary statistics]")
     s = P.summarize([-1.0, -2.0, -3.0, 1.0, float("nan")])

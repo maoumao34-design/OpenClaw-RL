@@ -301,3 +301,12 @@ KL 0.1 趟的 `0.1×kl_loss` 只占 `|opd_loss|` 约 2%，一度被判为"很弱
 **基线自己在 day12–15 的 Compl 也是 0.0%**——这几天本来就难。训练趟在这几天归零，区分不出任何东西。
 
 **能区分训练趟与基线的 Compl 窗口是 day16–20**（基线恢复到 33–62%）。Acc 同理，day12–15 基线只有 18–32%。
+
+## ⚠️ 生成温度 = 训练温度 = 0.6，但没有任何代码保证这一点
+
+训练把 logits 除以 `--rollout-temperature 0.6`（学生和 teacher 都是）。生成那边**谁都没设温度**：`openclaw.json` 没有 `temperature`，OpenClaw 只在配置了才写进请求；sglang 在 `sampling_defaults=model` 下改用模型 `generation_config.json` 的 0.6。两边一致是默认值碰巧对上（2026-09-29 查证，`metaclaw_migration_20260927_040725`）。
+
+> **换 sglang 版本、改启动参数、换模型文件之前先核对这一点。**sglang 的默认一旦变成 OpenAI 的 1.0，生成温度会悄悄变，训练仍按 0.6 算，不会报任何错。
+
+- 论文 Personal Agent 部分**没有写温度**；Table 6 的 1.0 是 **General Agent** 的参数，不适用于我们
+- `generation_config` 的 `top_p 0.95` / `top_k 20` 也在生成时生效，训练算概率用的是完整词表。从官方原样继承，不是我们的偏离

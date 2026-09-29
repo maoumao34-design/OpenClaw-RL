@@ -480,7 +480,7 @@ OPD 需要 `(response_t, next_state_{t+1})` 一对才能打分，但 next_state 
 | OPD subset S_i | student top-K | student top-K |
 | PPO clip (εlo / εhi) | 0.2 / 0.28 | 0.2 / 0.28 |
 | KL 系数 β | 0.0（关闭）| 0.01 |
-| rollout temperature | 0.6 | 0.6 |
+| rollout temperature | 0.6（官方脚本，论文未写）| 1.0（论文 Table 6）|
 | 每 prompt 采样数 N | 1 | 8 |
 | rollout batch size | 16 | 8（GUI/SWE）/ 16（Terminal）/ 32（Tool-call）|
 | 最大响应长度 | 8192 tokens | 8192 tokens |

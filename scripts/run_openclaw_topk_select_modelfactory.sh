@@ -222,6 +222,14 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
         echo "[profile] --kl-loss-coef 0.0 -> ${METACLAW_KL_LOSS_COEF}（锚 = --ref-load 的初始权重）"
     fi
 
+    # 2026-09-29 临时诊断（H-e 因果检验，openclaw-rl-metaclaw-opd-mask-commit）。
+    # 这里只负责打印确认；变量本身经下面 RUNTIME_ENV_JSON 进入 Ray，由
+    # prepare_patched_openclaw_combine_select.sh 生成的 loss 补丁读取。读完结果后删除。
+    if [ "${METACLAW_OPD_MASK_COMMIT:-0}" = "1" ]; then
+        echo "[profile] METACLAW_OPD_MASK_COMMIT=1：OPD 不作用于每个 </think> 到该轮 <|im_end|>，" \
+             "也不作用于 </think> 在学生 top-K 中的位置（临时诊断）"
+    fi
+
     # 2026-09-11：record 文件按 run 分路径。
     #
     # 官方脚本把它写死成 results/qwen3_4b_topk_select_record.jsonl，而
@@ -345,6 +353,21 @@ new_nccl_env = '\\"NCCL_DEBUG\\": \\"INFO\\",\n    \\"WANDB_API_KEY\\": \\"${WAN
 if old_nccl_env not in text:
     raise SystemExit("patch failed: NCCL_DEBUG line not found in topk-select launcher")
 text = text.replace(old_nccl_env, new_nccl_env, 1)
+
+# 2026-09-29 TEMPORARY DIAGNOSTIC (openclaw-rl-metaclaw-opd-mask-commit, see
+# scripts/prepare_patched_openclaw_combine_select.sh): the patched topk loss
+# reads these inside the Ray actor, so they travel in the runtime env
+# explicitly rather than relying on the workers inheriting the shell's
+# environment. The defaults keep the mask off. Remove with the patch.
+old_wandb_env = '\\"WANDB_API_KEY\\": \\"${WANDB_API_KEY:-}\\",'
+new_wandb_env = old_wandb_env + (
+    '\n    \\"METACLAW_OPD_MASK_COMMIT\\": \\"${METACLAW_OPD_MASK_COMMIT:-0}\\",'
+    '\n    \\"METACLAW_THINK_CLOSE_ID\\": \\"${METACLAW_THINK_CLOSE_ID:-151668}\\",'
+    '\n    \\"METACLAW_IM_END_ID\\": \\"${METACLAW_IM_END_ID:-151645}\\",'
+)
+if old_wandb_env not in text:
+    raise SystemExit("patch failed: WANDB_API_KEY runtime-env line not found in topk-select launcher")
+text = text.replace(old_wandb_env, new_wandb_env, 1)
 
 old_wandb_args = (
     "  WANDB_ARGS=(\n"

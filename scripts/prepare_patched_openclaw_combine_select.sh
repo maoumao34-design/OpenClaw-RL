@@ -826,3 +826,138 @@ PY
 
 python3 -m py_compile "${DEST}"
 echo "已生成 openclaw_combine_select_api_server.py 调试补丁（openclaw-rl-debug-turn-content）: ${DEST}"
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-opd-mask-commit (2026-09-29) -- TEMPORARY DIAGNOSTIC
+# ---------------------------------------------------------------------
+# Causal test of H-e (docs/work_log.md 2026-09-29): repeated thinking only
+# ever appears with OPD on, and OPD only carries a hint on FAILED rounds, so
+# the hypothesis is that a "you were wrong" teacher suppresses stopping and
+# acting. This stops OPD from touching that decision -- it leaves OPD on
+# every other position -- so pure OPD can be rerun and checked for whether
+# it still loops by day04-05 the way arm B did.
+#
+# The patched copy of openclaw_topk_select_loss.py lands in the same
+# DEST_DIR, which the launcher already puts ahead of the official
+# openclaw-combine/ on PYTHONPATH. With METACLAW_OPD_MASK_COMMIT unset or
+# "0" nothing changes: the patch only ADDS lines, and every added line is
+# either a definition or sits behind `if _MC_MASK_COMMIT`.
+#
+# Delete this block, the RUNTIME_ENV_JSON lines in
+# run_openclaw_topk_select_modelfactory.sh and the ledger row once the test
+# has been read (docs/change_ledger.md).
+LOSS_SRC="${REPO_ROOT}/openclaw-combine/openclaw_topk_select_loss.py"
+LOSS_DEST="${DEST_DIR}/openclaw_topk_select_loss.py"
+if [ ! -f "${LOSS_SRC}" ]; then
+    echo "错误：找不到官方文件 ${LOSS_SRC}" >&2
+    exit 1
+fi
+
+python3 - "${LOSS_SRC}" "${LOSS_DEST}" <<'PY'
+import sys
+
+src_path, dest_path = sys.argv[1], sys.argv[2]
+with open(src_path, encoding="utf-8") as f:
+    text = f.read()
+
+
+def insert(anchor, before="", after="", what=""):
+    global text
+    n = text.count(anchor)
+    if n != 1:
+        raise SystemExit(
+            f"patch failed ({what}): expected exactly 1 occurrence of the anchor in "
+            f"{src_path}, found {n} -- the official file changed, re-verify this patch"
+        )
+    text = text.replace(anchor, before + anchor + after, 1)
+
+
+HELPER = '''
+
+# --- openclaw-rl-metaclaw-opd-mask-commit (2026-09-29) -- TEMPORARY DIAGNOSTIC ---
+# See scripts/prepare_patched_openclaw_combine_select.sh. Off unless
+# METACLAW_OPD_MASK_COMMIT=1. The two ids default to Qwen3's </think> and
+# <|im_end|>; if the tokenizer differs they are overridable, and a wrong id
+# shows up as opd_commit_keep_frac == 1.0 (nothing masked).
+_MC_MASK_COMMIT = os.getenv("METACLAW_OPD_MASK_COMMIT", "0") == "1"
+_MC_THINK_CLOSE_ID = int(os.getenv("METACLAW_THINK_CLOSE_ID", "151668"))
+_MC_IM_END_ID = int(os.getenv("METACLAW_IM_END_ID", "151645"))
+if _MC_MASK_COMMIT:
+    print(
+        f"[openclaw-rl-metaclaw-opd-mask-commit] ON: close_id={_MC_THINK_CLOSE_ID} "
+        f"im_end_id={_MC_IM_END_ID}",
+        flush=True,
+    )
+
+
+def _metaclaw_commit_keep_mask(tokens: torch.Tensor, s_idx: torch.Tensor) -> torch.Tensor:
+    """True where OPD may still act on this response position.
+
+    False (a) from each </think> through the <|im_end|> that ends that turn,
+    both included -- the decision to stop thinking and the action it leads
+    to -- and (b) wherever </think> is among the student's top-K, i.e.
+    wherever OPD would directly re-weight "stop thinking now".
+
+    Works turn by turn inside a multi-turn trajectory sample: a position is
+    acting when the last </think> at or before it is later than the last
+    <|im_end|> strictly before it. Tool results and generation tails between
+    turns come out as not-acting, and carry loss_mask 0 anyway.
+    """
+    R = tokens.size(0)
+    if R == 0:
+        return torch.ones(0, dtype=torch.bool, device=tokens.device)
+    idx = torch.arange(R, device=tokens.device)
+    neg = torch.full_like(idx, -1)
+    last_close = torch.where(tokens == _MC_THINK_CLOSE_ID, idx, neg).cummax(0).values
+    last_end = torch.where(tokens == _MC_IM_END_ID, idx, neg).cummax(0).values
+    prev_end = torch.cat([neg[:1], last_end[:-1]])
+    acting = last_close > prev_end
+    stop_candidate = (s_idx == _MC_THINK_CLOSE_ID).any(dim=-1)
+    return ~(acting | stop_candidate)
+'''
+
+insert("from slime.utils.ppo_utils import compute_approx_kl, compute_policy_loss\n",
+       after=HELPER, what="helper after imports")
+insert("    sel_k_star_mean: torch.Tensor | None = None\n",
+       after="    _mc_keep_frac: torch.Tensor | None = None\n", what="keep-frac init")
+insert("        all_k_star = []\n",
+       after="        all_mc_keep = []\n", what="per-batch keep list")
+insert(
+    "            all_pg.append(pg_t)\n",
+    before=(
+        "            if _MC_MASK_COMMIT:\n"
+        "                _mc_keep = _metaclaw_commit_keep_mask(\n"
+        "                    _tokens_chunk.to(device=s_idx.device, dtype=torch.long), s_idx\n"
+        "                )\n"
+        "                # Zero the masked positions' OPD term without touching the\n"
+        "                # per-sample denominator, so the remaining positions keep\n"
+        "                # exactly the weight they had -- nothing is up-weighted.\n"
+        "                pg_t = pg_t * _mc_keep.to(pg_t.dtype)\n"
+        "                all_mc_keep.append(_mc_keep.float())\n"
+    ),
+    what="mask application",
+)
+insert(
+    "        sel_k_star_mean = sum_of_sample_mean(opd_k_star_tokens)\n",
+    after=(
+        "        if all_mc_keep:\n"
+        "            _mc_keep_frac = sum_of_sample_mean(torch.cat(all_mc_keep, dim=0))\n"
+    ),
+    what="keep-frac reduction",
+)
+insert(
+    "    if args.use_kl_loss:\n",
+    before=(
+        "    if _mc_keep_frac is not None:\n"
+        "        reported[\"opd_commit_keep_frac\"] = _mc_keep_frac.clone().detach()\n"
+    ),
+    what="keep-frac report",
+)
+
+with open(dest_path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched -> {dest_path}")
+PY
+
+python3 -m py_compile "${LOSS_DEST}"
+echo "已生成 openclaw_topk_select_loss.py 临时诊断补丁（openclaw-rl-metaclaw-opd-mask-commit，默认关闭）: ${LOSS_DEST}"
