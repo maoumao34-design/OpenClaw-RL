@@ -780,3 +780,45 @@ print(f"patched (dispatch-time drop of is_aborted/generated_while_paused/is_dupl
 PY
 
 echo "已生成 openclaw_combine_api_server.py 补丁: ${DEST_DIR}/openclaw_combine_api_server.py（_maybe_submit_ready_samples 拦截 is_aborted/generated_while_paused/is_duplicate_user_retry/skip_forced_negative_override，OPD+RL 两条提交路径一起挡住，见 docs/issues_log.md 2026-08-13 条目）"
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f)
+# ---------------------------------------------------------------------
+# Carries every turn's weight version (tagged by the proxy, see
+# prepare_patched_openclaw_opd.sh) onto the round's sample, so the rollout can
+# keep only trajectories produced entirely by the weights being trained.
+# Acts only when the turns carry tags, i.e. only with METACLAW_ONPOLICY=1;
+# otherwise nothing is added. Meant to be reverted once H-f is read
+# (docs/change_ledger.md).
+python3 - "${DEST}" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+
+anchor = "        await asyncio.to_thread(self.output_queue.put, (group_index, collect))\n"
+n = text.count(anchor)
+if n != 1:
+    raise SystemExit(
+        f"patch failed (onpolicy version hand-off): expected exactly 1 round queue put in "
+        f"{path}, found {n} -- re-verify this patch"
+    )
+text = text.replace(
+    anchor,
+    "        # --- openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f) ---\n"
+    "        _mc_wvs = [td.get(\"weight_version\") for td in all_tds]\n"
+    "        if any(v is not None for v in _mc_wvs):\n"
+    "            for _mc_s in collect:\n"
+    "                _mc_s.metadata = {\n"
+    "                    **(getattr(_mc_s, \"metadata\", None) or {}),\n"
+    "                    \"metaclaw_weight_versions\": _mc_wvs,\n"
+    "                }\n"
+    + anchor,
+    1,
+)
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (onpolicy version hand-off) -> {path}")
+PY
+python3 -m py_compile "${DEST}"

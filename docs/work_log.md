@@ -64,7 +64,7 @@
 - 挂起：`report/` 产物未跟踪；专利搁置（09-18）
 
 ### 下一步
-1. **H-f 第二步，方案 A（临时诊断，确认原因后很可能回退）**：每个 turn 标权重版本，凑批时只保留当前版本生成的轨迹，跑纯 OPD。改动先写出来给用户看。判据与有效性检查见 2026-10-08 条目
+1. **H-f 因果检验已实现（`METACLAW_ONPOLICY`，临时诊断，结果读完后很可能整体回退）**：先确认 router 的 `/model_info` 能读到 `weight_version`，再跑纯 OPD。有效性检查与判据见 2026-10-08 条目
 2. **待确认**：按台账删除临时遮罩补丁（结果已读完）
 3. 第 3 步检验脚本（`stop_cand`）**未跑**，H-e 被否定后优先级下降
 
@@ -3540,8 +3540,8 @@ d < 0 = teacher 比学生更不愿意写这个 token = OPD 在压低它。在健
 
 | 来源 | 机制 |
 |---|---|
-| 异步重叠 | 训练循环是 `train_async.py`：训练第 r 批时，第 r+1 批已在用旧权重收集（`train_async.py:103`），权重更新后后半批才换成新权重。**每批都混有上一版权重生成的样本** |
-| 队列不清空 | 每次凑够 8 组就暂停，多出的样本留给下一批（`openclaw_combine_select_rollout.py` 的 `_drain_output_queue`），可能更旧 |
+| 异步重叠 | 训练循环是 `train_async.py`：训练第 r 批时，第 r+1 批已在用旧权重收集（`train_async.py:103`）。~~权重更新后后半批才换成新权重~~ ⛔ **10-08 更正：更新权重之前会先等第 r+1 批全部收集完**（源码注释 "sync generate before update weights to prevent update weight in the middle of generation"），**所以除第一批外，每一批都是整批由上一版权重生成**，见下文 |
+| 队列不清空 | 每次凑够 8 组就暂停（`openclaw_combine_select_rollout.py` 的 `_drain_output_queue`）。⛔ **10-08 更正**：凑批时已从队列取出但没用上的样本会被直接丢掉，只有最后一次取队列之后才到达的样本留给下一批 |
 | 轨迹跨版本 | 09-14 起一个 round 是一个样本；权重在 round 中途更新时，同一条轨迹前几个 turn 来自旧权重、后几个来自新权重 |
 | 没有修正 | `--use-rollout-logprobs` 关闭，`ell_old` 用当前权重重算，PPO 比率从 1 开始——**相当于把旧样本当作当前权重生成的来训练** |
 
@@ -3627,6 +3627,58 @@ step 4 的 0.40（底线 6 倍）是**起病那一批**，样本本身已在复�
 **有效性检查（跑之前写定）：**
 - 每步打印目标版本、保留数、丢弃数；**目标版本必须每步加 1**，保留样本的版本必须全部等于目标。不满足即停掉，这一趟不算数
 - **混杂检查**：跨越权重更新的轨迹往往更长，而长轨迹与复读相关。每步记录丢弃与保留轨迹的长度；**丢弃的中位长度 ≥ 保留的 1.5 倍时，"不复读"可能只是长轨迹被丢掉了**，结论要打折扣，需补按长度匹配的对照
+
+**判据不变**：对照臂 B，day04–08 每天 copies≥8 都 < 25% → H-f 成立；到 day05 ≥ 50% → 不成立；介于两者之间不下结论。
+
+
+### ⛔ 实现前发现：除第一批外，每一批都是"整批旧一版"；原方案 A 会卡死
+
+`train_async.py` 循环末尾，更新权重**之前**先等下一批全部收集完：
+
+```python
+if (rollout_id + 1) % args.update_weights_interval == 0:
+    # sync generate before update weights to prevent update weight in the middle of generation
+    rollout_data_curr_ref = ray.get(x) if (x := rollout_data_next_future) is not None else None
+    rollout_data_next_future = None
+    actor_model.update_weights()
+```
+
+所以第 r+1 批**全部**由 W_r 生成、由 W_{r+1} 训练；只有 step 0 是同一版权重生成并训练。这与第一步 CLI 的数据完全吻合（只有 step 0 是底线）。之前写的"后半批才换成新权重"是错的，已在原表格处标注更正。**H-f 的前提比原先说的更扎实**；"OPD 对着当前模型重算差值"的论点仍成立。
+
+**对原方案 A 的影响**：收集第 r+1 批时要等新版本样本，而权重更新又要等这一批收集完——**互相等待，会卡死**。必须先改顺序。
+
+### H-f 诊断的实现（`openclaw-rl-metaclaw-onpolicy`，临时，诊断完回退）
+
+> ⚠️ **再次强调（用户要求）：这只是确认 H-f 是否成立的临时诊断。结果出来后很可能先整体回退，再决定具体怎么修改。不要在它上面叠加改动。**
+
+**调整后的做法：先更新再收集，训练期间 agent 照常跑。**环境完全不变（agent 不会遇到暂停、没有 503），只是训练数据全部来自当前权重。
+
+| # | 改动 | 位置 |
+|---|---|---|
+| ① | 训练循环副本：**更新权重之后**才开始收集下一批；断言 `--update-weights-interval 1` | `prepare_patched_openclaw_combine_select.sh` 生成 `train_async_onpolicy.py`；**只有开启时启动脚本才换用它** |
+| ② | rollout 副本：开启时**不暂停代理**（record 仍按步归档），训练期间产生的样本带旧版本标记，下次凑批时丢掉 | 同上，生成 `openclaw_combine_select_rollout.py` |
+| ③ | 代理给每个 main turn 记 `weight_version`（读 sglang 响应的 `metadata.weight_version`，兼容 `meta_info`） | `prepare_patched_openclaw_opd.sh` 末尾一段 |
+| ④ | round 的所有 turn 版本写进样本 `metadata["metaclaw_weight_versions"]`，在放进队列之前 | `prepare_patched_openclaw_combine.sh` 末尾一段 |
+| ⑤ | 凑批开始时向 sglang 查当前版本作目标（依次试 `/model_info`、`/get_model_info`、`/server_info`、`/get_server_info`；`METACLAW_WEIGHT_VERSION_URL` 可直接指定地址；**查不到就报错，不猜**）；只保留所有 turn 都是目标版本的轨迹 | rollout 副本 |
+| ⑥ | `METACLAW_ONPOLICY`（默认 0）与 `METACLAW_WEIGHT_VERSION_URL` 显式写进 `RUNTIME_ENV_JSON`；开启时检查副本存在、打印确认 | `run_openclaw_topk_select_modelfactory.sh` |
+
+**关闭时与官方一致**：代理不打标签、样本不加字段；rollout 副本走官方原路径（resume → drain → pause）；启动脚本用官方 `train_async.py`。
+
+**已知残余误差（不处理）**：权重恰好在某个 turn 生成到一半时更新，sglang 暂停该请求、更新完继续，这个 turn 会被标成新版本但前半段是旧权重。只发生在更新那几秒，数量很少。
+
+**验证**：`tests/test_metaclaw_onpolicy.py` **34 条**。rollout 副本用桩模块替换 slime 后**实际运行**凑批函数和 `generate`：保留恰好 3 组目标版本、丢 2 组旧版本和 1 组无标签并计数、记录两边长度；开启时不暂停但仍归档 record、每步一行汇总；关闭时 resume → drain → pause 与官方一致。读版本的四种情况、训练循环中"下一批的启动"恰好一处且在更新之后（对照：官方版在训练之前）、启动脚本两种状态下的运行环境 JSON 与入口替换都有覆盖。**故意改坏 9 处，9/9 被抓到**。全套回归 11 个测试全部通过。
+
+**启动前须在服务器确认**：训练起来后，用 curl 访问 router（代理连接的那个地址）的 `/model_info`，确认能读到 `weight_version`。读不到就设 `METACLAW_WEIGHT_VERSION_URL` 指向引擎地址。
+
+**开跑后的有效性检查（跑之前写定）**：
+- `training.log` 里有 `[openclaw-rl-metaclaw-onpolicy] train loop: collect after update`
+- 每步一行 `[openclaw-rl-metaclaw-onpolicy] rollout=… target=… kept=… stale=… untagged=…`：**target 每步加 1、untagged 始终为 0**，否则停掉，这一趟不算数
+- 丢弃轨迹的长度中位数 ≥ 保留的 1.5 倍时，结论要打折扣（混杂检查）
+
+**启动**：
+```
+METACLAW_ONPOLICY=1 OPENCLAW_TOPK_W_RL=0 bash scripts/metaclaw/run_metaclaw_migration_modelfactory.sh
+```
 
 **判据不变**：对照臂 B，day04–08 每天 copies≥8 都 < 25% → H-f 成立；到 day05 ≥ 50% → 不成立；介于两者之间不下结论。
 

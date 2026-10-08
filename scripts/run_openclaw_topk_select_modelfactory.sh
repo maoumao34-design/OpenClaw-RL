@@ -230,6 +230,20 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
              "也不作用于 </think> 在学生 top-K 中的位置（临时诊断）"
     fi
 
+    # 2026-10-08 临时诊断（H-f 因果检验，openclaw-rl-metaclaw-onpolicy）。
+    # 开启后训练入口换成 prepare_patched_openclaw_combine_select.sh 生成的
+    # train_async_onpolicy.py（权重更新之后才收集下一批），rollout 只保留
+    # 当前权重生成的轨迹。这里只做打印和前置检查；替换入口与传变量在下面的
+    # Python 补丁里。读完结果后整体回退。
+    if [ "${METACLAW_ONPOLICY:-0}" = "1" ]; then
+        if [ ! -f "${PATCHED_COMBINE_SELECT_DIR:-}/train_async_onpolicy.py" ]; then
+            echo "错误：METACLAW_ONPOLICY=1 但找不到 \${PATCHED_COMBINE_SELECT_DIR}/train_async_onpolicy.py" >&2
+            exit 1
+        fi
+        echo "[profile] METACLAW_ONPOLICY=1：只用当前权重生成的轨迹训练；入口改为" \
+             "${PATCHED_COMBINE_SELECT_DIR}/train_async_onpolicy.py（临时诊断）"
+    fi
+
     # 2026-09-11：record 文件按 run 分路径。
     #
     # 官方脚本把它写死成 results/qwen3_4b_topk_select_record.jsonl，而
@@ -255,6 +269,7 @@ elif [ "${METACLAW_MIGRATION_PROFILE}" = "1" ]; then
 fi
 
 python3 - "${PATCHED}" "${REPO_ROOT}" <<'PY'
+import os
 import pathlib
 import sys
 
@@ -368,6 +383,26 @@ new_wandb_env = old_wandb_env + (
 if old_wandb_env not in text:
     raise SystemExit("patch failed: WANDB_API_KEY runtime-env line not found in topk-select launcher")
 text = text.replace(old_wandb_env, new_wandb_env, 1)
+
+# 2026-10-08 TEMPORARY DIAGNOSTIC (openclaw-rl-metaclaw-onpolicy, H-f, see
+# scripts/prepare_patched_openclaw_combine_select.sh): the proxy and the
+# rollout read these inside Ray, so they travel in the runtime env explicitly.
+# Off by default. When on, the job also runs the patched train loop that
+# collects each batch after the weight update. Remove with the patch.
+old_mask_env = '\\"METACLAW_IM_END_ID\\": \\"${METACLAW_IM_END_ID:-151645}\\",'
+new_mask_env = old_mask_env + (
+    '\n    \\"METACLAW_ONPOLICY\\": \\"${METACLAW_ONPOLICY:-0}\\",'
+    '\n    \\"METACLAW_WEIGHT_VERSION_URL\\": \\"${METACLAW_WEIGHT_VERSION_URL:-}\\",'
+)
+if old_mask_env not in text:
+    raise SystemExit("patch failed: METACLAW_IM_END_ID runtime-env line not found in topk-select launcher")
+text = text.replace(old_mask_env, new_mask_env, 1)
+if os.environ.get("METACLAW_ONPOLICY", "0") == "1":
+    old_entry = '   -- python3 "${SLIME_ROOT}/train_async.py" \\'
+    new_entry = '   -- python3 "${PATCHED_COMBINE_SELECT_DIR}/train_async_onpolicy.py" \\'
+    if text.count(old_entry) != 1:
+        raise SystemExit("patch failed: train_async entry point not found in topk-select launcher")
+    text = text.replace(old_entry, new_entry, 1)
 
 old_wandb_args = (
     "  WANDB_ARGS=(\n"

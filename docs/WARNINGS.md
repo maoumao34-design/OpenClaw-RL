@@ -310,3 +310,11 @@ KL 0.1 趟的 `0.1×kl_loss` 只占 `|opd_loss|` 约 2%，一度被判为"很弱
 
 - 论文 Personal Agent 部分**没有写温度**；Table 6 的 1.0 是 **General Agent** 的参数，不适用于我们
 - `generation_config` 的 `top_p 0.95` / `top_k 20` 也在生成时生效，训练算概率用的是完整词表。从官方原样继承，不是我们的偏离
+
+## ⚠️ 除第一批外，每一批训练数据都是上一版权重生成的
+
+slime 的 `train_async.py` 在训练第 r 批时就开始收集第 r+1 批，并且**更新权重之前先等第 r+1 批全部收集完**（源码注释 "sync generate before update weights to prevent update weight in the middle of generation"）。所以第 r+1 批**整批**由 W_r 生成、由 W_{r+1} 训练；只有 step 0 是同策略的。
+
+而 `--use-rollout-logprobs` 关闭，`ell_old` 用当前权重重算，PPO 比率从 1 开始——**训练把旧样本当作当前权重生成的**，没有任何重要性修正。这是官方设定（2026-10-08 查证）。
+
+> `train/train_rollout_logprob_abs_diff`（当前权重与生成时权重在同一批 token 上的对数概率差）可以量化它，但这个数也随内容变化：复读 token 几乎确定，两套引擎打分一致，值会掉到 step 0 以下。读的时候不能把超出 step 0 的部分全算作"样本旧"。

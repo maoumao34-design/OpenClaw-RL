@@ -961,3 +961,216 @@ PY
 
 python3 -m py_compile "${LOSS_DEST}"
 echo "已生成 openclaw_topk_select_loss.py 临时诊断补丁（openclaw-rl-metaclaw-opd-mask-commit，默认关闭）: ${LOSS_DEST}"
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f)
+# ---------------------------------------------------------------------
+# H-f: every training batch after the first was produced by the previous
+# weights. train_async starts collecting batch r+1 while batch r trains, and
+# waits for that collection to finish before it updates the weights, so the
+# whole of batch r+1 comes from W_r and is trained by W_{r+1}. This pair of
+# patched copies makes training use only samples from the weights that train
+# on them, and changes nothing else:
+#
+#   train_async_onpolicy.py   start collecting the next batch AFTER the weight
+#                             update instead of before training
+#   openclaw_combine_select_rollout.py
+#                             read the current weight version when a batch
+#                             starts, keep only trajectories whose every turn
+#                             carries it, and do not pause the proxy -- the
+#                             agent keeps running through training and what
+#                             it produces meanwhile is tagged old and dropped
+#
+# Turns are tagged by prepare_patched_openclaw_opd.sh and the tags reach the
+# sample through prepare_patched_openclaw_combine.sh. With
+# METACLAW_ONPOLICY unset the launcher runs the official train_async.py and
+# the patched rollout takes the official path line for line.
+#
+# A diagnostic only, meant to be reverted once H-f is read, before any actual
+# fix is decided (docs/change_ledger.md lists every piece).
+ROLLOUT_SRC="${REPO_ROOT}/openclaw-combine/openclaw_combine_select_rollout.py"
+ROLLOUT_DEST="${DEST_DIR}/openclaw_combine_select_rollout.py"
+TRAIN_SRC="${REPO_ROOT}/slime/train_async.py"
+TRAIN_DEST="${DEST_DIR}/train_async_onpolicy.py"
+for f in "${ROLLOUT_SRC}" "${TRAIN_SRC}"; do
+    if [ ! -f "${f}" ]; then
+        echo "错误：找不到官方文件 ${f}" >&2
+        exit 1
+    fi
+done
+
+python3 - "${ROLLOUT_SRC}" "${ROLLOUT_DEST}" "${TRAIN_SRC}" "${TRAIN_DEST}" <<'PY'
+import sys
+
+rollout_src, rollout_dest, train_src, train_dest = sys.argv[1:5]
+
+
+def patch_file(src, dest, edits):
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+    for what, old, new in edits:
+        n = text.count(old)
+        if n != 1:
+            raise SystemExit(
+                f"patch failed ({what}): expected exactly 1 occurrence in {src}, found {n} "
+                "-- the official file changed, re-verify this patch"
+            )
+        text = text.replace(old, new, 1)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(f"patched -> {dest}")
+
+
+ROLLOUT_HELPERS = '''
+
+# --- openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f) ---
+# See scripts/prepare_patched_openclaw_combine_select.sh. Off unless
+# METACLAW_ONPOLICY=1, and then only paired with train_async_onpolicy.py.
+import json as _mc_json
+import statistics as _mc_statistics
+import urllib.request as _mc_urlreq
+
+_MC_ONPOLICY = os.getenv("METACLAW_ONPOLICY", "0") == "1"
+_MC_VERSION_PATHS = ("/model_info", "/get_model_info", "/server_info", "/get_server_info")
+
+
+def _mc_find_weight_version(info):
+    """weight_version from a sglang info payload: top level, or one level down."""
+    if isinstance(info, dict):
+        if info.get("weight_version") is not None:
+            return str(info["weight_version"])
+        for v in info.values():
+            if isinstance(v, dict) and v.get("weight_version") is not None:
+                return str(v["weight_version"])
+    return None
+
+
+def _mc_current_weight_version(args) -> str:
+    """The weight version sglang is serving right now. METACLAW_WEIGHT_VERSION_URL
+    overrides the address (a full URL); otherwise the router the proxy talks to
+    is asked on the known info paths. Raises rather than guessing: a batch
+    filtered against the wrong version would silently train on nothing or on
+    everything."""
+    override = os.getenv("METACLAW_WEIGHT_VERSION_URL", "").strip()
+    base = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
+    urls = [override] if override else [base + p for p in _MC_VERSION_PATHS]
+    errors = []
+    for url in urls:
+        try:
+            with _mc_urlreq.urlopen(url, timeout=10) as resp:
+                version = _mc_find_weight_version(_mc_json.loads(resp.read().decode("utf-8")))
+        except Exception as e:  # noqa: BLE001 -- collected and reported below
+            errors.append(f"{url}: {e}")
+            continue
+        if version is not None:
+            return version
+        errors.append(f"{url}: no weight_version field")
+    raise RuntimeError("[openclaw-rl-metaclaw-onpolicy] cannot read the weight version: " + "; ".join(errors))
+
+
+def _mc_group_versions(group):
+    """Every weight version behind a group's turns, or None if any turn is untagged."""
+    out = set()
+    for s in group:
+        vs = (getattr(s, "metadata", None) or {}).get("metaclaw_weight_versions")
+        if not vs or any(v is None for v in vs):
+            return None
+        out.update(str(v) for v in vs)
+    return out
+
+
+def _mc_median(xs):
+    return _mc_statistics.median(xs) if xs else 0
+'''
+
+patch_file(rollout_src, rollout_dest, [
+    ("helpers",
+     "from slime.utils.types import Sample\n",
+     "from slime.utils.types import Sample\n" + ROLLOUT_HELPERS),
+    ("drain signature",
+     "async def _drain_output_queue(args, worker: AsyncRolloutWorker) -> list[list[Sample]]:\n",
+     "async def _drain_output_queue(\n"
+     "    args, worker: AsyncRolloutWorker, mc_target: str | None = None, mc_stats: dict | None = None,\n"
+     ") -> list[list[Sample]]:\n"),
+    ("drain filter",
+     "            if any(sample.status == Sample.Status.ABORTED for sample in group):\n"
+     "                continue\n"
+     "            data.append(group)\n",
+     "            if any(sample.status == Sample.Status.ABORTED for sample in group):\n"
+     "                continue\n"
+     "            if mc_target is not None:\n"
+     "                # Keep only trajectories whose every turn came from the\n"
+     "                # weights that will train on them.\n"
+     "                _mc_vs = _mc_group_versions(group)\n"
+     "                _mc_len = sum(int(getattr(s, \"response_length\", 0) or 0) for s in group)\n"
+     "                if _mc_vs is None:\n"
+     "                    mc_stats[\"untagged\"] += 1\n"
+     "                    continue\n"
+     "                if _mc_vs != {mc_target}:\n"
+     "                    mc_stats[\"stale\"] += 1\n"
+     "                    mc_stats[\"stale_lens\"].append(_mc_len)\n"
+     "                    continue\n"
+     "                mc_stats[\"kept_lens\"].append(_mc_len)\n"
+     "            data.append(group)\n"),
+    ("generate",
+     "    worker._server.reset_eval_scores()\n"
+     "    worker.resume_submission()\n"
+     "    completed_samples = run(_drain_output_queue(args, worker))\n"
+     "    worker.pause_submission()\n",
+     "    worker._server.reset_eval_scores()\n"
+     "    worker.resume_submission()\n"
+     "    if _MC_ONPOLICY:\n"
+     "        # train_async_onpolicy.py calls this right after the weight update,\n"
+     "        # so the version sglang serves now is the one that trains this batch.\n"
+     "        _mc_target = _mc_current_weight_version(args)\n"
+     "        _mc_s = {\"stale\": 0, \"untagged\": 0, \"stale_lens\": [], \"kept_lens\": []}\n"
+     "        completed_samples = run(\n"
+     "            _drain_output_queue(args, worker, mc_target=_mc_target, mc_stats=_mc_s)\n"
+     "        )\n"
+     "        # No pause: the agent keeps running through training, and what it\n"
+     "        # produces meanwhile is tagged old and dropped at the next drain.\n"
+     "        # The per-step record archive still happens, as pause would do it.\n"
+     "        worker._server.purge_record_files()\n"
+     "        print(\n"
+     "            f\"[openclaw-rl-metaclaw-onpolicy] rollout={rollout_id} target={_mc_target} \"\n"
+     "            f\"kept={len(completed_samples)} stale={_mc_s['stale']} untagged={_mc_s['untagged']} \"\n"
+     "            f\"len_median kept={_mc_median(_mc_s['kept_lens'])} \"\n"
+     "            f\"stale={_mc_median(_mc_s['stale_lens'])}\",\n"
+     "            flush=True,\n"
+     "        )\n"
+     "    else:\n"
+     "        completed_samples = run(_drain_output_queue(args, worker))\n"
+     "        worker.pause_submission()\n"),
+])
+
+patch_file(train_src, train_dest, [
+    ("interval guard",
+     "    # async train loop.\n",
+     "    # --- openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f) ---\n"
+     "    # The next batch is collected only after each weight update, which\n"
+     "    # needs an update every step.\n"
+     "    assert args.update_weights_interval == 1, (\n"
+     "        \"train_async_onpolicy needs --update-weights-interval 1\"\n"
+     "    )\n"
+     "    print(\"[openclaw-rl-metaclaw-onpolicy] train loop: collect after update\", flush=True)\n"
+     "\n"
+     "    # async train loop.\n"),
+    ("no early start",
+     "        # Start the next rollout early.\n"
+     "        if rollout_id + 1 < args.num_rollout:\n"
+     "            rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)\n",
+     "        # [openclaw-rl-metaclaw-onpolicy] the next rollout is NOT started\n"
+     "        # here; it starts after the weight update below, so the batch it\n"
+     "        # collects comes from the weights that will train on it.\n"),
+    ("start after update",
+     "            rollout_data_next_future = None\n"
+     "            actor_model.update_weights()\n",
+     "            rollout_data_next_future = None\n"
+     "            actor_model.update_weights()\n"
+     "            if rollout_id + 1 < args.num_rollout:\n"
+     "                rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)\n"),
+])
+PY
+
+python3 -m py_compile "${ROLLOUT_DEST}" "${TRAIN_DEST}"
+echo "已生成 H-f 临时诊断副本（openclaw-rl-metaclaw-onpolicy，METACLAW_ONPOLICY=1 时才启用）: ${ROLLOUT_DEST} ${TRAIN_DEST}"

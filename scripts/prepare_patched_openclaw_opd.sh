@@ -1223,3 +1223,74 @@ print(f"patched -> {dest_path}")
 PY
 
 echo "已生成 session_id 兼容补丁: ${DEST_DIR}/openclaw_opd_api_server.py"
+
+# ---------------------------------------------------------------------
+# openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f)
+# ---------------------------------------------------------------------
+# Tags each main turn with the weight version sglang reports for it, so the
+# rollout can train only on trajectories produced by the weights being
+# trained (see prepare_patched_openclaw_combine_select.sh for the filter and
+# docs/work_log.md 2026-10-08 for the test). Off unless METACLAW_ONPOLICY=1;
+# then turn_data gains one key and nothing else changes.
+#
+# A diagnostic only: it is meant to be reverted once H-f is read, before any
+# actual fix is decided. Delete this block with the others listed in
+# docs/change_ledger.md.
+python3 - "${DEST_DIR}/openclaw_opd_api_server.py" <<'PY'
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+
+
+def insert(anchor, before="", after="", what=""):
+    global text
+    n = text.count(anchor)
+    if n != 1:
+        raise SystemExit(
+            f"patch failed ({what}): expected exactly 1 occurrence of the anchor in "
+            f"{path}, found {n} -- re-verify this patch"
+        )
+    text = text.replace(anchor, before + anchor + after, 1)
+
+
+insert(
+    "import httpx\n",
+    after=(
+        "\n"
+        "# --- openclaw-rl-metaclaw-onpolicy (2026-10-08) -- TEMPORARY DIAGNOSTIC (H-f) ---\n"
+        "import os as _mc_os_onpolicy\n"
+        "\n"
+        "_MC_ONPOLICY = _mc_os_onpolicy.getenv(\"METACLAW_ONPOLICY\", \"0\") == \"1\"\n"
+        "\n"
+        "\n"
+        "def _mc_weight_version_of(output):\n"
+        "    \"\"\"The weight version sglang reports for one completion. The chat\n"
+        "    endpoint carries meta_info.weight_version as metadata.weight_version;\n"
+        "    either place is accepted. None when absent.\"\"\"\n"
+        "    if not isinstance(output, dict):\n"
+        "        return None\n"
+        "    for key in (\"metadata\", \"meta_info\"):\n"
+        "        block = output.get(key)\n"
+        "        if isinstance(block, dict) and block.get(\"weight_version\") is not None:\n"
+        "            return str(block[\"weight_version\"])\n"
+        "    return None\n"
+        "\n"
+    ),
+    what="version helper",
+)
+insert(
+    "            self._pending_turn_data.setdefault(session_id, {})[turn_num] = turn_data\n",
+    before=(
+        "            if _MC_ONPOLICY:\n"
+        "                turn_data[\"weight_version\"] = _mc_weight_version_of(output)\n"
+    ),
+    what="tag the main turn",
+)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+print(f"patched (onpolicy weight-version tag) -> {path}")
+PY
+python3 -m py_compile "${DEST_DIR}/openclaw_opd_api_server.py"
