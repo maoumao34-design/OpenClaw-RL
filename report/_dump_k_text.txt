@@ -1,0 +1,30 @@
+slides 6
+===== SLIDE 1 =====
+[标题 1] 自进化调研及OpenClaw-RL 方法总览
+[内容占位符 2] ① 自进化的理解　（综述 [1]） | “…agentic AI is no longer defined only by what a model can infer from static data, but by how a deployed system accumulates, organizes, and reuses experience from interaction.” | ② 经验的五个更新层面　（同上） | reusable skill / persistent memory / verifiable environment feedback / trainable model behavior / meta-level control | ③ 本次实验的主要难点 | 不在 RL 算法本身，而在“经验 → 更新”这条链路：信号怎么提取、怎么区分环境故障与模型失败、训练怎么在真实运行时里跑 | ④ 本次工作的定位 | OpenClaw-RL ＝ 模型权重这一层，训练直接跑在真实对话流中 —— 对话本身就是训练信号
+[灯片编号占位符 3] 1
+[TextBox 4] [1] Self-Improving Agents in the Era of Experience: A Survey of Self- to Meta-Evolution (2026)
+===== SLIDE 2 =====
+[Title 1] OpenClaw-RL 实现方法
+[Content Placeholder 2] ① 三个角色，一套真实环境 | Simulator（Qwen3-32B）按人设扮演 Student / TA / Teacher，在 OpenClaw 里与 Policy（Qwen3-4B）对话 | ② 两种训练顺序 | Separate（本次已完成）：三角色各训一个模型，须依次进行　｜　Joint：三角色共享一个模型，同时训练 | ③ 一次回复，两条去向 | 对话循环：回复照常送回用户　｜　训练循环：同一次回复交给判官 | ④ 两类信号，同一个判官 | Eval 判官答“好不好”→ GRPO；Hint 判官答“该怎么改”→ OPD。同一份 PRM 权重，只是提示词不同 | ⑤ 一次反传，权重回流 | 两个损失加权合并后一次更新，新权重同步回线上 Policy | 训练与对话异步并行：回应照常送出，权重在线更新，全程不停机
+[Slide Number Placeholder 1] 2
+===== SLIDE 3 =====
+[Title 1] OpenClaw-RL复现实验结果
+[Slide Number Placeholder 1] 3
+[TextBox 8] 论文 Table 3 · 达到收敛所需的 session 数（越小越好）
+[TextBox 10] 高亮格 19.2 = 本次复现对应的 Separate / Student / Hybrid RL
+[TextBox 11] 本次复现结果 | 论文    ————　19.2 | 本次复现    ——　20 | 配置：Policy / PRM = Qwen3-4B-Thinking-2507 | 　　　Simulator = DeepSeek-V4-Flash　｜　GSM8K　｜　Separate-Student | 判定：rule-based，连续 3 个 session 的 Turn 1 回复均满足偏好 | 第 18 个 session 起共 15 次有效回复，14 次 Turn 1 直接达标，仅 1 次退化
+===== SLIDE 4 =====
+[Title 1] 方法泛化方案
+[Content Placeholder 2] ① 任务背景 | 方法已在 Personal Agent 场景复现校准，换到 MetaClaw-Bench（30 天连续任务流、CLI agent）验证能否迁移 | ② 按题隔离：训练有效果 | day 6 相对同路径 day 0（09-05）：Acc +2.9pt / Compl +1.8pt；训练窗 day1–6 达 61.4% / 45.0%，说明训练本身有效果
+[Slide Number Placeholder 1] 4
+[TextBox 6] 上表为本次按题隔离，不与论文 Table 1 数字直接对比；day 0 为 09-05 环境修复后定版；day 6 相对其有提升
+[TextBox 8] 论文 Table 1　·　Part I / Part II 全表（Acc. / Compl.）
+===== SLIDE 5 =====
+[Title 1] 按天隔离实验
+[Content Placeholder 2] ① 定版基线（day 0） | Acc.　　41.1% | Compl.　26.3% | 复核第二趟：44.7% / 25.9%（Acc 噪声约 ±3.6pt） | ② 能跑到 day 8 的结果 | 干净窗 day01–07　　+7.1 pt | Acc 67.1% vs 基线同窗 60.0%（约四分之一题量） | day08 起开始被超长回复 / timeout 打穿 | 配置：Qwen3-4B-Thinking-2507　｜　30 天 / 346 题　｜　按天会话
+[Slide Number Placeholder 1] 3
+[TextBox 8] ③ 后续会崩溃 | day08–21 Acc 17.1%，基线同窗 48.1%（−31pt） | 复读率：step≤9 为 0% → step10 起病 17% → step15 85% | 崩坏内容是字面重复 thinking（一句话复读两三千次），不是更细的推理 | ④ 还没完成 | 长度爆炸是训练造成的——基线同期没有大面积 timeout | 尚未稳定训满 30 天，不能把干净窗数字当成完整结论
+===== SLIDE 6 =====
+  [TextBox 1] THANKS
+  [TextBox 1] FOR WATCHING

@@ -1,0 +1,9 @@
+slide4 shapes=8
+  Title 1                      L=0.53 T=0.12 W=5.43 H=1.32 方法泛化方案
+  Content Placeholder 2        L=0.53 T=4.88 W=5.90 H=2.44 ① 任务背景 | 方法已在 Personal Agent 场景复现校准，换到 MetaClaw-Bench（30 天连续任务流、CLI agent）验证能否迁移 | ② 按题隔离：训练有效果 | day 6 相对同路径 day 0（09-05）：Acc +2.9pt / Compl +1.8pt；训练窗 day1–6 达 61.4% / 45.0%，说明训练
+  Slide Number Placeholder 1   L=13.56 T=7.47 W=0.51 H=0.18 4
+  Picture 4                    L=6.58 T=0.19 W=6.58 H=7.13 pic 
+  TextBox 6                    L=0.53 T=4.46 W=5.90 H=0.40 上表为本次按题隔离，不与论文 Table 1 数字直接对比；day 0 为 09-05 环境修复后定版；day 6 相对其有提升
+  Picture 7                    L=0.53 T=1.08 W=5.90 H=1.55 pic 
+  TextBox 8                    L=0.53 T=2.67 W=5.90 H=0.28 论文 Table 1　·　Part I / Part II 全表（Acc. / Compl.）
+  Picture 9                    L=0.53 T=2.97 W=5.90 H=1.45 pic 

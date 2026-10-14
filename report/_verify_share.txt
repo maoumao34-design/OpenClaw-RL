@@ -1,0 +1,22 @@
+backup slides=5 current slides=6
+slide 1 xml == backup: True
+slide 2 xml == backup: True
+slide 3 xml == backup: True
+THANKS xml == backup last: True
+=== CURRENT 4-6 ===
+-- slide 4 '方法泛化方案' shapes=8
+  Title 1                      L=0.53 T=0.12 W=5.43 H=1.32 方法泛化方案
+  Content Placeholder 2        L=0.53 T=4.88 W=5.90 H=2.44 ① 任务背景 | 方法已在 Personal Agent 场景复现校准，换到 MetaClaw-Bench（30 天连续任务流、CLI agent）验证能否迁移 | ② 按题隔离：训练有效果 | K=6 相对同路径 K=0：Acc +2.4pt / Compl +0.5pt；训练窗 day1–6 达 61.4% / 45.0%，说明训练本身有效果
+  Slide Number Placeholder 1   L=13.56 T=7.47 W=0.51 H=0.18 4
+  Picture 4                    L=6.58 T=0.19 W=6.58 H=7.13 
+  TextBox 6                    L=0.53 T=4.46 W=5.90 H=0.40 下表为本次按题隔离，不与上表论文数字直接对比；K=6 相对同路径 K=0 有提升
+  Picture 7                    L=0.53 T=1.08 W=5.90 H=1.55 
+  TextBox 8                    L=0.53 T=2.67 W=5.90 H=0.28 论文 Table 1　·　Part I / Part II 全表（Acc. / Compl.）
+  Picture 9                    L=0.53 T=2.97 W=5.90 H=1.45 
+-- slide 5 '按天隔离实验' shapes=4
+  Title 1                      L=0.53 T=0.28 W=12.20 H=0.90 按天隔离实验
+  Content Placeholder 2        L=0.53 T=1.30 W=6.15 H=5.80 ① 定版基线（按天 K=0） | Acc.　　41.1% | Compl.　26.3% | 复核第二趟：44.7% / 25.9%（Acc 噪声约 ±3.6pt） | ② 能跑到 day 8 的结果 | 干净窗 day01–07　　+7.1 pt | Acc 67.1% vs 基线同窗 60.0%（约四分之一题量） | day08 起开始被超长回复 / timeout 打穿 | 配置：Qwen3-4B-Thinking-2507　｜　30 天 / 346 题　｜　按天会话
+  Slide Number Placeholder 1   L=13.56 T=7.47 W=0.51 H=0.18 3
+  TextBox 8                    L=7.00 T=1.30 W=5.80 H=5.80 ③ 后续会崩溃 | day08–21 Acc 17.1%，基线同窗 48.1%（−31pt） | 复读率：step≤9 为 0% → step10 起病 17% → step15 85% | 崩坏内容是字面重复 thinking（一句话复读两三千次），不是更细的推理 | ④ 还没完成 | 长度爆炸是训练造成的——基线同期没有大面积 timeout | 尚未稳定训满 30 天，不能把干净窗数字当成完整结论
+-- slide 6 '' shapes=1
+  组合 6                         L=3.46 T=2.58 W=6.41 H=2.33 
