@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""在已汇报的《Openclaw-RL论文复现及迁移内容分享》第 5 页之后插入 MetaClaw 进展 4 页。
+"""在已汇报的《Openclaw-RL论文复现及迁移内容分享》第 5 页之后插入 MetaClaw 进展 5 页
+（消融 / 正则 / 机制验证 / 总结 / 正在进行的 H-f 重跑）。
 
 - 输入（只读，不改动）：Openclaw-RL论文复现及迁移内容分享.pptx（2026-09-18 已汇报版）
 - 输出：Openclaw-RL论文复现及迁移内容分享_MetaClaw进展.pptx
@@ -347,7 +348,7 @@ def build_slide8(s):
     mechanism_half(
         s, 0.53 + w + 0.17, w, "假设 H-f：训练用了旧权重生成的样本",
         "对照：混合训练　｜　实验：只用当前权重生成的样本训练",
-        tags, wins, "结果：未定论",
+        tags, wins, "结果：未定论（正在重跑，见第 10 页）",
         ["① 到 day09 没有成批复读（对照 day09 为 29%）；但 day09 结束时只训练到 step 7，对照起病时已到 step 11。",
          "② 出现了别的失效：day08 一个 95 turn 的超长轮次（不是复读 thinking），当天 Acc 0；day09 Compl 0。"])
     textbox(s, 0.53, 6.72, 12.27, 0.5, FOOTNOTE, sz=9.5)
@@ -366,7 +367,7 @@ def build_slide9(s):
         ("+ 熵 0.1", "混合", "day09 → day06", "加速崩溃"),
         ("+ KL 0.1", "混合", "day09 → day18", "推迟 9 天，挡不住"),
         ("遮住停止决策（H-e）", "纯 OPD", "day04 → day04", "一天没推迟，假设否定"),
-        ("只用当前权重样本（H-f）", "混合", "day09 → 到 day09 无复读", "步数没对齐、出现别的失效，未定论"),
+        ("只用当前权重样本（H-f）", "混合", "day09 → 到 day09 无复读", "步数没对齐、出现别的失效，正在重跑"),
     ]
     rows = []
     for name, ctrl, ons, concl in data:
@@ -386,11 +387,77 @@ def build_slide9(s):
           [("④ ", 14, False, INK), ("口径：健康期 ±10pt 以内的差异在两趟零训练基线的差距范围内；训练中途停止的趟，没跑到的天不计入。", 14, False, INK)]])
 
 
+def card(slide, x, y, w, h, heading, items, sz=12.5):
+    """白底卡片：粗体小标题 + 若干段落。items 元素为 str 或 runs 列表。"""
+    panel(slide, x, y, w, h)
+    tb = slide.shapes.add_textbox(Inches(x + 0.18), Inches(y + 0.12), Inches(w - 0.36), Inches(h - 0.2))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    for side in ("left", "right", "top", "bottom"):
+        setattr(tf, f"margin_{side}", 0)
+    paras = [(6, [(heading, 15, True, INK)])]
+    for i, it in enumerate(items):
+        runs = it if isinstance(it, list) else [(it, sz, False, INK)]
+        paras.append((0 if i == len(items) - 1 else 4, runs))
+    write_paras(tf, paras, ln_pct=110)
+    return tb
+
+
+def onp_step_at(day):
+    return RUNS["ONP"][day]["train_step_end"]
+
+
+def build_slide10(s):
+    """正在进行：H-f 同策略训练（防止旧轨迹影响当前参数）。"""
+    title(s, "正在进行：防止旧轨迹影响当前参数")
+    lx, rx, w = 0.53, 6.75, 6.05
+    ty, th = 1.18, 2.92
+    by, bh = ty + th + 0.17, 7.32 - (ty + th + 0.17)
+    card(s, lx, ty, w, th, "① 问题：训练数据整批来自上一版权重",
+         ["· 官方 slime 异步循环：训练第 r 批时就在用 W_r 收集第 r+1 批，更新前先等收集完；"
+          "除 step 0 外，每批都由上一版权重生成、新权重训练",
+          "· 没有重要性修正（--use-rollout-logprobs 关闭），旧样本被当作当前权重生成的来训练",
+          "· 同批 token 上「当前权重 vs 生成时权重」的对数概率差：step 0 底线 0.066，之后各步为底线的 1.4–2.7 倍",
+          "· MetaClaw 在技能库版本变化时清空样本缓冲区；本实验把这一原则推广到权重版本"])
+    card(s, rx, ty, w, th, "② 做法：只用当前权重生成的样本训练",
+         ["· 先更新权重、再收集下一批；训练期间 agent 照常运行，环境不变（无暂停、无 503）",
+          "· 每个 turn 记录生成它的权重版本（SGLang 返回的 weight_version），凑批时只保留所有 turn 都是当前版本的轨迹",
+          "· 有效性检查：目标版本每步 +1；无版本标记的样本为 0；丢弃与保留轨迹的长度比 < 1.5（排除"
+          "“只是丢掉了长轨迹”）",
+          [("· 临时诊断开关（METACLAW_ONPOLICY），只用于确认假设是否成立，结论出来后回退，不是修复方案",
+            12.5, False, GREY)]])
+    # ③ 首趟结果：卡片 + 小表
+    panel(s, lx, by, w, bh)
+    textbox(s, lx + 0.18, by + 0.12, w - 0.36, 0.3,
+            "③ 首趟结果（混合训练，day01–09）", sz=15, color=INK, bold=True)
+    h0, onp = cw.agg(RUNS, "H0", 9, 9), cw.agg(RUNS, "ONP", 9, 9)
+
+    def c(t, bold=False, color=INK, latin=LATIN_TXT, sz=11.5):
+        return [[(t, sz, bold, color, latin)]]
+    rows = [
+        [c("day09 复读占比"), c(f"{h0['rep']:.0f}%", color=RED), c(f"{onp['rep']:.0f}%")],
+        [c("day09 结束时训练步"), c(f"step {RUNS['H0'][9]['train_step_end']}"), c(f"step {onp_step_at(9)}")],
+        [c("样本新旧差（相对 step 0 底线）"), c("1.4–2.7×"), c("多数步 0.75–0.96×")],
+        [c("有效性检查"), c("—"), c("全部通过")],
+    ]
+    make_table(s, lx + 0.18, by + 0.52, [2.65, 1.5, 1.5], [0.32] + [0.33] * len(rows),
+               ["", "混合（对照）", "混合 + 同策略"], rows)
+    textbox(s, lx + 0.18, by + 0.52 + 0.32 + 0.33 * len(rows) + 0.08, w - 0.36, 0.45,
+            "到 day09 没有成批复读；但训练步数比对照少，且 day08 出现一个 95 turn 的超长轮次"
+            "（不是复读 thinking），当天 Acc 0。", sz=11, color=INK)
+    card(s, rx, by, w, bh, "④ 当前：从头重跑",
+         ["· 首趟 driver 在 day10 中途退出，只训练到 step 8；checkpoint 每 10 步才存一次，无法续跑",
+          "· 同策略会丢掉训练期间产生的样本，约每天 1 步，大约到 day13 才达到对照起病时的步数（step 11）",
+          [("· 判据（提议，按训练步数对齐）：", 12.5, True, INK),
+           ("训练到 step 15、且 day13 之前每天复读占比都 < 25% → H-f 成立；step 12 及以前出现 ≥ 25% 的一天 → 不成立；"
+            "其余不下结论", 12.5, False, INK)]])
+
+
 def main():
     prs = Presentation(SRC)
     n0 = len(prs.slides)
     layout = prs.slides[TEMPLATE_SLIDE - 1].slide_layout
-    builders = [build_slide6, build_slide7, build_slide8, build_slide9]
+    builders = [build_slide6, build_slide7, build_slide8, build_slide9, build_slide10]
     for b in builders:
         b(prs.slides.add_slide(layout))
     # 新页移到第 INSERT_AFTER 页之后
