@@ -3745,3 +3745,19 @@ idle timeout 全程 0。day08 有 1 个 95 turn、557376 token 的轮次因超�
 > ⚠️ **本仓库是公开的 GitHub 仓库**（创建于 2026-06-16，现为公开；GitHub 近 90 天事件中没有由私有转公开的记录）。此前写入的所有方案都已公开，**可能构成我们自己专利的现有技术**——中国专利法下，在网上公开代码不属于可享受宽限期的情形。**今后专利相关的具体方案不写入本仓库。**
 
 ---
+
+## 2026-10-16
+
+**目标：** 修复训练两次都在 day04–05 崩溃的问题。
+
+### 轨迹样本带 OPD hint 时，teacher 序列长度对不上 student
+
+**现象**：`20261015` 和 `metaclaw_migration_20261016_135901` 两趟都在 day04–05 退出，teacher 前向报 `chunk has 4079 tokens but payload has 19055 index rows`，之后连不上模型是训练进程退出的后果。
+
+**根因（CLI 读日志 + 本地读代码，两边一致）**：轮级 verdict 的 `_opd_evaluate` 只在本轮**最后一个 turn** 上运行，此时轨迹还没拼，`metaclaw_trajectory` 为假，走的是"整段文本重新 tokenize"，得到的是那一个 turn 的 prompt + hint + 回复（14919 token）。`_metaclaw_submit_round` 把 6 个 turn 拼成 `response_len=19055` 的轨迹后，直接把这份旧的 teacher token 贴上去，没有重算。teacher 按 student 回复长度从末尾切片，起点变负，只切出 4079 个。前一趟是 5 turn、16642 对 14975，同一路径。没带 hint 的样本 teacher 就是轨迹自己的 `prompt_ids + response_ids`，长度一致，所以 step 0–2 能过，直到第一次出现"带 hint 且拼起来比那一个 turn 长"的轮。
+
+**修复**（`scripts/prepare_patched_openclaw_combine.sh`）：新增 `_metaclaw_trajectory_teacher_ids`，在轨迹拼好之后重建 teacher：按 `metaclaw_task_prefix` 在本轮**第一个** prompt 的消息里找到题面，用官方 `_append_hint_to_messages` 加 hint、渲染、tokenize，再原样接上轨迹的 `response_ids`；重建结果末尾必须正好等于轨迹回复，否则该轮改走纯 RL 并打日志。`_metaclaw_submit_round` 不再复用 `opd_result` 里的旧候选。`combine_select` 里那条 `metaclaw_trajectory` 分支在 verdict 阶段永远走不到，保留不动。
+
+**验证**：新增 `scripts/tests/test_metaclaw_trajectory_teacher.py`，直接跑补丁脚本生成的代码，用生产形态的两 turn 轨迹复现崩溃形状（旧 teacher 比 student 回复短），13 项通过；**反向验证**：撤掉修复后在"旧候选不得发出"一项失败。其余 11 个测试全部通过。真实训练待跑：判据是跑过 day05，且 `opd=True` 的轨迹不再出现该报错。
+
+---
